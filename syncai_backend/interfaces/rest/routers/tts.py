@@ -4,6 +4,7 @@ from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 
 from syncai_backend.exceptions import BadRequestError, UpstreamError
+from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.tts.tts import TtsGateway
 
 
@@ -40,8 +41,11 @@ def init_tts_router(logger: structlog.stdlib.BoundLogger, tts_gw: TtsGateway) ->
 
     def _raise_for(message: str) -> None:
         # The gateway's one caller-fixable failure; everything else (missing
-        # weights, onnxruntime, aplay) is ours and answers 502.
-        if message.startswith("unknown voice"):
+        # weights, onnxruntime, aplay) is ours and answers 502. Keyed on the
+        # code the gateway tags the message with, not on the sentence: the
+        # SPEAK activity applies the same rule to decide retryability, and
+        # matching prose in two places is how the two drift apart on a reword.
+        if failure_code(message) is Failure.UNKNOWN_VOICE:
             raise BadRequestError(message)
         raise UpstreamError(message)
 

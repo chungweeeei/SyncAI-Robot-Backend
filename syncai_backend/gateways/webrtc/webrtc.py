@@ -7,6 +7,8 @@ from typing import Dict, FrozenSet, NamedTuple, Optional, Tuple
 
 import structlog
 
+from syncai_backend.gateways.failure import Failure, fail
+
 
 # Where the Go worker lands. Built out of tree in the SyncAI-WebRTC-Worker repo
 # with
@@ -141,8 +143,8 @@ class WebRtcGateway:
         # The Go side already guards its own session map, so Python needs a
         # lock only for its own bookkeeping. Serialising creates is the slot
         # claim in create_video_session(), not a mutex: acquire before start so
-        # there is no check-then-start race, the same shape as map.py's
-        # _ACTIVE_CONVERSIONS.
+        # there is no check-then-start race, the same shape as
+        # GridmapConversionService's registry.
         self._load_lock = threading.Lock()
         self._session_lock = threading.Lock()
 
@@ -353,7 +355,14 @@ class WebRtcGateway:
                     # delete. Reported under the requested kind's name -- the
                     # caller asked for this kind and cannot act on which other
                     # one is in the way.
-                    return False, f"{kind} session creation already in progress", {}
+                    return (
+                        False,
+                        fail(
+                            Failure.WHEP_SESSION_PENDING,
+                            f"{kind} session creation already in progress",
+                        ),
+                        {},
+                    )
 
             previous = [
                 (other, self._slots[other].session_id)

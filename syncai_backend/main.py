@@ -27,6 +27,10 @@ from syncai_backend.gateways.tts.tts import init_tts_gateway
 from syncai_backend.gateways.webrtc.webrtc import init_webrtc_gateway
 from syncai_backend.gateways.recording.recording import init_recording_gateway
 
+from syncai_backend.services.gridmap_conversion import (
+    init_gridmap_conversion_service,
+)
+
 from syncai_backend.subscribers.robot_state_subscriber import (
     init_robot_state_subscriber,
 )
@@ -133,6 +137,16 @@ class SyncAIBackend(Node):
             records_dir=recording_catalog_repo.records_dir,
         )
 
+        # The pcd -> gridmap conversion: the recipes, the registry of threads
+        # running right now, and the on-disk record each one leaves. Built here
+        # rather than reached for as module state inside the map router, which
+        # is what it used to be -- one process, one registry, and now a
+        # collaborator the router is handed like every other. It holds no node
+        # and no engine: a conversion is numpy/scipy/open3d over files in the
+        # map directory, and the only thing it shares with the rest of the
+        # process is the directory the catalogue repo also reads.
+        conversion_svc = init_gridmap_conversion_service(logger=logger)
+
         # One /tf + /tf_static subscription for the whole process, shared by the
         # two subscribers that need transforms. Held on self because this is the
         # object that owns it; see subscribers/tf.py for why they no longer
@@ -179,6 +193,7 @@ class SyncAIBackend(Node):
             webrtc_gw=webrtc_gw,
             recording_gw=recording_gw,
             recording_catalog_repo=recording_catalog_repo,
+            conversion_svc=conversion_svc,
         )
 
 

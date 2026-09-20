@@ -9,6 +9,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 import structlog
 
+from syncai_backend.gateways.failure import Failure, fail
+
 
 class TtsGateway:
     def __init__(self, logger: structlog.stdlib.BoundLogger):
@@ -44,12 +46,23 @@ class TtsGateway:
         # Loaded on first use, not here: the .onnx is ~310 MB and construction
         # happens in SyncAIBackend.__init__, where three seconds of session
         # building would delay every subscriber and the REST server for a
-        # feature most boots never use. The lock covers load-then-infer; it
-        # also serialises synthesis itself, which is deliberate — two aplay
-        # streams into one speaker is noise, and the upstream caller of the
-        # /speak route is a human pressing a button.
+        # feature most boots never use. This lock covers load-then-infer, so
+        # two first callers cannot build two sessions and synthesis stays
+        # single-threaded on a machine whose cores are spoken for.
         self._kokoro = None
         self._lock = threading.Lock()
+
+        # Playback is a second lock, not the one above, because the resource it
+        # protects is different: _lock guards the kokoro session, this guards
+        # the speaker. "Two aplay streams into one speaker is noise" was always
+        # the stated intent, but synthesis finishes in a few hundred
+        # milliseconds while aplay runs for the length of the utterance — so a
+        # single lock released at the end of synthesize() let a Temporal SPEAK
+        # step and a manual POST /api/v1/tts/speak overlap in exactly the
+        # window that matters. Keeping them apart also means a caller that only
+        # wants bytes (POST /api/v1/tts/synthesize) is not made to wait out
+        # somebody else's utterance.
+        self._playback_lock = threading.Lock()
 
         # Same breadcrumb rationale as MapCatalogRepo: the path is neither a
         # parameter nor an env var, so if the weights are missing this line is
@@ -118,9 +131,10 @@ class TtsGateway:
     ) -> Tuple[bool, str, bytes]:
         """Render text to a mono 16-bit WAV. Returns (success, message, wav_bytes).
 
-        An unknown voice is reported as "unknown voice ..." — the router keys
-        on that prefix to answer 400 instead of 502, because it is the one
-        failure here that is the caller's to fix.
+        An unknown voice is tagged Failure.UNKNOWN_VOICE — it is the one failure
+        here that is the caller's to fix, so the router answers 400 instead of
+        its uniform 502 and the SPEAK activity does not retry it. Both read the
+        code rather than the sentence; see gateways/failure.py.
         """
         with self._lock:
             success, message = self._ensure_loaded()
@@ -128,7 +142,11 @@ class TtsGateway:
                 return False, message, b""
 
             if voice not in self._kokoro.get_voices():
-                return False, f"unknown voice: {voice!r}", b""
+                return (
+                    False,
+                    fail(Failure.UNKNOWN_VOICE, f"unknown voice: {voice!r}"),
+                    b"",
+                )
 
             try:
                 samples, sample_rate = self._kokoro.create(text, voice=voice, speed=speed)
@@ -158,12 +176,20 @@ class TtsGateway:
             # aplay reads the WAV (header included) from stdin. -q so its
             # per-file banner does not land in the backend pane's multilog on
             # every utterance.
-            result = subprocess.run(
-                ["aplay", "-q", "-D", self._resolve_playback_device(), "-"],
-                input=wav_bytes,
-                capture_output=True,
-                timeout=duration + 10.0,
-            )
+            #
+            # The lock is held across the subprocess rather than just around
+            # starting it: the invariant is one utterance on the device at a
+            # time, so a second caller queues here and plays afterwards instead
+            # of opening a second stream on the same pcm node. The timeout
+            # budget starts after the acquire, so a queued utterance is never
+            # charged for the one it waited on.
+            with self._playback_lock:
+                result = subprocess.run(
+                    ["aplay", "-q", "-D", self._resolve_playback_device(), "-"],
+                    input=wav_bytes,
+                    capture_output=True,
+                    timeout=duration + 10.0,
+                )
         except FileNotFoundError:
             return False, "aplay not found — alsa-utils is not installed", None
         except subprocess.TimeoutExpired:

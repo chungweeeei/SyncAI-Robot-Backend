@@ -9,6 +9,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import structlog
 
+from syncai_backend.gateways.failure import Failure, fail
+
 
 # The LIO inputs, and the reason this API exists at all. pgo accumulates its
 # keyframes in RAM and ``save_maps`` is the only thing that serialises them, so
@@ -93,8 +95,8 @@ class RecordingGateway:
         does.)
 
     One recording at a time. The slot is claimed under the lock before the
-    spawn, so there is no check-then-start race -- the same shape as map.py's
-    _ACTIVE_CONVERSIONS and WebRtcGateway's session slots.
+    spawn, so there is no check-then-start race -- the same shape as
+    GridmapConversionService's registry and WebRtcGateway's session slots.
     """
 
     def __init__(
@@ -203,7 +205,10 @@ class RecordingGateway:
             if self._active is not None:
                 return (
                     False,
-                    f"already recording '{self._active.name}'",
+                    fail(
+                        Failure.RECORDING_RUNNING,
+                        f"already recording '{self._active.name}'",
+                    ),
                     {"name": self._active.name},
                 )
 
@@ -211,9 +216,13 @@ class RecordingGateway:
             if free < MIN_FREE_BYTES:
                 return (
                     False,
-                    f"only {free / 1e9:.1f} GB free where recordings are written, "
-                    f"and one bag file is {MAX_BAG_SIZE_BYTES / 1e9:.0f} GB — "
-                    "delete a recording first",
+                    fail(
+                        Failure.DISK_LOW,
+                        f"only {free / 1e9:.1f} GB free where recordings are "
+                        f"written, and one bag file is "
+                        f"{MAX_BAG_SIZE_BYTES / 1e9:.0f} GB — delete a "
+                        "recording first",
+                    ),
                     {"free_bytes": free},
                 )
 

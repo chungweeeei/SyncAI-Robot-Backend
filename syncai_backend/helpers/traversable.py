@@ -246,7 +246,7 @@ def _clean_obstacles(
     ror_nb_points: int,
     ror_radius: float,
 ) -> o3d.geometry.PointCloud:
-    """Reduce everything-that-is-not-floor to the solid parts a robot can hit.
+    r"""Reduce everything-that-is-not-floor to the solid parts a robot can hit.
 
     Three passes, each aimed at one thing the LIO map contains that is not an
     obstacle at the robot's height:
@@ -262,7 +262,7 @@ def _clean_obstacles(
        any cloud ever had nz below zero, let alone -0.2, and the pass removed
        exactly nothing. It read as working because it logged a plausible count —
        the input's, unchanged. ``ceiling_nz`` is kept as the flatness threshold,
-       now compared against \\|nz\\| and positive, since the sign it used to rely
+       now compared against \|nz\| and positive, since the sign it used to rely
        on no longer exists by the time this runs.
     2. **Foliage.** The local PCA scattering ratio λ3/Σλ is near 0 for a plane
        and large for a volume of scattered returns, so a tree canopy or its

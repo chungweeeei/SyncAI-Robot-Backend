@@ -26,6 +26,9 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
+from syncai_backend.services.gridmap_conversion import (  # noqa: E402
+    GridmapConversionService,
+)
 
 
 # No map_name: the owning map is the URL's path segment now.
@@ -80,6 +83,9 @@ def client(logger, map_repo, catalog_repo, task_template_repo):
             map_gw=_StubMapGateway(),
             task_template_repo=task_template_repo,
             workflow_gw=_StubWorkflowGateway(),
+            # A real one: the vertex routes never start a conversion, but the
+            # catalogue projection asks it whether one is running.
+            conversion_svc=GridmapConversionService(logger=logger),
         )
     )
     return TestClient(app)

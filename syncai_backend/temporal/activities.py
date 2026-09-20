@@ -7,6 +7,7 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError, CancelledError
 
 
+from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
@@ -72,8 +73,7 @@ class RobotActivities:
         state = self._wait_for_nav_goal(goal_id=goal_id, label="Move")
 
         if state != "succeeded":
-            raise ApplicationError(f"move ended in {state}", non_retryable=False
-            )
+            raise ApplicationError(f"move ended in {state}", non_retryable=False)
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 
@@ -128,7 +128,7 @@ class RobotActivities:
         (text is capped at 1000 chars, aplay at duration+10 s), so that is a
         few seconds of latency, not a hang.
 
-        Only "unknown voice" is the request's fault and non-retryable;
+        Only Failure.UNKNOWN_VOICE is the request's fault and non-retryable;
         everything else (model missing, aplay/device trouble) is treated as
         possibly transient, same philosophy as the move rejections — the
         workflow's maximum_attempts=3 bounds the ones that are not.
@@ -139,7 +139,10 @@ class RobotActivities:
         if not success:
             raise ApplicationError(
                 f"Speak failed: {message}",
-                non_retryable=message.startswith("unknown voice"),
+                # The gateway's code, not its prose. The tts router decides 400
+                # vs 502 from the same one, so the two answers to "whose fault
+                # is this?" cannot drift apart when the sentence is reworded.
+                non_retryable=failure_code(message) is Failure.UNKNOWN_VOICE,
             )
 
         self._logger.info("[RobotActivity] Speak finished", duration=duration)

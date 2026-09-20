@@ -41,6 +41,8 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
 
+from syncai_backend.services.gridmap_conversion import GridmapConversionService
+
 from syncai_backend.temporal.worker import TemporalWorkerHandle
 
 
@@ -94,6 +96,7 @@ def init_rest_server(
     webrtc_gw: WebRtcGateway,
     recording_gw: RecordingGateway,
     recording_catalog_repo: RecordingCatalogRepo,
+    conversion_svc: GridmapConversionService,
 ) -> FastAPI:
 
     description = """
@@ -173,6 +176,7 @@ def init_rest_server(
             map_gw=map_gw,
             task_template_repo=task_template_repo,
             workflow_gw=workflow_gw,
+            conversion_svc=conversion_svc,
         )
     )
     # Serves /api/v1/task_templates: the operator's library of re-dispatchable
@@ -254,6 +258,7 @@ def start_rest_server(
     webrtc_gw: WebRtcGateway,
     recording_gw: RecordingGateway,
     recording_catalog_repo: RecordingCatalogRepo,
+    conversion_svc: GridmapConversionService,
 ):
 
     app = init_rest_server(
@@ -273,6 +278,7 @@ def start_rest_server(
         webrtc_gw=webrtc_gw,
         recording_gw=recording_gw,
         recording_catalog_repo=recording_catalog_repo,
+        conversion_svc=conversion_svc,
     )
 
     def _run():

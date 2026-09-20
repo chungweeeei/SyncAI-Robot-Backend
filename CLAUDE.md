@@ -80,6 +80,9 @@ Consequences:
 ```
 interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain exceptions
         │
+services/                  domain work that outlives a request: gridmap_conversion (recipes,
+        │                  the registry of running threads, the gridmap.recipe.json protocol)
+        │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (kokoro-onnx → aplay), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
@@ -98,6 +101,11 @@ which hands them to `init_<x>_router(...)`. No DI container, no module-level sin
 Adding a dependency to a router means threading it through `main.py` → `server.py`.
 `repositories/base.py` and `jobs/base.py` are unused scaffolding.
 
+That rule is why the gridmap conversion is a `services/` object rather than the
+module-level `_ACTIVE_CONVERSIONS` set it used to be inside `routers/map.py`: it is
+built in `main.py` like everything else, so tests get a fresh registry per test and
+nothing reaches into another module's globals to say "a conversion is running".
+
 **Imports are grouped by layer, with blank lines carrying meaning** (see `main.py`).
 That is why `ruff.toml` excludes isort — do not "organize imports".
 
@@ -108,6 +116,14 @@ Routers raise from `exceptions.py`; `server.py:register_exception_handlers` maps
 machine-readable `code` beside `detail`, e.g. `conversion_running`, `map_active`),
 `UnauthorizedError`→401, `UpstreamError`→502 (a downstream — Temporal or a ROS service —
 failed). Cross-field validation errors answer 400 with a sentence, not 422.
+
+`WorkflowGateway` raises those directly. The rest return `(success, message, …)` and the
+router decides, uniformly 502 — **except** for the handful of failures a caller answers
+differently, which `gateways/failure.py` tags with a `Failure` code that rides on the
+message (a `str` subclass, so prose still reads as prose). Read it with `failure_code()`;
+never match on the sentence. That module is also the single home of the one rule two
+consumers share: an unknown TTS voice is a 400 for the router **and** non-retryable for
+the SPEAK activity.
 
 ### robot_id scopes everything
 
@@ -157,7 +173,8 @@ validation.
 ### Heavy imports
 
 `helpers/traversable.py` is the **only** module that imports open3d (~100 MB), and only
-inside the conversion thread's `try`. Keep `pcd_to_gridmap.py` open3d-free. The kokoro TTS
+inside `GridmapConversionService.start`'s conversion thread, in its `try`. Keep
+`pcd_to_gridmap.py` open3d-free. The kokoro TTS
 model (~310 MB) and the WebRTC Go worker are lazy-loaded on first use, each owned by
 exactly one gateway instance whose internal lock serialises REST and Temporal callers.
 

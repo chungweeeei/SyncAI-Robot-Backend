@@ -4,6 +4,7 @@ from fastapi import APIRouter, Body, Response
 from pydantic import BaseModel, Field
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
+from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 
 
@@ -83,19 +84,19 @@ def init_webrtc_router(
         return text
 
     def _raise_for(message: str) -> None:
-        # Keyed on the message, the tts router's `unknown voice` pattern: a
-        # typed error crossing the gateway boundary has no precedent here and
-        # the set of distinguishable failures is two.
+        # Keyed on the code the gateway tags the message with, the tts router's
+        # `unknown voice` pattern: the set of failures a caller answers
+        # differently is one, and it is one the gateway already knows it is
+        # returning.
         #
         # Everything else -- a missing library, a failed InitWorker, an offer
         # pion rejected, a GStreamer pipeline that would not start because the
         # camera is held by scripts/publish_camera_crop.sh -- answers 502 with
-        # the worker's own sentence. Camera-busy deliberately gets no `code`:
-        # it is indistinguishable from any other pipeline failure in the Go
-        # error string, and a code that guesses is worse than prose that does
-        # not.
-        if "creation already in progress" in message:
-            raise ConflictError(message, code="whep_session_pending")
+        # the worker's own sentence. Camera-busy deliberately gets no code: it
+        # is indistinguishable from any other pipeline failure in the Go error
+        # string, and a code that guesses is worse than prose that does not.
+        if failure_code(message) is Failure.WHEP_SESSION_PENDING:
+            raise ConflictError(message, code=Failure.WHEP_SESSION_PENDING.value)
         raise UpstreamError(message)
 
     # No response_model -- the body is the answer SDP itself, so the OpenAPI

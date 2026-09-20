@@ -7,6 +7,7 @@ from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
+from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.recording.recording import (
     DEFAULT_TOPICS,
     RESERVED_NAMES,
@@ -331,20 +332,25 @@ def _default_name() -> str:
 
 
 def _raise_for_start(message: str, payload: dict) -> None:
-    """Map the gateway's sentence onto a status code.
+    """Map the gateway's failure onto a status code.
 
-    Keyed on the message, the tts and webrtc routers' pattern: the gateway's
-    contract is a (success, message, payload) tuple and the set of failures the
-    caller can act on differently is two. Everything else — no `ros2` on PATH,
-    a spawn that failed, a recorder that exited on its own arguments — is this
-    robot's fault and answers 502 with the gateway's own sentence.
+    Keyed on the code the gateway tags the message with, the tts and webrtc
+    routers' pattern: the contract is a (success, message, payload) tuple and
+    the set of failures the caller can act on differently is two. Everything
+    else — no `ros2` on PATH, a spawn that failed, a recorder that exited on its
+    own arguments — is this robot's fault and answers 502 with the gateway's own
+    sentence.
+
+    The wire values are unchanged; Failure's members carry the same strings this
+    published as `code` before they had a name.
     """
-    if message.startswith("already recording"):
+    code = failure_code(message)
+    if code is Failure.RECORDING_RUNNING:
         raise ConflictError(
             f"This robot is {message}. Stop it before starting another "
             "(POST /api/v1/recordings/stop).",
-            code="recording_running",
+            code=Failure.RECORDING_RUNNING.value,
         )
-    if message.startswith("only "):
-        raise ConflictError(message, code="disk_low")
+    if code is Failure.DISK_LOW:
+        raise ConflictError(message, code=Failure.DISK_LOW.value)
     raise UpstreamError(message)

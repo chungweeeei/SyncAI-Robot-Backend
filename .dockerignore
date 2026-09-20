@@ -1,0 +1,5 @@
+# The image copies requirements.txt and nothing else -- the package itself is
+# bind-mounted at run time, so everything here only keeps the build context
+# from being shipped to the daemon on every build.
+*
+!requirements.txt

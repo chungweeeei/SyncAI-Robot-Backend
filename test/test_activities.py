@@ -2,7 +2,7 @@
 
 ``temporalio.testing.ActivityEnvironment`` supplies the activity context that
 ``activity.heartbeat`` needs, so the real polling loops run unmodified; the
-gateway is a MagicMock (the CoreManager seam-mocking pattern) and the module's
+gateways are MagicMocks (the CoreManager seam-mocking pattern) and the module's
 ``time`` is patched where a test would otherwise sleep.
 
 What is pinned here is the retryability contract, because Temporal acts on it:
@@ -37,8 +37,13 @@ def robot_gw():
 
 
 @pytest.fixture
-def activities(logger, robot_gw) -> RobotActivities:
-    return RobotActivities(logger=logger, robot_gw=robot_gw)
+def tts_gw():
+    return MagicMock()
+
+
+@pytest.fixture
+def activities(logger, robot_gw, tts_gw) -> RobotActivities:
+    return RobotActivities(logger=logger, robot_gw=robot_gw, tts_gw=tts_gw)
 
 
 @pytest.fixture

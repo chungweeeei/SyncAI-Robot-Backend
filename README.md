@@ -56,6 +56,10 @@ The layering is a convention, not something tooling enforces:
 ```
 interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; no business logic
         │
+services/                  domain work that outlives a request: gridmap_conversion owns the
+        │                  two recipes, the registry of conversions running right now, and
+        │                  the gridmap.recipe.json protocol they write
+        │
 gateways/                  outbound integrations: ROS (robot, map), Temporal (workflow),
         │                  speech (tts: kokoro-onnx → aplay), bags (recording:
         │                  a supervised `ros2 bag record` child) — the last two
@@ -88,10 +92,17 @@ runs only when an operator asks for it via `grid/convert`. There is deliberately
 no automatic pick between them; the workspace `CLAUDE.md` ("Backend
 architecture") records why and what each conversion writes to disk.
 `traversable.py` is the **only** module that imports open3d, and nothing imports
-it at module scope — `_start_grid_conversion` imports it inside the conversion
-thread's `try`, so a backend start never pays the ~100 MB import and an
-`ImportError` lands as a per-map failure instead of a bare thread traceback.
+it at module scope — `GridmapConversionService.start` imports it inside the
+conversion thread's `try`, so a backend start never pays the ~100 MB import and
+an `ImportError` lands as a per-map failure instead of a bare thread traceback.
 Keep `pcd_to_gridmap.py` open3d-free.
+
+The conversion itself lives in `services/gridmap_conversion.py`, not in the map
+router: the recipes, the in-process registry that refuses a second concurrent
+conversion of the same map, and the sidecar protocol below are one piece of
+domain behaviour, and none of it is HTTP. `main.py` builds one instance and
+hands it to the router, which validates requests against it and turns its
+refusals into status codes.
 
 **A conversion's outcome lives on disk, in `gridmap.recipe.json`.** The thread
 writes that sidecar three times — `status: converting` before it starts any
@@ -526,6 +537,23 @@ colcon test-result --verbose
 # or, inside the container, from src/syncai_backend/:
 pytest test/
 ```
+
+**Off the robot**, the `Dockerfile` at the repo root builds an image that
+supplies ROS 2 Humble and this package's pip dependencies; the source is
+bind-mounted rather than copied, so an edit is picked up by the next run with no
+rebuild. Its header comment carries the exact commands. Two things are worth
+knowing before reading a result from it:
+
+- **Mount `syncai_common` and FAST-LIO2's `interface` or most of the suite does
+  not run.** With them, 614 tests pass and one skips (`test_copyright`, which
+  the repo skips on purpose); without them, 11 files fail to collect and only
+  252 run — those files reach the generated interfaces through a plain import
+  rather than an `importorskip`, so they are collection errors rather than
+  skips. Anything that touches a router or a gateway needs the full mount to
+  mean anything.
+- **The image runs as a non-root user on purpose.** Root bypasses file
+  permission checks, so `os.access(W_OK)` answers `True` on a read-only file and
+  the map router's `ini_not_writable` refusal test fails against working code.
 
 `test/` holds ~40 files, roughly one per router / gateway / subscriber / repo /
 helper (`ls src/syncai_backend/test/` is the index). They must run where `rclpy`
