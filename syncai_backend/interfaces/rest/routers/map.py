@@ -1559,6 +1559,18 @@ def init_map_router(
         """
         stored = _require(name)
 
+        if conversion_svc.is_converting(name):
+            # The conversion thread is about to os.replace() gridmap.pgm and
+            # gridmap.yaml with whatever it computes. A save landing in that
+            # window is silently overwritten, and the once-only gridmap_raw.pgm
+            # snapshot write_gridmap takes could capture the half-finished grid
+            # as the "original". Same refusal rename, delete and activate make.
+            raise ConflictError(
+                f"A gridmap conversion for '{name}' is running; save the edit "
+                "once it has finished, or the conversion will overwrite it.",
+                code="conversion_running",
+            )
+
         # stored.grid rather than a fresh read: _read_grid has already parsed the
         # .pgm header *and* gridmap.yaml, so one None test covers "no pgm", "no
         # yaml" and "torn pgm" — and it makes "the two agree" a precondition of

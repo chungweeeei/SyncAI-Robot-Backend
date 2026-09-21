@@ -577,6 +577,26 @@ def test_save_grid_rejects_a_wrong_length_body(client, maps_dir, map_gw):
     assert map_gw.calls == []
 
 
+def test_save_grid_refuses_while_a_conversion_is_running(
+    client, conversion_svc, maps_dir
+):
+    """The one write path that used to lack the check rename/delete/activate make.
+
+    The conversion thread os.replace()s the very files this route writes, so an
+    edit saved mid-conversion vanished without a word, and the once-only raw
+    snapshot could capture the half-finished grid as the original.
+    """
+    before = (maps_dir / "full" / "gridmap.pgm").read_bytes()
+    _mark_converting(conversion_svc, "full")
+
+    response = _put_grid(client, "full", b"\x00" * 24)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conversion_running"
+    assert (maps_dir / "full" / "gridmap.pgm").read_bytes() == before
+    assert not (maps_dir / "full" / "gridmap_raw.pgm").exists()
+
+
 def test_save_grid_404_for_a_missing_map(client):
     assert _put_grid(client, "nosuchmap", b"\x00" * 24).status_code == 404
 
