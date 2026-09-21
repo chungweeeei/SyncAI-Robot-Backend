@@ -1,5 +1,46 @@
-# The image copies requirements.txt and nothing else -- the package itself is
-# bind-mounted at run time, so everything here only keeps the build context
-# from being shipped to the daemon on every build.
-*
-!requirements.txt
+# The base stage copies requirements.txt alone; the builder stage copies the
+# whole repo. So this file is no longer "deny everything" — it is the list of
+# things that must not reach the build context, either because they would
+# invalidate the layer cache on every commit or because they have no business
+# inside an image.
+#
+# Two entries are load-bearing rather than tidy:
+#
+#   .env      real credentials. `COPY . src/syncai_backend` would bake them into
+#             the image, and main.py's load_dotenv() would then read them in
+#             preference to nothing, quietly ignoring compose's environment.
+#   .git      several MB that change on every commit, for no build input.
+#
+# Note what is NOT here: `.interface/`, the optional FAST-LIO2 interface package
+# the builder picks up (see the Dockerfile header). It has to reach the context
+# to be built.
+
+.git
+.github
+.gitignore
+.dockerignore
+
+# Python / colcon / tooling artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+install/
+log/
+
+# Secrets and local settings
+.env
+.claude/settings.local.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

@@ -1,12 +1,19 @@
 # syncai_backend
 
 > **Standalone repository of a colcon package.** This repo is the source of
-> truth for `syncai_backend`, but it is not runnable on its own: it is a ROS 2
-> `ament_python` package that imports `syncai_common` (msgs/srvs) and
-> `interface` (FAST-LIO2's srvs) and expects the rest of the robot stack around
-> it. It is meant to be vcs-imported into `SyncAI-Robot-Workspace/src/syncai_backend`
-> and built there; the workspace-relative paths below (`src/syncai_backend/…`,
-> the workspace `CLAUDE.md`, `.env`) assume that placement.
+> truth for `syncai_backend`. It is a ROS 2 `ament_python` package that imports
+> `syncai_common` (msgs/srvs) and `interface` (FAST-LIO2's srvs). `syncai_common`
+> is named in `interface.repos`, so `vcs import < interface.repos` from a colcon
+> workspace root fetches it with no `SyncAI-Robot-Workspace` checkout and no
+> credentials. `interface` is not there yet — it lives inside a private SSH fork
+> and is still bind-mounted from a workspace checkout; see the `Dockerfile`.
+>
+> **Running** it is the other half and still needs the rest of the robot stack
+> around it: the nav stack's topics and services, Postgres, and the workspace
+> laid out at `~/robot_ws` (see *Configuration*). On a robot it is vcs-imported
+> into `SyncAI-Robot-Workspace/src/syncai_backend`, and the workspace-relative
+> paths below (`src/syncai_backend/…`, the workspace `CLAUDE.md`, `.env`) assume
+> that placement.
 
 The robot's application-layer process: a **FastAPI REST/WebSocket server and an
 rclpy ROS 2 node running inside one Python process**, plus a **Temporal worker**
@@ -533,8 +540,8 @@ source install/setup.bash
 ```
 
 Python deps are **not** managed by rosdep (jammy has no reliable key for
-fastapi); `requirements.txt` is the single source of truth and both the dev and
-`backend-runtime` Docker stages install from it:
+fastapi); `requirements.txt` is the single source of truth and every Docker
+stage in this repo installs from it:
 
 ```bash
 pip install -r src/syncai_backend/requirements.txt
@@ -562,6 +569,58 @@ lives in the infra compose stack and is up regardless of which session exists.
 > the installed modules are symlinks, so `--symlink-install` developer builds are
 > unaffected.
 
+### As its own container
+
+`Dockerfile` builds four stages — `base` (ROS + the pip deps, the expensive one),
+`builder` (the colcon install space), `runtime` (the service) and `dev` (the test
+image) — and `docker-compose.yml` runs the `runtime` one as a single service.
+There is no default target; name it.
+
+```bash
+# Optional but wanted: FAST-LIO2's `interface`, which interface.repos cannot
+# name because it lives in a private SSH fork. Without it the service starts
+# anyway — `gateways/map`'s import of interface.srv is wrapped in a TEMPORARY
+# try/except — but map save, new map, map switch and relocalize all refuse.
+cp -r ~/SyncAI-Robot-Workspace/src/third-party/FASTLIO2_ROS2/interface .interface
+
+docker compose up -d --build
+docker compose logs -f
+```
+
+The INI is mounted the way the workspace's compose mounts it: the per-robot
+`config/instances/robotNN.ini` goes **over** `config/system.ini` as a single
+file (the checked-out `system.ini` is an empty placeholder). Miss that and the
+launch file finds no `[system] robot_id`, and the namespace, the database and
+the task queue all move to `default_robot`.
+
+What that service is, and why each piece is the way it is, is commented in the
+compose file; the four that bite are:
+
+- **`network_mode: host`.** DDS discovery with the nav stack runs over `lo` with
+  multicast off (`config/cyclonedds.xml`), so both sides have to share the host's
+  network namespace. It also means compose service names do not resolve —
+  postgres, temporal and syncai_tts are addressed as `127.0.0.1:<published port>`,
+  and the REST API lands on the host's `:3000` with no `ports:` mapping.
+- **`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`,** with the package installed in the
+  image. A backend left on the default fastrtps starts cleanly, logs nothing
+  alarming and sees not one topic.
+- **Four bind mounts** carry everything this package needs from `~/robot_ws`:
+  `config/` (read-write — activating a map rewrites `system.ini` in place),
+  `map/` (must be the same directory the nav stack's `map_server` reads),
+  `record/`, and `lib/libsyncai_worker.so`. `[system] robot_id` in the mounted
+  INI is still what namespaces the node, the database and the task queue.
+- **One backend at a time.** `NodeManager` starts this process as a byobu pane
+  inside the robot container. Running the service alongside it gives two
+  processes on `:3000` and, less visibly, two Temporal workers polling the same
+  `<robot_id>.ROBOT_TASK_QUEUE`. Take it out of the session spec first.
+
+Note the knock-on for `switch_mode`: as a byobu pane the process dies with the
+session and `NodeManager` restarts it, which is the mechanism the route's
+"success looks like a dropped connection" semantics rest on. In its own
+container it survives the session teardown instead, and `restart:
+unless-stopped` only covers a crash — the mode switch itself no longer recycles
+it.
+
 ## Tests
 
 ```bash
@@ -571,19 +630,30 @@ colcon test-result --verbose
 pytest test/
 ```
 
-**Off the robot**, the `Dockerfile` at the repo root builds an image that
-supplies ROS 2 Humble and this package's pip dependencies; the source is
-bind-mounted rather than copied, so an edit is picked up by the next run with no
-rebuild. Its header comment carries the exact commands. Two things are worth
+**Off the robot**, the `Dockerfile`'s `dev` target (`docker build --target dev
+-t syncai-backend-dev .`) builds an image that supplies ROS 2 Humble and this
+package's pip dependencies; the source is bind-mounted rather than copied, so an
+edit is picked up by the next run with no rebuild. Its header comment carries the
+exact commands. Two things are worth
 knowing before reading a result from it:
 
-- **Mount `syncai_common` and FAST-LIO2's `interface` or most of the suite does
-  not run.** With them, 614 tests pass and one skips (`test_copyright`, which
-  the repo skips on purpose); without them, 11 files fail to collect and only
-  252 run — those files reach the generated interfaces through a plain import
-  rather than an `importorskip`, so they are collection errors rather than
-  skips. Anything that touches a router or a gateway needs the full mount to
-  mean anything.
+- **Get `syncai_common` in, or a third of the suite does not run.**
+  `vcs import < interface.repos` materialises it; FAST-LIO2's `interface` is
+  still bind-mounted from a workspace checkout, because it sits inside a private
+  SSH fork that `interface.repos` deliberately does not name. Measured
+  2026-09-21, on this branch:
+
+  | in the image | result |
+  |---|---|
+  | both | 659 passed, 1 skipped (`test_copyright`, skipped on purpose) |
+  | `syncai_common` only | 625 passed, 2 skipped — `test_map_gateway` `importorskip`s `interface` and skips as a whole module |
+  | neither | 284 passed, 6 skipped, **11 collection errors** — those files reach `syncai_common` through a plain import rather than an `importorskip` |
+
+  Anything that touches a router or a gateway needs `syncai_common` for the run
+  to mean anything. `test_map_gateway_no_interface.py` runs in all three: it
+  patches `MapGateway`'s `_INTERFACE_SRVS` flag rather than requiring the
+  package to be absent, so the guarded branch — the one the runtime image
+  currently ships — is covered wherever the suite is run.
 - **The image runs as a non-root user on purpose.** Root bypasses file
   permission checks, so `os.access(W_OK)` answers `True` on a read-only file and
   the map router's `ini_not_writable` refusal test fails against working code.

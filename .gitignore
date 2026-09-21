@@ -35,3 +35,7 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Optional FAST-LIO2 `interface` package, copied in for a runtime build
+# (see the Dockerfile header). Never committed: it belongs to the private fork.
+.interface/

@@ -9,14 +9,27 @@ server, an rclpy ROS 2 node and a Temporal worker in one Python process**. It is
 ROS 2 `ament_python` package (`package.xml`, `setup.py`), split out of
 `SyncAI-Robot-Workspace` into its own repository with the package at the repo root.
 
-It **cannot run or be tested standalone**. It imports generated interfaces from two
-other colcon packages — `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`,
-`WifiNetwork`; `SwitchMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`)
-and `interface` from the FAST-LIO2 fork (`SaveMaps`, `ResetMapping`, `Relocalize`,
-`IsValid`) — plus `rclpy`, `nav2_msgs`, `tf2_ros`. Keep those imports as they are; the
-workspace pulls this repo and the interface repos side by side with vcstool into
-`<workspace>/src/`, and that is where builds, tests and runs happen (inside the robot
-container, ROS 2 Humble / Python 3.10).
+It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
+standalone. It imports generated interfaces from two other colcon packages —
+`syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`;
+`SwitchMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`) and
+`interface` from the FAST-LIO2 fork (`SaveMaps`, `ResetMapping`, `Relocalize`,
+`IsValid`) — plus `rclpy`, `nav2_msgs`, `tf2_ros`. Keep those imports as they are.
+`syncai_common` is named in **`interface.repos`**: `vcs import <
+interface.repos` from any colcon workspace root materialises it into `src/`
+beside this package, with no `SyncAI-Robot-Workspace` checkout and no
+credentials. It lives in `SyncAI-Robot-Interface` (split out of the workspace
+2026-09) — edit the messages there, never in a materialised `src/syncai_common`.
+
+`interface` is **not** in that file: it sits inside the private SSH FAST-LIO2
+fork, and naming it would make every `vcs import` need credentials. It is still
+bind-mounted from a workspace checkout (see the `Dockerfile`), and the fix is to
+split it into its own repo the way `syncai_common` was.
+
+**Running** still happens inside the robot container (ROS 2 Humble / Python 3.10),
+in a workspace that also carries the nav stack, with this repo vcs-imported to
+`<workspace>/src/syncai_backend` — the rest of the stack's topics, services and
+the `~/robot_ws` layout are all runtime requirements.
 
 `README.md` is the long-form reference (every REST route, ROS interface + QoS, Temporal
 semantics, gotchas). Read the relevant section before changing a route or a subscriber;
@@ -30,6 +43,11 @@ All of these run inside the robot container, from the **workspace root** after
 ```bash
 # Python deps (not rosdep-managed; requirements.txt is the single source of truth)
 pip install -r src/syncai_backend/requirements.txt
+
+# syncai_common, if not already in src/. `interface` is not in this file --
+# it comes from the workspace's own third-party.repos (FAST-LIO2 fork).
+vcs import < src/syncai_backend/interface.repos
+colcon build --packages-select syncai_common
 
 # Build
 colcon build --packages-select syncai_backend --symlink-install
@@ -48,6 +66,23 @@ colcon test --packages-select syncai_backend && colcon test-result --verbose
 # Lint (ruff.toml in this repo pins the rule set; isort is deliberately off)
 ruff check .
 ```
+
+Containers (`Dockerfile` has four stages: `base` → `builder` → `runtime`, plus
+`dev`; there is no default target):
+
+```bash
+docker build --target dev -t syncai-backend-dev .   # test image, source bind-mounted
+docker compose up -d --build                        # the runtime image as a service
+```
+
+`docker-compose.yml` runs the `runtime` stage alone — host networking (DDS over
+`lo`, so `127.0.0.1:<published port>` for postgres/temporal/tts),
+`rmw_cyclonedds_cpp`, and four bind mounts for `~/robot_ws/{config,map,record,lib}`.
+Copy FAST-LIO2's `interface` to `.interface/` in the repo root to get the pgo /
+localizer services; without it the backend still runs (the import in
+`gateways/map/map.py` is wrapped in a TEMPORARY try/except) and map save / new
+map / map switch refuse. The README's *As its own container* and the Dockerfile
+header carry the rest, including why only one backend may run at a time.
 
 Test notes: tests `importorskip` `rclpy` / `syncai_common` / `httpx` etc., so on a machine
 without ROS most of them skip rather than fail — a green run outside the container proves

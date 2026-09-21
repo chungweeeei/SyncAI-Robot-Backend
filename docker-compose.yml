@@ -1,0 +1,179 @@
+# Standalone compose for syncai_backend: this one service, nothing else.
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Everything it talks to is expected to be running already and reachable on the
+# host's published ports — postgres and temporal from the workspace's infra
+# stack, syncai_tts from SyncAI-TTS, and the ROS side (nav, robot_state,
+# sys_manager, the localizer) from the robot container. This file deliberately
+# does not start any of them: on this machine they already exist, and a second
+# postgres fighting for 5432 is not a deployment, it is an outage.
+#
+#   docker compose -f ~/SyncAI-Robot-Workspace/docker-compose.yml up -d \
+#       postgres temporal      # if the infra is not up
+#
+# ⚠ ONE BACKEND AT A TIME. On the robot today, syncai_backend is started as a
+# byobu pane inside the robot01 container by NodeManager. Bringing this service
+# up alongside it gives you two processes binding :3000 (the second dies) and —
+# worse, because it fails quietly — two Temporal workers polling the same
+# <robot_id>.ROBOT_TASK_QUEUE, so a task goes to whichever one grabs it. Take
+# the backend out of the session spec before running this, or stop robot01.
+#
+# ⚠ WITHOUT the FAST-LIO2 `interface` package in the image — it is not there by
+# default — the service still comes up, but map save, new map, map switch and
+# relocalize refuse, and MapGateway logs a warning at startup. See the Dockerfile
+# header for the one-line stopgap that puts them back.
+
+services:
+  backend:
+    build:
+      context: .
+      target: runtime
+      args:
+        # Must match the owner of the mounted map/ record/ config/ directories.
+        # `id -u` on the host.
+        USER_UID: "${UID:-1000}"
+    image: syncai-backend
+    container_name: syncai_backend
+    restart: unless-stopped
+
+    # Host networking, and it is not a shortcut. DDS discovery between this
+    # process and the nav stack happens over lo with multicast off (see
+    # CYCLONEDDS_URI below), which only works if both are on the host's network
+    # namespace — the robot01 container already is. It also puts the REST API on
+    # the host's :3000 with no `ports:` mapping, which is how the frontend and
+    # the operator console reach it.
+    #
+    # The cost: compose service names do NOT resolve here. Everything below is
+    # addressed as 127.0.0.1 plus a published port, not `postgres:5432`.
+    network_mode: host
+
+    # The container user must own what it writes: `ros2 bag record` into
+    # record/, gridmap conversions into map/, and the in-place rewrite of
+    # system.ini into config/. Same pattern as the workspace's robot services —
+    # note that bash does not export UID/GID, so either export them or rely on
+    # the 1000 default, which is correct on this Jetson.
+    user: "${UID:-1000}:${GID:-1000}"
+
+    # main.py calls dotenv.load_dotenv(), which resolves `.env` against the
+    # process cwd. Pointing cwd at the mounted workspace root means a .env there
+    # is picked up exactly as it is on the robot today. Nothing below depends on
+    # that file existing; the environment block is the real source.
+    working_dir: /home/syncrobotic/robot_ws
+
+    environment:
+      # ── ROS ──────────────────────────────────────────────────────────────
+      # A literal, NOT ${ROS_DOMAIN_ID:-1}: compose interpolation gives the
+      # invoking shell precedence over .env, and this Jetson's ~/.bashrc exports
+      # ROS_DOMAIN_ID=69 — an "overridable default" silently resolves to 69 and
+      # the backend sees an empty ROS graph. It also has to stay in step with
+      # <Domain Id="1"> in the cyclonedds.xml mounted below.
+      ROS_DOMAIN_ID: "1"
+      # Not the default. The rest of the stack is cyclonedds; a backend left on
+      # fastrtps comes up looking perfectly healthy and sees no topics at all.
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      CYCLONEDDS_URI: /home/syncrobotic/robot_ws/config/cyclonedds.xml
+      # rcl/spdlog per-process logs, onto the size-capped tmpfs below instead of
+      # ~/.ros/log — they never rotate and this container is long-lived.
+      ROS_LOG_DIR: /tmp/ros_log
+
+      # ── PostgreSQL (hard dependency: 20 retries × 5 s, then the process
+      #    exits). The database itself, `<robot_id>_db`, is created on first
+      #    connect. Defaults here are the infra stack's, which are NOT the
+      #    package's own defaults (syncrobotic/syncrobotic in .env.example).
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+
+      # ── Temporal (soft: /health reports `degraded` rather than crashing).
+      TEMPORAL_ADDRESS: 127.0.0.1:7233
+
+      # ── Speech. syncai_tts publishes 8080 on the host as 9090, so under host
+      #    networking this is 127.0.0.1:9090 — not the package default of
+      #    http://syncai_tts:8080, which only resolves on a bridge network.
+      TTS_SERVICE_URL: http://127.0.0.1:9090
+
+      # ── WebRTC. Empty STUN is deliberate on a LAN robot: console and robot
+      #    share a subnet, so host candidates are what connect them, and a
+      #    public STUN URL on a robot with no internet only makes ICE gathering
+      #    wait out a timeout.
+      STUN_SERVERS: ""
+
+      # ── Logs: unbuffered, uncoloured. Also set in the image; repeated here
+      #    because these are the two that make `docker logs` readable.
+      PYTHONUNBUFFERED: "1"
+      RCUTILS_COLORIZED_OUTPUT: "0"
+
+      # SYNCAI_SYSTEM_INI is left unset on purpose. The package's own default,
+      # ~/robot_ws/config/system.ini, is exactly where the mount below puts it,
+      # and the launch file reads [system] robot_id from that same path to
+      # namespace the node. Override both together or neither.
+
+    volumes:
+      # ROBOT_WS is the host directory that carries the robot's config, maps and
+      # recordings. Today that is the workspace checkout — these four paths are
+      # the entirety of what this package needs from it, and `map/` in
+      # particular MUST be the same directory the nav stack's map_server reads,
+      # or an activated map exists for one of them only.
+      #
+      #   export ROBOT_WS=/some/other/place   # to point it elsewhere
+      #
+      # config/ is read-write: activating a map rewrites [map] name and zeroes
+      # [initial_pose] in system.ini, in place. Mounting it :ro turns that route
+      # into a 409 `ini_not_writable`.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config:/home/syncrobotic/robot_ws/config
+      # The per-robot identity file, mounted OVER config/system.ini as a single
+      # file — the same thing the workspace's compose does, and the reason
+      # `config/system.ini` is an empty placeholder in the checkout. Without
+      # this the launch file finds no [system] robot_id, falls back to
+      # `default_robot`, and the node namespace, the `<robot_id>_db` database
+      # and the Temporal task queue all quietly move somewhere nobody is
+      # listening.
+      #
+      # Read-write, and single-file on purpose: activating a map rewrites
+      # [map] name in place rather than through a temp file and a rename,
+      # because a rename would give the content a new inode that this mount
+      # would never resolve (helpers/system_config.py says so at length).
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config/instances/${ROBOT_INSTANCE:-robot01}.ini:/home/syncrobotic/robot_ws/config/system.ini
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/map:/home/syncrobotic/robot_ws/map
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/record:/home/syncrobotic/robot_ws/record
+      # The WebRTC Go worker, dlopen'd lazily on the first /whep request. A
+      # single file, read-only: nothing here writes it, and it is built
+      # elsewhere (SyncAI-WebRTC-Worker). Without it the camera stream 502s and
+      # everything else works.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/lib/libsyncai_worker.so:/home/syncrobotic/robot_ws/lib/libsyncai_worker.so:ro
+      # RAM-backed, size-capped ROS_LOG_DIR. Long-form because the short
+      # `tmpfs:` syntax cannot set a size; the octal mode matters (a bare 1777
+      # is parsed as decimal and lands as mode 3361, which uid 1000 cannot
+      # write).
+      - type: tmpfs
+        target: /tmp/ros_log
+        tmpfs:
+          size: 134217728 # 128 MiB
+          mode: 0o1777
+
+    # /health is always 200 by design — degradation (Temporal down, say) lives
+    # in the body, because a non-200 wired into a healthcheck would restart a
+    # process that is still serving. So this proves the REST thread is up and
+    # nothing more, which is exactly what a container healthcheck should decide
+    # on. `python3` rather than curl: curl is not in ros-base and this saves
+    # installing it for one line.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:3000/health", timeout=5)
+      interval: 30s
+      timeout: 10s
+      # Postgres is retried 20 × 5 s before the process gives up, so the first
+      # start can legitimately take 100 s when the infra comes up alongside it.
+      start_period: 120s
+      retries: 3
+
+    # SIGTERM has to reach uvicorn, the ROS executor and the Temporal worker,
+    # and the last of those is finishing whatever activity it holds. 10 s is
+    # not enough for an in-flight NAVIGATE step to be cancelled cleanly.
+    stop_grace_period: 30s
