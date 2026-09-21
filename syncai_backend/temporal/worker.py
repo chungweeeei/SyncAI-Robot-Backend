@@ -112,7 +112,18 @@ async def run_worker(
             activities.execute_lie_down,
             activities.execute_speak,
         ],
+        # One activity at a time, stated twice because the two settings mean
+        # different things. The executor is the thread that runs activities;
+        # max_concurrent_activities is how many the worker *accepts* from the
+        # server. Left at its default (100) the worker would take a second
+        # activity while the first held the only thread, and that activity's
+        # heartbeat_timeout and start_to_close would tick while it queued
+        # behind the thread -- so the one realistic overlap, a schedule firing
+        # during a direct task (see _require_idle's docstring), failed its
+        # MOVE by heartbeat timeout instead of waiting. Capped to 1, Temporal
+        # holds the second task server-side until this worker asks for it.
         activity_executor=ThreadPoolExecutor(max_workers=1),
+        max_concurrent_activities=1,
     )
 
     logger.info(

@@ -427,7 +427,10 @@ that still carry an ARTIFACT step must be purged before deploying.)
 Details that matter when editing this path:
 
 - **Activities are synchronous** and run in a single-worker `ThreadPoolExecutor`,
-  matching the one-thing-at-a-time reality of a robot. On cancellation Temporal
+  matching the one-thing-at-a-time reality of a robot. The worker also declares
+  `max_concurrent_activities=1`, so Temporal holds a second activity server-side
+  rather than handing it over to queue behind the thread with its timeouts
+  already ticking. On cancellation Temporal
   *throws* `CancelledError` into the thread wherever it happens to be (often
   inside `time.sleep`), so cleanup lives in an `except CancelledError:` block, not
   in an `is_cancelled()` poll. `execute_move` wraps the whole of the send and
