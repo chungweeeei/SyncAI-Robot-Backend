@@ -44,6 +44,23 @@ class MapRepo:
                 self.logger.error(f"[MapRepo][{op}] database operation failed", exc_info=True)
                 raise
 
+    @contextmanager
+    def transaction(self, op: str) -> Generator[Session, None, None]:
+        """One session for several writes that must land or fail together.
+
+        Yields a session; commits when the block exits cleanly, and lets the
+        sessionmaker's context manager roll back when it does not. Exists for
+        the map rename: ``move_vertices`` and ``TaskTemplateRepo.rebind_map``
+        used to each open and commit their own session, so a failure in the
+        second left the vertices already re-keyed to a name the directory had
+        just been moved back from -- permanently orphaned waypoints. Both repos
+        take a ``session`` argument for exactly this caller; the two tables
+        share one engine, so a session from this repo's maker serves both.
+        """
+        with self._session(op=op) as session:
+            yield session
+            session.commit()
+
     def create_vertices(self, map: str, vertices: list[VertexFields]) -> list[MapPoint]:
         """Batch-insert vertices in a single transaction.
 
@@ -99,8 +116,14 @@ class MapRepo:
             session.commit()
             return vertex
 
-    def move_vertices(self, old_map: str, new_map: str) -> int:
+    def move_vertices(
+        self, old_map: str, new_map: str, session: Optional[Session] = None
+    ) -> int:
         """Re-key every vertex of ``old_map`` to ``new_map``; return how many.
+
+        With ``session`` given, the UPDATE runs inside the caller's transaction
+        and is *not* committed here -- see ``transaction``. Without it, the
+        method is its own transaction, as every other write in this repo is.
 
         The cascade half of a map rename: ``map_vertices.map`` holds the bare
         directory name with no foreign key behind it, so when the directory
@@ -115,13 +138,17 @@ class MapRepo:
         while this runs. ``updated_at`` is set by hand because ``onupdate``
         fires for ORM unit-of-work flushes, not for a Core bulk update.
         """
-        with self._session(op="move_vertices") as session:
-            result = session.execute(
-                update(MapPoint)
-                .where(MapPoint.map == old_map)
-                .values(map=new_map, updated_at=_utcnow())
-            )
-            session.commit()
+        statement = (
+            update(MapPoint)
+            .where(MapPoint.map == old_map)
+            .values(map=new_map, updated_at=_utcnow())
+        )
+        if session is not None:
+            return session.execute(statement).rowcount
+
+        with self._session(op="move_vertices") as own:
+            result = own.execute(statement)
+            own.commit()
             return result.rowcount
 
     def delete_vertices(self, map: str) -> int:

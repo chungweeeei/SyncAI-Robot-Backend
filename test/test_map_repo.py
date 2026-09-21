@@ -4,6 +4,8 @@ The repo used to also cache the live map topic's OccupancyGrid; that went with
 the endpoints that read it, and with it this module's need for nav_msgs.
 """
 
+import pytest
+
 import uuid
 
 _MISSING_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -136,6 +138,33 @@ def test_move_vertices_bumps_updated_at_and_keeps_ids(map_repo):
     assert after.id == before.id
     assert after.created_at == before.created_at
     assert after.updated_at >= before.updated_at
+
+
+def test_move_vertices_in_a_caller_transaction_is_committed_by_the_block(map_repo):
+    """The rename cascade's contract: the block, not the method, commits.
+
+    Isolation itself is not asserted here on purpose -- the test engine is a
+    single-connection SQLite StaticPool, so a second session shares the
+    connection and sees uncommitted rows. The rollback test below is what pins
+    that nothing lands when the block fails.
+    """
+    created = _create(map_repo, map="old")
+
+    with map_repo.transaction(op="test") as session:
+        assert map_repo.move_vertices("old", "new", session=session) == 1
+
+    assert map_repo.get_vertex(created.id).map == "new"
+
+
+def test_move_vertices_in_a_failed_transaction_is_rolled_back(map_repo):
+    created = _create(map_repo, map="old")
+
+    with pytest.raises(RuntimeError):
+        with map_repo.transaction(op="test") as session:
+            map_repo.move_vertices("old", "new", session=session)
+            raise RuntimeError("the second update failed")
+
+    assert map_repo.get_vertex(created.id).map == "old"
 
 
 def test_move_vertices_of_an_unknown_map_moves_nothing(map_repo):

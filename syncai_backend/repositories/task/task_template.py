@@ -133,8 +133,14 @@ class TaskTemplateRepo:
             session.refresh(row)
             return row
 
-    def rebind_map(self, old_name: str, new_name: str) -> int:
+    def rebind_map(
+        self, old_name: str, new_name: str, session: Optional[Session] = None
+    ) -> int:
         """Point every template bound to ``old_name`` at ``new_name``; return how many.
+
+        With ``session`` given, the UPDATE joins the caller's transaction and is
+        not committed here: the rename runs this and ``MapRepo.move_vertices``
+        under one ``MapRepo.transaction`` so the two re-keys cannot half-land.
 
         The other cascade half of a map rename (``MapRepo.move_vertices`` is the
         first). Without it a rename silently disables every task bound to the
@@ -152,13 +158,17 @@ class TaskTemplateRepo:
         router documents as unvalidated, and it stays stale on purpose rather
         than re-registering every schedule from here.
         """
-        with self._session("rebind_map") as session:
-            result = session.execute(
-                update(TaskTemplate)
-                .where(TaskTemplate.map_name == old_name)
-                .values(map_name=new_name, updated_at=_utcnow())
-            )
-            session.commit()
+        statement = (
+            update(TaskTemplate)
+            .where(TaskTemplate.map_name == old_name)
+            .values(map_name=new_name, updated_at=_utcnow())
+        )
+        if session is not None:
+            return session.execute(statement).rowcount
+
+        with self._session("rebind_map") as own:
+            result = own.execute(statement)
+            own.commit()
             return result.rowcount
 
     def delete_task_template(self, task_id: uuid.UUID) -> bool:

@@ -944,7 +944,7 @@ def test_rename_moves_the_directory_back_when_the_database_fails(
     client, maps_dir, map_repo, monkeypatch
 ):
     """The two stores cannot share a transaction, so the filesystem is undone."""
-    def _boom(old_map, new_map):
+    def _boom(old_map, new_map, session=None):
         raise RuntimeError("database is away")
 
     monkeypatch.setattr(map_repo, "move_vertices", _boom)
@@ -955,6 +955,32 @@ def test_rename_moves_the_directory_back_when_the_database_fails(
     assert "left under its old name" in response.json()["detail"]
     assert (maps_dir / "rawonly" / "map.pcd").is_file()
     assert not (maps_dir / "hall").exists()
+
+
+def test_rename_leaves_the_vertices_under_the_old_name_when_the_second_update_fails(
+    client, maps_dir, map_repo, task_template_repo, monkeypatch
+):
+    """The two DB re-keys are one transaction.
+
+    move_vertices used to commit on its own before rebind_map ran, so a failure
+    in rebind_map moved the directory back while the vertices stayed keyed to
+    the new name -- waypoints nobody could reach under either name.
+    """
+    map_repo.create_vertices(
+        "rawonly", [dict(name="dock", type="dock", x=0.0, y=0.0, theta=0.0)]
+    )
+
+    def _boom(old_name, new_name, session=None):
+        raise RuntimeError("templates table is away")
+
+    monkeypatch.setattr(task_template_repo, "rebind_map", _boom)
+
+    response = _rename(client, "rawonly", "hall")
+
+    assert response.status_code == 502
+    assert (maps_dir / "rawonly").is_dir() and not (maps_dir / "hall").exists()
+    assert len(map_repo.list_vertices(map="rawonly")) == 1
+    assert map_repo.list_vertices(map="hall") == []
 
 
 def test_rename_drops_the_cached_renderings_of_the_old_name(client, maps_dir, make_pcd):

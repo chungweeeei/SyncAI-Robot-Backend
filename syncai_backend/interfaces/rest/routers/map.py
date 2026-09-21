@@ -723,10 +723,13 @@ def init_map_router(
 
         Filesystem first, database second. The directory move is the step most
         likely to fail (target exists, permissions), and failing there needs no
-        compensation. The two repos run separate sessions, so there is no single
-        transaction to lean on for the DB half; if either UPDATE fails the
-        directory is moved back, because a renamed map whose vertices still
-        answer to the old name is worse than a rename that did not happen.
+        compensation. The two UPDATEs -- vertices and template bindings -- run
+        in one transaction (``MapRepo.transaction``), so the DB half lands or
+        fails as a unit; if it fails the directory is moved back, because a
+        renamed map whose vertices still answer to the old name is worse than a
+        rename that did not happen. They used to be two sessions, and a failure
+        in the second left the vertices committed under a name the directory
+        had just been moved back from.
         """
         _require(name)
 
@@ -748,8 +751,13 @@ def init_map_router(
         new_dir = map_catalog_repo.rename_map_dir(name, request.name)
 
         try:
-            vertices_moved = map_repo.move_vertices(name, request.name)
-            templates_moved = task_template_repo.rebind_map(name, request.name)
+            with map_repo.transaction(op="rename_map") as session:
+                vertices_moved = map_repo.move_vertices(
+                    name, request.name, session=session
+                )
+                templates_moved = task_template_repo.rebind_map(
+                    name, request.name, session=session
+                )
         except Exception as exc:
             # Best-effort compensation. A second failure here is logged and
             # reported, not raised over the first: the operator needs the
