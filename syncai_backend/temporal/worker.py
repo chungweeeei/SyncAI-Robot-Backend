@@ -9,7 +9,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from syncai_backend.temporal.shared import TEMPORAL_SERVER_URL
+from syncai_backend.temporal.shared import temporal_server_url
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
 
@@ -77,11 +77,12 @@ async def run_worker(
     `ready` is set right before the worker starts polling, so a caller running
     this in a background thread can block until the worker is up.
     """
+    server = temporal_server_url()
     client = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             client = await Client.connect(
-                TEMPORAL_SERVER_URL, data_converter=pydantic_data_converter
+                server, data_converter=pydantic_data_converter
             )
             break
         except Exception as err:
@@ -96,7 +97,7 @@ async def run_worker(
                 handle.mark_dead(str(err))
                 logger.error(
                     "Giving up on Temporal; task server is dead until restart",
-                    server=TEMPORAL_SERVER_URL,
+                    server=server,
                 )
                 return
             await asyncio.sleep(RETRY_INTERVAL)
@@ -116,7 +117,7 @@ async def run_worker(
 
     logger.info(
         "Temporal worker started",
-        server=TEMPORAL_SERVER_URL,
+        server=server,
         task_queue=f"{robot_id}.ROBOT_TASK_QUEUE",
     )
 
@@ -164,7 +165,7 @@ def start_temporal_worker(
     if not ready.wait(timeout=10.0):
         logger.warning(
             "Temporal worker not ready yet; still connecting in the background",
-            server=TEMPORAL_SERVER_URL,
+            server=temporal_server_url(),
         )
 
     return handle
