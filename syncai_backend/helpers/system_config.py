@@ -21,6 +21,7 @@ would be free not to.
 import configparser
 import os
 import re
+import threading
 from typing import Optional
 
 import structlog
@@ -30,6 +31,19 @@ import structlog
 DEFAULT_SYSTEM_INI = os.path.expanduser("~/robot_ws/config/system.ini")
 
 SYSTEM_INI_ENV = "SYNCAI_SYSTEM_INI"
+
+# Serialises every read and write of the INI within this process. The reason is
+# the in-place rewrite in `set_active_map` (see there for why it cannot be a
+# temp-file-and-rename): for the width of that rewrite the file is truncated
+# or half-written, and `active_map_name` reading it in that window answers
+# None -- which the map router's rename and delete routes take as "this map is
+# not active", and let a destructive operation through on the very map
+# map_server has open. Two operators and a few milliseconds, but rmtree is
+# what is on the other side of that guard. An RLock rather than a Lock so a
+# writer that re-reads to verify (which set_active_map does) does not deadlock
+# on itself. Process-local: a second process rewriting this file would need
+# its own coordination.
+_INI_LOCK = threading.RLock()
 
 
 def system_ini_path() -> str:
@@ -56,7 +70,9 @@ def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
     config = configparser.ConfigParser()
 
     try:
-        if not config.read(path):
+        with _INI_LOCK:
+            found = config.read(path)
+        if not found:
             logger.warning("[SystemConfig] System INI not found", path=path)
             return None
     except configparser.Error as exc:
@@ -130,7 +146,16 @@ def set_active_map(name: str, logger: structlog.stdlib.BoundLogger) -> str:
     Raises OSError if the file cannot be read or written, and ValueError if it
     has no ``[map] name`` to rewrite (the caller turns both into a 5xx; the
     router checks W_OK up front so the common case never reaches here).
+
+    Held under ``_INI_LOCK`` from the first read to the verifying re-read, so a
+    concurrent ``active_map_name`` waits for a whole file rather than reading
+    the truncated one.
     """
+    with _INI_LOCK:
+        return _set_active_map_locked(name, logger)
+
+
+def _set_active_map_locked(name: str, logger: structlog.stdlib.BoundLogger) -> str:
     path = system_ini_path()
 
     with open(path, "r", encoding="utf-8") as handle:

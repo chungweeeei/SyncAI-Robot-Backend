@@ -45,6 +45,7 @@ from syncai_backend.helpers.pcd_to_gridmap import (
     convert_traversable_to_gridmap,
     floor_level,
     read_poses_xy,
+    write_text_atomic,
 )
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
 from syncai_backend.repositories.map.catalog import (
@@ -299,9 +300,15 @@ def write_recipe_sidecar(
     """
     path = os.path.join(directory, GRIDMAP_RECIPE_SIDECAR)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        # Temp file + os.replace, the same way the yaml beside it is written.
+        # This used to be a plain open("w"), the one non-atomic write in the
+        # map directory: a listing that landed mid-write on the `failed`
+        # record of a re-conversion saw a torn sidecar, which the reader
+        # tolerates by returning None -- and _grid_status then fell through to
+        # "the grid on disk decides", reporting `ok` for a grid whose rebuild
+        # had just failed. A flicker rather than corruption, but a wrong answer
+        # from the one place the operator looks.
+        write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     except OSError as exc:
         logger.warning("Could not write gridmap recipe sidecar", path=path, error=str(exc))
 

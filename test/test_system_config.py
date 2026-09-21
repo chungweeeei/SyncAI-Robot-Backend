@@ -14,9 +14,11 @@ above all, which is what keeps the next hand edit a one-line change.
 """
 
 import configparser
+import threading
 
 import pytest
 
+from syncai_backend.helpers import system_config
 from syncai_backend.helpers.system_config import active_map_name, set_active_map
 
 
@@ -183,3 +185,39 @@ def test_switching_twice_is_stable(logger, ini):
 
     assert path.read_text() == first.replace("name: warehouse01", "name: dp2f")
     assert active_map_name(logger) == "dp2f"
+
+
+# --- The read and the write exclude each other ------------------------------
+
+
+def test_a_reader_waits_for_a_writer_to_finish(logger, ini):
+    """set_active_map rewrites the file in place, so for its duration the INI
+    is truncated or half-written. A concurrent active_map_name used to read
+    that and answer None -- the answer rename and delete take as "not active",
+    on the very map map_server has open."""
+    ini("[map]\nname = dp2f\n")
+    answered = []
+
+    def _read():
+        answered.append(active_map_name(logger))
+
+    # Stand in for a writer mid-rewrite: hold the lock, then let the reader go.
+    with system_config._INI_LOCK:
+        reader = threading.Thread(target=_read)
+        reader.start()
+        reader.join(timeout=0.2)
+        assert reader.is_alive()
+        assert answered == []  # still waiting on the lock
+
+    reader.join(timeout=5.0)
+    assert answered == ["dp2f"]
+
+
+def test_the_writer_can_re_read_under_its_own_lock(logger, ini):
+    """set_active_map verifies by reading the file back while it still holds
+    the lock -- an RLock, so that is not a deadlock."""
+    ini("[map]\nname = dp2f\n")
+
+    set_active_map("hall", logger)
+
+    assert active_map_name(logger) == "hall"

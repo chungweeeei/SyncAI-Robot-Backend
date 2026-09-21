@@ -287,13 +287,15 @@ def _fill_holes(
     return grid
 
 
-def _write_yaml_atomic(path: str, content: str) -> None:
-    """Write gridmap.yaml via a temp file + rename, like ``write_pgm``.
+def write_text_atomic(path: str, content: str) -> None:
+    """Write a small text file via a temp file + rename, like ``write_pgm``.
 
-    Same reader-race rationale: the catalogue parses gridmap.yaml on every
-    ``GET /api/v1/maps``, and a listing that lands mid-write would see a torn
-    file and degrade the map to ``grid: None``. Written *after* the .pgm by the
-    caller, so a reader that sees the yaml always finds the pgm it names.
+    Same reader-race rationale: the catalogue parses gridmap.yaml (and the
+    recipe sidecar) on every ``GET /api/v1/maps``, and a listing that lands
+    mid-write would see a torn file. For the yaml that degrades the map to
+    ``grid: None``; for the sidecar it makes a failed re-conversion read as
+    ``ok`` for the width of the write. The yaml is written *after* the .pgm by
+    the caller, so a reader that sees the yaml always finds the pgm it names.
     """
     directory = os.path.dirname(path) or "."
     handle = tempfile.NamedTemporaryFile(
@@ -339,7 +341,7 @@ def _write_gridmap(
     write_pgm(pgm_path, width, height, np.flipud(grid).tobytes())
     # Hand-formatted, not yaml.dump — same reason MapCatalogRepo.write_gridmap
     # never touches this file: image: must stay the relative basename.
-    _write_yaml_atomic(
+    write_text_atomic(
         yaml_path,
         f"image: {os.path.basename(pgm_path)}\n"
         f"mode: trinary\n"
