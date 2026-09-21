@@ -341,4 +341,4 @@ def test_a_missing_service_url_falls_back_to_the_local_default(monkeypatch):
 
     gateway = init_tts_gateway(logger=structlog.get_logger())
 
-    assert gateway._base_url == "http://127.0.0.1:8080"
+    assert gateway._base_url == tts_module._DEFAULT_BASE_URL

@@ -485,7 +485,7 @@ Details that matter when editing this path:
 | `POSTGRES_USER` | `syncrobotic` | ditto |
 | `POSTGRES_PASSWORD` | `syncrobotic` | ditto |
 | `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads, e.g. `[map]`) |
-| `TTS_SERVICE_URL` | `http://127.0.0.1:8080` | `gateways/tts` — the syncai_tts container (`http://tts:8080` in the compose network) |
+| `TTS_SERVICE_URL` | `http://syncai_tts:8080` | `gateways/tts` — the syncai_tts container, by its compose service name; `http://127.0.0.1:8080` when the backend runs on the host |
 
 `.env` in the workspace root is loaded via `python-dotenv` at import time.
 

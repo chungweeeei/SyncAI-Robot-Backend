@@ -41,8 +41,10 @@ import structlog
 from syncai_backend.gateways.failure import Failure, fail
 
 
-# Same host, different container. Overridden with TTS_SERVICE_URL; the compose
-# stack sets it to the service name.
+# The compose service name: the backend and the speech service share a compose
+# network on the robot, so this is what resolves there without configuration.
+# TTS_SERVICE_URL overrides it -- to 127.0.0.1:8080 when running the backend
+# on the host against a published port, for instance.
 _DEFAULT_BASE_URL = "http://syncai_tts:8080"
 
 # Connecting is local and should be immediate; a slow answer is the service
@@ -290,8 +292,8 @@ def init_tts_gateway(
     logger: structlog.stdlib.BoundLogger, base_url: Optional[str] = None
 ) -> TtsGateway:
     # Read here rather than at import, which is the rule the rest of this
-    # package's env reading follows (and the one temporal/shared.py breaks): the
-    # factory runs inside SyncAIBackend.__init__, well after main.py's
-    # load_dotenv(), so a value living only in .env is actually seen.
+    # package's env reading follows: the factory runs inside
+    # SyncAIBackend.__init__, well after main.py's load_dotenv(), so a value
+    # living only in .env is actually seen.
     resolved = base_url or os.getenv("TTS_SERVICE_URL") or _DEFAULT_BASE_URL
     return TtsGateway(logger=logger, base_url=resolved)
