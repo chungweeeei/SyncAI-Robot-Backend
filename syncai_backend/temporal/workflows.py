@@ -15,6 +15,14 @@ with workflow.unsafe.imports_passed_through():
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
 
 
+# Heartbeat window for MOVE (and the posture steps). execute_move heartbeats
+# once before the goal is sent and then once per poll, so the only stretch with
+# no heartbeat in it is the send itself -- which the gateway bounds by
+# NAV_GOAL_SEND_BUDGET_S, and test_activities.py checks that this stays above
+# it. Tighten either side and the other has to follow.
+MOVE_HEARTBEAT_TIMEOUT = timedelta(seconds=3)
+
+
 @workflow.defn
 class RobotWorkflow:
     def __init__(self) -> None:
@@ -53,7 +61,7 @@ class RobotWorkflow:
             # SPEAK cannot heartbeat: execute_speak sits in a single blocking
             # gateway call -- one HTTP request to the speech service, held open
             # for the whole utterance by `wait=true` -- so the
-            # 3s heartbeat_timeout below would kill every attempt before its
+            # MOVE_HEARTBEAT_TIMEOUT below would kill every attempt before its
             # first heartbeat could ever arrive. Dead-worker detection for
             # SPEAK therefore falls to start_to_close alone -- which is also
             # why it gets a much shorter one than the heartbeating activities:
@@ -65,7 +73,7 @@ class RobotWorkflow:
                 heartbeat_timeout = None
             else:
                 start_to_close_timeout = timedelta(hours=1)
-                heartbeat_timeout = timedelta(seconds=3)
+                heartbeat_timeout = MOVE_HEARTBEAT_TIMEOUT
 
             step.status = StepStatus.IN_PROGRESS
             try:

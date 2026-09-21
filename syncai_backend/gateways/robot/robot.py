@@ -90,11 +90,30 @@ MAX_TRACKED_GOALS = 5
 # outcome beats a blind "dispatched". Module-level so tests can shrink it.
 SWITCH_MODE_ACK_TIMEOUT = 2.0
 
+# How long move() waits for the NavigateToPose server, then for nav2 to accept
+# the goal. Short on purpose, and the reason is in temporal/workflows.py: the
+# MOVE activity runs under a 3 s heartbeat_timeout and has no loop to heartbeat
+# from while it is inside this call, so the whole send has to fit under that
+# window or Temporal kills the attempt from the outside. That is worse than a
+# quick refusal here, because a goal nav2 accepts just after the kill has no
+# supervisor. A nav2 that is not answering within a second on a robot in AUTO
+# mode is a real fault; the workflow's retry policy (3 attempts, 5 s apart) is
+# what gives a server that is merely slow to come up its chance. The old values
+# were 30 s and 10 s, which the heartbeat made unreachable in practice.
+# test_activities.py checks the workflow's timeout against the budget.
+NAV_SERVER_WAIT_S = 1.0
+NAV_ACCEPT_WAIT_S = 1.5
+NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
+
 
 def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
     event = threading.Event()
     future.add_done_callback(lambda _: event.set())
     return event.wait(timeout=timeout)
+
+
+def _goal_id_str(goal_handle: ClientGoalHandle) -> str:
+    return str(uuid.UUID(bytes=bytes(goal_handle.goal_id.uuid)))
 
 
 def _clamp_normalized(value: float) -> float:
@@ -425,31 +444,87 @@ class RobotGateway:
         self, client_name: str, goal_msg
     ) -> Tuple[bool, str, Optional[str]]:
         client = self._action_clients.get(client_name)
-        if not client.wait_for_server(timeout_sec=30.0):
+        if not client.wait_for_server(timeout_sec=NAV_SERVER_WAIT_S):
             return False, "Action server is not available", None
 
+        # The goal is registered by the response callback, on the executor
+        # thread, rather than by this thread once its wait returns. The
+        # difference matters exactly when this thread stops waiting -- the
+        # acceptance times out, or a Temporal cancel is thrown into the
+        # activity thread mid-wait -- and nav2 accepts the goal anyway.
+        # Registered, it can be cancelled; unregistered, it is a robot driving
+        # to a pose nobody is watching. `pending` is the handshake between the
+        # two threads: whichever side is second learns what the first did.
+        pending: dict = {"abandoned": False, "goal_id": None}
         future = client.send_goal_async(
             goal=goal_msg, feedback_callback=self._move_feedback_cb
         )
-        if not _wait_for_future(future, timeout=10.0):
+        future.add_done_callback(lambda fut: self._goal_response_cb(fut, pending))
+
+        try:
+            answered = _wait_for_future(future, timeout=NAV_ACCEPT_WAIT_S)
+        except BaseException:
+            # Whatever interrupted the wait -- the expected one is Temporal's
+            # CancelledError thrown into the activity thread -- the goal is no
+            # longer ours to leave running.
+            self._disown_pending(pending)
+            raise
+        if not answered:
+            self._disown_pending(pending)
             return False, "Timeout waiting for goal acceptance", None
 
         goal_handle: ClientGoalHandle = future.result()
         if not goal_handle.accepted:
             return False, "Goal rejected by task runner node", None
 
-        goal_id = goal_handle.goal_id
-        goal_id = str(uuid.UUID(bytes=bytes(goal_id.uuid)))
+        return True, "", _goal_id_str(goal_handle)
+
+    def _goal_response_cb(self, future, pending: dict) -> None:
+        """Register an accepted goal. Runs on the executor thread; see _send_nav_goal."""
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self._logger.error("[RobotGateway] Goal request failed", error=str(exc))
+            return
+        if goal_handle is None or not goal_handle.accepted:
+            return
+
+        goal_id = _goal_id_str(goal_handle)
         with self._lock:
             self._goals[goal_id] = MoveGoal(goal_id=goal_id, goal_handle=goal_handle)
             self._evict_finished_goals()
+            pending["goal_id"] = goal_id
+            abandoned = pending["abandoned"]
 
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
             lambda fut, gid=goal_id: self._move_result_cb(gid, fut)
         )
 
-        return True, "", goal_id
+        if abandoned:
+            # The sender gave up (timed out, or was cancelled) before nav2
+            # answered. Nobody will poll this goal, so nobody may leave it
+            # driving. Fire-and-forget: the result callback records CANCELED
+            # when nav2 confirms, and there is no caller left to report to.
+            self._logger.warning(
+                "[RobotGateway] Goal accepted after its sender gave up; cancelling",
+                goal_id=goal_id,
+            )
+            goal_handle.cancel_goal_async()
+
+    def _disown_pending(self, pending: dict) -> None:
+        """The sender stopped waiting: cancel the goal if it already arrived,
+        or arrange for the response callback to cancel it when it does."""
+        with self._lock:
+            pending["abandoned"] = True
+            goal_id = pending["goal_id"]
+            goal = self._goals.get(goal_id) if goal_id else None
+        if goal is not None and goal.state is MoveState.EXECUTING:
+            self._logger.warning(
+                "[RobotGateway] Sender stopped waiting on an accepted goal; cancelling",
+                goal_id=goal_id,
+            )
+            goal.goal_handle.cancel_goal_async()
 
     def _evict_finished_goals(self) -> None:
         """Trim _goals to MAX_TRACKED_GOALS, oldest finished first.
@@ -479,9 +554,7 @@ class RobotGateway:
         return self._send_nav_goal("move", goal_msg)
 
     def _move_feedback_cb(self, goal_handle):
-
-        goal_id = goal_handle.goal_id
-        goal_id = str(uuid.UUID(bytes=bytes(goal_id.uuid)))
+        goal_id = _goal_id_str(goal_handle)
 
         with self._lock:
             goal = self._goals.get(goal_id)
@@ -538,6 +611,31 @@ class RobotGateway:
             return False, "Cancel rejected by server"
 
         return True, ""
+
+    def cancel_active_moves(self) -> Tuple[bool, str]:
+        """Cancel every goal still executing -- the cancelled-MOVE cleanup path.
+
+        By goal state rather than by id, because the activity may not have one:
+        a Temporal cancel can land while nav2 is still deciding, before move()
+        has returned anything. The task-level mutex keeps live goals at one, so
+        "everything executing" is at most one goal and it is, by construction,
+        ours. Anything accepted after this ran is handled by _disown_pending.
+        """
+        with self._lock:
+            active = [
+                goal_id
+                for goal_id, goal in self._goals.items()
+                if goal.state is MoveState.EXECUTING
+            ]
+        if not active:
+            return True, "no goal was executing"
+
+        failures: List[str] = []
+        for goal_id in active:
+            success, message = self.cancel_move(goal_id=goal_id)
+            if not success:
+                failures.append(f"{goal_id}: {message}")
+        return (not failures), "; ".join(failures)
 
 
 def init_robot_gateway(

@@ -9,8 +9,8 @@ test hold a goal in EXECUTING, then deliver the result callback and watch the
 state machine move.
 
 This is the state machine the Temporal MOVE activity polls via
-``get_move_status`` and unwinds via ``cancel_move`` on cancellation, so the
-terminal-state bookkeeping here is business logic, not plumbing.
+``get_move_status`` and unwinds via ``cancel_active_moves`` on cancellation, so
+the terminal-state bookkeeping here is business logic, not plumbing.
 """
 
 import math
@@ -27,6 +27,7 @@ from builtin_interfaces.msg import Time  # noqa: E402
 
 from geometry_msgs.msg import Twist  # noqa: E402
 
+from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
 from syncai_backend.gateways.robot.robot import (  # noqa: E402
     MAX_TRACKED_GOALS,
     MotionKey,
@@ -196,6 +197,104 @@ class TestCancelMove:
 
         assert success is False
         assert "rejected" in message
+
+    def test_cancel_active_moves_targets_whatever_is_executing(self, robot_gw, move_client):
+        """The activity's cleanup path: by state, not id, because a cancel that
+        lands inside move() has no id to remember."""
+        _send_goal(robot_gw, move_client)
+        handle = move_client.send_goal_async.return_value.result()
+        handle.cancel_goal_async.return_value = _Future(
+            result=SimpleNamespace(goals_canceling=[object()])
+        )
+
+        assert robot_gw.cancel_active_moves() == (True, "")
+        handle.cancel_goal_async.assert_called_once()
+
+    def test_cancel_active_moves_with_nothing_running_is_a_no_op(self, robot_gw):
+        success, message = robot_gw.cancel_active_moves()
+
+        assert success is True
+        assert "no goal" in message
+
+
+class TestAbandonedGoals:
+    """A goal nav2 accepts after its sender stopped waiting is cancelled, not orphaned.
+
+    The sender stops waiting for one of two reasons -- the acceptance timed out,
+    or a Temporal cancel was thrown into the activity thread mid-wait -- and the
+    goal used to be registered by that waiting thread, so an acceptance that
+    arrived afterwards was a robot driving to a pose nobody was watching. The
+    response callback registers it now, and whichever of the two threads is
+    second sees what the first did.
+    """
+
+    class _ThreadCancel(BaseException):
+        """Stands in for temporalio's CancelledError thrown into the thread."""
+
+    def _unanswered_send(self, move_client):
+        """nav2 has not answered yet: the response future is left pending."""
+        handle = _goal_handle()
+        handle.get_result_async.return_value = _Future(completed=False)
+        response = _Future(completed=False)
+        move_client.send_goal_async.return_value = response
+        return handle, response
+
+    def test_acceptance_after_the_timeout_is_cancelled_on_arrival(
+        self, robot_gw, move_client, monkeypatch
+    ):
+        monkeypatch.setattr(robot_module, "NAV_ACCEPT_WAIT_S", 0.01)
+        handle, response = self._unanswered_send(move_client)
+
+        accepted, message, goal_id = robot_gw.move(x=0.0, y=0.0, yaw=0.0)
+        assert (accepted, goal_id) == (False, None)
+        assert "Timeout" in message
+
+        response.complete(handle)  # nav2 answers late
+
+        handle.cancel_goal_async.assert_called_once()
+        # Registered all the same, so the result callback still lands the
+        # terminal state when nav2 confirms the cancel.
+        status = robot_gw.get_move_status(goal_id=str(GOAL_UUID))
+        assert status["state"] == MoveState.EXECUTING.value
+
+    def test_an_interrupted_wait_disowns_the_goal(self, robot_gw, move_client, monkeypatch):
+        def _interrupted(future, timeout=None):
+            raise self._ThreadCancel()
+
+        monkeypatch.setattr(robot_module, "_wait_for_future", _interrupted)
+        handle, response = self._unanswered_send(move_client)
+
+        with pytest.raises(self._ThreadCancel):
+            robot_gw.move(x=0.0, y=0.0, yaw=0.0)
+
+        response.complete(handle)
+
+        handle.cancel_goal_async.assert_called_once()
+
+    def test_a_goal_accepted_just_before_the_interrupt_is_cancelled_too(
+        self, robot_gw, move_client, monkeypatch
+    ):
+        """The other ordering: the callback registered the goal, then the wait
+        was interrupted. _disown_pending finds it and cancels it directly."""
+        handle, response = self._unanswered_send(move_client)
+
+        def _accept_then_interrupt(future, timeout=None):
+            response.complete(handle)
+            raise self._ThreadCancel()
+
+        monkeypatch.setattr(robot_module, "_wait_for_future", _accept_then_interrupt)
+
+        with pytest.raises(self._ThreadCancel):
+            robot_gw.move(x=0.0, y=0.0, yaw=0.0)
+
+        handle.cancel_goal_async.assert_called_once()
+
+    def test_a_normal_acceptance_is_not_touched(self, robot_gw, move_client):
+        goal_id, _ = _send_goal(robot_gw, move_client)
+        handle = move_client.send_goal_async.return_value.result()
+
+        handle.cancel_goal_async.assert_not_called()
+        assert robot_gw.get_move_status(goal_id=goal_id)["state"] == MoveState.EXECUTING.value
 
 
 class TestGoalBookEviction:

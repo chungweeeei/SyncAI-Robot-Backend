@@ -430,9 +430,21 @@ Details that matter when editing this path:
   matching the one-thing-at-a-time reality of a robot. On cancellation Temporal
   *throws* `CancelledError` into the thread wherever it happens to be (often
   inside `time.sleep`), so cleanup lives in an `except CancelledError:` block, not
-  in an `is_cancelled()` poll. `execute_move` wraps the `cancel_move` RPC in
-  `activity.shield_thread_cancel_exception()` so the goal is really cancelled
-  before the activity dies.
+  in an `is_cancelled()` poll. `execute_move` wraps the whole of the send and
+  the poll loop in one `except CancelledError` that calls
+  `cancel_active_moves()` under `activity.shield_thread_cancel_exception()`, so
+  the goal is really cancelled before the activity dies. By goal *state* rather
+  than by id, because the cancel can land inside `move()` before nav2 has
+  answered — and for the goal nav2 accepts a moment after that, the gateway
+  itself disowns it: whichever of the two threads (the waiter, the rclpy
+  response callback) is second sees what the first did and cancels.
+- **MOVE heartbeats before it sends.** The heartbeat clock starts at activity
+  start, and `move()` has no loop to heartbeat from, so its two waits (server
+  ready, goal accepted) are bounded by `NAV_GOAL_SEND_BUDGET_S` in the gateway
+  and `MOVE_HEARTBEAT_TIMEOUT` in the workflow must stay above it —
+  `test_activities.py` pins that. The old 30 s / 10 s waits were unreachable
+  under a 3 s heartbeat anyway; a nav2 that is slow to come up gets its chance
+  from the retry policy, not from a wait the heartbeat would have killed.
 - **`SPEAK` does not heartbeat.** `execute_speak` sits in one blocking gateway
   call — a single HTTP request to the speech service, held open for the whole
   utterance by `wait=true` — so the 3 s `heartbeat_timeout` the other activities

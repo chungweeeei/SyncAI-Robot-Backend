@@ -9,9 +9,10 @@ What is pinned here is the retryability contract, because Temporal acts on it:
 a MOVE that aborts is retryable (the path may clear), a rejected motion key is
 not (the driver said no and will keep saying no).
 
-The cancellation paths (thread-cancel shielding in ``_wait_for_nav_goal``) are
-deliberately not covered: they need a real threaded worker to inject the
-cancel, which is integration-test territory.
+Cancellation is covered by raising ``CancelledError`` from the gateway seam
+(where Temporal would throw it into the thread) and asserting the cleanup call;
+the real thread injection and shielding need a threaded worker, which is
+integration-test territory.
 """
 
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,7 @@ import pytest
 
 pytest.importorskip("temporalio")
 
-from temporalio.exceptions import ApplicationError  # noqa: E402
+from temporalio.exceptions import ApplicationError, CancelledError  # noqa: E402
 from temporalio.testing import ActivityEnvironment  # noqa: E402
 
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
@@ -99,8 +100,55 @@ class TestExecuteMove:
             )
 
         assert result.success is True
-        # One heartbeat per poll is what keeps the 3 s heartbeat_timeout fed.
-        assert beats == [("executing",), ("succeeded",)]
+        # One before the send, then one per poll: what keeps the 3 s
+        # heartbeat_timeout fed from activity start onwards.
+        assert beats == [("sending",), ("executing",), ("succeeded",)]
+
+    def test_the_first_heartbeat_precedes_the_send(self, env, activities, robot_gw):
+        """The heartbeat clock starts at activity start, and move() has no loop
+        to heartbeat from; a slow nav2 used to fail the attempt before the poll
+        loop -- and its first heartbeat -- was ever reached."""
+        order = []
+
+        def _move(**kwargs):
+            order.append("move")
+            return True, "", "goal-1"
+
+        robot_gw.move.side_effect = _move
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+        env.on_heartbeat = lambda *details: order.append(("beat", *details))
+
+        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert order[:2] == [("beat", "sending"), "move"]
+
+    def test_the_heartbeat_window_covers_the_goal_send(self):
+        """Tighten either side and the other has to follow -- see the comments
+        on both constants."""
+        from syncai_backend.gateways.robot.robot import NAV_GOAL_SEND_BUDGET_S
+        from syncai_backend.temporal.workflows import MOVE_HEARTBEAT_TIMEOUT
+
+        assert MOVE_HEARTBEAT_TIMEOUT.total_seconds() > NAV_GOAL_SEND_BUDGET_S
+
+    def test_a_cancel_during_the_send_cancels_whatever_is_executing(
+        self, env, activities, robot_gw
+    ):
+        """No goal id to remember yet, so the cleanup goes by goal state."""
+        robot_gw.move.side_effect = CancelledError()
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        robot_gw.cancel_active_moves.assert_called_once()
+
+    def test_a_cancel_while_polling_cancels_the_goal(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.side_effect = CancelledError()
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        robot_gw.cancel_active_moves.assert_called_once()
 
 
 class TestPostureActivities:
