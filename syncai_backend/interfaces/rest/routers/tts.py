@@ -3,7 +3,7 @@ from typing import List
 from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 
-from syncai_backend.exceptions import BadRequestError, UpstreamError
+from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.tts.tts import TtsGateway
 
@@ -34,19 +34,27 @@ class ListVoicesResponse(BaseModel):
 def init_tts_router(logger: structlog.stdlib.BoundLogger, tts_gw: TtsGateway) -> APIRouter:
     tts_router = APIRouter(prefix="", tags=["TTS"])
 
-    # Plain (non-async) handlers: synthesis is CPU-bound for up to a few
-    # seconds (plus the one-time ~310 MB model load on the first request), and
-    # /speak additionally blocks for the length of the utterance — threadpool
-    # work, not event-loop work.
+    # Plain (non-async) handlers, still: the work moved out of this process but
+    # the blocking did not. Every one of these is a synchronous HTTP call to the
+    # speech service — synthesis takes as long as it takes there (including the
+    # one-time model load on its first request) and /speak additionally waits
+    # out the utterance. Threadpool work, not event-loop work.
 
     def _raise_for(message: str) -> None:
-        # The gateway's one caller-fixable failure; everything else (missing
-        # weights, onnxruntime, aplay) is ours and answers 502. Keyed on the
-        # code the gateway tags the message with, not on the sentence: the
-        # SPEAK activity applies the same rule to decide retryability, and
-        # matching prose in two places is how the two drift apart on a reword.
-        if failure_code(message) is Failure.UNKNOWN_VOICE:
+        # Two caller-fixable failures; everything else (the speech service
+        # unreachable, its weights missing, a wedged speaker) is ours and
+        # answers 502. Keyed on the code the gateway tags the message with, not
+        # on the sentence: the SPEAK activity applies the same rule to decide
+        # retryability, and matching prose in two places is how the two drift
+        # apart on a reword.
+        code = failure_code(message)
+        if code is Failure.UNKNOWN_VOICE:
             raise BadRequestError(message)
+        if code is Failure.TTS_QUEUE_FULL:
+            # 409 rather than 502: the robot is fine, there is just already a
+            # backlog of speech. The console's next step is to wait or to stop
+            # queueing, which is not the next step for a 502.
+            raise ConflictError(message, code=Failure.TTS_QUEUE_FULL.value)
         raise UpstreamError(message)
 
     @tts_router.get("/api/v1/tts/voices", response_model=ListVoicesResponse)

@@ -116,22 +116,32 @@ class RobotActivities:
     def execute_speak(self, params: SpeakParams) -> ActivityResult:
         """Speak on the robot speaker, blocking until playback finishes.
 
-        This never heartbeats: TtsGateway.speak() sits in one blocking call
-        (synthesis, then aplay for the length of the utterance, plus the
-        one-time ~3 s model load on the first call), so there is no loop to
-        heartbeat from. The workflow therefore drops the heartbeat_timeout
-        for SPEAK steps and relies on a short start_to_close instead — see
-        the per-step options in workflows.py. Same reason it is effectively
-        not cancellable mid-utterance: without heartbeats the worker never
-        learns of a cancel, so a canceled task finishes the sentence it is on
-        before the workflow's CancelledError lands. An utterance is bounded
-        (text is capped at 1000 chars, aplay at duration+10 s), so that is a
-        few seconds of latency, not a hang.
+        This never heartbeats: TtsGateway.speak() sits in one blocking call —
+        now a single HTTP request to the syncai_tts service, held open for the
+        utterance by `wait=true` — so there is no loop to heartbeat from. The
+        workflow therefore drops the heartbeat_timeout for SPEAK steps and
+        relies on a short start_to_close instead; see the per-step options in
+        workflows.py. Same reason it is effectively not cancellable
+        mid-utterance: without heartbeats the worker never learns of a cancel,
+        so a canceled task finishes the sentence it is on before the workflow's
+        CancelledError lands. An utterance is bounded (text is capped at 1000
+        chars, and the gateway gives up at 240 s), so that is a few seconds of
+        latency, not a hang.
+
+        **That is now a choice rather than a constraint.** The speech service's
+        playback is a job: POST returns an id, GET reports its state and DELETE
+        stops it. Rewriting this to enqueue and then poll once a second would
+        make the heartbeat real and let `except CancelledError` cut the
+        utterance, the way `_wait_for_nav_goal` already does for MOVE. It is
+        left blocking here so that moving speech out of this process changed
+        nothing about the task path; do that next, not at the same time.
 
         Only Failure.UNKNOWN_VOICE is the request's fault and non-retryable;
-        everything else (model missing, aplay/device trouble) is treated as
-        possibly transient, same philosophy as the move rejections — the
-        workflow's maximum_attempts=3 bounds the ones that are not.
+        everything else (the service unreachable, its model missing, device
+        trouble) is treated as possibly transient, same philosophy as the move
+        rejections — the workflow's maximum_attempts=3 bounds the ones that are
+        not. Note that a full speech queue is retryable on purpose: three
+        attempts five seconds apart is exactly the right response to a backlog.
         """
         success, message, duration = self._tts_gw.speak(
             text=params.text, voice=params.voice, speed=params.speed

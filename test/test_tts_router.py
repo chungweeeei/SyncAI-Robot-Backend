@@ -1,14 +1,19 @@
 """Tests for /api/v1/tts — projection over a stubbed TtsGateway.
 
-The gateway itself (kokoro session, aplay) is not exercised here: it needs the
-310 MB weights and a speaker. What the router owns is the request validation,
-the WAV passthrough, and the status-code mapping — an unknown voice is the
-caller's typo (400), everything else that fails (missing weights, onnxruntime,
-aplay) is the robot's problem (502).
+The gateway itself is not exercised here; it is an HTTP client for the
+syncai_tts service and its own tests live in test_tts_gateway.py. What the
+router owns is the request validation, the WAV passthrough, and the status-code
+mapping:
 
-The stub tags its unknown-voice failure with Failure.UNKNOWN_VOICE because the
-real gateway does; the router reads that code rather than the sentence, so an
-untagged message is by design just another 502 (pinned below).
+- an unknown voice is the caller's typo (400),
+- a full speech queue is a backlog the caller can wait out or stop adding to
+  (409, with a machine-readable code beside the detail),
+- everything else that fails — the speech service unreachable, its weights
+  missing, a wedged speaker — is the robot's problem (502).
+
+The stub tags those two failures the way the real gateway does, by re-tagging
+the code the service sent. The router reads the code rather than the sentence,
+so an untagged message is by design just another 502 (pinned below).
 """
 
 import pytest
@@ -103,8 +108,33 @@ def test_a_failure_that_carries_no_code_is_a_502(client, tts_gw):
     assert response.status_code == 502
 
 
-def test_missing_weights_are_a_502(client, tts_gw):
-    tts_gw.synthesize_result = (False, "kokoro model file missing: ...", b"")
+def test_a_full_speech_queue_is_a_409_with_a_code(client, tts_gw):
+    """Not a 502: the robot is fine, there is just already a backlog of speech.
+
+    The console's next step is to wait or stop queueing, which is not the next
+    step for a 502, and it branches on the code rather than on the sentence —
+    the ConflictError.code precedent.
+    """
+    tts_gw.speak_result = (
+        False,
+        fail(Failure.TTS_QUEUE_FULL, "8 utterances are already waiting"),
+        None,
+    )
+
+    response = client.post("/api/v1/tts/speak", json={"text": "hi"})
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "tts_queue_full"
+    assert "already waiting" in body["detail"]
+
+
+def test_an_unreachable_speech_service_is_a_502(client, tts_gw):
+    tts_gw.synthesize_result = (
+        False,
+        "could not reach the speech service at http://tts:8080: Connection refused",
+        b"",
+    )
 
     response = client.post("/api/v1/tts/synthesize", json={"text": "hello"})
 

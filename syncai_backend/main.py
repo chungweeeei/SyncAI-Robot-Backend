@@ -102,12 +102,17 @@ class SyncAIBackend(Node):
         # holding a handle that can command the robot to move.
         map_gw = init_map_gateway(logger=logger, node=self)
         workflow_gw = init_workflow_gateway(logger=logger, robot_id=robot_id)
-        # Speech out (kokoro-onnx -> the USB speaker). No node handle: nothing
-        # about it is ROS — it exists at this layer because the REST router
-        # and the Temporal worker's SPEAK activity share one long-lived owner
-        # for the lazily-loaded inference session. One instance on purpose:
-        # its internal lock is what keeps a scheduled SPEAK step and a manual
-        # POST /api/v1/tts/speak from talking over each other.
+        # Speech out, over HTTP to the syncai_tts container. No node handle:
+        # nothing about it is ROS.
+        #
+        # It used to hold the kokoro session and the aplay subprocess, and one
+        # instance was load-bearing — its internal lock was the only thing
+        # keeping a scheduled SPEAK step and a manual POST /api/v1/tts/speak off
+        # the speaker at the same time. That guarantee now lives in the service,
+        # in front of the one piece of hardware, which is what lets the Temporal
+        # worker move to a process of its own without two locks in two processes
+        # failing to see each other. One instance here is now merely tidy: it is
+        # a pooled httpx.Client, not a resource owner.
         tts_gw = init_tts_gateway(logger=logger)
         # WHEP signalling for the camera stream. No node handle, same as the
         # TTS gateway: nothing about it is ROS. One instance because two things

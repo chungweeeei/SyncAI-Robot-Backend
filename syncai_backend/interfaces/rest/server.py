@@ -213,8 +213,9 @@ def init_rest_server(
     # control sends normalized velocity frames here. Takes robot_gw, not a
     # repo — it is a command surface, same as the robot router.
     app.include_router(init_teleop_router(logger=logger, robot_gw=robot_gw))
-    # Speech out. A gateway like robot/map, but its downstream is the kokoro
-    # inference session plus the speaker rather than a ROS service.
+    # Speech out. A gateway like robot/map, but its downstream is the
+    # syncai_tts container over HTTP rather than a ROS service -- and that
+    # container, not this process, is what owns the speaker.
     app.include_router(init_tts_router(logger=logger, tts_gw=tts_gw))
     # Video out, as WHEP. The backend owns the signalling only -- SDP
     # exchange, the Location header, CORS; the media path lives inside a Go

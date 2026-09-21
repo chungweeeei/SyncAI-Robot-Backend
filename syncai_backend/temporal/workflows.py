@@ -51,7 +51,8 @@ class RobotWorkflow:
             args = [] if step.params is None else [step.params]
 
             # SPEAK cannot heartbeat: execute_speak sits in a single blocking
-            # gateway call (synthesis + aplay for the whole utterance), so the
+            # gateway call -- one HTTP request to the speech service, held open
+            # for the whole utterance by `wait=true` -- so the
             # 3s heartbeat_timeout below would kill every attempt before its
             # first heartbeat could ever arrive. Dead-worker detection for
             # SPEAK therefore falls to start_to_close alone -- which is also

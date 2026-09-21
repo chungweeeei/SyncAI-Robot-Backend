@@ -36,7 +36,19 @@ class Failure(str, Enum):
 
     # TtsGateway: the one failure that is the caller's to fix (400, and
     # non-retryable for a SPEAK step) rather than the robot's (502).
+    #
+    # This string is also the one the syncai_tts service publishes, and the two
+    # are deliberately identical: the gateway reads `code` off that service's
+    # error body and re-tags it with this enum, so renaming either side silently
+    # turns a 400 into a 502 and makes a typo'd voice retry three times.
     UNKNOWN_VOICE = "unknown_voice"
+
+    # TtsGateway: more utterances are already waiting than the speech service's
+    # queue allows. A 409 the console offers "wait or cancel" for, rather than
+    # the 502 that would tell an operator the robot is broken when in fact they
+    # pressed Speak nine times. New with the move to the service — while the
+    # speaker was a lock inside this process, a ninth caller simply blocked.
+    TTS_QUEUE_FULL = "tts_queue_full"
 
     # RecordingGateway: both are 409s the console offers a different next step
     # for -- stop the running bag, or free some disk.

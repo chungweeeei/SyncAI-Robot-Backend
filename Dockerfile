@@ -68,7 +68,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-humble-ament-copyright \
         ros-humble-ament-flake8 \
         ros-humble-ament-pep257 \
-        alsa-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /ros2_ws
@@ -88,13 +87,12 @@ COPY requirements.txt /tmp/requirements.txt
 # unavailable. The z-band recipe, which is what every save actually uses, is
 # open3d-free by design. Read the warning; do not let it become invisible.
 #
-# --no-deps for kokoro-onnx, matching the robot's Dockerfile: its metadata
-# demands onnxruntime>=1.20.1 and numpy>=2, both of which are wrong here, and
-# requirements.txt spells out the dependencies it actually needs instead.
+# There is no kokoro-onnx step any more, and no alsa-utils above: the speech
+# engine and the speaker moved to the syncai_tts container, so this image holds
+# neither onnxruntime nor a ~310 MB model. gateways/tts is an httpx client.
 RUN python3 -m pip install --no-cache-dir --upgrade pip \
     && grep -v '^open3d' /tmp/requirements.txt > /tmp/requirements.core.txt \
     && python3 -m pip install --no-cache-dir -r /tmp/requirements.core.txt \
-    && python3 -m pip install --no-cache-dir --no-deps kokoro-onnx \
     && { python3 -m pip install --no-cache-dir "$(grep '^open3d' /tmp/requirements.txt)" \
          || echo "WARNING: open3d unavailable for this platform — test_traversable.py will skip and the traversability recipe is disabled"; }
 

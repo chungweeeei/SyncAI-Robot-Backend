@@ -15,10 +15,11 @@ from syncai_backend.gateways.failure import Failure, fail
 #
 #   go build -buildmode=c-shared -o dist/libsyncai_worker.so ./cmd/lib
 #
-# and copied into the workspace by hand, the same arrangement as the kokoro
-# weights under models/: an artifact the build does not produce and git does
-# not carry (*.so is gitignored), reachable in the container through the
-# workspace bind mount.
+# and copied into the workspace by hand: an artifact the build does not produce
+# and git does not carry (*.so is gitignored), reachable in the container
+# through the workspace bind mount. The kokoro weights under models/ were the
+# other one of these until speech moved to the syncai_tts container, which
+# mounts them itself.
 _DEFAULT_LIB = os.path.expanduser("~/robot_ws/lib/libsyncai_worker.so")
 
 # Applied with setdefault immediately before InitWorker, never after: the

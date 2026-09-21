@@ -84,7 +84,7 @@ services/                  domain work that outlives a request: gridmap_conversi
         │                  the registry of running threads, the gridmap.recipe.json protocol)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
-        │                  tts (kokoro-onnx → aplay), webrtc (dlopen'd Go worker), recording
+        │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry),
         │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
@@ -135,12 +135,12 @@ TF frame names are not namespaced.
 
 ### Configuration
 
-Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`), loaded from the
-cwd `.env` via python-dotenv at import time — see `.env.example`. **No ROS parameters**
-anywhere. Everything is read once at startup. Several paths are absolute on purpose
-(`~/robot_ws/config/system.ini`, `~/robot_ws/map`, `~/robot_ws/record`,
-`~/robot_ws/models/kokoro/`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do
-not reliably run from the workspace root.
+Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
+`TTS_SERVICE_URL`), loaded from the cwd `.env` via python-dotenv at import time — see
+`.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
+Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
+`~/robot_ws/record`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
+reliably run from the workspace root.
 
 ### Persistence rules worth knowing before touching `database/` or `repositories/`
 
@@ -164,7 +164,9 @@ not reliably run from the workspace root.
 
 Activities are synchronous; cancellation arrives as `CancelledError` thrown into the
 thread — cleanup goes in `except CancelledError`, not an `is_cancelled()` poll. `SPEAK`
-cannot heartbeat (blocks on `aplay`) so it runs on `start_to_close` alone. Per-step state
+does not heartbeat (one blocking HTTP call to the speech service, held open for the
+utterance) so it runs on `start_to_close` alone; that service's playback is a pollable,
+cancellable job, so this is now a choice rather than a constraint. Per-step state
 is a workflow **query**, not a table. Schedules use `SKIP` overlap; their steps are frozen
 at registration; the original cron string and `map_name`/template ids ride in the schedule
 **memo**. `ARTIFACT` steps were removed 2026-08 — stored templates carrying one fail
@@ -174,14 +176,15 @@ validation.
 
 `helpers/traversable.py` is the **only** module that imports open3d (~100 MB), and only
 inside `GridmapConversionService.start`'s conversion thread, in its `try`. Keep
-`pcd_to_gridmap.py` open3d-free. The kokoro TTS
-model (~310 MB) and the WebRTC Go worker are lazy-loaded on first use, each owned by
-exactly one gateway instance whose internal lock serialises REST and Temporal callers.
+`pcd_to_gridmap.py` open3d-free. The WebRTC Go worker is lazy-loaded on first use, owned
+by exactly one gateway instance whose internal lock serialises REST and Temporal callers.
+The kokoro TTS model (~310 MB) used to be the other one of these; it lives in the
+syncai_tts container now and `gateways/tts` is an httpx client.
 
 ## Dependency pins that are not negotiable without reading `requirements.txt`
 
-`onnxruntime==1.18.1` (newer versions corrupt the heap on the Orin with cores offlined),
 `scipy>=1.8,<1.11` and `open3d>=0.18,<0.20` (both exist to stop pip dragging numpy past
-1.26, which the ROS ecosystem tolerates). `kokoro-onnx` is deliberately absent — the
-Dockerfile installs it `--no-deps`. `setup.py` ships **bytecode only** on a non-symlink
+1.26, which the ROS ecosystem tolerates). `onnxruntime==1.18.1` and the `--no-deps`
+`kokoro-onnx` install are **gone from this repo** — they moved to SyncAI-TTS with the
+engine; do not reinstate them here. `setup.py` ships **bytecode only** on a non-symlink
 install (`InstallNoSource`); `--symlink-install` dev builds are unaffected.
