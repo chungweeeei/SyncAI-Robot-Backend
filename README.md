@@ -140,9 +140,6 @@ them down as constructor arguments. There is no DI container and no module-level
 singleton — if a router needs something, it arrives through
 `init_<x>_router(...)`.
 
-`repositories/base.py` and `jobs/base.py` are abstract scaffolding that nothing
-currently implements; the live repos are plain classes.
-
 ## robot_id, namespaces, and per-robot isolation
 
 The launch file reads `[system] robot_id` from the system INI — by default the

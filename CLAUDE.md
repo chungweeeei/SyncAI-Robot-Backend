@@ -134,7 +134,6 @@ helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-ba
 subscriber via `init_<x>(...)` factories and passes them into `start_rest_server(...)`,
 which hands them to `init_<x>_router(...)`. No DI container, no module-level singletons.
 Adding a dependency to a router means threading it through `main.py` → `server.py`.
-`repositories/base.py` and `jobs/base.py` are unused scaffolding.
 
 That rule is why the gridmap conversion is a `services/` object rather than the
 module-level `_ACTIVE_CONVERSIONS` set it used to be inside `routers/map.py`: it is
