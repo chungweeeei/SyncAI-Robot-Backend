@@ -112,11 +112,12 @@ services:
       # namespace the node. Override both together or neither.
 
     volumes:
-      # ROBOT_WS is the host directory that carries the robot's config, maps and
-      # recordings. Today that is the workspace checkout — these four paths are
-      # the entirety of what this package needs from it, and `map/` in
-      # particular MUST be the same directory the nav stack's map_server reads,
-      # or an activated map exists for one of them only.
+      # ROBOT_WS is the host directory that carries the robot's config and maps.
+      # Today that is the workspace checkout — these three paths are the
+      # entirety of what this package needs *shared* with the rest of the stack,
+      # and `map/` in particular MUST be the same directory the nav stack's
+      # map_server reads, or an activated map exists for one of them only.
+      # (record/ is deliberately NOT one of them; see below.)
       #
       #   export ROBOT_WS=/some/other/place   # to point it elsewhere
       #
@@ -138,7 +139,25 @@ services:
       # would never resolve (helpers/system_config.py says so at length).
       - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config/instances/${ROBOT_INSTANCE:-robot01}.ini:/home/syncrobotic/robot_ws/config/system.ini
       - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/map:/home/syncrobotic/robot_ws/map
-      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/record:/home/syncrobotic/robot_ws/record
+      # Recordings, and the one directory that is NOT shared with the workspace.
+      # Nothing else in the stack reads a bag — the recorder writes them, this
+      # backend lists and deletes them, and that is the whole of it — so there
+      # is no reason for the path to be tied to a workspace checkout the way
+      # config/ and map/ are. It defaults to `record/` beside this compose file
+      # (gitignored, and `record/.gitkeep` keeps it in the checkout so Docker
+      # never has to create the bind source itself — a missing source is created
+      # root:root, which uid 1000 then cannot write).
+      #
+      #   export RECORD_DIR=/mnt/ssd/record   # bags are large; point it at disk
+      #
+      # Note that the *container* path is unchanged and hardcoded in
+      # repositories/recording/catalog.py; only where it comes from on the host
+      # moved. The byobu-pane backend inside robot01 keeps whatever record/ that
+      # container mounts, so after this change the two deployments no longer see
+      # each other's bags — and since only one backend may run at a time, no
+      # recording is reachable from one and invisible to the other at the moment
+      # it matters.
+      - ${RECORD_DIR:-./record}:/home/syncrobotic/robot_ws/record
       # The WebRTC Go worker, dlopen'd lazily on the first /whep request. A
       # single file, read-only: nothing here writes it, and it is built
       # elsewhere (SyncAI-WebRTC-Worker). Without it the camera stream 502s and

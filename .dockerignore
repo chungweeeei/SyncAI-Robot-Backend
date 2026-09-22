@@ -34,6 +34,13 @@ build/
 install/
 log/
 
+# Recordings. This is the default RECORD_DIR, so on a robot that has recorded
+# anything it is the largest thing in the repo by orders of magnitude (2 GB per
+# bag split) and it is pure runtime data — the image creates its own empty
+# ~/robot_ws/record mount point. Letting it reach the context would mean
+# uploading every bag to the daemon on every build.
+record/
+
 # Secrets and local settings
 .env
 .claude/settings.local.json

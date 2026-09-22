@@ -348,9 +348,12 @@ instead of a backlog.
 
 ### Recordings
 
-Bags land in `record/<name>/` in the workspace root (bind-mounted, gitignored),
-the same layout `ros2 bag record` writes by hand: `<name>_N.db3` splits cut at
-2 GB plus a `metadata.yaml`. Nothing else in the stack reads them — a bag is
+Bags land in `~/robot_ws/record/<name>/` (gitignored), the same layout `ros2 bag
+record` writes by hand: `<name>_N.db3` splits cut at 2 GB plus a `metadata.yaml`.
+As its own container that directory is bind-mounted from `record/` beside the
+compose file rather than from the workspace, because — unlike `config/` and
+`map/` — nothing outside this process touches it; `RECORD_DIR` points it at a
+bigger disk. Nothing else in the stack reads them — a bag is
 insurance, and the thing it insures against is a mapping run that ends without a
 save, since `pgo_node` holds its keyframes in RAM and replaying `livox/lidar` +
 `livox/imu` is the only way to get one back.
@@ -601,11 +604,17 @@ compose file; the four that bite are:
 - **`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`,** with the package installed in the
   image. A backend left on the default fastrtps starts cleanly, logs nothing
   alarming and sees not one topic.
-- **Four bind mounts** carry everything this package needs from `~/robot_ws`:
-  `config/` (read-write — activating a map rewrites `system.ini` in place),
-  `map/` (must be the same directory the nav stack's `map_server` reads),
-  `record/`, and `lib/libsyncai_worker.so`. `[system] robot_id` in the mounted
-  INI is still what namespaces the node, the database and the task queue.
+- **Three bind mounts from `ROBOT_WS`** carry what this package shares with the
+  rest of the stack: `config/` (read-write — activating a map rewrites
+  `system.ini` in place, and the per-robot `instances/robotNN.ini` goes over
+  `config/system.ini` as a single file), `map/` (must be the same directory the
+  nav stack's `map_server` reads) and `lib/libsyncai_worker.so`. `[system]
+  robot_id` in the mounted INI is still what namespaces the node, the database
+  and the task queue. **`record/` is not one of them**: no other process reads a
+  bag, so it defaults to `record/` beside the compose file and moves with
+  `RECORD_DIR` (`export RECORD_DIR=/mnt/ssd/record`). It is tracked as an empty
+  directory so Docker never creates the bind source itself — a source it creates
+  is `root:root`, which the uid-1000 container user cannot write.
 - **One backend at a time.** `NodeManager` starts this process as a byobu pane
   inside the robot container. Running the service alongside it gives two
   processes on `:3000` and, less visibly, two Temporal workers polling the same

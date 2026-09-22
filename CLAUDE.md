@@ -77,7 +77,10 @@ docker compose up -d --build                        # the runtime image as a ser
 
 `docker-compose.yml` runs the `runtime` stage alone — host networking (DDS over
 `lo`, so `127.0.0.1:<published port>` for postgres/temporal/tts),
-`rmw_cyclonedds_cpp`, and four bind mounts for `~/robot_ws/{config,map,record,lib}`.
+`rmw_cyclonedds_cpp`, three bind mounts from `ROBOT_WS` for
+`~/robot_ws/{config,map,lib}`, and `~/robot_ws/record` from this repo's own
+`record/` (`RECORD_DIR`) — bags are the one thing nothing else in the stack
+reads, so they are not tied to a workspace checkout.
 Copy FAST-LIO2's `interface` to `.interface/` in the repo root to get the pgo /
 localizer services; without it the backend still runs (the import in
 `gateways/map/map.py` is wrapped in a TEMPORARY try/except) and map save / new
