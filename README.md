@@ -177,14 +177,17 @@ source frame from the message header and only pins the target frame (`map`).
 | `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state` |
 | `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS |
 | `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
-| `plan` | `nav_msgs/Path` | **RELIABLE**, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
+| `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
 | `pgo/map_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, **depth 1** | already in `map`; stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only) |
 
-`plan` is the only RELIABLE subscription here. The others read 20 Hz feeds where
-the next sample is 50 ms behind the one that was dropped; a plan arrives once per
-BT replan (~3 s), so dropping one leaves the operator looking at a route the
-robot has already left.
+Every subscription here is BEST_EFFORT, `plan` included. Its publisher is a
+`rclcpp::QoS(1)` — RELIABLE — and a BEST_EFFORT subscriber still matches a
+RELIABLE publisher, so the topic connects either way; what the request gives up
+is retransmission. That costs more on this topic than on the others: they read
+20 Hz feeds where the next sample is 50 ms behind the one that was dropped,
+while a plan arrives once per BT replan (~3 s), so a dropped one leaves the
+operator looking at a route the robot has already left until the next replan.
 
 Two properties of `syncai_planner`'s publisher are worth knowing before debugging
 a missing route: it skips the publish entirely while nothing is subscribed, and
