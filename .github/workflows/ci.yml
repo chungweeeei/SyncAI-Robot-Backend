@@ -1,0 +1,131 @@
+# syncai_backend CI.
+#
+# Two jobs, and the split is about cost: `lint` needs nothing but a python and
+# the docker CLI and answers in under a minute; `test` builds a ROS 2 Humble
+# image and is measured in minutes even warm.
+#
+# The test job deliberately runs the suite through the Dockerfile's `dev` stage
+# rather than reproducing it with apt/pip steps here. That stage already encodes
+# the parts of this environment nobody should have to rediscover -- the
+# `pytest>=7,<8` window (anyio needs >=7, Humble's launch_testing breaks on 8),
+# the `-p no:launch_testing -p no:launch_ros` PYTEST_ADDOPTS, the ament linters
+# that test_copyright/test_flake8/test_pep257 silently skip without, and the
+# non-root user that test_activate_refuses_when_the_ini_is_not_writable needs
+# (root bypasses the mode-0444 check and the test fails for the wrong reason).
+# A second copy of that list in YAML is a second copy to keep in sync.
+#
+# What CI does NOT have: FAST-LIO2's `interface`. It lives in a private SSH fork
+# and is not in interface.repos (see the Dockerfile header), so `.interface/` is
+# never in this build context and test_map_gateway.py importorskips itself away.
+# `syncai_common` IS public and IS in interface.repos, so it is imported and
+# built below -- without it 11 files reach it through a plain import and fail to
+# collect, which is the difference between a meaningful run and a useless one.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A force-push to a PR should not leave the previous image build burning a
+# runner for ten more minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff + compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.10 because that is what ROS 2 Humble ships and what ruff.toml pins as
+      # target-version; a newer interpreter would let syntax through that the
+      # robot cannot run.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # Pinned, for the same reason ruff.toml pins `select` explicitly: ruff's
+      # default rule set grows between releases, and CI failing on a rule nobody
+      # opted into -- because the runner picked up a newer ruff overnight -- is
+      # exactly the churn that config comment exists to prevent. Bump it
+      # deliberately, in this line.
+      - run: pip install ruff==0.16.8
+      - run: ruff check --output-format=github .
+
+      # Catches a malformed compose file without starting anything. Every
+      # variable in docker-compose.yml has a default, so this needs no .env.
+      - run: docker compose config --quiet
+
+  test:
+    name: pytest (ROS 2 Humble)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The dev stage's USER_UID exists for bind mounts, and this is a bind
+      # mount: the checkout is owned by the runner's user (uid 1001 on
+      # ubuntu-latest, but read it rather than assume it), and the container
+      # writes __pycache__ and .pytest_cache back into it.
+      - id: runner-uid
+        run: echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+
+      # Both builds share one cache scope on purpose. The expensive layer is
+      # `base` (ROS apt packages plus ~400 MB of pip wheels, open3d most of it)
+      # and dev/runtime both sit on it; separate scopes would store it twice and
+      # push this repo toward the 10 GB GitHub cache ceiling. mode=max keeps the
+      # intermediate layers, which is what makes a warm run cheap.
+      - name: Build the dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          build-args: USER_UID=${{ steps.runner-uid.outputs.uid }}
+          load: true
+          tags: syncai-backend-dev
+          cache-from: type=gha,scope=syncai-backend
+          cache-to: type=gha,mode=max,scope=syncai-backend
+
+      # The source is bind-mounted rather than baked in (the dev stage copies no
+      # source at all), and syncai_common is cloned and built inside the
+      # container, into /ros2_ws/{build,install} -- paths that are NOT the mount,
+      # so nothing lands in the checkout. `colcon-build` is the image's wrapper;
+      # it sources ROS and builds with --symlink-install.
+      #
+      # install/setup.bash has to be sourced by hand here: the entrypoint sources
+      # it only if it already exists when the container starts, and this build
+      # happens after that.
+      #
+      # `python3 -m pytest` (not bare `pytest`) puts the repo root on sys.path,
+      # which is how `import syncai_backend` resolves uninstalled.
+      - name: Run the test suite
+        run: |
+          docker run --rm \
+            -v "$PWD":/ros2_ws/src/syncai_backend \
+            syncai-backend-dev bash -lc '
+              set -eo pipefail
+              cd /ros2_ws
+              vcs import < src/syncai_backend/interface.repos
+              colcon-build --packages-select syncai_common
+              source /ros2_ws/install/setup.bash
+              cd /ros2_ws/src/syncai_backend
+              python3 -m pytest test/ -q -ra'
+
+      # The image docker-compose.yml actually runs. It is a different stage
+      # (builder + runtime, colcon without --symlink-install, non-root, no test
+      # tooling) and can break while the dev stage is green -- a missing
+      # setup.py entry point or data_files shows up here and nowhere else.
+      # Warm off the cache the dev build just wrote, so this costs the builder
+      # and runtime layers alone.
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          cache-from: type=gha,scope=syncai-backend
+          cache-to: type=gha,mode=max,scope=syncai-backend
