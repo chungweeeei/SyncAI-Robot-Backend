@@ -615,7 +615,12 @@ def init_map_router(
         # this catalogue uses. RobotState.map, by contrast, is a path
         # ("map/dp2f/gridmap.yaml") — reconciling the two is exactly why `active`
         # is resolved on this side and not in the UI.
-        return len(map_repo.list_vertices(map=name))
+        #
+        # count_vertices, not len(list_vertices(...)): `list_maps` calls this
+        # once per map on disk, so the listing route would otherwise hydrate
+        # every vertex of every map into an ORM object on every page load, to
+        # produce one integer per map.
+        return map_repo.count_vertices(map=name)
 
     def _require(name: str) -> StoredMap:
         stored = map_catalog_repo.get_map(name)

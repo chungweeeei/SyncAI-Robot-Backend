@@ -1,11 +1,11 @@
 import uuid
 import structlog
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from typing import Optional, TypedDict
 
-from sqlalchemy import Engine, delete, select, update
+from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -112,6 +112,20 @@ class MapRepo:
             f"{listed} is already taken or repeated in this request."
         )
 
+    @staticmethod
+    def _scope(stmt, map: Optional[str], type: Optional[str]):
+        """AND the two optional filters onto a statement over ``map_vertices``.
+
+        Shared by ``list_vertices`` and ``count_vertices`` so the two can never
+        disagree about what they are describing — a count that does not match
+        the listing it labels is the whole bug class this exists to prevent.
+        """
+        if map is not None:
+            stmt = stmt.where(MapPoint.map == map)
+        if type is not None:
+            stmt = stmt.where(MapPoint.type == type)
+        return stmt
+
     def list_vertices(
         self, map: Optional[str] = None, type: Optional[str] = None
     ) -> list[MapPoint]:
@@ -120,14 +134,15 @@ class MapRepo:
         The filters are optional and AND together; omitting both lists every
         vertex on the robot, and callers treat an empty result as normal (a map
         with no vertices yet), so this must never raise on zero rows.
+
+        Unbounded on purpose — the REST listing answers the whole set — so every
+        row becomes a fully instrumented ORM object. Callers that only need *how
+        many* must use ``count_vertices``, and callers that only need *some*
+        must use ``get_vertices``; both exist because doing either through this
+        method hydrates the entire map to throw most of it away.
         """
         with self._session(op="list_vertices") as session:
-            # database statements
-            stmt = select(MapPoint)
-            if map is not None:
-                stmt = stmt.where(MapPoint.map == map)
-            if type is not None:
-                stmt = stmt.where(MapPoint.type == type)
+            stmt = self._scope(select(MapPoint), map, type)
             # id is a random UUID, so order by creation time for a stable,
             # meaningful listing order.
             stmt = stmt.order_by(MapPoint.created_at)
@@ -135,9 +150,60 @@ class MapRepo:
             # already-built Select, and returns Rows rather than MapPoints.
             return list(session.scalars(stmt).all())
 
+    def count_vertices(self, map: Optional[str] = None, type: Optional[str] = None) -> int:
+        """How many vertices match the same filters ``list_vertices`` takes.
+
+        A ``SELECT count(*)``, not ``len(list_vertices(...))``: the map
+        catalogue labels every card with its vertex count, so the cheap version
+        of this question is asked once per map on disk per page load, and the
+        expensive version answers it by building one ORM object per row —
+        identity map, instrumented attributes and all — purely to call ``len``
+        on the list and drop it. The count belongs in the database, where it is
+        an index scan and one integer on the wire.
+
+        No ``order_by``: it cannot change a count, and sorting rows only to
+        count them is work PostgreSQL would otherwise have to do.
+        """
+        with self._session(op="count_vertices") as session:
+            stmt = self._scope(select(func.count()).select_from(MapPoint), map, type)
+            # scalar_one(): count(*) always returns exactly one row, and a None
+            # here would be a bug rather than an empty result.
+            return session.scalars(stmt).one()
+
     def get_vertex(self, vertex_id: uuid.UUID) -> Optional[MapPoint]:
         with self._session(op="get_vertex") as session:
             return session.get(MapPoint, vertex_id)
+
+    def get_vertices(
+        self, map: str, vertex_ids: Iterable[uuid.UUID]
+    ) -> list[MapPoint]:
+        """The vertices of ``map`` whose ids are in ``vertex_ids``.
+
+        Both conditions matter. The ids narrow the query to what a caller
+        actually referenced, instead of loading a whole map to look a handful of
+        them up. The ``map`` filter is what makes a *present* row mean "exists
+        **and** belongs here" — task templates rely on absence from the result
+        to tell an operator a step points at another map's vertex, so widening
+        this to an id-only lookup would silently accept cross-map references.
+
+        Ids the map does not hold are simply absent from the result; callers
+        distinguish "deleted" from "belongs elsewhere" themselves, with
+        ``get_vertex``, only for the ids that came back missing.
+        """
+        ids = list(vertex_ids)
+        if not ids:
+            # `IN ()` is legal in SQLAlchemy 2.0 but still a round trip to ask
+            # the database about nothing.
+            return []
+
+        with self._session(op="get_vertices") as session:
+            stmt = (
+                select(MapPoint)
+                .where(MapPoint.map == map)
+                .where(MapPoint.id.in_(ids))
+                .order_by(MapPoint.created_at)
+            )
+            return list(session.scalars(stmt).all())
 
     def update_vertex(self, vertex_id: uuid.UUID, **fields) -> Optional[MapPoint]:
         """Apply ``fields`` to one vertex; None when no such vertex exists.

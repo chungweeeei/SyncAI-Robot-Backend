@@ -31,7 +31,7 @@ import structlog
 
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
@@ -323,10 +323,36 @@ def init_task_template_router(
         if map_catalog_repo.get_map(map_name) is None:
             raise BadRequestError(f"No map named '{map_name}' on this robot.")
 
-    def _vertices(map_name: Optional[str]) -> Dict[uuid.UUID, MapPoint]:
+    def _referenced_ids(
+        steps: Sequence[Union[TemplateStepRequest, _StoredStep]]
+    ) -> List[uuid.UUID]:
+        """The distinct vertex ids a step list points at, in first-seen order.
+
+        Takes request steps and stored steps alike: both spell the reference
+        ``vertex_id``, and every caller of ``_vertices`` below is resolving one
+        or the other.
+        """
+        seen: Dict[uuid.UUID, None] = {}
+        for step in steps:
+            if step.vertex_id is not None:
+                seen.setdefault(step.vertex_id, None)
+        return list(seen)
+
+    def _vertices(
+        map_name: Optional[str], vertex_ids: Sequence[uuid.UUID]
+    ) -> Dict[uuid.UUID, MapPoint]:
+        """Resolve just the referenced vertices, keyed by id.
+
+        Scoped to the ids the steps actually name rather than loading the whole
+        map: a template references a handful of vertices and a surveyed map
+        holds thousands, and this used to pull every row of the map to look up
+        five. Absence from the returned dict keeps its meaning exactly — "not a
+        vertex of ``map_name``" — because ``get_vertices`` filters on the map as
+        well as the ids.
+        """
         if map_name is None:
             return {}
-        return {v.id: v for v in map_repo.list_vertices(map=map_name)}
+        return {v.id: v for v in map_repo.get_vertices(map=map_name, vertex_ids=vertex_ids)}
 
     def _require_vertex_refs(
         map_name: Optional[str],
@@ -449,8 +475,15 @@ def init_task_template_router(
         row: TaskTemplate,
         active_name: Optional[str],
         vertices: Dict[uuid.UUID, MapPoint],
+        stored_steps: List[_StoredStep],
     ) -> TaskTemplateResponse:
-        steps = [_step_response(stored, vertices) for stored in _read_steps(row)]
+        """``stored_steps`` is ``_read_steps(row)``, passed in rather than read.
+
+        Every caller already needs the parsed steps to know which vertex ids to
+        resolve, and re-reading them here would validate the same JSON blob
+        twice per template on a listing of them.
+        """
+        steps = [_step_response(stored, vertices) for stored in stored_steps]
         return TaskTemplateResponse(
             id=row.id,
             name=row.name,
@@ -489,7 +522,7 @@ def init_task_template_router(
     def create_task_template(req: TaskTemplateRequest):
         _check(req.map_name, req.steps)
         _require_map(req.map_name)
-        vertices = _vertices(req.map_name)
+        vertices = _vertices(req.map_name, _referenced_ids(req.steps))
         _require_vertex_refs(req.map_name, req.steps, vertices)
 
         row = task_template_repo.create_task_template(
@@ -498,7 +531,7 @@ def init_task_template_router(
             map_name=req.map_name,
             steps=_stored_steps(req.steps, vertices),
         )
-        return _response(row, map_catalog_repo.active_name(), vertices)
+        return _response(row, map_catalog_repo.active_name(), vertices, _read_steps(row))
 
     @task_template_router.get(
         "/api/v1/task_templates",
@@ -516,13 +549,28 @@ def init_task_template_router(
         rows = task_template_repo.list_task_templates(map_name=map_name)
         active_name = map_catalog_repo.active_name()
 
-        # One vertex query per distinct map among the rows, not per row.
-        by_map: Dict[Optional[str], Dict[uuid.UUID, MapPoint]] = {}
-        for row in rows:
-            if row.map_name not in by_map:
-                by_map[row.map_name] = _vertices(row.map_name)
+        # Parsed once per row and carried to _response, because the ids to
+        # resolve and the steps to answer with come from the same blob.
+        steps_by_row: List[List[_StoredStep]] = [_read_steps(row) for row in rows]
 
-        return [_response(row, active_name, by_map[row.map_name]) for row in rows]
+        # One vertex query per distinct map among the rows, not per row, and
+        # each one asks only for the ids that map's templates actually
+        # reference -- a surveyed map holds far more vertices than any set of
+        # templates points at.
+        ids_by_map: Dict[Optional[str], Dict[uuid.UUID, None]] = {}
+        for row, stored_steps in zip(rows, steps_by_row):
+            referenced = ids_by_map.setdefault(row.map_name, {})
+            for vertex_id in _referenced_ids(stored_steps):
+                referenced.setdefault(vertex_id, None)
+
+        by_map: Dict[Optional[str], Dict[uuid.UUID, MapPoint]] = {
+            name: _vertices(name, list(ids)) for name, ids in ids_by_map.items()
+        }
+
+        return [
+            _response(row, active_name, by_map[row.map_name], stored_steps)
+            for row, stored_steps in zip(rows, steps_by_row)
+        ]
 
     @task_template_router.get(
         "/api/v1/task_templates/{id}",
@@ -531,7 +579,13 @@ def init_task_template_router(
     )
     def get_task_template(id: uuid.UUID):
         row = _require(id)
-        return _response(row, map_catalog_repo.active_name(), _vertices(row.map_name))
+        stored_steps = _read_steps(row)
+        return _response(
+            row,
+            map_catalog_repo.active_name(),
+            _vertices(row.map_name, _referenced_ids(stored_steps)),
+            stored_steps,
+        )
 
     @task_template_router.put(
         "/api/v1/task_templates/{id}",
@@ -556,7 +610,7 @@ def init_task_template_router(
 
         _check(merged_map, merged_steps)
         _require_map(merged_map)
-        vertices = _vertices(merged_map)
+        vertices = _vertices(merged_map, _referenced_ids(merged_steps))
         _require_vertex_refs(merged_map, merged_steps, vertices)
 
         if "steps" in changes and req.steps is not None:
@@ -565,7 +619,9 @@ def init_task_template_router(
         updated = task_template_repo.update_task_template(task_id=id, **changes)
         if updated is None:
             raise NotFoundError(f"Task template {id} was not found.")
-        return _response(updated, map_catalog_repo.active_name(), vertices)
+        return _response(
+            updated, map_catalog_repo.active_name(), vertices, _read_steps(updated)
+        )
 
     @task_template_router.delete(
         "/api/v1/task_templates/{id}", response_model=DeleteResponse
@@ -608,9 +664,10 @@ def init_task_template_router(
                     "map's coordinate frame."
                 )
 
-            vertices = _vertices(row.map_name)
+            stored_steps = _read_steps(row)
+            vertices = _vertices(row.map_name, _referenced_ids(stored_steps))
             steps: List[Step] = []
-            for stored in _read_steps(row):
+            for stored in stored_steps:
                 resolved = _step_response(stored, vertices)
                 if resolved.vertex_status is VertexRefStatus.MISSING:
                     raise BadRequestError(

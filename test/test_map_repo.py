@@ -119,6 +119,58 @@ def test_list_vertices_filters_by_map_and_type(map_repo):
     assert map_repo.list_vertices(map="does-not-exist") == []
 
 
+def test_count_vertices_matches_list_under_the_same_filters(map_repo):
+    _create(map_repo, name="g1", type="GENERAL", map="warehouse")
+    _create(map_repo, name="a1", type="ARTIFACT", map="warehouse")
+    _create(map_repo, name="g2", type="GENERAL", map="office")
+
+    for filters in (
+        {},
+        {"map": "warehouse"},
+        {"map": "office"},
+        {"type": "GENERAL"},
+        {"map": "warehouse", "type": "ARTIFACT"},
+        {"map": "does-not-exist"},
+    ):
+        assert map_repo.count_vertices(**filters) == len(
+            map_repo.list_vertices(**filters)
+        ), filters
+
+
+def test_count_vertices_is_zero_not_none_on_an_empty_table(map_repo):
+    # count(*) returns a row even with nothing to count; callers render this
+    # straight into a response field, so it must be an int.
+    assert map_repo.count_vertices(map="warehouse") == 0
+
+
+def test_get_vertices_returns_only_the_requested_ids(map_repo):
+    wanted = _create(map_repo, name="a", map="warehouse")
+    _create(map_repo, name="b", map="warehouse")
+
+    fetched = map_repo.get_vertices(map="warehouse", vertex_ids=[wanted.id])
+
+    assert [v.id for v in fetched] == [wanted.id]
+
+
+def test_get_vertices_excludes_ids_belonging_to_another_map(map_repo):
+    # The map filter is what makes absence from the result mean "not a vertex
+    # of this map" -- task templates report a cross-map reference from it.
+    elsewhere = _create(map_repo, name="g2", map="office")
+
+    assert map_repo.get_vertices(map="warehouse", vertex_ids=[elsewhere.id]) == []
+
+
+def test_get_vertices_ignores_unknown_ids_and_an_empty_request(map_repo):
+    known = _create(map_repo, name="a", map="warehouse")
+
+    fetched = map_repo.get_vertices(
+        map="warehouse", vertex_ids=[known.id, _MISSING_ID]
+    )
+    assert [v.id for v in fetched] == [known.id]
+
+    assert map_repo.get_vertices(map="warehouse", vertex_ids=[]) == []
+
+
 def test_update_changes_fields(map_repo):
     created = _create(map_repo, name="old", x=1.0)
 
