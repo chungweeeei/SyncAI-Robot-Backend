@@ -112,7 +112,7 @@ FROM ros:humble-ros-base AS base
 ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Three groups here, and the split is worth keeping straight:
+# Four groups here, and the split is worth keeping straight:
 #
 #   * ROS interfaces this package imports that ros-base does not carry.
 #     nav2_msgs is the one that actually matters (the robot gateway's
@@ -129,6 +129,24 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #     here ever renders: open3d links it unconditionally, so without it every
 #     `import open3d` fails on a missing shared library while pip insists the
 #     package is installed. libgomp is its OpenMP runtime.
+#   * the GStreamer 1.0 runtime, for the WebRTC worker. This one is easy to
+#     misdiagnose, which is why it is spelled out: libsyncai_worker.so links
+#     GStreamer through cgo, so its DT_NEEDED list carries
+#     libgstreamer-1.0.so.0 and libgstcontroller-1.0.so.0. Without them the
+#     mounted .so is present and readable and `dlopen` still fails with
+#     "libgstcontroller-1.0.so.0: cannot open shared object file: No such file
+#     or directory" — a No-such-file naming a library, not the path anyone is
+#     looking at. The plugins are the elements the worker's pipelines name:
+#     coreelements and -base (queue, videoconvert, audioconvert/resample,
+#     volume, opusenc/dec), -good (v4l2src, the rtp payloaders, udpsrc/sink),
+#     -bad (h264parse alone — the rest of the package is dead weight the
+#     archive does not let us drop) and -alsa (alsasink for the WHIP branch).
+#
+#     What is deliberately NOT here: nvjpegdec / nvvidconv / nvv4l2h264enc.
+#     Those are the Tegra plugins, they are not in the Ubuntu archive, and they
+#     arrive from the host through the nvidia container runtime — so the video
+#     session additionally needs `runtime: nvidia` and /dev/video* in compose,
+#     while the audio session works on what is installed here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         ros-humble-nav2-msgs \
@@ -137,6 +155,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-humble-rmw-cyclonedds-cpp \
         libgl1 \
         libgomp1 \
+        libgstreamer1.0-0 \
+        libgstreamer-plugins-base1.0-0 \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-alsa \
     && rm -rf /var/lib/apt/lists/*
 
 # Copied on its own, ahead of any source, so editing the package does not

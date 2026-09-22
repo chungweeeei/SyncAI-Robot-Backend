@@ -44,6 +44,14 @@ Thumbs.db
 record/*
 !record/.gitkeep
 
+# The WebRTC Go worker's c-shared library, built in SyncAI-WebRTC-Worker and
+# copied in by hand. docker-compose bind-mounts the file into the container as
+# ~/robot_ws/lib/libsyncai_worker.so (WEBRTC_LIB overrides it). Same deal as
+# record/ above: the directory is tracked via .gitkeep so Docker never has to
+# create a missing bind source, but the 14 MB binary itself is not committed.
+lib/*
+!lib/.gitkeep
+
 # Optional FAST-LIO2 `interface` package, copied in for a runtime build
 # (see the Dockerfile header). Never committed: it belongs to the private fork.
 .interface/

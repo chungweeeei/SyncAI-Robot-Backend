@@ -49,6 +49,25 @@ services:
     # addressed as 127.0.0.1 plus a published port, not `postgres:5432`.
     network_mode: host
 
+    # The Tegra userspace, for the WebRTC worker's video pipeline
+    # (`v4l2src ! nvjpegdec ! nvvidconv ! nvv4l2h264enc`). Those three elements
+    # are NOT in the Ubuntu archive and are not in this image: the nvidia
+    # container runtime bind-mounts them in from the host, off the list in
+    # /etc/nvidia-container-runtime/host-files-for-container.d/drivers.csv.
+    #
+    # Explicit rather than relying on the host's default runtime, for the same
+    # reason the workspace's robot service pins it: this Jetson's daemon.json
+    # only *registers* the nvidia runtime, so a service without this line comes
+    # up under runc, nothing is injected, and the pipeline dies on
+    #
+    #   failed to start GStreamer: no element "nvjpegdec"
+    #
+    # with the NVIDIA_* variables below set and looking perfectly correct. The
+    # variables select what gets injected; only the runtime does the injecting.
+    # Audio sessions do not need any of this — their pipeline is pure
+    # upstream GStreamer, which is why the .so loads and WHIP works without it.
+    runtime: nvidia
+
     # The container user must own what it writes: `ros2 bag record` into
     # record/, gridmap conversions into map/, and the in-place rewrite of
     # system.ini into config/. Same pattern as the workspace's robot services —
@@ -100,6 +119,12 @@ services:
       #    public STUN URL on a robot with no internet only makes ICE gathering
       #    wait out a timeout.
       STUN_SERVERS: ""
+      #    These two are what the `runtime: nvidia` above reads to decide what
+      #    to inject; `all` rather than `video` because the CSV is consumed
+      #    wholesale and trimming it brings the missing elements back without
+      #    saving anything measurable.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
 
       # ── Logs: unbuffered, uncoloured. Also set in the image; repeated here
       #    because these are the two that make `docker logs` readable.
@@ -111,13 +136,45 @@ services:
       # and the launch file reads [system] robot_id from that same path to
       # namespace the node. Override both together or neither.
 
+    devices:
+      # The USB cameras, passed through under the SAME names they have on the
+      # host. Individual minors are not stable — two camera models, two nodes
+      # each (capture + UVC metadata), and probe order decides who gets which —
+      # but the SET {video0..video3} is, so all four go through and the worker
+      # is pointed at a stable /dev/syncai/* symlink instead (VIDEO_DEVICE
+      # defaults to /dev/syncai/camera0). Remapping a node to a different name
+      # in here would break that symlink, which resolves by host name.
+      #
+      # Not covered by the nvidia runtime: its devices.csv lists Tegra hardware
+      # only, so a USB camera still needs an entry of its own.
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
+      - /dev/video3:/dev/video3
+
+    group_add:
+      # The video nodes are root:video 0660 and the container user is uid 1000,
+      # so without the host's video group the camera is present and unopenable
+      # — v4l2src fails with a permission error, not a missing-element one.
+      # Overridable because the gid is per-host: `getent group video`.
+      - "${VIDEO_GID:-44}"
+
     volumes:
+      # Stable device names from syncai_sys_manager's udev rules, installed on
+      # the HOST (udev does not run in here): camera0/camera1 are the capture
+      # nodes keyed to the cameras' USB product IDs. Bind-mounted as a
+      # directory rather than passed as devices so a replug re-creating a
+      # symlink is visible without recreating this container, and the links
+      # resolve because the real nodes above keep their host names. If the
+      # rules are not installed the mount is simply empty — nothing at startup
+      # depends on it, only the first video session does.
+      - /dev/syncai:/dev/syncai:ro
       # ROBOT_WS is the host directory that carries the robot's config and maps.
       # Today that is the workspace checkout — these three paths are the
       # entirety of what this package needs *shared* with the rest of the stack,
       # and `map/` in particular MUST be the same directory the nav stack's
       # map_server reads, or an activated map exists for one of them only.
-      # (record/ is deliberately NOT one of them; see below.)
+      # (record/ and lib/ are deliberately NOT among them; see below.)
       #
       #   export ROBOT_WS=/some/other/place   # to point it elsewhere
       #
@@ -160,9 +217,20 @@ services:
       - ${RECORD_DIR:-./record}:/home/syncrobotic/robot_ws/record
       # The WebRTC Go worker, dlopen'd lazily on the first /whep request. A
       # single file, read-only: nothing here writes it, and it is built
-      # elsewhere (SyncAI-WebRTC-Worker). Without it the camera stream 502s and
-      # everything else works.
-      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/lib/libsyncai_worker.so:/home/syncrobotic/robot_ws/lib/libsyncai_worker.so:ro
+      # elsewhere (SyncAI-WebRTC-Worker, `docker compose up build-lib`) and
+      # copied into `lib/` beside this compose file by hand. Without it the
+      # camera stream 502s and everything else works.
+      #
+      # Deliberately NOT under ROBOT_WS: the .so is not shared with the rest of
+      # the stack the way config/ and map/ are — nothing else in the workspace
+      # dlopens it — and tying it to a workspace checkout meant this repo could
+      # not be deployed on its own. `lib/` is tracked via .gitkeep (the .so
+      # itself is gitignored) so Docker never has to create the bind source: a
+      # missing single-file source is created as a root-owned *directory*, and
+      # the dlopen then fails with an error that names the path but not this.
+      #
+      #   export WEBRTC_LIB=/opt/syncai/libsyncai_worker.so   # to point it elsewhere
+      - ${WEBRTC_LIB:-./lib/libsyncai_worker.so}:/home/syncrobotic/robot_ws/lib/libsyncai_worker.so:ro
       # RAM-backed, size-capped ROS_LOG_DIR. Long-form because the short
       # `tmpfs:` syntax cannot set a size; the octal mode matters (a bare 1777
       # is parsed as decimal and lands as mode 3361, which uid 1000 cannot

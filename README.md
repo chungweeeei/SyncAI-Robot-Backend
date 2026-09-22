@@ -610,14 +610,18 @@ compose file; the four that bite are:
 - **Three bind mounts from `ROBOT_WS`** carry what this package shares with the
   rest of the stack: `config/` (read-write — activating a map rewrites
   `system.ini` in place, and the per-robot `instances/robotNN.ini` goes over
-  `config/system.ini` as a single file), `map/` (must be the same directory the
-  nav stack's `map_server` reads) and `lib/libsyncai_worker.so`. `[system]
-  robot_id` in the mounted INI is still what namespaces the node, the database
-  and the task queue. **`record/` is not one of them**: no other process reads a
-  bag, so it defaults to `record/` beside the compose file and moves with
-  `RECORD_DIR` (`export RECORD_DIR=/mnt/ssd/record`). It is tracked as an empty
-  directory so Docker never creates the bind source itself — a source it creates
-  is `root:root`, which the uid-1000 container user cannot write.
+  `config/system.ini` as a single file) and `map/` (must be the same directory
+  the nav stack's `map_server` reads). `[system] robot_id` in the mounted INI is
+  still what namespaces the node, the database and the task queue. **`record/`
+  and `lib/libsyncai_worker.so` are not among them**: no other process reads a
+  bag or dlopens the worker, so both default to a directory beside the compose
+  file — `record/`, moved with `RECORD_DIR` (`export
+  RECORD_DIR=/mnt/ssd/record`), and `lib/libsyncai_worker.so`, moved with
+  `WEBRTC_LIB`. Both are tracked as empty directories (`.gitkeep`; the `.so`
+  itself is gitignored) so Docker never creates the bind source itself — a
+  source it creates is `root:root`, which the uid-1000 container user cannot
+  write, and a missing *single-file* source is created as a directory, which
+  dlopen then fails on.
 - **One backend at a time.** `NodeManager` starts this process as a byobu pane
   inside the robot container. Running the service alongside it gives two
   processes on `:3000` and, less visibly, two Temporal workers polling the same
