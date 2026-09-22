@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import JSON, DateTime, Float, String, Uuid
+from sqlalchemy import JSON, DateTime, Float, String, UniqueConstraint, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -26,6 +26,24 @@ class MapPoint(Base):
     """
 
     __tablename__ = "map_vertices"
+
+    # A vertex name is how an operator addresses a place, so it has to be
+    # unambiguous within the map it names -- two vertices called "dock" on one
+    # map are indistinguishable in the UI. Scoped to ``(map, name)`` rather than
+    # ``name`` alone because the *opposite* is normal: every map is expected to
+    # have its own "dock", and a global constraint would forbid that.
+    #
+    # Both columns are NOT NULL, so this behaves the same on PostgreSQL and
+    # SQLite -- the NULLs-are-distinct problem that ruled a unique constraint out
+    # for ``TaskTemplate`` does not arise here.
+    #
+    # Enforced in the schema and not in the router because the DB is the only
+    # place that can check and insert in one step: the router would have to
+    # re-check on create *and* on rename, and still race between the two. The
+    # cost is that ``create_all`` cannot add this to a ``map_vertices`` that
+    # already exists -- any database created before this constraint keeps
+    # accepting duplicates, silently, until the table is dropped and remade.
+    __table_args__ = (UniqueConstraint("map", "name", name="uq_map_vertices_map_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -94,12 +112,16 @@ class TaskTemplate(Base):
     __tablename__ = "task_templates"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    # A label, not an identity: two templates may share a name, exactly as two
-    # map vertices may (map_vertices has no unique constraint either), and the id
-    # is what addresses one. A unique constraint was considered and rejected --
-    # there is no migration path to add or drop one later, and it could not cover
-    # the map-independent rows anyway, since both PostgreSQL and SQLite treat
-    # NULLs in a unique index as distinct.
+    # A label, not an identity: two templates may share a name, and the id is
+    # what addresses one. Deliberately unlike ``MapPoint.name``, which *is*
+    # unique within its map -- the difference is ``map_name`` below being
+    # nullable. The only scope worth constraining here would be
+    # ``(map_name, name)``, since two maps may each want a "patrol"; but both
+    # PostgreSQL and SQLite treat NULLs in a unique index as distinct, so such a
+    # constraint would silently not apply to the map-independent templates --
+    # exactly the rows most likely to collide, because they are the ones
+    # offered on every map. ``map_vertices`` has no such hole: both of its
+    # constrained columns are NOT NULL.
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
     # The map whose frame this task's MOVE coordinates are in, or NULL when the

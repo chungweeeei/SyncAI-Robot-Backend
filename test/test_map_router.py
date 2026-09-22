@@ -26,6 +26,9 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
+from syncai_backend.services.gridmap_conversion import (  # noqa: E402
+    GridmapConversionService,
+)
 
 
 # No map_name: the owning map is the URL's path segment now.
@@ -80,6 +83,9 @@ def client(logger, map_repo, catalog_repo, task_template_repo):
             map_gw=_StubMapGateway(),
             task_template_repo=task_template_repo,
             workflow_gw=_StubWorkflowGateway(),
+            # A real one: the vertex routes never start a conversion, but the
+            # catalogue projection asks it whether one is running.
+            conversion_svc=GridmapConversionService(logger=logger),
         )
     )
     return TestClient(app)
@@ -113,6 +119,54 @@ def test_create_batch_returns_all_in_order(client):
     # All persisted and independently retrievable.
     assert len(client.get(f"/api/v1/maps/{_MAP}/vertices").json()) == 3
     assert len({v["id"] for v in body}) == 3
+
+
+def test_create_duplicate_name_on_the_same_map_returns_409(client):
+    client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX])
+
+    resp = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX])
+
+    # 409 rather than the unhandled IntegrityError 500 the constraint alone
+    # would produce; the code lets the UI tell this apart from the map-level
+    # "name_taken" that the same path can raise on a rename.
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "vertex_name_taken"
+    assert len(client.get(f"/api/v1/maps/{_MAP}/vertices").json()) == 1
+
+
+def test_create_duplicate_name_on_another_map_is_allowed(client):
+    client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX])
+
+    resp = client.post(f"/api/v1/maps/{_OTHER_MAP}/vertices", json=[_VERTEX])
+
+    assert resp.status_code == 200
+    assert resp.json()[0]["name"] == _VERTEX["name"]
+
+
+def test_create_batch_repeating_a_name_returns_409_and_persists_nothing(client):
+    resp = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[
+        {**_VERTEX, "name": "a"},
+        {**_VERTEX, "name": "a"},
+    ])
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "vertex_name_taken"
+    assert client.get(f"/api/v1/maps/{_MAP}/vertices").json() == []
+
+
+def test_rename_vertex_onto_a_taken_name_returns_409(client):
+    client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX])
+    other = client.post(f"/api/v1/maps/{_MAP}/vertices",
+                        json=[{**_VERTEX, "name": "desk"}]).json()[0]
+
+    resp = client.put(f"/api/v1/maps/{_MAP}/vertices/{other['id']}",
+                      json={"name": _VERTEX["name"]})
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "vertex_name_taken"
+    assert client.get(
+        f"/api/v1/maps/{_MAP}/vertices/{other['id']}"
+    ).json()["name"] == "desk"
 
 
 def test_get_missing_vertex_returns_404(client):

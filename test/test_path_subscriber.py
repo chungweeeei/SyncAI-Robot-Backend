@@ -3,10 +3,11 @@ path slot.
 
 What is pinned:
 
-* The QoS asymmetry. Every other backend subscriber is best-effort; this one
-  is RELIABLE depth 1, matching the planner's ``rclcpp::QoS(1)``, because a
-  plan arrives every ~3 s — a dropped one leaves the operator staring at a
-  route the robot has already left for the whole replan period.
+* The QoS: best-effort depth 1, like every other backend subscriber. The
+  planner publishes ``rclcpp::QoS(1)`` (RELIABLE), which a best-effort request
+  still matches, so only the retransmission is given up — and at one plan per
+  ~3 s a drop leaves the operator staring at a route the robot has already
+  left for the whole replan period, which is what makes this worth pinning.
 
 * The frame gate DROPS, it never reprojects. Everything downstream treats the
   numbers as map metres; forwarding another frame's coordinates would draw a
@@ -98,12 +99,14 @@ def test_subscribes_to_the_relative_plan_topic(subscription):
     assert subscription.msg_type is Path
 
 
-def test_qos_is_reliable_depth_one_matching_the_planner(subscription):
+def test_qos_is_best_effort_depth_one(subscription):
     qos = subscription.qos_profile
 
-    # The deliberate odd-one-out among the backend subscribers: at one plan
-    # per ~3 s, a drop costs the operator the whole replan period.
-    assert qos.reliability == rclpy.qos.ReliabilityPolicy.RELIABLE
+    # Best-effort against the planner's RELIABLE offer: the request is the
+    # weaker one, so the topic still matches. Depth 1 because only the newest
+    # plan is worth drawing -- at one per ~3 s, a queued older route is
+    # already wrong by the time it would be delivered.
+    assert qos.reliability == rclpy.qos.ReliabilityPolicy.BEST_EFFORT
     assert qos.durability == rclpy.qos.DurabilityPolicy.VOLATILE
     assert qos.depth == 1
 

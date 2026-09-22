@@ -34,6 +34,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers import map as map_router_module  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
+from syncai_backend.services import gridmap_conversion as conversion_module  # noqa: E402
+from syncai_backend.services.gridmap_conversion import (  # noqa: E402
+    GridmapConversionService,
+)
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
@@ -125,6 +129,29 @@ def workflow_gw():
 
 
 @pytest.fixture
+def conversion_svc(logger):
+    """The conversion service the router under test is wired to.
+
+    One per test, which the module-level registry it replaced could not be: a
+    test that marks a map as converting no longer needs a finally to undo it,
+    and one that leaks an entry cannot reach the next test.
+    """
+    return GridmapConversionService(logger=logger)
+
+
+def _mark_converting(conversion_svc, name):
+    """Pretend a conversion for ``name`` is running in this process."""
+    with conversion_svc._lock:
+        conversion_svc._active.add(name)
+
+
+def _clear_converting(conversion_svc, name):
+    """Release the slot again, for the tests that assert on both states."""
+    with conversion_svc._lock:
+        conversion_svc._active.discard(name)
+
+
+@pytest.fixture
 def client(
     logger,
     catalog_repo,
@@ -132,6 +159,7 @@ def client(
     map_gw,
     workflow_gw,
     task_template_repo,
+    conversion_svc,
     tmp_path,
     monkeypatch,
 ):
@@ -150,6 +178,7 @@ def client(
             map_gw=map_gw,
             task_template_repo=task_template_repo,
             workflow_gw=workflow_gw,
+            conversion_svc=conversion_svc,
         )
     )
     return TestClient(app)
@@ -170,7 +199,7 @@ def _plant_sidecar(directory, payload):
     record left behind by a process that no longer exists, and one written by a
     version of this code that had no status field.
     """
-    path = directory / map_router_module.GRIDMAP_RECIPE_SIDECAR
+    path = directory / conversion_module.GRIDMAP_RECIPE_SIDECAR
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
@@ -248,6 +277,33 @@ def test_list_reports_ok_for_a_sidecar_written_before_the_status_field(
     assert _by_name(client.get("/api/v1/maps").json())["full"]["grid_status"] == "ok"
 
 
+def test_list_reports_ok_for_a_status_this_build_does_not_know(client, maps_dir):
+    """A sidecar written by a newer backend, read after a rollback.
+
+    GridRecordStatus.parse returns None for a value it cannot name, which puts
+    this on the same path as a sidecar with no status at all: the grid on disk
+    decides. The requirement is that it does not raise -- this read runs once
+    per map on every catalogue listing, which every screen polls.
+    """
+    _plant_sidecar(
+        maps_dir / "full", {"status": "cancelled", "recipe": "z-band"}
+    )
+
+    entry = _by_name(client.get("/api/v1/maps").json())["full"]
+
+    assert entry["grid_status"] == "ok"
+    assert entry["grid_error"] is None
+
+
+def test_list_reports_none_for_an_unknown_status_over_no_grid(client, maps_dir):
+    """The other half of the same fallthrough: no grid, so `none`, not `ok`."""
+    _plant_sidecar(
+        maps_dir / "rawonly", {"status": "cancelled", "recipe": "z-band"}
+    )
+
+    assert _by_name(client.get("/api/v1/maps").json())["rawonly"]["grid_status"] == "none"
+
+
 def test_list_reports_a_failed_conversion_with_its_reason(client, maps_dir):
     """The whole point of the sidecar carrying a status: before it, this map was
     indistinguishable from one nobody had converted and the reason lived only in
@@ -302,26 +358,25 @@ def test_list_reports_an_abandoned_conversion_as_interrupted(client, maps_dir):
     assert entry["grid_error"] is None
 
 
-def test_a_running_conversion_outranks_whatever_the_sidecar_says(client, maps_dir):
+def test_a_running_conversion_outranks_whatever_the_sidecar_says(
+    client, conversion_svc, maps_dir
+):
     """The registry is authoritative while this process is up. The sidecar write
     is best-effort, so a conversion whose record never landed — or landed as the
     previous run's failure — must still report as running."""
     _plant_sidecar(maps_dir / "rawonly", {"status": "failed", "error": "last time"})
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("rawonly")
-    try:
-        entry = _by_name(client.get("/api/v1/maps").json())["rawonly"]
-        assert entry["grid_status"] == "converting"
-        assert entry["grid_error"] is None
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("rawonly")
+    _mark_converting(conversion_svc, "rawonly")
+
+    entry = _by_name(client.get("/api/v1/maps").json())["rawonly"]
+
+    assert entry["grid_status"] == "converting"
+    assert entry["grid_error"] is None
 
 
 def test_list_survives_a_half_written_sidecar(client, maps_dir):
     """A conversion writes this file while the console's two-second catalogue
     poll reads it, so a torn read is expected traffic, not a corrupt map."""
-    (maps_dir / "rawonly" / map_router_module.GRIDMAP_RECIPE_SIDECAR).write_text(
+    (maps_dir / "rawonly" / conversion_module.GRIDMAP_RECIPE_SIDECAR).write_text(
         '{"status": "conv'
     )
 
@@ -547,6 +602,26 @@ def test_save_grid_rejects_a_wrong_length_body(client, maps_dir, map_gw):
     assert response.status_code == 400
     assert (maps_dir / "full" / "gridmap.pgm").read_bytes() == before
     assert map_gw.calls == []
+
+
+def test_save_grid_refuses_while_a_conversion_is_running(
+    client, conversion_svc, maps_dir
+):
+    """The one write path that used to lack the check rename/delete/activate make.
+
+    The conversion thread os.replace()s the very files this route writes, so an
+    edit saved mid-conversion vanished without a word, and the once-only raw
+    snapshot could capture the half-finished grid as the original.
+    """
+    before = (maps_dir / "full" / "gridmap.pgm").read_bytes()
+    _mark_converting(conversion_svc, "full")
+
+    response = _put_grid(client, "full", b"\x00" * 24)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conversion_running"
+    assert (maps_dir / "full" / "gridmap.pgm").read_bytes() == before
+    assert not (maps_dir / "full" / "gridmap_raw.pgm").exists()
 
 
 def test_save_grid_404_for_a_missing_map(client):
@@ -853,14 +928,10 @@ def test_rename_refuses_the_active_map(client, maps_dir):
     assert not (maps_dir / "hall").exists()
 
 
-def test_rename_refuses_while_a_conversion_is_running(client, maps_dir):
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("rawonly")
-    try:
-        response = _rename(client, "rawonly", "hall")
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("rawonly")
+def test_rename_refuses_while_a_conversion_is_running(client, conversion_svc, maps_dir):
+    _mark_converting(conversion_svc, "rawonly")
+
+    response = _rename(client, "rawonly", "hall")
 
     assert response.status_code == 409
     assert response.json()["code"] == "conversion_running"
@@ -900,7 +971,7 @@ def test_rename_moves_the_directory_back_when_the_database_fails(
     client, maps_dir, map_repo, monkeypatch
 ):
     """The two stores cannot share a transaction, so the filesystem is undone."""
-    def _boom(old_map, new_map):
+    def _boom(old_map, new_map, session=None):
         raise RuntimeError("database is away")
 
     monkeypatch.setattr(map_repo, "move_vertices", _boom)
@@ -911,6 +982,32 @@ def test_rename_moves_the_directory_back_when_the_database_fails(
     assert "left under its old name" in response.json()["detail"]
     assert (maps_dir / "rawonly" / "map.pcd").is_file()
     assert not (maps_dir / "hall").exists()
+
+
+def test_rename_leaves_the_vertices_under_the_old_name_when_the_second_update_fails(
+    client, maps_dir, map_repo, task_template_repo, monkeypatch
+):
+    """The two DB re-keys are one transaction.
+
+    move_vertices used to commit on its own before rebind_map ran, so a failure
+    in rebind_map moved the directory back while the vertices stayed keyed to
+    the new name -- waypoints nobody could reach under either name.
+    """
+    map_repo.create_vertices(
+        "rawonly", [dict(name="dock", type="dock", x=0.0, y=0.0, theta=0.0)]
+    )
+
+    def _boom(old_name, new_name, session=None):
+        raise RuntimeError("templates table is away")
+
+    monkeypatch.setattr(task_template_repo, "rebind_map", _boom)
+
+    response = _rename(client, "rawonly", "hall")
+
+    assert response.status_code == 502
+    assert (maps_dir / "rawonly").is_dir() and not (maps_dir / "hall").exists()
+    assert len(map_repo.list_vertices(map="rawonly")) == 1
+    assert map_repo.list_vertices(map="hall") == []
 
 
 def test_rename_drops_the_cached_renderings_of_the_old_name(client, maps_dir, make_pcd):
@@ -972,14 +1069,10 @@ def test_delete_refuses_the_active_map(client, maps_dir):
     assert (maps_dir / "full" / "gridmap.pgm").is_file()
 
 
-def test_delete_refuses_while_a_conversion_is_running(client, maps_dir):
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("rawonly")
-    try:
-        response = _delete(client, "rawonly")
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("rawonly")
+def test_delete_refuses_while_a_conversion_is_running(client, conversion_svc, maps_dir):
+    _mark_converting(conversion_svc, "rawonly")
+
+    response = _delete(client, "rawonly")
 
     assert response.status_code == 409
     assert response.json()["code"] == "conversion_running"
@@ -1057,10 +1150,10 @@ def test_delete_drops_the_cached_renderings(client, maps_dir, make_pcd):
 
 # --- the background gridmap conversion ---------------------------------------
 #
-# _start_grid_conversion is exercised directly rather than through POST
-# /api/v1/maps: the route answers as soon as the pcd is on disk and the
-# conversion runs on a daemon thread, so going through the client would mean
-# asserting against a race.
+# The service is driven directly rather than through POST /api/v1/maps: the
+# route answers as soon as the pcd is on disk and the conversion runs on a
+# daemon thread, so going through the client would mean asserting against a
+# race.
 
 
 @pytest.fixture
@@ -1192,10 +1285,10 @@ def small_saved_map(maps_dir, make_pcd):
 
 
 def test_conversion_writes_a_gridmap_from_the_traversable_cloud(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc, saved_map, fake_traversable, conversion_threads
 ):
-    started = map_router_module._start_grid_conversion(
-        logger, "newmap", saved_map, recipe_request="traversability"
+    started = conversion_svc.start(
+        "newmap", saved_map, recipe_request="traversability"
     )
     _join(conversion_threads)
 
@@ -1214,13 +1307,19 @@ def test_conversion_writes_a_gridmap_from_the_traversable_cloud(
 
 
 def test_conversion_passes_a_debug_dir_when_one_is_configured(
-    logger, saved_map, fake_traversable, conversion_threads, monkeypatch
+    logger, saved_map, fake_traversable, conversion_threads
 ):
-    monkeypatch.setattr(map_router_module, "TRAVERSABLE_DEBUG_SUBDIR", "traversable_debug")
+    """The process-wide override is a constructor argument, not a constant.
 
-    map_router_module._start_grid_conversion(
-        logger, "newmap", saved_map, recipe_request="traversability"
+    Set where the service is built, so turning the intermediates on for every
+    conversion is visible in the wiring rather than done by reassigning a module
+    attribute from wherever.
+    """
+    conversion_svc = GridmapConversionService(
+        logger=logger, debug_subdir="traversable_debug"
     )
+
+    conversion_svc.start("newmap", saved_map, recipe_request="traversability")
     _join(conversion_threads)
 
     assert fake_traversable.calls[0]["debug_dir"] == os.path.join(
@@ -1229,12 +1328,13 @@ def test_conversion_passes_a_debug_dir_when_one_is_configured(
 
 
 def test_conversion_passes_a_debug_dir_when_the_request_asks(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc, saved_map, fake_traversable, conversion_threads
 ):
-    """debug=True is the per-request tuning interface — the module constant
-    stays None so ordinary conversions never inflate the catalogue's sizes."""
-    map_router_module._start_grid_conversion(
-        logger, "newmap", saved_map, recipe_request="traversability", debug=True
+    """debug=True is the per-request tuning interface — the service is built
+    without an override so ordinary conversions never inflate the catalogue's
+    sizes."""
+    conversion_svc.start(
+        "newmap", saved_map, recipe_request="traversability", debug=True
     )
     _join(conversion_threads)
 
@@ -1244,16 +1344,14 @@ def test_conversion_passes_a_debug_dir_when_the_request_asks(
 
 
 def test_conversion_reports_a_failed_segmentation_instead_of_dying(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc, saved_map, fake_traversable, conversion_threads
 ):
     """A site whose intensity window selects no floor raises ValueError. The map
     ends up without a grid — the route has already answered 200 by then."""
     fake_traversable.raises = ValueError("intensity/normal gate selected no ground points")
 
     assert (
-        map_router_module._start_grid_conversion(
-            logger, "newmap", saved_map, recipe_request="traversability"
-        )
+        conversion_svc.start("newmap", saved_map, recipe_request="traversability")
         is True
     )
     _join(conversion_threads)
@@ -1270,7 +1368,7 @@ def test_conversion_reports_a_failed_segmentation_instead_of_dying(
 
 
 def test_a_conversion_records_itself_before_doing_any_work(
-    logger, small_saved_map, conversion_threads, monkeypatch
+    conversion_svc, small_saved_map, conversion_threads, monkeypatch
 ):
     """The `converting` record has to land before the pipeline runs, not after.
 
@@ -1282,16 +1380,16 @@ def test_a_conversion_records_itself_before_doing_any_work(
     """
     entered = threading.Event()
     release = threading.Event()
-    real_measure = map_router_module.measure_cloud
+    real_measure = conversion_module.measure_cloud
 
     def _blocking(bound, pcd_path):
         entered.set()
         assert release.wait(10.0), "the test never released the conversion"
         return real_measure(bound, pcd_path)
 
-    monkeypatch.setattr(map_router_module, "measure_cloud", _blocking)
+    monkeypatch.setattr(conversion_module, "measure_cloud", _blocking)
 
-    map_router_module._start_grid_conversion(logger, "smallmap", small_saved_map)
+    conversion_svc.start("smallmap", small_saved_map)
     assert entered.wait(10.0), "the conversion thread never reached measure_cloud"
 
     mid_run = _sidecar(small_saved_map)
@@ -1308,9 +1406,9 @@ def test_a_conversion_records_itself_before_doing_any_work(
 
 
 def test_a_successful_conversion_records_ok_and_keeps_the_diagnostics(
-    logger, small_saved_map, conversion_threads
+    conversion_svc, small_saved_map, conversion_threads
 ):
-    map_router_module._start_grid_conversion(logger, "smallmap", small_saved_map)
+    conversion_svc.start("smallmap", small_saved_map)
     _join(conversion_threads)
 
     side = _sidecar(small_saved_map)
@@ -1326,14 +1424,12 @@ def test_a_successful_conversion_records_ok_and_keeps_the_diagnostics(
 
 
 def test_a_failed_conversion_records_the_reason(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc, saved_map, fake_traversable, conversion_threads
 ):
     """The same sentence the log line carries, put where a client can read it."""
     fake_traversable.raises = ValueError("intensity/normal gate selected no ground points")
 
-    map_router_module._start_grid_conversion(
-        logger, "newmap", saved_map, recipe_request="traversability"
-    )
+    conversion_svc.start("newmap", saved_map, recipe_request="traversability")
     _join(conversion_threads)
 
     side = _sidecar(saved_map)
@@ -1345,7 +1441,7 @@ def test_a_failed_conversion_records_the_reason(
 
 
 def test_a_missing_open3d_is_recorded_as_a_failure_naming_the_fix(
-    logger, saved_map, conversion_threads, monkeypatch
+    conversion_svc, saved_map, conversion_threads, monkeypatch
 ):
     """An environment fault, not a bad cloud: re-converting this map will fail
     identically until the container is fixed, so the operator has to be told
@@ -1360,9 +1456,7 @@ def test_a_missing_open3d_is_recorded_as_a_failure_naming_the_fix(
     monkeypatch.delitem(sys.modules, "syncai_backend.helpers.traversable", raising=False)
     monkeypatch.setattr(builtins, "__import__", _no_open3d)
 
-    map_router_module._start_grid_conversion(
-        logger, "newmap", saved_map, recipe_request="traversability"
-    )
+    conversion_svc.start("newmap", saved_map, recipe_request="traversability")
     _join(conversion_threads)
 
     side = _sidecar(saved_map)
@@ -1372,46 +1466,38 @@ def test_a_missing_open3d_is_recorded_as_a_failure_naming_the_fix(
 
 
 def test_a_failed_conversion_releases_the_slot(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc, saved_map, fake_traversable, conversion_threads
 ):
     """The registry entry must not outlive the thread, or the map is stuck
     unconvertible until a backend restart."""
     fake_traversable.raises = ValueError("no ground")
-    map_router_module._start_grid_conversion(
-        logger, "newmap", saved_map, recipe_request="traversability"
-    )
+    conversion_svc.start("newmap", saved_map, recipe_request="traversability")
     _join(conversion_threads)
 
-    assert not map_router_module._is_converting("newmap")
+    assert not conversion_svc.is_converting("newmap")
     # And a second attempt is accepted rather than 409'd.
     fake_traversable.raises = None
     assert (
-        map_router_module._start_grid_conversion(
-            logger, "newmap", saved_map, recipe_request="traversability"
-        )
+        conversion_svc.start("newmap", saved_map, recipe_request="traversability")
         is True
     )
     _join(conversion_threads)
     assert os.path.isfile(os.path.join(saved_map, "gridmap.pgm"))
 
 
-def test_a_running_conversion_conflicts(logger, saved_map):
+def test_a_running_conversion_conflicts(conversion_svc, saved_map):
     """Two threads writing the same gridmap.pgm would interleave outputs."""
     from syncai_backend.exceptions import ConflictError
 
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("newmap")
-    try:
-        with pytest.raises(ConflictError) as exc:
-            map_router_module._start_grid_conversion(logger, "newmap", saved_map)
-        assert exc.value.code == "conversion_running"
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("newmap")
+    _mark_converting(conversion_svc, "newmap")
+
+    with pytest.raises(ConflictError) as exc:
+        conversion_svc.start("newmap", saved_map)
+    assert exc.value.code == "conversion_running"
 
 
 def test_conversion_survives_open3d_being_absent(
-    logger, saved_map, conversion_threads, monkeypatch
+    conversion_svc, saved_map, conversion_threads, monkeypatch
 ):
     """ImportError is caught on its own: uncaught it would kill the thread and
     land as a bare traceback with nothing naming the map being saved."""
@@ -1426,9 +1512,7 @@ def test_conversion_survives_open3d_being_absent(
     monkeypatch.setattr(builtins, "__import__", _no_open3d)
 
     assert (
-        map_router_module._start_grid_conversion(
-            logger, "newmap", saved_map, recipe_request="traversability"
-        )
+        conversion_svc.start("newmap", saved_map, recipe_request="traversability")
         is True
     )
     _join(conversion_threads)
@@ -1437,7 +1521,7 @@ def test_conversion_survives_open3d_being_absent(
 
 
 def _sidecar(directory):
-    path = os.path.join(directory, map_router_module.GRIDMAP_RECIPE_SIDECAR)
+    path = os.path.join(directory, conversion_module.GRIDMAP_RECIPE_SIDECAR)
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -1469,7 +1553,10 @@ def glassy_saved_map(maps_dir, make_pcd):
 
 
 def test_the_default_recipe_is_z_band_whatever_the_footprint(
-    logger, glassy_saved_map, fake_traversable, conversion_threads
+    conversion_svc,
+    glassy_saved_map,
+    fake_traversable,
+    conversion_threads,
 ):
     """The conference regression: a glass-inflated bbox must not change the
     recipe, because no recipe is picked by size any more.
@@ -1478,7 +1565,7 @@ def test_the_default_recipe_is_z_band_whatever_the_footprint(
     traversability pipeline did not run, and — since the open3d import sits
     inside that branch — was never even imported.
     """
-    map_router_module._start_grid_conversion(logger, "glassy", glassy_saved_map)
+    conversion_svc.start("glassy", glassy_saved_map)
     _join(conversion_threads)
 
     assert fake_traversable.calls == []
@@ -1492,9 +1579,12 @@ def test_the_default_recipe_is_z_band_whatever_the_footprint(
 
 
 def test_the_z_band_sidecar_carries_both_area_diagnostics(
-    logger, small_saved_map, fake_traversable, conversion_threads
+    conversion_svc,
+    small_saved_map,
+    fake_traversable,
+    conversion_threads,
 ):
-    map_router_module._start_grid_conversion(logger, "smallmap", small_saved_map)
+    conversion_svc.start("smallmap", small_saved_map)
     _join(conversion_threads)
 
     assert fake_traversable.calls == []
@@ -1511,11 +1601,13 @@ def test_the_z_band_sidecar_carries_both_area_diagnostics(
 
 
 def test_a_requested_traversability_conversion_records_the_override(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc,
+    saved_map,
+    fake_traversable,
+    conversion_threads,
 ):
     override = {"requested": "traversability", "picked_by": "test", "reason": None}
-    map_router_module._start_grid_conversion(
-        logger,
+    conversion_svc.start(
         "newmap",
         saved_map,
         recipe_request="traversability",
@@ -1530,12 +1622,14 @@ def test_a_requested_traversability_conversion_records_the_override(
 
 
 def test_grid_overrides_reach_the_traversable_projection_and_the_sidecar(
-    logger, saved_map, fake_traversable, conversion_threads
+    conversion_svc,
+    saved_map,
+    fake_traversable,
+    conversion_threads,
 ):
     """gap_fill_size is the acknowledged per-site knob (dp1f's bottom aisle);
     an override must land in the conversion and be readable off the sidecar."""
-    map_router_module._start_grid_conversion(
-        logger,
+    conversion_svc.start(
         "newmap",
         saved_map,
         recipe_request="traversability",
@@ -1548,7 +1642,10 @@ def test_grid_overrides_reach_the_traversable_projection_and_the_sidecar(
 
 
 def test_the_z_band_recipe_produces_a_trinary_map(
-    logger, small_saved_map, fake_traversable, conversion_threads
+    conversion_svc,
+    small_saved_map,
+    fake_traversable,
+    conversion_threads,
 ):
     """The reason the split exists: unknown survives, and unknown is recoverable.
 
@@ -1556,7 +1653,7 @@ def test_the_z_band_recipe_produces_a_trinary_map(
     does not cover is wall, permanently, since costmap_layer.cpp:90 can lower a
     NO_INFORMATION master cell but never a LETHAL one.
     """
-    map_router_module._start_grid_conversion(logger, "smallmap", small_saved_map)
+    conversion_svc.start("smallmap", small_saved_map)
     _join(conversion_threads)
 
     grid = cv2.imread(os.path.join(small_saved_map, "gridmap.pgm"), cv2.IMREAD_UNCHANGED)
@@ -1567,7 +1664,10 @@ def test_the_z_band_recipe_produces_a_trinary_map(
 
 
 def test_the_z_band_bands_are_recentred_on_the_measured_floor(
-    logger, small_saved_map, fake_traversable, conversion_threads
+    conversion_svc,
+    small_saved_map,
+    fake_traversable,
+    conversion_threads,
 ):
     """Absolute bands are a per-site guess; z=0 is only the lidar mount height.
 
@@ -1575,25 +1675,29 @@ def test_the_z_band_bands_are_recentred_on_the_measured_floor(
     roughly that much from the offsets — not at the constants the fleet's older
     maps were built with.
     """
-    map_router_module._start_grid_conversion(logger, "smallmap", small_saved_map)
+    conversion_svc.start("smallmap", small_saved_map)
     _join(conversion_threads)
 
     params = _sidecar(small_saved_map)["params"]
     floor_z = params["floor_z"]
     assert floor_z == pytest.approx(-0.4, abs=0.1)
-    for key, offset in map_router_module.GRIDMAP_BANDS_ABOVE_FLOOR.items():
+    for key, offset in conversion_module.GRIDMAP_BANDS_ABOVE_FLOOR.items():
         assert params[key] == pytest.approx(offset + floor_z, abs=0.01)
     # The floor band actually brackets the fixture's floor, which is the whole
     # point of measuring it rather than trusting the constant.
     assert params["floor_zmin"] < -0.4 < params["floor_zmax"]
 
 
-def test_conversion_is_skipped_without_a_pcd(logger, maps_dir, conversion_threads):
+def test_conversion_is_skipped_without_a_pcd(
+    conversion_svc,
+    maps_dir,
+    conversion_threads,
+):
     """pgo reported success but wrote nothing: report False, start no thread."""
     directory = str(maps_dir / "newmap")
     os.makedirs(directory, exist_ok=True)
 
-    assert map_router_module._start_grid_conversion(logger, "newmap", directory) is False
+    assert conversion_svc.start("newmap", directory) is False
     assert list(conversion_threads) == []
 
 
@@ -1601,7 +1705,10 @@ def test_conversion_is_skipped_without_a_pcd(logger, maps_dir, conversion_thread
 
 
 def test_z_band_conversion_reverts_free_space_the_poses_cannot_reach(
-    logger, maps_dir, make_pcd, conversion_threads
+    conversion_svc,
+    maps_dir,
+    make_pcd,
+    conversion_threads,
 ):
     """The glass-leak regression in miniature: two floor sheets 8 m apart, poses
     on one. The undriven, unconnected sheet must come back unknown — 205, not 0,
@@ -1628,7 +1735,7 @@ def test_z_band_conversion_reverts_free_space_the_poses_cannot_reach(
         )
     )
 
-    map_router_module._start_grid_conversion(logger, "twosheets", str(directory))
+    conversion_svc.start("twosheets", str(directory))
     _join(conversion_threads)
 
     side = _sidecar(str(directory))
@@ -1650,7 +1757,10 @@ def test_z_band_conversion_reverts_free_space_the_poses_cannot_reach(
 
 
 def test_z_band_conversion_survives_a_malformed_poses_txt(
-    logger, maps_dir, make_pcd, conversion_threads
+    conversion_svc,
+    maps_dir,
+    make_pcd,
+    conversion_threads,
 ):
     """A broken poses.txt costs the filter, never the gridmap."""
     directory = maps_dir / "badposes"
@@ -1667,7 +1777,7 @@ def test_z_band_conversion_survives_a_malformed_poses_txt(
     make_pcd(directory / "map.pcd", points=points)
     (directory / "poses.txt").write_text("not a pose line\n")
 
-    map_router_module._start_grid_conversion(logger, "badposes", str(directory))
+    conversion_svc.start("badposes", str(directory))
     _join(conversion_threads)
 
     assert os.path.isfile(directory / "gridmap.pgm")
@@ -1820,31 +1930,26 @@ def test_convert_endpoint_overwrites_hand_edits_only_on_confirmation(
     assert (maps_dir / "full" / "gridmap.pgm").read_bytes() != edited
 
 
-def test_convert_endpoint_conflicts_while_a_conversion_runs(client):
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("full")
-    try:
-        response = _post_convert(client, "full")
-        assert response.status_code == 409
-        assert response.json()["code"] == "conversion_running"
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("full")
+def test_convert_endpoint_conflicts_while_a_conversion_runs(client, conversion_svc):
+    _mark_converting(conversion_svc, "full")
+
+    response = _post_convert(client, "full")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conversion_running"
 
 
-def test_grid_status_is_converting_while_the_slot_is_held(client):
+def test_grid_status_is_converting_while_the_slot_is_held(client, conversion_svc):
     """Both fields, read from one sample of the registry: `grid_converting` is a
     deprecated alias of `grid_status == "converting"`, and an alias that can
     disagree with what it aliases is worse than no alias."""
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("full")
-    try:
-        entry = _by_name(client.get("/api/v1/maps").json())["full"]
-        assert entry["grid_status"] == "converting"
-        assert entry["grid_converting"] is True
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("full")
+    _mark_converting(conversion_svc, "full")
+
+    entry = _by_name(client.get("/api/v1/maps").json())["full"]
+    assert entry["grid_status"] == "converting"
+    assert entry["grid_converting"] is True
+
+    _clear_converting(conversion_svc, "full")
 
     entry = _by_name(client.get("/api/v1/maps").json())["full"]
     assert entry["grid_status"] == "ok"
@@ -1989,16 +2094,14 @@ def test_activate_refuses_a_map_with_no_pointcloud(
     assert map_gw.order == []
 
 
-def test_activate_refuses_while_a_conversion_runs(client, map_gw, monkeypatch, tmp_path):
+def test_activate_refuses_while_a_conversion_runs(
+    client, conversion_svc, map_gw, monkeypatch, tmp_path
+):
     _point_ini_at(monkeypatch, tmp_path, "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")
 
-    with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-        map_router_module._ACTIVE_CONVERSIONS.add("full")
-    try:
-        response = _activate(client, "full")
-    finally:
-        with map_router_module._ACTIVE_CONVERSIONS_LOCK:
-            map_router_module._ACTIVE_CONVERSIONS.discard("full")
+    _mark_converting(conversion_svc, "full")
+
+    response = _activate(client, "full")
 
     assert response.status_code == 409
     assert response.json()["code"] == "conversion_running"

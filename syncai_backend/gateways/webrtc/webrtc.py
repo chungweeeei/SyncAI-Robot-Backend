@@ -7,16 +7,19 @@ from typing import Dict, FrozenSet, NamedTuple, Optional, Tuple
 
 import structlog
 
+from syncai_backend.gateways.failure import Failure, fail
+
 
 # Where the Go worker lands. Built out of tree in the SyncAI-WebRTC-Worker repo
 # with
 #
 #   go build -buildmode=c-shared -o dist/libsyncai_worker.so ./cmd/lib
 #
-# and copied into the workspace by hand, the same arrangement as the kokoro
-# weights under models/: an artifact the build does not produce and git does
-# not carry (*.so is gitignored), reachable in the container through the
-# workspace bind mount.
+# and copied into the workspace by hand: an artifact the build does not produce
+# and git does not carry (*.so is gitignored), reachable in the container
+# through the workspace bind mount. The kokoro weights under models/ were the
+# other one of these until speech moved to the syncai_tts container, which
+# mounts them itself.
 _DEFAULT_LIB = os.path.expanduser("~/robot_ws/lib/libsyncai_worker.so")
 
 # Applied with setdefault immediately before InitWorker, never after: the
@@ -141,8 +144,8 @@ class WebRtcGateway:
         # The Go side already guards its own session map, so Python needs a
         # lock only for its own bookkeeping. Serialising creates is the slot
         # claim in create_video_session(), not a mutex: acquire before start so
-        # there is no check-then-start race, the same shape as map.py's
-        # _ACTIVE_CONVERSIONS.
+        # there is no check-then-start race, the same shape as
+        # GridmapConversionService's registry.
         self._load_lock = threading.Lock()
         self._session_lock = threading.Lock()
 
@@ -353,7 +356,14 @@ class WebRtcGateway:
                     # delete. Reported under the requested kind's name -- the
                     # caller asked for this kind and cannot act on which other
                     # one is in the way.
-                    return False, f"{kind} session creation already in progress", {}
+                    return (
+                        False,
+                        fail(
+                            Failure.WHEP_SESSION_PENDING,
+                            f"{kind} session creation already in progress",
+                        ),
+                        {},
+                    )
 
             previous = [
                 (other, self._slots[other].session_id)

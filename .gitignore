@@ -35,3 +35,15 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# rosbag2 recordings. docker-compose bind-mounts this directory into the
+# container as ~/robot_ws/record (RECORD_DIR overrides it), so bags land here on
+# the host. The directory itself is tracked, via .gitkeep, so Docker never has
+# to create a missing bind source — it would create it root:root, and the
+# container runs as uid 1000.
+record/*
+!record/.gitkeep
+
+# Optional FAST-LIO2 `interface` package, copied in for a runtime build
+# (see the Dockerfile header). Never committed: it belongs to the private fork.
+.interface/

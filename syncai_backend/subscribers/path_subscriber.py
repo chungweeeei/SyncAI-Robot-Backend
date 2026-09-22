@@ -67,17 +67,21 @@ class PathSubscriber:
         self._frame_ok = None
 
     def register(self, node: Node):
-        # RELIABLE, matching the publisher's rclcpp::QoS(1) exactly, rather than
-        # the BEST_EFFORT the other subscribers use. Those read 20 Hz feeds where
-        # the next sample is 50 ms away; a plan arrives every ~3 s, so a dropped
-        # one leaves the operator looking at a route the robot has already left.
+        # BEST_EFFORT, like every other subscriber here, even though the
+        # publisher is a RELIABLE rclcpp::QoS(1) -- a BEST_EFFORT request still
+        # matches a RELIABLE offer, so the topic connects and only the
+        # retransmission is given up. The cost is higher here than elsewhere:
+        # the other subscribers read 20 Hz feeds where the next sample is 50 ms
+        # away, while a plan arrives every ~3 s, so a dropped one leaves the
+        # operator looking at a route the robot has already left until the next
+        # BT replan.
         node.create_subscription(
             msg_type=Path,
             topic="plan",  # relative, so it inherits the robot_id namespace
             callback=self._plan_cb,
             qos_profile=QoSProfile(
                 depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
                 durability=rclpy.qos.DurabilityPolicy.VOLATILE,
                 history=rclpy.qos.HistoryPolicy.KEEP_LAST,
             ),

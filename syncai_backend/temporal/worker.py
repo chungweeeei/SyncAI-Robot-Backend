@@ -9,7 +9,7 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from syncai_backend.temporal.shared import TEMPORAL_SERVER_URL
+from syncai_backend.temporal.shared import temporal_server_url
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
 
@@ -77,11 +77,12 @@ async def run_worker(
     `ready` is set right before the worker starts polling, so a caller running
     this in a background thread can block until the worker is up.
     """
+    server = temporal_server_url()
     client = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             client = await Client.connect(
-                TEMPORAL_SERVER_URL, data_converter=pydantic_data_converter
+                server, data_converter=pydantic_data_converter
             )
             break
         except Exception as err:
@@ -96,7 +97,7 @@ async def run_worker(
                 handle.mark_dead(str(err))
                 logger.error(
                     "Giving up on Temporal; task server is dead until restart",
-                    server=TEMPORAL_SERVER_URL,
+                    server=server,
                 )
                 return
             await asyncio.sleep(RETRY_INTERVAL)
@@ -111,12 +112,23 @@ async def run_worker(
             activities.execute_lie_down,
             activities.execute_speak,
         ],
+        # One activity at a time, stated twice because the two settings mean
+        # different things. The executor is the thread that runs activities;
+        # max_concurrent_activities is how many the worker *accepts* from the
+        # server. Left at its default (100) the worker would take a second
+        # activity while the first held the only thread, and that activity's
+        # heartbeat_timeout and start_to_close would tick while it queued
+        # behind the thread -- so the one realistic overlap, a schedule firing
+        # during a direct task (see _require_idle's docstring), failed its
+        # MOVE by heartbeat timeout instead of waiting. Capped to 1, Temporal
+        # holds the second task server-side until this worker asks for it.
         activity_executor=ThreadPoolExecutor(max_workers=1),
+        max_concurrent_activities=1,
     )
 
     logger.info(
         "Temporal worker started",
-        server=TEMPORAL_SERVER_URL,
+        server=server,
         task_queue=f"{robot_id}.ROBOT_TASK_QUEUE",
     )
 
@@ -164,7 +176,7 @@ def start_temporal_worker(
     if not ready.wait(timeout=10.0):
         logger.warning(
             "Temporal worker not ready yet; still connecting in the background",
-            server=TEMPORAL_SERVER_URL,
+            server=temporal_server_url(),
         )
 
     return handle

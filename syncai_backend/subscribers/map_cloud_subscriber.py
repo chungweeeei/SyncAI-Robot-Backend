@@ -27,7 +27,7 @@ class MapCloudSubscriber:
       Transforming it again would be a no-op bought with a lookup that can
       fail.
     * **No voxel_downsample.** pgo already voxelised at its publish resolution
-      (``map_cloud_resolution``); re-voxelising ~half a million points through
+      (``map_cloud_resolution``); re-voxelising millions of points through
       ``np.unique(axis=0)`` every few seconds is O(N log N) of pure waste.
       ``cap_points`` (a stride) stays as the one wire-size guard.
 
@@ -53,8 +53,12 @@ class MapCloudSubscriber:
     ):
         self._logger = logger
         self._map_cloud_repo = map_cloud_repo
-        # ~6 MB per frame at the cap. pgo's 0.2 m voxel keeps real sites well
-        # under this; the cap is for a misconfigured resolution, not a budget.
+        # ~6 MB per frame at the cap, and real sites reach it: a large floor
+        # at pgo's 0.2 m voxel came out at 2.79 M points (44.7 MB on the
+        # topic, 2026-09), so the stride keeps every ~6th point. This is the
+        # browser's wire/GPU budget, not a guard against a misconfigured
+        # resolution -- lower the ceiling here if the viewer struggles, and
+        # do not expect the cap to be a no-op on anything bigger than a room.
         self._max_points = 500000
 
         # Edge-triggered: log once when the first merge lands (the "mapping is

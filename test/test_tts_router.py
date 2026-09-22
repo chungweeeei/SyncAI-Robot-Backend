@@ -1,10 +1,19 @@
 """Tests for /api/v1/tts — projection over a stubbed TtsGateway.
 
-The gateway itself (kokoro session, aplay) is not exercised here: it needs the
-310 MB weights and a speaker. What the router owns is the request validation,
-the WAV passthrough, and the status-code mapping — an unknown voice is the
-caller's typo (400), everything else that fails (missing weights, onnxruntime,
-aplay) is the robot's problem (502).
+The gateway itself is not exercised here; it is an HTTP client for the
+syncai_tts service and its own tests live in test_tts_gateway.py. What the
+router owns is the request validation, the WAV passthrough, and the status-code
+mapping:
+
+- an unknown voice is the caller's typo (400),
+- a full speech queue is a backlog the caller can wait out or stop adding to
+  (409, with a machine-readable code beside the detail),
+- everything else that fails — the speech service unreachable, its weights
+  missing, a wedged speaker — is the robot's problem (502).
+
+The stub tags those two failures the way the real gateway does, by re-tagging
+the code the service sent. The router reads the code rather than the sentence,
+so an untagged message is by design just another 502 (pinned below).
 """
 
 import pytest
@@ -14,6 +23,7 @@ pytest.importorskip("httpx")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
 from syncai_backend.interfaces.rest.routers.tts import init_tts_router  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
@@ -68,7 +78,11 @@ def test_synthesize_returns_the_wav_bytes(client, tts_gw):
 
 
 def test_an_unknown_voice_is_a_400(client, tts_gw):
-    tts_gw.synthesize_result = (False, "unknown voice: 'af_nope'", b"")
+    tts_gw.synthesize_result = (
+        False,
+        fail(Failure.UNKNOWN_VOICE, "unknown voice: 'af_nope'"),
+        b"",
+    )
 
     response = client.post(
         "/api/v1/tts/synthesize", json={"text": "hello", "voice": "af_nope"}
@@ -78,8 +92,49 @@ def test_an_unknown_voice_is_a_400(client, tts_gw):
     assert "af_nope" in response.json()["detail"]
 
 
-def test_missing_weights_are_a_502(client, tts_gw):
-    tts_gw.synthesize_result = (False, "kokoro model file missing: ...", b"")
+def test_a_failure_that_carries_no_code_is_a_502(client, tts_gw):
+    """The sentence is not the contract: only the code moves a failure off 502.
+
+    Pins the half of the rule that is easy to lose — a gateway failure nobody
+    tagged stays the robot's problem even when its prose reads like the
+    caller's fault.
+    """
+    tts_gw.synthesize_result = (False, "unknown voice: 'af_nope'", b"")
+
+    response = client.post(
+        "/api/v1/tts/synthesize", json={"text": "hello", "voice": "af_nope"}
+    )
+
+    assert response.status_code == 502
+
+
+def test_a_full_speech_queue_is_a_409_with_a_code(client, tts_gw):
+    """Not a 502: the robot is fine, there is just already a backlog of speech.
+
+    The console's next step is to wait or stop queueing, which is not the next
+    step for a 502, and it branches on the code rather than on the sentence —
+    the ConflictError.code precedent.
+    """
+    tts_gw.speak_result = (
+        False,
+        fail(Failure.TTS_QUEUE_FULL, "8 utterances are already waiting"),
+        None,
+    )
+
+    response = client.post("/api/v1/tts/speak", json={"text": "hi"})
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "tts_queue_full"
+    assert "already waiting" in body["detail"]
+
+
+def test_an_unreachable_speech_service_is_a_502(client, tts_gw):
+    tts_gw.synthesize_result = (
+        False,
+        "could not reach the speech service at http://tts:8080: Connection refused",
+        b"",
+    )
 
     response = client.post("/api/v1/tts/synthesize", json={"text": "hello"})
 

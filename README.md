@@ -1,12 +1,19 @@
 # syncai_backend
 
 > **Standalone repository of a colcon package.** This repo is the source of
-> truth for `syncai_backend`, but it is not runnable on its own: it is a ROS 2
-> `ament_python` package that imports `syncai_common` (msgs/srvs) and
-> `interface` (FAST-LIO2's srvs) and expects the rest of the robot stack around
-> it. It is meant to be vcs-imported into `SyncAI-Robot-Workspace/src/syncai_backend`
-> and built there; the workspace-relative paths below (`src/syncai_backend/…`,
-> the workspace `CLAUDE.md`, `.env`) assume that placement.
+> truth for `syncai_backend`. It is a ROS 2 `ament_python` package that imports
+> `syncai_common` (msgs/srvs) and `interface` (FAST-LIO2's srvs). `syncai_common`
+> is named in `interface.repos`, so `vcs import < interface.repos` from a colcon
+> workspace root fetches it with no `SyncAI-Robot-Workspace` checkout and no
+> credentials. `interface` is not there yet — it lives inside a private SSH fork
+> and is still bind-mounted from a workspace checkout; see the `Dockerfile`.
+>
+> **Running** it is the other half and still needs the rest of the robot stack
+> around it: the nav stack's topics and services, Postgres, and the workspace
+> laid out at `~/robot_ws` (see *Configuration*). On a robot it is vcs-imported
+> into `SyncAI-Robot-Workspace/src/syncai_backend`, and the workspace-relative
+> paths below (`src/syncai_backend/…`, the workspace `CLAUDE.md`, `.env`) assume
+> that placement.
 
 The robot's application-layer process: a **FastAPI REST/WebSocket server and an
 rclpy ROS 2 node running inside one Python process**, plus a **Temporal worker**
@@ -56,10 +63,14 @@ The layering is a convention, not something tooling enforces:
 ```
 interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; no business logic
         │
+services/                  domain work that outlives a request: gridmap_conversion owns the
+        │                  two recipes, the registry of conversions running right now, and
+        │                  the gridmap.recipe.json protocol they write
+        │
 gateways/                  outbound integrations: ROS (robot, map), Temporal (workflow),
-        │                  speech (tts: kokoro-onnx → aplay), bags (recording:
-        │                  a supervised `ros2 bag record` child) — the last two
-        │                  hold no ROS handle at all
+        │                  speech (tts: HTTP to the syncai_tts container), bags
+        │                  (recording: a supervised `ros2 bag record` child) —
+        │                  the last two hold no ROS handle at all
 repositories/              state stores: in-memory caches, PostgreSQL CRUD, and the two
         │                  on-disk catalogues (map/, record/)
         │
@@ -72,12 +83,21 @@ helpers/                   occupancy_grid (OccupancyGrid→PNG), pointcloud (dow
                            traversable (traversability recipe), system_config (INI reader)
 ```
 
-`gateways/tts` is a gateway like `robot` / `map` even though its downstream is
-an inference session plus the speaker rather than a ROS service: the REST router
-and the Temporal worker's `SPEAK` activity share **one long-lived owner** for the
-lazily-loaded (~310 MB) kokoro model, and that instance's internal lock is what
-keeps a scheduled SPEAK step and a manual `POST /api/v1/tts/speak` from talking
-over each other. `main.py` constructs exactly one.
+`gateways/tts` is a gateway like `robot` / `map`, but its downstream is neither
+a ROS service nor anything in this process: it is an HTTP client for the
+**syncai_tts container** (the `SyncAI-TTS` repo), which owns the kokoro session
+and the speaker.
+
+It used to be the engine itself, and one instance was load-bearing — its
+internal lock was the only thing keeping a scheduled `SPEAK` step and a manual
+`POST /api/v1/tts/speak` off the speaker at once. That guarantee moved into the
+service, in front of the single piece of hardware, which is what lets the
+Temporal worker become its own process later without two locks in two processes
+failing to see each other. The service also serialises as a FIFO queue rather
+than a lock, so utterances come out in the order they were accepted, and refuses
+a backlog past its `TTS_MAX_QUEUE` — which this side reports as a 409, not a
+502. Along with the engine went `onnxruntime`, `kokoro-onnx` and a ~310 MB model
+that no longer sits in the rclpy process's address space.
 
 There are **two pcd → gridmap recipes** in `helpers/`, and the default is
 z-band: `pcd_to_gridmap.py` slices the cloud into floor / obstacle height bands
@@ -88,10 +108,17 @@ runs only when an operator asks for it via `grid/convert`. There is deliberately
 no automatic pick between them; the workspace `CLAUDE.md` ("Backend
 architecture") records why and what each conversion writes to disk.
 `traversable.py` is the **only** module that imports open3d, and nothing imports
-it at module scope — `_start_grid_conversion` imports it inside the conversion
-thread's `try`, so a backend start never pays the ~100 MB import and an
-`ImportError` lands as a per-map failure instead of a bare thread traceback.
+it at module scope — `GridmapConversionService.start` imports it inside the
+conversion thread's `try`, so a backend start never pays the ~100 MB import and
+an `ImportError` lands as a per-map failure instead of a bare thread traceback.
 Keep `pcd_to_gridmap.py` open3d-free.
+
+The conversion itself lives in `services/gridmap_conversion.py`, not in the map
+router: the recipes, the in-process registry that refuses a second concurrent
+conversion of the same map, and the sidecar protocol below are one piece of
+domain behaviour, and none of it is HTTP. `main.py` builds one instance and
+hands it to the router, which validates requests against it and turns its
+refusals into status codes.
 
 **A conversion's outcome lives on disk, in `gridmap.recipe.json`.** The thread
 writes that sidecar three times — `status: converting` before it starts any
@@ -112,9 +139,6 @@ Wiring is explicit: `main.py` constructs every repo/gateway/subscriber and passe
 them down as constructor arguments. There is no DI container and no module-level
 singleton — if a router needs something, it arrives through
 `init_<x>_router(...)`.
-
-`repositories/base.py` and `jobs/base.py` are abstract scaffolding that nothing
-currently implements; the live repos are plain classes.
 
 ## robot_id, namespaces, and per-robot isolation
 
@@ -153,14 +177,17 @@ source frame from the message header and only pins the target frame (`map`).
 | `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state` |
 | `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS |
 | `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
-| `plan` | `nav_msgs/Path` | **RELIABLE**, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
+| `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
 | `pgo/map_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, **depth 1** | already in `map`; stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only) |
 
-`plan` is the only RELIABLE subscription here. The others read 20 Hz feeds where
-the next sample is 50 ms behind the one that was dropped; a plan arrives once per
-BT replan (~3 s), so dropping one leaves the operator looking at a route the
-robot has already left.
+Every subscription here is BEST_EFFORT, `plan` included. Its publisher is a
+`rclcpp::QoS(1)` — RELIABLE — and a BEST_EFFORT subscriber still matches a
+RELIABLE publisher, so the topic connects either way; what the request gives up
+is retransmission. That costs more on this topic than on the others: they read
+20 Hz feeds where the next sample is 50 ms behind the one that was dropped,
+while a plan arrives once per BT replan (~3 s), so a dropped one leaves the
+operator looking at a route the robot has already left until the next replan.
 
 Two properties of `syncai_planner`'s publisher are worth knowing before debugging
 a missing route: it skips the publish entirely while nothing is subscribed, and
@@ -273,13 +300,13 @@ Interactive docs are generated by FastAPI at `http://<robot>:3000/docs`.
 | POST | `/api/v1/maps/{name}/activate` | Switch the robot onto this map, live — no session restart. Re-points the localizer (`relocalize`, which takes a `pcd_path`) and map_server (`load_map`), then writes `[map] name` into the instance INI so the choice survives a restart; `[initial_pose]` is zeroed, so the operator re-seeds from the dashboard. The localizer moves first because its refusals happen before it mutates anything; later steps compensate the earlier ones. `switched: false` is the no-op for the map already active. `localized` is a best-effort poll of `relocalize_check` — `false` means "not yet" (registration retries indefinitely), `null` means it could not be asked; do **not** substitute `RobotState.localization_valid`, which is TF-presence only. Refusals, all before any mutation: 409 `grid_missing`, `pointcloud_missing`, `conversion_running`, `ini_not_writable`, `task_running`, `tasks_unknown` (Temporal unreachable — refuses rather than assuming idle), `stack_not_ready` (how mapping mode is detected: service discoverability, not the cached mode). Lifts the `map_active` refusal on rename and delete |
 | POST | `/api/v1/maps/{name}/grid/convert` | (Re)build the gridmap from `map.pcd` with a chosen recipe (`z_band` default / `traversability`), optional `z_band_offsets` or `gap_fill_size`, `debug` for intermediate clouds. `started: true` means the thread launched, nothing more — the outcome arrives as `grid_status`. 409 `conversion_running` (try later) or 409 `gridmap_hand_edited` (confirm with `overwrite_edits`; the edited grid survives as `gridmap_prev.pgm`, its recipe record as `gridmap_prev.recipe.json`). Reloads map_server when the map is active |
 | GET | `/api/v1/maps/{name}/image` · `/thumbnail` | The gridmap as a full-size / downscaled PNG, content-hash ETag'd |
-| PUT | `/api/v1/maps/{name}/grid` | Write edited cells back (raw `application/octet-stream`); reloads map_server when the map is active |
+| PUT | `/api/v1/maps/{name}/grid` | Write edited cells back (raw `application/octet-stream`); reloads map_server when the map is active. 409 `conversion_running` while that map is being converted — the conversion would overwrite the edit |
 | GET | `/api/v1/maps/{name}/pointcloud` | The saved `map.pcd`, packed binary |
 | POST · GET | `/api/v1/maps/{name}/vertices` | Batch-create (single transaction) / list with an optional `?type=` filter |
 | GET · PUT · DELETE | `/api/v1/maps/{name}/vertices/{id}` | Read / partial update / delete |
-| GET | `/api/v1/tts/voices` | The voice ids the loaded kokoro model carries |
+| GET | `/api/v1/tts/voices` | The voice ids the speech service's model carries |
 | POST | `/api/v1/tts/synthesize` | Render `{text, voice, speed}` and return the WAV (`audio/wav`) without playing it |
-| POST | `/api/v1/tts/speak` | Same body, played on the robot speaker; blocks for the utterance (`duration` in the response). `unknown voice` is a 400, everything else (weights, onnxruntime, aplay) a 502. Text is English only, ≤1000 chars; `speed` 0.5–2.0 |
+| POST | `/api/v1/tts/speak` | Same body, played on the robot speaker; blocks for the utterance (`duration` in the response). `unknown voice` is a 400; a full speech queue is a 409 with `code: tts_queue_full`; everything else (the speech service unreachable, its weights missing, a wedged speaker) a 502. Text is English only, ≤1000 chars; `speed` 0.5–2.0 |
 | POST | `/api/v1/recordings` | Start `ros2 bag record` into `record/<name>/`. Body `{name?, topics?, compression?}`; `name` defaults to `rec_<UTC timestamp>` and `topics` to the LIO inputs (`livox/lidar`, `livox/imu`). A topic without a leading slash is resolved under this robot's namespace, so `/tf` and `/tf_static` are how fleet-wide topics are asked for. 201 means the recorder survived its liveness probe, i.e. it is running. Refusals, all before any spawn: 409 `recording_running` (one at a time; its name is in the message), 409 `name_taken`, 409 `disk_low` (< 2 GB free — one bag file), 400 for a reserved or malformed name or an empty `topics` |
 | GET | `/api/v1/recordings/active` | The live recording with `elapsed_seconds` and `size_bytes`, or `null`. Its own route rather than a filter over the catalogue (the map router's rule) because a 1 Hz poll would otherwise walk every bag on disk; also where a recorder that died on its own is reaped |
 | POST | `/api/v1/recordings/stop` | SIGINT the recorder and block until it has flushed (up to ~22 s). `complete: false` means it had to be killed and the bag needs `ros2 bag reindex` — the messages are still there. 409 `not_recording` when nothing is running |
@@ -324,9 +351,12 @@ instead of a backlog.
 
 ### Recordings
 
-Bags land in `record/<name>/` in the workspace root (bind-mounted, gitignored),
-the same layout `ros2 bag record` writes by hand: `<name>_N.db3` splits cut at
-2 GB plus a `metadata.yaml`. Nothing else in the stack reads them — a bag is
+Bags land in `~/robot_ws/record/<name>/` (gitignored), the same layout `ros2 bag
+record` writes by hand: `<name>_N.db3` splits cut at 2 GB plus a `metadata.yaml`.
+As its own container that directory is bind-mounted from `record/` beside the
+compose file rather than from the workspace, because — unlike `config/` and
+`map/` — nothing outside this process touches it; `RECORD_DIR` points it at a
+bigger disk. Nothing else in the stack reads them — a bag is
 insurance, and the thing it insures against is a mapping run that ends without a
 save, since `pgo_node` holds its keyframes in RAM and replaying `livox/lidar` +
 `livox/imu` is the only way to get one back.
@@ -407,21 +437,44 @@ that still carry an ARTIFACT step must be purged before deploying.)
 Details that matter when editing this path:
 
 - **Activities are synchronous** and run in a single-worker `ThreadPoolExecutor`,
-  matching the one-thing-at-a-time reality of a robot. On cancellation Temporal
+  matching the one-thing-at-a-time reality of a robot. The worker also declares
+  `max_concurrent_activities=1`, so Temporal holds a second activity server-side
+  rather than handing it over to queue behind the thread with its timeouts
+  already ticking. On cancellation Temporal
   *throws* `CancelledError` into the thread wherever it happens to be (often
   inside `time.sleep`), so cleanup lives in an `except CancelledError:` block, not
-  in an `is_cancelled()` poll. `execute_move` wraps the `cancel_move` RPC in
-  `activity.shield_thread_cancel_exception()` so the goal is really cancelled
-  before the activity dies.
-- **`SPEAK` cannot heartbeat.** `execute_speak` sits in one blocking gateway call
-  (synthesis, then `aplay` for the whole utterance, plus the one-time model load),
-  so the 3 s `heartbeat_timeout` the other activities run under would kill every
-  attempt before its first heartbeat. The workflow therefore drops the heartbeat
-  for SPEAK and relies on a **5-minute `start_to_close`** alone — much shorter
-  than the heartbeating activities' hour, because a dead worker holding a SPEAK
-  step would otherwise go unnoticed for that hour. The same fact makes it
-  effectively not cancellable mid-utterance: without heartbeats the worker never
-  learns of the cancel, so a cancelled task finishes the sentence it is on.
+  in an `is_cancelled()` poll. `execute_move` wraps the whole of the send and
+  the poll loop in one `except CancelledError` that calls
+  `cancel_active_moves()` under `activity.shield_thread_cancel_exception()`, so
+  the goal is really cancelled before the activity dies. By goal *state* rather
+  than by id, because the cancel can land inside `move()` before nav2 has
+  answered — and for the goal nav2 accepts a moment after that, the gateway
+  itself disowns it: whichever of the two threads (the waiter, the rclpy
+  response callback) is second sees what the first did and cancels.
+- **MOVE heartbeats before it sends.** The heartbeat clock starts at activity
+  start, and `move()` has no loop to heartbeat from, so its two waits (server
+  ready, goal accepted) are bounded by `NAV_GOAL_SEND_BUDGET_S` in the gateway
+  and `MOVE_HEARTBEAT_TIMEOUT` in the workflow must stay above it —
+  `test_activities.py` pins that. The old 30 s / 10 s waits were unreachable
+  under a 3 s heartbeat anyway; a nav2 that is slow to come up gets its chance
+  from the retry policy, not from a wait the heartbeat would have killed.
+- **`SPEAK` does not heartbeat.** `execute_speak` sits in one blocking gateway
+  call — a single HTTP request to the speech service, held open for the whole
+  utterance by `wait=true` — so the 3 s `heartbeat_timeout` the other activities
+  run under would kill every attempt before its first heartbeat. The workflow
+  therefore drops the heartbeat for SPEAK and relies on a **5-minute
+  `start_to_close`** alone — much shorter than the heartbeating activities'
+  hour, because a dead worker holding a SPEAK step would otherwise go unnoticed
+  for that hour. The same fact makes it effectively not cancellable
+  mid-utterance: without heartbeats the worker never learns of the cancel, so a
+  cancelled task finishes the sentence it is on.
+
+  This is now a **choice, not a constraint.** The speech service's playback is a
+  job — POST returns an id, GET reports its state, DELETE stops it — so
+  rewriting `execute_speak` to enqueue and poll once a second would make the
+  heartbeat real and let `except CancelledError` cut the utterance, exactly as
+  `_wait_for_nav_goal` already does for MOVE. It was left blocking so that
+  moving speech out of this process changed nothing about the task path.
 - **Per-step state is a workflow query** (`get_step_states`), not a database
   table. `GET /api/v1/tasks/{id}` degrades to an empty step list if the query
   fails (no worker polling yet), rather than erroring the whole request.
@@ -457,6 +510,7 @@ Details that matter when editing this path:
 | `POSTGRES_USER` | `syncrobotic` | ditto |
 | `POSTGRES_PASSWORD` | `syncrobotic` | ditto |
 | `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads, e.g. `[map]`) |
+| `TTS_SERVICE_URL` | `http://syncai_tts:8080` | `gateways/tts` — the syncai_tts container, by its compose service name; `http://127.0.0.1:8080` when the backend runs on the host |
 
 `.env` in the workspace root is loaded via `python-dotenv` at import time.
 
@@ -489,8 +543,8 @@ source install/setup.bash
 ```
 
 Python deps are **not** managed by rosdep (jammy has no reliable key for
-fastapi); `requirements.txt` is the single source of truth and both the dev and
-`backend-runtime` Docker stages install from it:
+fastapi); `requirements.txt` is the single source of truth and every Docker
+stage in this repo installs from it:
 
 ```bash
 pip install -r src/syncai_backend/requirements.txt
@@ -518,6 +572,64 @@ lives in the infra compose stack and is up regardless of which session exists.
 > the installed modules are symlinks, so `--symlink-install` developer builds are
 > unaffected.
 
+### As its own container
+
+`Dockerfile` builds four stages — `base` (ROS + the pip deps, the expensive one),
+`builder` (the colcon install space), `runtime` (the service) and `dev` (the test
+image) — and `docker-compose.yml` runs the `runtime` one as a single service.
+There is no default target; name it.
+
+```bash
+# Optional but wanted: FAST-LIO2's `interface`, which interface.repos cannot
+# name because it lives in a private SSH fork. Without it the service starts
+# anyway — `gateways/map`'s import of interface.srv is wrapped in a TEMPORARY
+# try/except — but map save, new map, map switch and relocalize all refuse.
+cp -r ~/SyncAI-Robot-Workspace/src/third-party/FASTLIO2_ROS2/interface .interface
+
+docker compose up -d --build
+docker compose logs -f
+```
+
+The INI is mounted the way the workspace's compose mounts it: the per-robot
+`config/instances/robotNN.ini` goes **over** `config/system.ini` as a single
+file (the checked-out `system.ini` is an empty placeholder). Miss that and the
+launch file finds no `[system] robot_id`, and the namespace, the database and
+the task queue all move to `default_robot`.
+
+What that service is, and why each piece is the way it is, is commented in the
+compose file; the four that bite are:
+
+- **`network_mode: host`.** DDS discovery with the nav stack runs over `lo` with
+  multicast off (`config/cyclonedds.xml`), so both sides have to share the host's
+  network namespace. It also means compose service names do not resolve —
+  postgres, temporal and syncai_tts are addressed as `127.0.0.1:<published port>`,
+  and the REST API lands on the host's `:3000` with no `ports:` mapping.
+- **`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`,** with the package installed in the
+  image. A backend left on the default fastrtps starts cleanly, logs nothing
+  alarming and sees not one topic.
+- **Three bind mounts from `ROBOT_WS`** carry what this package shares with the
+  rest of the stack: `config/` (read-write — activating a map rewrites
+  `system.ini` in place, and the per-robot `instances/robotNN.ini` goes over
+  `config/system.ini` as a single file), `map/` (must be the same directory the
+  nav stack's `map_server` reads) and `lib/libsyncai_worker.so`. `[system]
+  robot_id` in the mounted INI is still what namespaces the node, the database
+  and the task queue. **`record/` is not one of them**: no other process reads a
+  bag, so it defaults to `record/` beside the compose file and moves with
+  `RECORD_DIR` (`export RECORD_DIR=/mnt/ssd/record`). It is tracked as an empty
+  directory so Docker never creates the bind source itself — a source it creates
+  is `root:root`, which the uid-1000 container user cannot write.
+- **One backend at a time.** `NodeManager` starts this process as a byobu pane
+  inside the robot container. Running the service alongside it gives two
+  processes on `:3000` and, less visibly, two Temporal workers polling the same
+  `<robot_id>.ROBOT_TASK_QUEUE`. Take it out of the session spec first.
+
+Note the knock-on for `switch_mode`: as a byobu pane the process dies with the
+session and `NodeManager` restarts it, which is the mechanism the route's
+"success looks like a dropped connection" semantics rest on. In its own
+container it survives the session teardown instead, and `restart:
+unless-stopped` only covers a crash — the mode switch itself no longer recycles
+it.
+
 ## Tests
 
 ```bash
@@ -526,6 +638,34 @@ colcon test-result --verbose
 # or, inside the container, from src/syncai_backend/:
 pytest test/
 ```
+
+**Off the robot**, the `Dockerfile`'s `dev` target (`docker build --target dev
+-t syncai-backend-dev .`) builds an image that supplies ROS 2 Humble and this
+package's pip dependencies; the source is bind-mounted rather than copied, so an
+edit is picked up by the next run with no rebuild. Its header comment carries the
+exact commands. Two things are worth
+knowing before reading a result from it:
+
+- **Get `syncai_common` in, or a third of the suite does not run.**
+  `vcs import < interface.repos` materialises it; FAST-LIO2's `interface` is
+  still bind-mounted from a workspace checkout, because it sits inside a private
+  SSH fork that `interface.repos` deliberately does not name. Measured
+  2026-09-21, on this branch:
+
+  | in the image | result |
+  |---|---|
+  | both | 659 passed, 1 skipped (`test_copyright`, skipped on purpose) |
+  | `syncai_common` only | 625 passed, 2 skipped — `test_map_gateway` `importorskip`s `interface` and skips as a whole module |
+  | neither | 284 passed, 6 skipped, **11 collection errors** — those files reach `syncai_common` through a plain import rather than an `importorskip` |
+
+  Anything that touches a router or a gateway needs `syncai_common` for the run
+  to mean anything. `test_map_gateway_no_interface.py` runs in all three: it
+  patches `MapGateway`'s `_INTERFACE_SRVS` flag rather than requiring the
+  package to be absent, so the guarded branch — the one the runtime image
+  currently ships — is covered wherever the suite is run.
+- **The image runs as a non-root user on purpose.** Root bypasses file
+  permission checks, so `os.access(W_OK)` answers `True` on a read-only file and
+  the map router's `ini_not_writable` refusal test fails against working code.
 
 `test/` holds ~40 files, roughly one per router / gateway / subscriber / repo /
 helper (`ls src/syncai_backend/test/` is the index). They must run where `rclpy`
