@@ -49,10 +49,8 @@ from syncai_backend.helpers.pcd_to_gridmap import (
 )
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
 from syncai_backend.repositories.map.catalog import (
-    GRID_STATUS_CONVERTING,
-    GRID_STATUS_FAILED,
-    GRID_STATUS_OK,
     GRIDMAP_RECIPE_SIDECAR,
+    GridRecordStatus,
 )
 
 
@@ -430,8 +428,15 @@ class GridmapConversionService:
             basename = os.path.join(directory, "gridmap")
             started_at = iso_now()
 
-            def _record(status: str, **extra: object) -> Dict[str, object]:
-                """Build a sidecar payload, with the keys every state shares."""
+            def _record(
+                status: GridRecordStatus, **extra: object
+            ) -> Dict[str, object]:
+                """Build a sidecar payload, with the keys every state shares.
+
+                The status goes in as the enum member, not ``.value``: it is a
+                ``str`` subclass, so ``json.dumps`` writes the bare
+                ``"converting"`` / ``"ok"`` / ``"failed"`` the reader expects.
+                """
                 payload: Dict[str, object] = {
                     "status": status,
                     "recipe": recipe_request,
@@ -446,7 +451,7 @@ class GridmapConversionService:
             # record saying so. This is the write the `interrupted` state is derived
             # from; without it the only trace of an abandoned conversion is a map
             # that looks like it was never converted at all.
-            write_recipe_sidecar(bound, directory, _record(GRID_STATUS_CONVERTING))
+            write_recipe_sidecar(bound, directory, _record(GridRecordStatus.CONVERTING))
 
             try:
                 # Measured whichever recipe runs: z-band needs floor_z to place its
@@ -543,7 +548,7 @@ class GridmapConversionService:
                     bound,
                     directory,
                     _record(
-                        GRID_STATUS_FAILED,
+                        GridRecordStatus.FAILED,
                         error=str(exc),
                         hint=hint,
                         finished_at=iso_now(),
@@ -570,7 +575,7 @@ class GridmapConversionService:
                     bound,
                     directory,
                     _record(
-                        GRID_STATUS_FAILED,
+                        GridRecordStatus.FAILED,
                         error=(
                             "the traversability recipe needs open3d, which is not "
                             f"installed ({exc})"
@@ -585,7 +590,7 @@ class GridmapConversionService:
                 bound,
                 directory,
                 _record(
-                    GRID_STATUS_OK,
+                    GridRecordStatus.OK,
                     footprint_m2=round(measure.footprint_m2, 1),
                     floor_area_m2=round(measure.floor_area_m2, 1),
                     params=params,

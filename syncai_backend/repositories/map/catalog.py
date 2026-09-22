@@ -4,6 +4,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import List, Optional, Tuple
 
 import structlog
@@ -29,13 +30,67 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 GRIDMAP_RECIPE_SIDECAR = "gridmap.recipe.json"
 GRIDMAP_RECIPE_SIDECAR_PREV = "gridmap_prev.recipe.json"
 
-# The ``status`` values the sidecar can carry. Deliberately only the three a
-# conversion itself can write: "a thread is running" is process state, not disk
-# state, so "interrupted" is not one of them — it is what the REST layer
-# *derives* from a sidecar that says ``converting`` with no thread behind it.
-GRID_STATUS_CONVERTING = "converting"
-GRID_STATUS_OK = "ok"
-GRID_STATUS_FAILED = "failed"
+# The rest of that vocabulary, named here for the same reason and used
+# throughout this module instead of the literals it grew up with: the four
+# current files, then the generation ``archive_gridmap`` sets aside before a
+# re-convert. ``gridmap_raw.pgm`` is the pristine snapshot the z-band recipe
+# writes once, so "the grid as converted" survives an operator's patches.
+GRIDMAP_PGM = "gridmap.pgm"
+GRIDMAP_YAML = "gridmap.yaml"
+GRIDMAP_RAW_PGM = "gridmap_raw.pgm"
+POINTCLOUD_PCD = "map.pcd"
+
+GRIDMAP_PREV_PGM = "gridmap_prev.pgm"
+GRIDMAP_PREV_YAML = "gridmap_prev.yaml"
+GRIDMAP_PREV_RAW_PGM = "gridmap_prev_raw.pgm"
+
+
+class GridRecordStatus(str, Enum):
+    """The ``status`` values the sidecar on disk can carry.
+
+    Deliberately only the three a conversion itself can write: "a thread is
+    running" is process state, not disk state, so ``interrupted`` is not one of
+    them — it is what the REST layer *derives* from a sidecar that says
+    ``converting`` with no thread behind it.
+
+    **Not to be confused with ``GridStatus`` in ``interfaces/rest/routers/map.py``**,
+    which is the *wire* contract and has five members. Three of its values are
+    spelled identically to these, and that overlap is the reason these two are
+    separate types rather than one: this enum is the vocabulary of a file on
+    disk, that one is what a client is promised, and the two sets are allowed to
+    drift apart. Nothing should convert between them except that module's
+    ``_grid_status``, which is where the reconciliation deliberately lives.
+
+    ``str`` mixin (not ``enum.StrEnum``, which is 3.11+ and this runs on ROS
+    Humble's 3.10) so members serialise through ``json.dumps`` as their bare
+    value and compare equal to the plain strings older sidecars hold.
+    """
+
+    CONVERTING = "converting"
+    OK = "ok"
+    FAILED = "failed"
+
+    @classmethod
+    def parse(cls, value: object) -> Optional["GridRecordStatus"]:
+        """The member ``value`` names, or None if it names nothing this build knows.
+
+        Tolerant on purpose, and the tolerance is load-bearing twice over. The
+        sidecar is untrusted input: it is read once per map on every catalogue
+        listing, possibly while a conversion is rewriting it, so a value this
+        build does not recognise must degrade one card rather than raise into
+        the listing every screen depends on. And a status written by a *newer*
+        backend is read by an older one after a rollback — the same
+        forward-compatibility rule the stored task-template steps follow.
+
+        None puts the caller on the same path as a sidecar with no status at
+        all: what the map has on disk is the only evidence.
+        """
+        if not isinstance(value, str):
+            return None
+        try:
+            return cls(value)
+        except ValueError:
+            return None
 
 
 @dataclass(frozen=True)
@@ -59,7 +114,7 @@ class GridRecord:
     every other status.
     """
 
-    status: str
+    status: GridRecordStatus
     error: Optional[str]
 
 
@@ -107,10 +162,25 @@ class MapCatalogRepo:
 
         return candidate
 
+    def _artifact_path(self, name: str, filename: str) -> Optional[str]:
+        """Path of ``filename`` inside map ``name``, or None if it is not there.
+
+        The shared body of the three accessors below, which differ only in the
+        filename. They stay as three named methods rather than collapsing into
+        one public ``artifact_path(name, GRIDMAP_PGM)``: every caller is in the
+        REST layer asking for one specific thing, and ``gridmap_yaml_path(name)``
+        says what it wants where a constant passed as an argument would make the
+        reader look it up.
+
+        ``resolve_dir`` first, always -- it is the path-traversal check, and the
+        reason no caller is allowed to join a name onto ``maps_dir`` itself.
+        """
+        path = os.path.join(self.resolve_dir(name), filename)
+        return path if os.path.isfile(path) else None
+
     def gridmap_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``gridmap.pgm``, or None if absent."""
-        path = os.path.join(self.resolve_dir(name), "gridmap.pgm")
-        return path if os.path.isfile(path) else None
+        return self._artifact_path(name, GRIDMAP_PGM)
 
     def gridmap_yaml_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``gridmap.yaml``, or None if absent.
@@ -126,8 +196,7 @@ class MapCatalogRepo:
         the INI's ``[map] map`` also sidesteps a second trap: that value is
         *relative* to the workspace root.
         """
-        path = os.path.join(self.resolve_dir(name), "gridmap.yaml")
-        return path if os.path.isfile(path) else None
+        return self._artifact_path(name, GRIDMAP_YAML)
 
     def pointcloud_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``map.pcd``, or None if absent.
@@ -136,8 +205,7 @@ class MapCatalogRepo:
         so the REST layer can parse it, rather than making the caller rebuild it
         from ``resolve_dir`` and re-do the containment checks.
         """
-        path = os.path.join(self.resolve_dir(name), "map.pcd")
-        return path if os.path.isfile(path) else None
+        return self._artifact_path(name, POINTCLOUD_PCD)
 
     # --- Listing ------------------------------------------------------------
 
@@ -313,8 +381,8 @@ class MapCatalogRepo:
         is a property of the store, true for any future caller.
         """
         directory = self.resolve_dir(name)
-        raw_path = os.path.join(directory, "gridmap_raw.pgm")
-        grid_path = os.path.join(directory, "gridmap.pgm")
+        raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
+        grid_path = os.path.join(directory, GRIDMAP_PGM)
         if not os.path.isfile(raw_path) or not os.path.isfile(grid_path):
             return False
         try:
@@ -363,17 +431,17 @@ class MapCatalogRepo:
         POST /api/v1/maps path) is a no-op, not an error.
         """
         directory = self.resolve_dir(name)
-        grid_path = os.path.join(directory, "gridmap.pgm")
+        grid_path = os.path.join(directory, GRIDMAP_PGM)
         if not os.path.isfile(grid_path):
             return
 
-        shutil.copy2(grid_path, os.path.join(directory, "gridmap_prev.pgm"))
-        yaml_path = os.path.join(directory, "gridmap.yaml")
+        shutil.copy2(grid_path, os.path.join(directory, GRIDMAP_PREV_PGM))
+        yaml_path = os.path.join(directory, GRIDMAP_YAML)
         if os.path.isfile(yaml_path):
-            shutil.copy2(yaml_path, os.path.join(directory, "gridmap_prev.yaml"))
-        raw_path = os.path.join(directory, "gridmap_raw.pgm")
+            shutil.copy2(yaml_path, os.path.join(directory, GRIDMAP_PREV_YAML))
+        raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
         if os.path.isfile(raw_path):
-            os.replace(raw_path, os.path.join(directory, "gridmap_prev_raw.pgm"))
+            os.replace(raw_path, os.path.join(directory, GRIDMAP_PREV_RAW_PGM))
         sidecar_path = os.path.join(directory, GRIDMAP_RECIPE_SIDECAR)
         if os.path.isfile(sidecar_path):
             os.replace(sidecar_path, os.path.join(directory, GRIDMAP_RECIPE_SIDECAR_PREV))
@@ -407,7 +475,7 @@ class MapCatalogRepo:
         map stops loading entirely.
         """
         directory = self.resolve_dir(name)
-        path = os.path.join(directory, "gridmap.pgm")
+        path = os.path.join(directory, GRIDMAP_PGM)
 
         # Re-checked here even though the router already 404'd on a map without a
         # grid. Without it a race would *create* a gridmap.pgm in a directory that
@@ -422,7 +490,7 @@ class MapCatalogRepo:
         # back to the conversion tool's result. copy2 rather than copy to keep the
         # original mtime: otherwise the backup becomes the newest file under
         # _walk_stats and drags the card's modified_at forward to now.
-        raw_path = os.path.join(directory, "gridmap_raw.pgm")
+        raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
         if not os.path.exists(raw_path):
             shutil.copy2(path, raw_path)
             self.logger.info("[MapCatalogRepo] Kept the pre-edit gridmap", map=name, path=raw_path)
@@ -461,7 +529,7 @@ class MapCatalogRepo:
         return StoredMap(
             name=name,
             grid=self._read_grid(name, path),
-            has_pointcloud=os.path.isfile(os.path.join(path, "map.pcd")),
+            has_pointcloud=os.path.isfile(os.path.join(path, POINTCLOUD_PCD)),
             size_bytes=size_bytes,
             modified_at=datetime.fromtimestamp(newest_mtime, tz=timezone.utc),
             grid_record=self._read_grid_record(name, path),
@@ -470,12 +538,13 @@ class MapCatalogRepo:
     def _read_grid_record(self, name: str, path: str) -> Optional[GridRecord]:
         """Read how the last conversion ended off the sidecar, or None.
 
-        None means "the sidecar says nothing usable", which covers four cases
+        None means "the sidecar says nothing usable", which covers five cases
         that all want the same treatment: no sidecar (a map saved before the
         status field existed, or one whose conversion never started), a sidecar
-        written by that older code and so carrying no ``status``, an unreadable
-        one, and a malformed one. In each, what the map *has* is the only
-        evidence — a grid on disk or not.
+        written by that older code and so carrying no ``status``, one carrying a
+        ``status`` this build does not know (see ``GridRecordStatus.parse``), an
+        unreadable one, and a malformed one. In each, what the map *has* is the
+        only evidence — a grid on disk or not.
 
         Never raises. This runs once per map on every catalogue listing, and a
         conversion is writing this exact file in another thread while it does;
@@ -502,8 +571,8 @@ class MapCatalogRepo:
 
         if not isinstance(document, dict):
             return None
-        status = document.get("status")
-        if not isinstance(status, str):
+        status = GridRecordStatus.parse(document.get("status"))
+        if status is None:
             return None
         error = document.get("error")
         return GridRecord(status=status, error=error if isinstance(error, str) else None)
@@ -516,8 +585,8 @@ class MapCatalogRepo:
         catalogue listing down with it. The reason is logged, because "the card
         says no 2D grid but the files are right there" is otherwise a mystery.
         """
-        yaml_path = os.path.join(path, "gridmap.yaml")
-        pgm_path = os.path.join(path, "gridmap.pgm")
+        yaml_path = os.path.join(path, GRIDMAP_YAML)
+        pgm_path = os.path.join(path, GRIDMAP_PGM)
         if not os.path.isfile(yaml_path) or not os.path.isfile(pgm_path):
             return None
 

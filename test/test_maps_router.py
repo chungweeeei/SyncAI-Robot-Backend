@@ -277,6 +277,33 @@ def test_list_reports_ok_for_a_sidecar_written_before_the_status_field(
     assert _by_name(client.get("/api/v1/maps").json())["full"]["grid_status"] == "ok"
 
 
+def test_list_reports_ok_for_a_status_this_build_does_not_know(client, maps_dir):
+    """A sidecar written by a newer backend, read after a rollback.
+
+    GridRecordStatus.parse returns None for a value it cannot name, which puts
+    this on the same path as a sidecar with no status at all: the grid on disk
+    decides. The requirement is that it does not raise -- this read runs once
+    per map on every catalogue listing, which every screen polls.
+    """
+    _plant_sidecar(
+        maps_dir / "full", {"status": "cancelled", "recipe": "z-band"}
+    )
+
+    entry = _by_name(client.get("/api/v1/maps").json())["full"]
+
+    assert entry["grid_status"] == "ok"
+    assert entry["grid_error"] is None
+
+
+def test_list_reports_none_for_an_unknown_status_over_no_grid(client, maps_dir):
+    """The other half of the same fallthrough: no grid, so `none`, not `ok`."""
+    _plant_sidecar(
+        maps_dir / "rawonly", {"status": "cancelled", "recipe": "z-band"}
+    )
+
+    assert _by_name(client.get("/api/v1/maps").json())["rawonly"]["grid_status"] == "none"
+
+
 def test_list_reports_a_failed_conversion_with_its_reason(client, maps_dir):
     """The whole point of the sidecar carrying a status: before it, this map was
     indistinguishable from one nobody had converted and the reason lived only in

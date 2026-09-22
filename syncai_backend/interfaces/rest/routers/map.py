@@ -32,8 +32,7 @@ from syncai_backend.helpers.pointcloud import (
     voxel_downsample,
 )
 from syncai_backend.repositories.map.catalog import (
-    GRID_STATUS_CONVERTING,
-    GRID_STATUS_FAILED,
+    GridRecordStatus,
     MapCatalogRepo,
     StoredMap,
 )
@@ -156,9 +155,14 @@ class GridStatus(str, Enum):
     """How this map's 2D gridmap stands: the conversion-status surface.
 
     Five states, of which the sidecar on disk can only ever hold three (see
-    GRID_STATUS_* in the catalogue repo). ``interrupted`` and ``none`` are
+    ``GridRecordStatus`` in the catalogue repo). ``interrupted`` and ``none`` are
     derived — the first from a sidecar claiming to be mid-conversion with no
     thread behind it, the second from the absence of both a grid and a record.
+
+    A separate type from ``GridRecordStatus`` even though three of the values are
+    spelled the same, because this one is the promise made to a client and that
+    one is the vocabulary of a file on disk. ``_grid_status`` below is the only
+    place the two meet.
 
     The distinction that matters is between ``none`` and the two failure states.
     All three leave a map the nav stack cannot load, but they call for different
@@ -499,9 +503,9 @@ def _grid_status(stored: StoredMap, converting: bool) -> Tuple[GridStatus, Optio
 
     record = stored.grid_record
     if record is not None:
-        if record.status == GRID_STATUS_CONVERTING:
+        if record.status is GridRecordStatus.CONVERTING:
             return GridStatus.INTERRUPTED, None
-        if record.status == GRID_STATUS_FAILED:
+        if record.status is GridRecordStatus.FAILED:
             return GridStatus.FAILED, record.error
 
     return (GridStatus.OK if stored.grid is not None else GridStatus.NONE), None
