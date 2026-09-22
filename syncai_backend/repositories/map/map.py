@@ -6,9 +6,11 @@ from contextlib import contextmanager
 from typing import Optional, TypedDict
 
 from sqlalchemy import Engine, delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from syncai_backend.database.models import MapPoint, _utcnow
+from syncai_backend.exceptions import ConflictError
 
 
 class VertexFields(TypedDict):
@@ -40,6 +42,12 @@ class MapRepo:
         with self.session_maker() as session:
             try:
                 yield session
+            except ConflictError:
+                # A domain outcome this repo produced on purpose (a duplicate
+                # vertex name), not a database that misbehaved. Logging it at
+                # ERROR with a traceback would put a stack trace in the journal
+                # every time an operator types a name twice.
+                raise
             except Exception:
                 self.logger.error(f"[MapRepo][{op}] database operation failed", exc_info=True)
                 raise
@@ -66,12 +74,43 @@ class MapRepo:
 
         Each dict carries the column values (name/type/x/y/theta).
         All rows are committed together, so a failure inserts none of them.
+
+        Raises ConflictError when a name is already taken on this map, or when
+        the batch repeats one within itself — ``uq_map_vertices_map_name``
+        cannot tell those apart, and neither answer differs to the caller.
         """
         with self._session(op="create_vertices") as session:
             rows = [MapPoint(map=map, **fields) for fields in vertices]
             session.add_all(rows)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                # The constraint is the check; this only translates it. A
+                # SELECT-then-INSERT here would race, and would have to be
+                # repeated in update_vertex -- see MapPoint.__table_args__.
+                raise ConflictError(
+                    self._name_taken_detail(map, [fields["name"] for fields in vertices]),
+                    code="vertex_name_taken",
+                ) from exc
             return rows
+
+    @staticmethod
+    def _name_taken_detail(map: str, names: list[str]) -> str:
+        """The 409 sentence for a rejected insert.
+
+        The database reports the constraint, not which row tripped it, and a
+        batch arrives as one statement. Rather than issue another query on the
+        error path to find out, the message names the whole submitted set and
+        says the collision is somewhere in it — true for both the "already on
+        the map" and the "repeated within this batch" case.
+        """
+        if len(names) == 1:
+            return f"A vertex in '{map}' is already named '{names[0]}'."
+        listed = ", ".join(repr(name) for name in names)
+        return (
+            f"Vertex names must be unique within '{map}', and one of "
+            f"{listed} is already taken or repeated in this request."
+        )
 
     def list_vertices(
         self, map: Optional[str] = None, type: Optional[str] = None
@@ -101,6 +140,12 @@ class MapRepo:
             return session.get(MapPoint, vertex_id)
 
     def update_vertex(self, vertex_id: uuid.UUID, **fields) -> Optional[MapPoint]:
+        """Apply ``fields`` to one vertex; None when no such vertex exists.
+
+        Raises ConflictError when the rename would collide with another vertex
+        on the same map. Renaming to the name it already has is not a collision
+        -- the row is excluded from its own constraint check.
+        """
         # Only these columns may be updated through the API.
         allowed = {"name", "type", "x", "y", "theta"}
         changes = {k: v for k, v in fields.items() if k in allowed and v is not None}
@@ -110,11 +155,33 @@ class MapRepo:
             if vertex is None:
                 return None
 
+            # Read for the error message before the commit that may fail: a
+            # rolled-back session expires its objects, so touching the instance
+            # afterwards would re-query inside a dead transaction.
+            owning_map = vertex.map
+            new_name = changes.get("name", vertex.name)
+
             for key, value in changes.items():
                 setattr(vertex, key, value)
 
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                raise ConflictError(
+                    self._name_taken_detail(owning_map, [new_name]),
+                    code="vertex_name_taken",
+                ) from exc
             return vertex
+
+    def delete_vertex(self, vertex_id: uuid.UUID) -> bool:
+        with self._session(op="delete_vertex") as session:
+            vertex = session.get(MapPoint, vertex_id)
+            if vertex is None:
+                return False
+
+            session.delete(vertex)
+            session.commit()
+            return True
 
     def move_vertices(
         self, old_map: str, new_map: str, session: Optional[Session] = None
@@ -172,16 +239,6 @@ class MapRepo:
             result = session.execute(delete(MapPoint).where(MapPoint.map == map))
             session.commit()
             return result.rowcount
-
-    def delete_vertex(self, vertex_id: uuid.UUID) -> bool:
-        with self._session(op="delete_vertex") as session:
-            vertex = session.get(MapPoint, vertex_id)
-            if vertex is None:
-                return False
-
-            session.delete(vertex)
-            session.commit()
-            return True
 
 
 def init_map_repo(

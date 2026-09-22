@@ -8,6 +8,8 @@ import pytest
 
 import uuid
 
+from syncai_backend.exceptions import ConflictError
+
 _MISSING_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
 
@@ -40,6 +42,51 @@ def test_create_vertices_batch_persists_all_in_order(map_repo):
     assert [v.name for v in created] == ["a", "b"]
     assert all(isinstance(v.id, uuid.UUID) for v in created)
     assert {v.id for v in map_repo.list_vertices()} == {c.id for c in created}
+
+
+def test_create_rejects_a_name_the_map_already_has(map_repo):
+    _create(map_repo, name="dock")
+
+    with pytest.raises(ConflictError) as caught:
+        _create(map_repo, name="dock", x=9.0)
+
+    assert caught.value.code == "vertex_name_taken"
+    assert "dock" in str(caught.value)
+    assert len(map_repo.list_vertices(map="warehouse")) == 1
+
+
+def test_create_allows_the_same_name_on_a_different_map(map_repo):
+    # The constraint is (map, name), not name: every map is expected to have
+    # its own "dock", and forbidding that would be the wrong fix.
+    first = _create(map_repo, name="dock", map="warehouse")
+    second = _create(map_repo, name="dock", map="lab")
+
+    assert first.id != second.id
+    assert {v.map for v in map_repo.list_vertices()} == {"warehouse", "lab"}
+
+
+def test_create_batch_rejects_a_name_repeated_within_the_request(map_repo):
+    with pytest.raises(ConflictError) as caught:
+        map_repo.create_vertices(map="warehouse", vertices=[
+            {"name": "a", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+            {"name": "a", "type": "GENERAL", "x": 1.0, "y": 1.0, "theta": 0.0},
+        ])
+
+    assert caught.value.code == "vertex_name_taken"
+    # Batch inserts are all-or-nothing, so the non-colliding row is gone too.
+    assert map_repo.list_vertices() == []
+
+
+def test_create_batch_inserts_nothing_when_one_name_collides(map_repo):
+    _create(map_repo, name="taken")
+
+    with pytest.raises(ConflictError):
+        map_repo.create_vertices(map="warehouse", vertices=[
+            {"name": "fresh", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+            {"name": "taken", "type": "GENERAL", "x": 1.0, "y": 1.0, "theta": 0.0},
+        ])
+
+    assert [v.name for v in map_repo.list_vertices()] == ["taken"]
 
 
 def test_get_returns_vertex_and_none_when_missing(map_repo):
@@ -95,6 +142,34 @@ def test_update_ignores_unknown_and_none_fields(map_repo):
     assert updated.name == "keep"  # None ignored
     assert updated.theta == 45.0
     assert not hasattr(updated, "bogus")
+
+
+def test_update_rejects_a_rename_onto_a_taken_name(map_repo):
+    _create(map_repo, name="dock")
+    other = _create(map_repo, name="desk")
+
+    with pytest.raises(ConflictError) as caught:
+        map_repo.update_vertex(other.id, name="dock")
+
+    assert caught.value.code == "vertex_name_taken"
+    assert map_repo.get_vertex(other.id).name == "desk"
+
+
+def test_update_allows_renaming_a_vertex_to_the_name_it_already_has(map_repo):
+    # A row is not its own duplicate; a no-op PUT must not 409.
+    created = _create(map_repo, name="dock")
+
+    updated = map_repo.update_vertex(created.id, name="dock", x=7.0)
+
+    assert updated.name == "dock"
+    assert updated.x == 7.0
+
+
+def test_update_allows_a_name_taken_only_on_another_map(map_repo):
+    _create(map_repo, name="dock", map="lab")
+    created = _create(map_repo, name="desk", map="warehouse")
+
+    assert map_repo.update_vertex(created.id, name="dock").name == "dock"
 
 
 def test_update_missing_returns_none(map_repo):
