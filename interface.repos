@@ -3,3 +3,18 @@ repositories:
     type: git
     url: https://github.com/chungweeeei/SyncAI-Robot-Interface.git
     version: main
+  # FAST-LIO2's `interface` package (SaveMaps / ResetMapping / Relocalize /
+  # IsValid). It has no repo of its own, so this clones the whole fork and
+  # builds only that one package out of it (`--packages-up-to syncai_backend`
+  # or `--packages-select interface`); fastlio2 / pgo / localizer need PCL and
+  # the livox driver and are never built from here.
+  #
+  # HTTPS, not the SSH URL the workspace's third-party.repos uses, so an import
+  # needs no credentials. Same path as the workspace's entry on purpose: run
+  # there, vcs finds the existing checkout, reports the URL mismatch and leaves
+  # it alone -- a different path would put every FAST-LIO2 package in the
+  # workspace twice and colcon refuses duplicate package names.
+  src/third-party/FASTLIO2_ROS2:
+    type: git
+    url: https://github.com/chungweeeei/SyncAI-Fast-LIO2.git
+    version: dev

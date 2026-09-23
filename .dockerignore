@@ -10,10 +10,6 @@
 #             the image, and main.py's load_dotenv() would then read them in
 #             preference to nothing, quietly ignoring compose's environment.
 #   .git      several MB that change on every commit, for no build input.
-#
-# Note what is NOT here: `.interface/`, the optional FAST-LIO2 interface package
-# the builder picks up (see the Dockerfile header). It has to reach the context
-# to be built.
 
 .git
 .github

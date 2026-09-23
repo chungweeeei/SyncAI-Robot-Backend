@@ -15,16 +15,20 @@ standalone. It imports generated interfaces from two other colcon packages —
 `SwitchMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`) and
 `interface` from the FAST-LIO2 fork (`SaveMaps`, `ResetMapping`, `Relocalize`,
 `IsValid`) — plus `rclpy`, `nav2_msgs`, `tf2_ros`. Keep those imports as they are.
-`syncai_common` is named in **`interface.repos`**: `vcs import <
-interface.repos` from any colcon workspace root materialises it into `src/`
-beside this package, with no `SyncAI-Robot-Workspace` checkout and no
-credentials. It lives in `SyncAI-Robot-Interface` (split out of the workspace
+Both are named in **`interface.repos`**: `vcs import < interface.repos` from
+any colcon workspace root materialises them into `src/` beside this package,
+over HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
+`syncai_common` lives in `SyncAI-Robot-Interface` (split out of the workspace
 2026-09) — edit the messages there, never in a materialised `src/syncai_common`.
 
-`interface` is **not** in that file: it sits inside the private SSH FAST-LIO2
-fork, and naming it would make every `vcs import` need credentials. It is still
-bind-mounted from a workspace checkout (see the `Dockerfile`), and the fix is to
-split it into its own repo the way `syncai_common` was.
+`interface` has no repo of its own: the entry clones the whole `SyncAI-Fast-LIO2`
+fork (branch `dev`) to `src/third-party/FASTLIO2_ROS2` — the same path the
+workspace's `third-party.repos` uses, so vcs leaves an existing checkout alone
+instead of duplicating every FAST-LIO2 package. Build only `interface` out of
+it (`--packages-up-to syncai_backend` or `--packages-select interface`);
+fastlio2 / pgo / localizer need PCL and the livox driver. `interface` is a
+**hard** import (`gateways/map/map.py`, module level) — the 2026-09-21
+`.interface/` copy + try/except stopgap is gone; do not reintroduce it.
 
 **Running** still happens inside the robot container (ROS 2 Humble / Python 3.10),
 in a workspace that also carries the nav stack, with this repo vcs-imported to
@@ -44,10 +48,9 @@ All of these run inside the robot container, from the **workspace root** after
 # Python deps (not rosdep-managed; requirements.txt is the single source of truth)
 pip install -r src/syncai_backend/requirements.txt
 
-# syncai_common, if not already in src/. `interface` is not in this file --
-# it comes from the workspace's own third-party.repos (FAST-LIO2 fork).
+# syncai_common + FAST-LIO2's interface, if not already in src/
 vcs import < src/syncai_backend/interface.repos
-colcon build --packages-select syncai_common
+colcon build --packages-select syncai_common interface
 
 # Build
 colcon build --packages-select syncai_backend --symlink-install
@@ -80,12 +83,11 @@ docker compose up -d --build                        # the runtime image as a ser
 `rmw_cyclonedds_cpp`, three bind mounts from `ROBOT_WS` for
 `~/robot_ws/{config,map,lib}`, and `~/robot_ws/record` from this repo's own
 `record/` (`RECORD_DIR`) — bags are the one thing nothing else in the stack
-reads, so they are not tied to a workspace checkout.
-Copy FAST-LIO2's `interface` to `.interface/` in the repo root to get the pgo /
-localizer services; without it the backend still runs (the import in
-`gateways/map/map.py` is wrapped in a TEMPORARY try/except) and map save / new
-map / map switch refuse. The README's *As its own container* and the Dockerfile
-header carry the rest, including why only one backend may run at a time.
+reads, so they are not tied to a workspace checkout — plus **`ipc: host`**, so
+this container shares the host's `/dev/shm` with the robot container (see
+*Mapping-mode map cloud* below). The builder stage vcs-imports both interface
+packages itself; nothing needs copying in. The README's *As its own container*
+and the Dockerfile header carry the rest, including why only one backend may run at a time.
 
 Test notes: tests `importorskip` `rclpy` / `syncai_common` / `httpx` etc., so on a machine
 without ROS most of them skip rather than fail — a green run outside the container proves
@@ -208,6 +210,20 @@ is a workflow **query**, not a table. Schedules use `SKIP` overlap; their steps 
 at registration; the original cron string and `map_name`/template ids ride in the schedule
 **memo**. `ARTIFACT` steps were removed 2026-08 — stored templates carrying one fail
 validation.
+
+### Mapping-mode map cloud (`subscribers/map_cloud_subscriber.py`)
+
+pgo's merged "map so far" arrives as a **file, not a topic payload**: pgo writes a
+binary PCD to `/dev/shm/syncai_pgo/<robot_id>/map_cloud_<seq>.pcd` (tmp + rename,
+newest two kept) and publishes a ~200 B JSON notice on `pgo/map_cloud_file`
+(`std_msgs/String`, RELIABLE + **TRANSIENT_LOCAL** depth 1 — durability must match
+pgo exactly). The 16–45 MB `PointCloud2` on `pgo/map_cloud` overflowed the kernel's
+default UDP receive buffer over CycloneDDS; do not go back to it or "fix" it with
+`net.core.rmem_max`. Requires `ipc: host` on both containers — without it notices
+arrive and every read is ENOENT. An empty notice (`points: 0`, `path: ""`) clears
+the slot (pgo's reset signal); every other failure (missing file, bad JSON, path
+outside `/dev/shm`, bad PCD) is a warning that leaves the slot untouched — never
+raise out of the callback, it would end `spin()` and the process.
 
 ### Heavy imports
 

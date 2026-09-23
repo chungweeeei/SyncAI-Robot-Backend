@@ -2,11 +2,12 @@
 
 > **Standalone repository of a colcon package.** This repo is the source of
 > truth for `syncai_backend`. It is a ROS 2 `ament_python` package that imports
-> `syncai_common` (msgs/srvs) and `interface` (FAST-LIO2's srvs). `syncai_common`
-> is named in `interface.repos`, so `vcs import < interface.repos` from a colcon
-> workspace root fetches it with no `SyncAI-Robot-Workspace` checkout and no
-> credentials. `interface` is not there yet — it lives inside a private SSH fork
-> and is still bind-mounted from a workspace checkout; see the `Dockerfile`.
+> `syncai_common` (msgs/srvs) and `interface` (FAST-LIO2's srvs). Both are named
+> in `interface.repos`, so `vcs import < interface.repos` from a colcon workspace
+> root fetches them over HTTPS with no `SyncAI-Robot-Workspace` checkout and no
+> credentials. `interface` has no repo of its own, so the whole FAST-LIO2 fork is
+> cloned and only that package is built (`--packages-up-to syncai_backend` or
+> `--packages-select interface`); see the `Dockerfile`.
 >
 > **Running** it is the other half and still needs the rest of the robot stack
 > around it: the nav stack's topics and services, Postgres, and the workspace
@@ -48,9 +49,9 @@ threads from inside its constructor:
 Two consequences worth remembering:
 
 - The executor is **multi-threaded on purpose**. Each point-cloud callback
-  (`body_cloud`, and the multi-MB `pgo/map_cloud` merges) sits in its own
-  `MutuallyExclusiveCallbackGroup` so a busy cloud frame cannot starve the
-  `robot_state` / telemetry / TF callbacks — or each other.
+  (`body_cloud`, and the multi-MB PCD reads behind `pgo/map_cloud_file`) sits
+  in its own `MutuallyExclusiveCallbackGroup` so a busy cloud frame cannot
+  starve the `robot_state` / telemetry / TF callbacks — or each other.
 - REST handlers that block — ROS service calls (up to ~70 s for wifi), psycopg2
   queries, OccupancyGrid→PNG encoding — are declared as **plain `def`, not
   `async def`**, so FastAPI runs them in its worker thread pool instead of
@@ -188,9 +189,11 @@ source frame from the message header and only pins the target frame (`map`).
 | `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
 | `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
-| `pgo/map_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, **depth 1** | already in `map`; stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only) |
+| `pgo/map_cloud_file` | `std_msgs/String` (JSON notice) | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | names a PCD in the shared `/dev/shm`; read, stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only) |
 
-Every subscription here is BEST_EFFORT, `plan` included. Its publisher is a
+Every subscription here is BEST_EFFORT — except the map-cloud notice, which
+is a 200-byte control message and is discussed below — `plan` included. Its
+publisher is a
 `rclcpp::QoS(1)` — RELIABLE — and a BEST_EFFORT subscriber still matches a
 RELIABLE publisher, so the topic connects either way; what the request gives up
 is retransmission. That costs more on this topic than on the others: they read
@@ -206,23 +209,52 @@ mid-run the route is blank until the next replan.
 The saved map is *not* subscribed. `map` and `localizer/map_cloud` used to be
 (both TRANSIENT_LOCAL, to match their latched publishers), but the map endpoints
 read the files on disk on request now — see the note at the top of
-`routers/map.py`. The one map-shaped cloud that **is** subscribed is
-`pgo/map_cloud`, pgo's merged "map so far" during a MANUAL (mapping) session:
-every message is a complete loop-closure-corrected replacement of the last, so
-`MapCloudSubscriber` uses depth 1 (a queued older merge is never worth
-delivering), skips TF (the points were placed with corrected global poses at
-merge time) and skips voxel downsampling (pgo already voxelised at its publish
-resolution). pgo publishes subscriber-gated, so this subscription is what
-un-gates it. The topic simply does not exist under `AUTO`, which is why the
-stream is silent on a navigating robot. An **empty** merge on that topic is a
-message rather than a non-event: pgo publishes one from `reset_mapping` to say
-the map has been discarded, and it is the only thing that stops a console
-drawing a map that no longer exists, so the subscriber clears its slot on it
-instead of skipping it. (A NaN-only cloud lands on that same path — `skip_nans`
-drops the rows before the count is checked, and both mean "nothing to draw".)
+`routers/map.py`. The one map-shaped cloud that **is** consumed live is pgo's
+merged "map so far" during a MANUAL (mapping) session, and it arrives as a
+**file, not a topic payload**. pgo writes each merge as a binary PCD to
+`/dev/shm/syncai_pgo/<robot_id>/map_cloud_<seq>.pcd` (tmp + rename, newest two
+kept) and publishes a ~200 B JSON notice naming it on `pgo/map_cloud_file`;
+`MapCloudSubscriber` reads the file with the same `read_pcd_xyz` the map
+endpoints use. The reason is a size cliff, not taste: a large floor at pgo's
+0.2 m voxel is ~16 MB per merge (44.7 MB at full resolution — 2.79 M points,
+2026-09), CycloneDDS sends that over UDP on `lo` as tens of thousands of
+datagrams in one burst, the kernel's default receive buffer
+(`net.core.rmem_max`, 208 KB) overflows, fragments drop, and a BEST_EFFORT
+reader loses the whole sample — the preview simply stopped once the map grew.
+Raising the sysctl is host state on every robot and only moves the cliff; a
+tmpfs write has none. The `PointCloud2` on `pgo/map_cloud` still exists for
+rviz, subscriber-gated as before, and nothing here reads it.
+
+Both containers must see the same `/dev/shm` for the path in the notice to
+mean anything, which is what `ipc: host` on this compose service **and** the
+workspace's robot service is for (a private container `/dev/shm` is 64 MB and
+would not hold two merges anyway). Without it the notices arrive and every
+read is `ENOENT`, logged as a warning, and the preview never updates.
+
+The notice is the one subscription here that is RELIABLE and
+**TRANSIENT_LOCAL** (depth 1, matching pgo's publisher exactly — a VOLATILE
+reader would match but never get the replay): latching 200 bytes is free, and
+it means a backend (re)started mid-mapping draws the current map at once
+instead of waiting for the next keyframe. Every notice is a complete
+loop-closure-corrected replacement of the last, so the subscriber uses depth 1
+(a queued older merge is never worth delivering), skips TF (the points were
+placed with corrected global poses at merge time) and skips voxel
+downsampling (pgo already voxelised at its publish resolution); `cap_points`
+stays as the wire-size guard. pgo publishes subscriber-gated, so this
+subscription is what un-gates it. The topic simply does not exist under
+`AUTO`, which is why the stream is silent on a navigating robot. An **empty**
+notice (`points: 0`, `path: ""`) is a message rather than a non-event: pgo
+publishes one from `reset_mapping` to say the map has been discarded, and it
+is the only thing that stops a console drawing a map that no longer exists, so
+the subscriber clears its slot on it instead of skipping it — and, being
+latched, it replaces the notice that named the files the reset deleted. (A
+NaN-only file lands on the same clearing path; both mean "nothing to draw".)
 That signal travels the topic on purpose, so it reaches every dashboard and
 rviz alike rather than only the client that pressed the button — which is why
-the reset's REST handler does not touch the repo itself.
+the reset's REST handler does not touch the repo itself. Every other failure
+in that callback — a file pgo already pruned, bad JSON, a path outside
+`/dev/shm`, a file that is not a PCD — is a warning that leaves the slot as it
+was: an exception out of a callback would end the executor and the process.
 
 **`RobotState` carries more than `GET /api/v1/robot/state` exposes.**
 `motor_status`' kinematic half (`q` / `dq` / `ddq` / `tau_est`), its source
@@ -589,12 +621,8 @@ image) — and `docker-compose.yml` runs the `runtime` one as a single service.
 There is no default target; name it.
 
 ```bash
-# Optional but wanted: FAST-LIO2's `interface`, which interface.repos cannot
-# name because it lives in a private SSH fork. Without it the service starts
-# anyway — `gateways/map`'s import of interface.srv is wrapped in a TEMPORARY
-# try/except — but map save, new map, map switch and relocalize all refuse.
-cp -r ~/SyncAI-Robot-Workspace/src/third-party/FASTLIO2_ROS2/interface .interface
-
+# syncai_common and FAST-LIO2's `interface` are both cloned by the builder
+# stage from interface.repos (HTTPS, no credentials); nothing to copy in first.
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -631,6 +659,12 @@ compose file; the four that bite are:
   source it creates is `root:root`, which the uid-1000 container user cannot
   write, and a missing *single-file* source is created as a directory, which
   dlopen then fails on.
+- **`ipc: host`.** pgo hands this process the mapping-mode map cloud as a PCD
+  under the host's `/dev/shm/syncai_pgo/<robot_id>` (see *ROS interfaces*),
+  and the path in its notice only names the same file if both containers
+  share the host's IPC namespace — the workspace's robot service sets this
+  too. Not a bind mount of a `/dev/shm` subdirectory, for the reason `record/`
+  and `lib/` give above: Docker would create the host source `root:root`.
 - **One backend at a time.** `NodeManager` starts this process as a byobu pane
   inside the robot container. Running the service alongside it gives two
   processes on `:3000` and, less visibly, two Temporal workers polling the same
@@ -659,23 +693,20 @@ edit is picked up by the next run with no rebuild. Its header comment carries th
 exact commands. Two things are worth
 knowing before reading a result from it:
 
-- **Get `syncai_common` in, or a third of the suite does not run.**
-  `vcs import < interface.repos` materialises it; FAST-LIO2's `interface` is
-  still bind-mounted from a workspace checkout, because it sits inside a private
-  SSH fork that `interface.repos` deliberately does not name. Measured
-  2026-09-21, on this branch:
+- **Get the two interface packages in, or a third of the suite does not run.**
+  `vcs import < interface.repos` materialises both `syncai_common` and
+  FAST-LIO2's `interface` (the whole fork is cloned; build only
+  `--packages-select syncai_common interface`). Measured 2026-09-23:
 
   | in the image | result |
   |---|---|
-  | both | 659 passed, 1 skipped (`test_copyright`, skipped on purpose) |
-  | `syncai_common` only | 625 passed, 2 skipped — `test_map_gateway` `importorskip`s `interface` and skips as a whole module |
-  | neither | 284 passed, 6 skipped, **11 collection errors** — those files reach `syncai_common` through a plain import rather than an `importorskip` |
+  | both | 704 passed, 1 skipped (`test_copyright`, skipped on purpose) |
+  | neither | 315 passed, 6 skipped, **11 collection errors** — those files reach `syncai_common` or `interface` through a plain import rather than an `importorskip` |
 
-  Anything that touches a router or a gateway needs `syncai_common` for the run
-  to mean anything. `test_map_gateway_no_interface.py` runs in all three: it
-  patches `MapGateway`'s `_INTERFACE_SRVS` flag rather than requiring the
-  package to be absent, so the guarded branch — the one the runtime image
-  currently ships — is covered wherever the suite is run.
+  Anything that touches a router or a gateway needs both for the run to mean
+  anything. (The `_INTERFACE_SRVS` guard and its
+  `test_map_gateway_no_interface.py` are gone: `interface` is a hard import
+  again, and an image without it fails in the builder.)
 - **The image runs as a non-root user on purpose.** Root bypasses file
   permission checks, so `os.access(W_OK)` answers `True` on a read-only file and
   the map router's `ini_not_writable` refusal test fails against working code.
@@ -697,13 +728,19 @@ linters (`test_copyright`, `test_flake8`, `test_pep257`).
   change, but the INI (`[map]`, `robot_id`), `.env` and the environment are all
   read during construction — a change to any of them needs a backend restart.
 - A relative topic name is not optional — see the namespace section above.
-- **Nothing here subscribes to a latched topic any more.** `map` and
+- **Exactly one latched subscription: `pgo/map_cloud_file`.** `map` and
   `localizer/map_cloud` (both TRANSIENT_LOCAL) went away with the file-based map
-  endpoints. `pgo/map_cloud` is *not* latched — it is VOLATILE, BEST_EFFORT,
-  subscriber-gated and exists only under `MANUAL`; a silent
-  `pointcloud/map/stream` on a navigating robot is the expected state, not a QoS
-  mismatch. If a latched subscription ever comes back, remember the durability
-  has to match the publisher exactly or nothing arrives.
+  endpoints; the map-cloud notice came back TRANSIENT_LOCAL on purpose, and its
+  durability has to match pgo's publisher exactly — a VOLATILE reader connects
+  and gets nothing replayed. It is subscriber-gated and exists only under
+  `MANUAL`; a silent `pointcloud/map/stream` on a navigating robot is the
+  expected state, not a QoS mismatch.
+- **The map cloud is a file in the host's `/dev/shm`, and both containers need
+  `ipc: host` to see it.** The symptom without it is not silence: notices
+  arrive, every read logs `map cloud file unreadable`, and the preview never
+  updates. Do not "fix" the size cliff by raising `net.core.rmem_max` and
+  going back to the `PointCloud2` — that is host state on every robot, and
+  16-45 MB per merge only moves the cliff.
 - `map -> pointlio_odom` only exists **after** you call `/localizer/relocalize`.
   Until then the live cloud stream is silent; the subscriber logs once on the
   first drop and once on recovery rather than per frame, so check the log if the
