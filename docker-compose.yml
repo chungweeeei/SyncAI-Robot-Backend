@@ -49,6 +49,20 @@ services:
     # addressed as 127.0.0.1 plus a published port, not `postgres:5432`.
     network_mode: host
 
+    # Host IPC namespace, so /dev/shm in here IS the host's /dev/shm — the same
+    # one the robot container sees, because its compose sets this too. That is
+    # how pgo hands this process the mapping-mode "map so far" cloud: a binary
+    # PCD under /dev/shm/syncai_pgo/<robot_id>, named by a ~200 B notice on
+    # pgo/map_cloud_file (see subscribers/map_cloud_subscriber.py). The
+    # PointCloud2 it replaced was 16-45 MB at a large site, which CycloneDDS
+    # over UDP on lo could not get through the kernel's default 208 KB socket
+    # buffer — the preview stopped once the map grew. Without this line the
+    # notices still arrive and every file read is ENOENT: the path names a
+    # file in a /dev/shm this container cannot see. Not a bind mount of a
+    # /dev/shm subdir, for the reason record/ and lib/ give below: Docker
+    # creates a missing host source root:root, which uid 1000 cannot write.
+    ipc: host
+
     # The Tegra userspace, for the WebRTC worker's video pipeline
     # (`v4l2src ! nvjpegdec ! nvvidconv ! nvv4l2h264enc`). Those three elements
     # are NOT in the Ubuntu archive and are not in this image: the nvidia

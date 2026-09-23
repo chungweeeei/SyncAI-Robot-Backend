@@ -31,32 +31,7 @@ from rclpy.qos import QoSProfile
 from geometry_msgs.msg import Point, Pose, PoseWithCovarianceStamped, Quaternion
 from std_msgs.msg import Header
 from nav2_msgs.srv import LoadMap
-# TEMPORARY (container deployment trial, 2026-09-21). FAST-LIO2's `interface`
-# package is not in the runtime image yet -- it lives in a private SSH fork that
-# interface.repos deliberately does not name -- and this module-level import is
-# what made the whole process fail to start without it. Guarded so the backend
-# comes up: the four clients it types (pgo's save_maps / reset_mapping, the
-# localizer's relocalize / relocalize_check) are simply not registered, and
-# every route that needs one answers with `_NO_INTERFACE` instead of crashing.
-#
-# REVERT by dropping a copy at .interface/ and rebuilding the image -- the flag
-# then reads True and nothing below changes behaviour. The permanent fix is to
-# split `interface` into its own repo, the way syncai_common was, and add it to
-# interface.repos; then this guard goes away entirely.
-try:
-    from interface.srv import IsValid, Relocalize, ResetMapping, SaveMaps
-
-    _INTERFACE_SRVS = True
-except ImportError:  # pragma: no cover - depends on what is in the image
-    IsValid = Relocalize = ResetMapping = SaveMaps = None
-    _INTERFACE_SRVS = False
-
-# One sentence, shared by every caller, and it names the cause rather than the
-# symptom: "service is not available" would read as a robot in the wrong mode.
-_NO_INTERFACE = (
-    "FAST-LIO2's `interface` package is missing from this backend image, so pgo "
-    "and localizer services cannot be called (map save, new map, map switch)."
-)
+from interface.srv import IsValid, Relocalize, ResetMapping, SaveMaps
 
 
 # LoadMap.srv carries no `message` field -- only `uint8 result` and the grid --
@@ -116,19 +91,6 @@ class MapGateway:
             srv_name="map_server/load_map",
         )
 
-        # TEMPORARY: everything below this point is typed by `interface`. Without
-        # it only load_map -- which is nav2_msgs and always present -- is
-        # registered, and the keys the other four would occupy stay absent, so
-        # `self._service_clients.get(...)` answers None and the guards in each
-        # method fire.
-        if not _INTERFACE_SRVS:
-            self._service_clients["load_map"] = load_map_client
-            self._logger.warning(
-                "[MapGateway] `interface` not installed — pgo and localizer "
-                "clients not registered; map save / reset / switch will refuse"
-            )
-            return
-
         save_maps_client = self._node.create_client(
             srv_type=SaveMaps,
             srv_name="pgo/save_maps",
@@ -184,12 +146,6 @@ class MapGateway:
         lost localization has no cached state and therefore no mode -- and that
         is exactly the robot whose operator most wants to switch maps.
         """
-        # TEMPORARY: `relocalize` is one of the clients that is not registered
-        # without `interface`, and a missing key here would be a KeyError rather
-        # than a False. The honest answer in that state is "no".
-        if not _INTERFACE_SRVS:
-            return False
-
         return all(
             self._service_clients[key].wait_for_service(timeout_sec=timeout_sec)
             for key in ("relocalize", "load_map")
@@ -223,9 +179,6 @@ class MapGateway:
         which the timer picks up on its next 200 ms cycle. Dropping the second
         call reintroduces the freeze.
         """
-        if not _INTERFACE_SRVS:  # TEMPORARY
-            return False, _NO_INTERFACE
-
         relocalize_client = self._service_clients.get("relocalize")
         if not relocalize_client.wait_for_service(timeout_sec=5.0):
             return False, "relocalize service is not available."
@@ -300,9 +253,6 @@ class MapGateway:
         inside a REST handler, and the operator's recourse -- setting an initial
         pose from the dashboard -- is the same either way.
         """
-        if not _INTERFACE_SRVS:  # TEMPORARY
-            return None
-
         check_client = self._service_clients.get("relocalize_check")
         if not check_client.wait_for_service(timeout_sec=1.0):
             return None
@@ -370,9 +320,6 @@ class MapGateway:
 
     def save_map(self, directory: str) -> tuple[bool, str]:
 
-        if not _INTERFACE_SRVS:  # TEMPORARY
-            return False, _NO_INTERFACE
-
         save_maps_client = self._service_clients.get("save_maps")
         if not save_maps_client.wait_for_service(timeout_sec=5.0):
             # Name the mode: pgo runs only in the mapping (MANUAL) session, and
@@ -423,9 +370,6 @@ class MapGateway:
         clouds -- hundreds of MB after a long run. Generous, still bounded, and
         it holds a FastAPI worker thread for the duration.
         """
-        if not _INTERFACE_SRVS:  # TEMPORARY
-            return False, _NO_INTERFACE
-
         reset_client = self._service_clients.get("reset_mapping")
         if not reset_client.wait_for_service(timeout_sec=5.0):
             # Named the same way save_maps names it, and for the same reason:

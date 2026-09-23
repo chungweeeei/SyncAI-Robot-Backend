@@ -3,8 +3,9 @@
 #   base     ROS 2 Humble + this package's pip dependencies. Shared by
 #            everything below and by far the most expensive layer (~20 min on
 #            aarch64), so nothing that changes often goes in it.
-#     ├─ builder  colcon-builds this package and syncai_common into an install
-#     │           space. Throwaway: only its /ros2_ws/install survives.
+#     ├─ builder  colcon-builds this package, syncai_common and interface into
+#     │           an install space. Throwaway: only its /ros2_ws/install
+#     │           survives.
 #     ├─ runtime  base + that install space. `ros2 launch`, non-root, no
 #     │           compilers, no test tooling. This is what docker-compose runs.
 #     └─ dev      base + the ament linters and pytest. Source is bind-mounted,
@@ -18,40 +19,27 @@
 # stage, and which stage that is should not be the thing that decides whether
 # you get a service or a test harness. Name it.
 #
-# ── the missing package ──────────────────────────────────────────────────────
+# ── the generated interfaces ─────────────────────────────────────────────────
 #
 # This repo imports generated interfaces from two other colcon packages, and
-# they arrive by different routes:
+# both come from `vcs import < interface.repos` in the builder stage below, over
+# HTTPS, with no workspace checkout and no credentials:
 #
-#   syncai_common  -- `vcs import < interface.repos`, from its own repo, in the
-#                     builder stage below. No workspace checkout, no credentials.
+#   syncai_common  -- its own repo, SyncAI-Robot-Interface.
 #   interface      -- FAST-LIO2's srvs (SaveMaps / ResetMapping / Relocalize /
-#                     IsValid). Still inside the private SSH FAST-LIO2 fork, so
-#                     naming it in interface.repos would make every import need
-#                     credentials. It is NOT in this image.
+#                     IsValid). It has no repo of its own, so the whole
+#                     SyncAI-Fast-LIO2 fork is cloned and only `interface` is
+#                     built out of it; `--packages-up-to syncai_backend` is what
+#                     keeps colcon off fastlio2 / pgo / localizer, which need
+#                     PCL and the livox driver.
 #
-# Missing `interface` used to mean the process could not start at all --
-# `gateways/map/map.py` imported `interface.srv` at module level and main.py
-# imports that gateway. That import is currently wrapped in a TEMPORARY
-# try/except (see the comment on it), so the backend comes up either way and the
-# four services it types simply refuse:
+# Both are hard requirements: `gateways/map/map.py` imports `interface.srv` at
+# module level and main.py imports that gateway, so an image without it would
+# not start. The builder fails instead, which is where you want to find out.
 #
-#   with .interface/     everything works.
-#   without              REST, telemetry, point clouds, nav goals, Temporal and
-#                        the map catalogue all work; map save, new map, map
-#                        switch and relocalize answer with "`interface` is
-#                        missing from this image" and the gateway logs a warning
-#                        at startup.
-#
-# The builder stage picks the package up if you drop a copy at `.interface/` in
-# the repo root (gitignored):
-#
-#   cp -r ~/SyncAI-Robot-Workspace/src/third-party/FASTLIO2_ROS2/interface .interface
-#
-# That is a stopgap, and it is the reason this image still has a string tied to
-# a workspace checkout. The real fix is the one syncai_common already had:
-# split `interface` into its own repo and add it to interface.repos; the
-# try/except goes away with it.
+# (Until 2026-09-23 `interface` was an optional `.interface/` copy with the
+# import in a try/except, because the fork was SSH-only. It is cloneable over
+# HTTPS now; the copy, the guard and the "map save refuses" mode are gone.)
 #
 # ── dev image usage ──────────────────────────────────────────────────────────
 #
@@ -59,33 +47,17 @@
 # the host is visible to the next pytest run with no rebuild — the reason to
 # rebuild it is a change to requirements.txt, nothing else.
 #
-#   # Without either package: 284 pass, 6 skip, and 11 files cannot even be
-#   # collected because they reach syncai_common through an import rather than
-#   # through an importorskip. Useful for the helpers, the repos and the
+#   # Without the two packages: 315 pass, 6 skip, and 11 files cannot even be
+#   # collected because they reach syncai_common or interface through an import
+#   # rather than through an importorskip. Useful for the helpers, the repos and the
 #   # catalogue; not enough to trust a change to a router or a gateway.
 #   docker run --rm -v "$PWD":/ros2_ws/src/syncai_backend syncai-backend-dev
 #
-#   # With syncai_common only: 625 pass, 2 skip, nothing errors — test_map_gateway
-#   # importorskips `interface` and skips as a module, which is the whole of the
-#   # difference. vcs clones it into /ros2_ws/src and colcon builds it, a few
-#   # seconds; this needs no workspace checkout at all.
+#   # With both: 704 pass, 1 skip. vcs clones them into /ros2_ws/src and colcon
+#   # builds the two interface packages, a minute or so; this needs no workspace
+#   # checkout at all.
 #   docker run --rm -v "$PWD":/ros2_ws/src/syncai_backend syncai-backend-dev \
 #       bash -lc '
-#           cd /ros2_ws
-#           vcs import < src/syncai_backend/interface.repos
-#           colcon-build --packages-select syncai_common >/dev/null
-#           source /ros2_ws/install/setup.bash
-#           cd /ros2_ws/src/syncai_backend && python3 -m pytest test/ -q'
-#
-#   # With both: 659 pass, 1 skips. WS is a SyncAI-Robot-Workspace checkout,
-#   # needed for `interface` alone -- mounted read-only, the build writes only
-#   # to /ros2_ws. Drop this mount and the map-gateway tests go with it while
-#   # everything syncai_common covers still runs.
-#   WS=~/SyncAI-Robot-Workspace
-#   docker run --rm \
-#       -v "$PWD":/ros2_ws/src/syncai_backend \
-#       -v "$WS/src/third-party/FASTLIO2_ROS2/interface":/ros2_ws/src/interface:ro \
-#       syncai-backend-dev bash -lc '
 #           cd /ros2_ws
 #           vcs import < src/syncai_backend/interface.repos
 #           colcon-build --packages-select syncai_common interface >/dev/null
@@ -206,14 +178,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /ros2_ws
 COPY . /ros2_ws/src/syncai_backend
 
-# Three packages at most, and only one of them is unconditional:
+# Three packages, all required:
 #
-#   syncai_common  cloned by vcs from interface.repos (public, no credentials).
-#   interface      only if you dropped a copy at .interface/ — see the header.
-#                  Without it the image builds and runs, with map save / new map
-#                  / map switch refusing. Deliberately not a hard failure here,
-#                  so the image stays buildable from a clean clone with no
-#                  workspace anywhere.
+#   syncai_common  cloned by vcs from interface.repos.
+#   interface      cloned by vcs from interface.repos, as part of the whole
+#                  FAST-LIO2 fork -- see the header for why only it gets built.
 #   syncai_backend this repo.
 #
 # No --symlink-install: that flag is what disables setup.py's InstallNoSource,
@@ -221,12 +190,7 @@ COPY . /ros2_ws/src/syncai_backend
 # than source. Do not add it here to "make rebuilds faster".
 RUN source /opt/ros/humble/setup.bash \
     && vcs import < src/syncai_backend/interface.repos \
-    && if [ -d src/syncai_backend/.interface ]; then \
-           cp -r src/syncai_backend/.interface src/interface; \
-       else \
-           echo "WARNING: FAST-LIO2 'interface' not in the build context — map save / new map / map switch will refuse at runtime (see the Dockerfile header)"; \
-       fi \
-    && colcon build --install-base /ros2_ws/install \
+    && colcon build --install-base /ros2_ws/install --packages-up-to syncai_backend \
     && rm -rf build log src
 
 # =============================================================================
@@ -415,14 +379,12 @@ WORKDIR /ros2_ws/src/syncai_backend
 # In the environment variable rather than in CMD so it still applies when you
 # pass your own pytest arguments, and overridable with `-e PYTEST_ADDOPTS=` if
 # you ever do want them.
-# --continue-on-collection-errors is the third piece: with neither generated
-# interface package present, 11 files reach syncai_common through a plain import
-# (not an importorskip) and fail to collect. Left fatal, those 11 abort the run
-# and the 284 tests that would have passed never execute. They are still
-# reported as errors and the run still exits non-zero -- nothing is hidden, the
-# rest just gets to finish. `interface` no longer contributes to that count:
-# gateways/map's import of it is guarded (TEMPORARY, see the module), so the
-# files that reach it skip rather than error.
+# --continue-on-collection-errors is the third piece: with the generated
+# interface packages missing, the files that reach syncai_common or interface
+# through a plain import (not an importorskip) fail to collect. Left fatal,
+# those abort the run and the tests that would have passed never execute. They
+# are still reported as errors and the run still exits non-zero -- nothing is
+# hidden, the rest just gets to finish.
 ENV PYTEST_ADDOPTS="-p no:launch_testing -p no:launch_ros --continue-on-collection-errors"
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

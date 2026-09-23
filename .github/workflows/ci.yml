@@ -14,12 +14,12 @@
 # (root bypasses the mode-0444 check and the test fails for the wrong reason).
 # A second copy of that list in YAML is a second copy to keep in sync.
 #
-# What CI does NOT have: FAST-LIO2's `interface`. It lives in a private SSH fork
-# and is not in interface.repos (see the Dockerfile header), so `.interface/` is
-# never in this build context and test_map_gateway.py importorskips itself away.
-# `syncai_common` IS public and IS in interface.repos, so it is imported and
-# built below -- without it 11 files reach it through a plain import and fail to
-# collect, which is the difference between a meaningful run and a useless one.
+# Both generated-interface packages are imported and built below. Neither is
+# optional: `syncai_common` and FAST-LIO2's `interface` are reached through
+# plain imports (not importorskip) by 11 test files, which without them fail to
+# collect -- the difference between a meaningful run and a useless one. Since
+# 2026-09-23 `interface` is a hard dependency of `gateways/map/map.py`, and
+# interface.repos clones the fork over HTTPS, so CI needs no credentials for it.
 name: CI
 
 on:
@@ -92,10 +92,12 @@ jobs:
           cache-to: type=gha,mode=max,scope=syncai-backend
 
       # The source is bind-mounted rather than baked in (the dev stage copies no
-      # source at all), and syncai_common is cloned and built inside the
-      # container, into /ros2_ws/{build,install} -- paths that are NOT the mount,
-      # so nothing lands in the checkout. `colcon-build` is the image's wrapper;
-      # it sources ROS and builds with --symlink-install.
+      # source at all), and both interface packages are cloned and built inside
+      # the container, into /ros2_ws/{build,install} -- paths that are NOT the
+      # mount, so nothing lands in the checkout. `colcon-build` is the image's
+      # wrapper; it sources ROS and builds with --symlink-install. Only
+      # `interface` is built out of the FAST-LIO2 clone: fastlio2 / pgo /
+      # localizer need PCL and the livox driver.
       #
       # install/setup.bash has to be sourced by hand here: the entrypoint sources
       # it only if it already exists when the container starts, and this build
@@ -111,7 +113,7 @@ jobs:
               set -eo pipefail
               cd /ros2_ws
               vcs import < src/syncai_backend/interface.repos
-              colcon-build --packages-select syncai_common
+              colcon-build --packages-select syncai_common interface
               source /ros2_ws/install/setup.bash
               cd /ros2_ws/src/syncai_backend
               python3 -m pytest test/ -q -ra'
