@@ -77,11 +77,14 @@ repositories/              state stores: in-memory caches, PostgreSQL CRUD, and 
         │
 database/                  SQLAlchemy engine + ORM models
 
-subscribers/               ROS topics → repositories (the ingest side)
+subscribers/               ROS topics → repositories (the ingest side) — with one exception:
+                           the map cloud's topic only names a PCD, which the subscriber
+                           reads from the /dev/shm both containers share
 temporal/                  worker, RobotWorkflow, activities
-helpers/                   occupancy_grid (OccupancyGrid→PNG), pointcloud (downsample /
-                           transform / pack), pgm, pcd_to_gridmap (z-band recipe),
-                           traversable (traversability recipe), system_config (INI reader)
+helpers/                   occupancy_grid (OccupancyGrid→PNG), pointcloud (read a binary
+                           PCD, downsample / transform / pack), pgm, pcd_to_gridmap
+                           (z-band recipe), traversable (traversability recipe),
+                           system_config (INI reader)
 ```
 
 `gateways/tts` is a gateway like `robot` / `map`, but its downstream is neither
@@ -567,6 +570,14 @@ backend is also started from tests and shells that do not. Override with the
 There are **no ROS parameters** in this package — nothing calls
 `declare_parameter`. Everything configurable is the INI, the environment, or a
 constant with a comment explaining it.
+
+One of those constants spans two containers and is worth naming here:
+`MapCloudSubscriber`'s `allowed_root`, `/dev/shm`. pgo writes the mapping-mode
+map cloud to `/dev/shm/syncai_pgo/<robot_id>` and names the file in its notice;
+this side only checks the path sits under that root before reading it. Neither
+end reads the root from the INI or the environment — they agree on it by
+convention, and `ipc: host` on both compose services is what makes it the same
+tmpfs (see *ROS interfaces*). Tests pass a tmp dir; nothing else overrides it.
 
 Postgres connection is retried 20× at 5 s intervals on startup, and the
 `<robot_id>_db` database is created if absent — the backend can therefore come up

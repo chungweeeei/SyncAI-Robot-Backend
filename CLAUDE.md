@@ -89,9 +89,9 @@ this container shares the host's `/dev/shm` with the robot container (see
 packages itself; nothing needs copying in. The README's *As its own container*
 and the Dockerfile header carry the rest, including why only one backend may run at a time.
 
-Test notes: tests `importorskip` `rclpy` / `syncai_common` / `httpx` etc., so on a machine
-without ROS most of them skip rather than fail — a green run outside the container proves
-little. The DB layer is tested against in-memory SQLite (`StaticPool`); no PostgreSQL
+Test notes: tests `importorskip` `rclpy` / `syncai_common` / `interface` / `httpx` etc., so on a
+machine without ROS most of them skip rather than fail — a green run outside the container
+proves little. The DB layer is tested against in-memory SQLite (`StaticPool`); no PostgreSQL
 needed. `test_traversable.py` needs open3d, `test_pcd_to_gridmap.py` needs scipy. The
 ament linters (`test_copyright`, `test_flake8`, `test_pep257`) are part of the suite.
 
@@ -130,7 +130,8 @@ repositories/              state: in-memory single-slot caches (robot, pointclou
         │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
 database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate)
 
-subscribers/               ROS topics → repositories (ingest side)
+subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
+                           names the PCD, which the subscriber reads from the shared /dev/shm)
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), traversable, system_config
 ```
@@ -179,7 +180,11 @@ Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
 Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
 `~/robot_ws/record`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
-reliably run from the workspace root.
+reliably run from the workspace root. `/dev/shm` is absolute for a different reason: it is
+the tmpfs `ipc: host` makes common to this container and the robot's, and pgo and this
+process agree on `/dev/shm/syncai_pgo/<robot_id>` by convention — neither end reads it from
+env or INI. It is `MapCloudSubscriber`'s `allowed_root` constructor default, and tests are
+the only caller that passes anything else.
 
 ### Persistence rules worth knowing before touching `database/` or `repositories/`
 
