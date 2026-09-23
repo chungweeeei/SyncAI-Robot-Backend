@@ -32,11 +32,12 @@ every backend start, on a robot that mostly never converts a map, is not worth
 it. **Nothing imports this module at startup.** Import it inside the function
 that needs it.
 
-``POST /api/v1/maps`` runs this recipe for a **large** site only, and the z-band
-one below the area threshold — see ``GRIDMAP_RECIPE`` and ``pick_recipe`` in
-``routers/map.py`` for why the split falls that way. It is also worth running by
-hand on a site whose grid came out wrong, because ``debug_dir`` is the only way
-to see which stage rejected the floor:
+Nothing runs this recipe automatically: ``POST /api/v1/maps`` always converts
+with the z-band one, and this runs only when an operator asks for it through
+``POST /api/v1/maps/{name}/grid/convert`` — the comment above ``GRIDMAP_RECIPE``
+in ``services/gridmap_conversion.py`` records why the automatic pick was removed.
+It is worth running by hand on a site whose grid came out wrong, because
+``debug_dir`` is the only way to see which stage rejected the floor:
 
     from syncai_backend.helpers.traversable import build_traversable_cloud
     from syncai_backend.helpers.pcd_to_gridmap import convert_traversable_to_gridmap

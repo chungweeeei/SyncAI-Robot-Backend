@@ -33,6 +33,12 @@ Cell classification for ``convert_pcd_to_gridmap`` (unchanged from the tool):
              ``any`` counts a point at any z, ``none`` marks nothing free
   unknown  : everything else
 
+What "z" means in those bands is the one thing that has changed since the tool:
+given the keyframe trajectory (``floor_reference_xyz``), z is each point's height
+above the floor measured *near it* (``local_floor_levels``), so a site whose LIO
+map drifted in z is banded correctly end to end. Without the trajectory z is the
+cloud's own, as it always was.
+
 Failures raise ``ValueError`` (bad bands, oversized grid) or propagate the
 underlying ``OSError`` — the caller decides how to report them.
 """
@@ -44,6 +50,7 @@ from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import structlog
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 from syncai_backend.helpers.pgm import write_pgm
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
@@ -85,20 +92,22 @@ def floor_level(z: np.ndarray, bin_size: float = 0.10, relative_peak: float = 0.
     return float(0.5 * (edges[first] + edges[first + 1]))
 
 
-def read_poses_xy(path: str) -> np.ndarray:
-    """Read the map-frame xy of every keyframe from a pgo ``poses.txt``.
+def read_poses_xyz(path: str) -> np.ndarray:
+    """Read the map-frame xyz of every keyframe from a pgo ``poses.txt``.
 
-    Lives here rather than in ``helpers.pointcloud`` because its one consumer is
-    the pose-connectivity filter below — ``pointcloud`` is the pcd-wire-format
-    module and a keyframe pose list is not a point cloud.
+    Lives here rather than in ``helpers.pointcloud`` because its consumers are
+    the two passes below — ``pointcloud`` is the pcd-wire-format module and a
+    keyframe pose list is not a point cloud.
 
     The format is what ``pgo/save_maps`` writes next to ``map.pcd``: one line per
-    keyframe, ``<N>.pcd x y z qw qx qy qz``. Only x and y are taken — the filter
-    works on the projected 2D grid, and z/orientation carry nothing it can use.
-    Blank lines are tolerated (a trailing newline is normal); anything else
-    malformed raises ``ValueError`` with the line number, and so does an empty
-    file — a poses.txt with no poses means the save is broken in a way the
-    caller should hear about rather than silently skip.
+    keyframe, ``<N>.pcd x y z qw qx qy qz``, in trajectory order. Orientation is
+    dropped; x/y feed the pose-connectivity filter and z the local floor
+    estimate (``local_floor_levels``), which is why this reads three columns
+    where its predecessor read two. Blank lines are tolerated (a trailing
+    newline is normal); anything else malformed raises ``ValueError`` with the
+    line number, and so does an empty file — a poses.txt with no poses means the
+    save is broken in a way the caller should hear about rather than silently
+    skip.
     """
     rows = []
     with open(path, "r", encoding="utf-8") as handle:
@@ -106,19 +115,164 @@ def read_poses_xy(path: str) -> np.ndarray:
             parts = line.split()
             if not parts:
                 continue
-            if len(parts) < 3:
+            if len(parts) < 4:
                 raise ValueError(
                     f"{path}:{lineno}: expected '<name> x y z qw qx qy qz', got {line!r}"
                 )
             try:
-                rows.append((float(parts[1]), float(parts[2])))
+                rows.append((float(parts[1]), float(parts[2]), float(parts[3])))
             except ValueError:
                 raise ValueError(
-                    f"{path}:{lineno}: could not parse x/y from {line!r}"
+                    f"{path}:{lineno}: could not parse x/y/z from {line!r}"
                 )
     if not rows:
         raise ValueError(f"no poses in {path}")
     return np.asarray(rows, dtype=np.float64)
+
+
+def read_poses_xy(path: str) -> np.ndarray:
+    """The xy columns of ``read_poses_xyz`` — what the connectivity filter takes."""
+    return read_poses_xyz(path)[:, :2]
+
+
+class LocalFloorError(ValueError):
+    """The local floor could not be measured from these poses and this cloud.
+
+    Its own type so the conversion service can tell "the floor reference is
+    unusable" (retry with the global one) from every other ValueError the
+    conversion raises (an empty obstacle band, an oversized grid), which are
+    failures of the map itself.
+    """
+
+
+def local_floor_levels(
+    logger: structlog.stdlib.BoundLogger,
+    xyz: np.ndarray,
+    pose_xyz: np.ndarray,
+    *,
+    radius: float = 4.0,
+    below: float = 3.0,
+    min_points: int = 200,
+    smooth: int = 5,
+    max_deviation: float = 0.5,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Estimate the floor height under every keyframe, from the cloud around it.
+
+    Exists because of 0917_TP1F_test1 (2026-09): a 110 x 117 m single-storey
+    venue whose LIO trajectory drifted a metre in z across the site (keyframe z
+    from -0.48 to +0.51, smoothly, no step) and was pulled back at loop closure.
+    The z-band recipe placed its bands off ONE floor level for the whole cloud,
+    so wherever the map had drifted up by more than the floor band's headroom
+    the floor left the band, landed in the obstacle band, and half the venue
+    came out as speckle over unknown — while the other half was fine. No single
+    band setting fixes that, because the two halves need different ones; the
+    floor has to be measured as a function of position, and the keyframe
+    trajectory is the natural sample grid: the robot was on the floor at every
+    one of them.
+
+    Per keyframe, the points within ``radius`` (xy) that lie below the lidar and
+    no more than ``below`` under it go through ``floor_level`` — the same lowest-
+    substantial-peak estimate the global measurement uses, on a neighbourhood
+    small enough that drift is negligible inside it. Restricting to points below
+    the lidar keeps a ceiling from ever being the peak. A keyframe with fewer
+    than ``min_points`` such points (a doorway dwell, a pose at the cloud's rim)
+    gets no measurement of its own.
+
+    The measured keyframes give the lidar's height above the floor as the median
+    of ``pose_z - floor`` — a property of the robot, so it should be one number,
+    and on this fleet it is (0.46-0.48 m across three maps). That constant fills
+    the unmeasured keyframes and catches the outliers: a measurement more than
+    ``max_deviation`` from ``pose_z - height`` has locked onto something that is
+    not the floor the robot stands on (a pit seen through a railing, a lower
+    level through glass) and is replaced. A ``smooth``-wide median filter along
+    the trajectory then removes single-keyframe jitter. Both are safety rails
+    around an estimate that is already right almost everywhere, not the
+    estimate itself.
+
+    Returns the per-keyframe floor heights (same order as ``pose_xyz``) and the
+    stats the sidecar records — including ``pose_z_spread``, the p95-p5 of
+    keyframe z, which is the number that says whether a map needed this at all
+    (0.03 m on a small hall, 0.8 m on TP1F).
+    """
+    pose_xyz = np.asarray(pose_xyz, dtype=np.float64)
+    if pose_xyz.ndim != 2 or pose_xyz.shape[1] < 3:
+        raise LocalFloorError(f"expected (N, 3) poses, got shape {pose_xyz.shape}")
+    if len(pose_xyz) == 0:
+        raise LocalFloorError("no poses to measure the local floor at")
+
+    tree = cKDTree(xyz[:, :2])
+    floors = np.full(len(pose_xyz), np.nan)
+    for k, (x, y, z) in enumerate(pose_xyz):
+        idx = tree.query_ball_point([x, y], radius)
+        if len(idx) < min_points:
+            continue
+        zz = xyz[idx, 2]
+        zz = zz[(zz < z) & (zz > z - below)]
+        if len(zz) < min_points:
+            continue
+        floors[k] = floor_level(zz)
+
+    measured = np.isfinite(floors)
+    if not measured.any():
+        raise LocalFloorError(
+            "no keyframe has enough cloud around it to measure a floor — "
+            "poses.txt and map.pcd look mismatched"
+        )
+    lidar_height = float(np.median(pose_xyz[measured, 2] - floors[measured]))
+    expected = pose_xyz[:, 2] - lidar_height
+    outlier = measured & (np.abs(floors - expected) > max_deviation)
+    floors = np.where(measured & ~outlier, floors, expected)
+    if smooth > 1 and len(floors) >= smooth:
+        floors = ndimage.median_filter(floors, size=smooth, mode="nearest")
+
+    stats: Dict[str, object] = {
+        "keyframes": int(len(pose_xyz)),
+        "keyframes_measured": int(measured.sum()),
+        "keyframes_filled": int((~measured).sum()),
+        "keyframes_replaced": int(outlier.sum()),
+        "lidar_height": round(lidar_height, 3),
+        "floor_min": round(float(floors.min()), 3),
+        "floor_max": round(float(floors.max()), 3),
+        "pose_z_spread": round(
+            float(np.percentile(pose_xyz[:, 2], 95) - np.percentile(pose_xyz[:, 2], 5)), 3
+        ),
+        "radius": radius,
+    }
+    logger.info("local floor", **stats)
+    return floors, stats
+
+
+def flatten_to_local_floor(
+    xyz: np.ndarray,
+    pose_xy: np.ndarray,
+    floors: np.ndarray,
+    *,
+    neighbours: int = 4,
+) -> np.ndarray:
+    """Every point's height above the floor **near it**, not above one global floor.
+
+    The floor under a point is the inverse-distance-weighted mean of the floor
+    heights at its ``neighbours`` nearest keyframes (from ``local_floor_levels``).
+    Weighted over several rather than copied from the nearest one because a
+    corridor driven twice at different drift heights would otherwise carry a
+    Voronoi seam down its middle, with the floor band jumping by the drift at
+    the seam; blending the neighbours turns that into a ramp shorter than the
+    band's headroom. Points far from every keyframe (structure seen through
+    glass) take the floor of the nearest ones, which is the best available
+    guess and is where the pose-connectivity filter takes over anyway.
+
+    Returns ``z - floor(x, y)`` as float32 so the caller can substitute it for
+    the cloud's z column and run the band classification unchanged.
+    """
+    pose_xy = np.asarray(pose_xy, dtype=np.float64)[:, :2]
+    floors = np.asarray(floors, dtype=np.float64)
+    k = min(neighbours, len(pose_xy))
+    dist, nn = cKDTree(pose_xy).query(xyz[:, :2], k=k)
+    if k == 1:
+        return (xyz[:, 2] - floors[nn]).astype(np.float32)
+    weights = 1.0 / (dist + 1e-3)
+    floor_xy = (floors[nn] * weights).sum(axis=1) / weights.sum(axis=1)
+    return (xyz[:, 2] - floor_xy).astype(np.float32)
 
 
 def revert_unreachable_free(
@@ -372,7 +526,8 @@ def convert_pcd_to_gridmap(
     despeckle_min_size: Optional[int] = None,
     fill_holes_max_size: Optional[int] = None,
     pose_seed_xy: Optional[np.ndarray] = None,
-) -> Optional[Dict[str, int]]:
+    floor_reference_xyz: Optional[np.ndarray] = None,
+) -> Dict[str, Dict[str, object]]:
     """Convert a 3D point-cloud map into a 2D occupancy grid (pgm + yaml).
 
     Writes ``<output_basename>.pgm`` and ``<output_basename>.yaml``. The grid
@@ -387,10 +542,22 @@ def convert_pcd_to_gridmap(
     for off, replacing the CLI's flag-plus-size pairs.
 
     ``pose_seed_xy`` — (N, 2) map-frame keyframe positions (see
-    ``read_poses_xy``) — enables ``revert_unreachable_free`` as the final pass,
-    and its stats are the return value (None when no poses are given, so the
-    pre-existing callers that ignore the return are unaffected). The CLI had no
-    such flag; it postdates the CLI by a year of glass-walled venues.
+    ``read_poses_xy``) — enables ``revert_unreachable_free`` as the final pass.
+    The CLI had no such flag; it postdates the CLI by a year of glass-walled
+    venues.
+
+    ``floor_reference_xyz`` — (N, 3) keyframe positions (``read_poses_xyz``) —
+    makes the bands **relative to the local floor**: the cloud's z is replaced
+    by its height above the floor measured around the nearest keyframes
+    (``local_floor_levels`` + ``flatten_to_local_floor``) before any band is
+    applied, so ``zmin``/``zmax``/``floor_zmin``/``floor_zmax`` are then
+    offsets from the floor wherever the point is, not absolute z. Without it the
+    bands are absolute and the output is bit-identical to what this function
+    always produced.
+
+    Returns the stats of the passes that ran, keyed ``pose_filter`` and
+    ``local_floor``; an empty dict when neither was enabled. Callers spread it
+    into the recipe sidecar.
     """
     if free_mode not in ("floor", "any", "none"):
         raise ValueError(f"unknown free_mode: {free_mode!r}")
@@ -405,6 +572,16 @@ def convert_pcd_to_gridmap(
     # produced with float32 arithmetic; keep it that way so a re-conversion
     # reproduces the map it replaces.
     xyz = read_pcd_xyz(pcd_path).astype(np.float32)
+    stats: Dict[str, Dict[str, object]] = {}
+
+    if floor_reference_xyz is not None:
+        # Only z changes. xy stays the pcd's own, so the grid's origin and
+        # extent — and therefore its registration against the SLAM map frame —
+        # are exactly what the absolute-band conversion would have produced.
+        poses = np.asarray(floor_reference_xyz, dtype=np.float64)
+        floors, stats["local_floor"] = local_floor_levels(logger, xyz, poses)
+        xyz = xyz.copy()
+        xyz[:, 2] = flatten_to_local_floor(xyz, poses[:, :2], floors)
 
     obst = xyz[(xyz[:, 2] >= zmin) & (xyz[:, 2] <= zmax)]
     if free_mode == "floor":
@@ -504,11 +681,11 @@ def convert_pcd_to_gridmap(
     # before it the filter's reverted cells would be resurrected as exactly the
     # leakage it just removed (a glass-leak blob ringed by free is precisely a
     # "hole" to that pass).
-    pose_stats: Optional[Dict[str, int]] = None
     if pose_seed_xy is not None:
         grid, pose_stats = revert_unreachable_free(
             logger, grid, np.asarray(pose_seed_xy, dtype=np.float64), min_xy, resolution
         )
+        stats["pose_filter"] = dict(pose_stats)
 
     occ = int((grid == 0).sum())
     fre = int((grid == 254).sum())
@@ -520,7 +697,7 @@ def convert_pcd_to_gridmap(
     )
 
     _write_gridmap(logger, output_basename, grid, min_xy, resolution)
-    return pose_stats
+    return stats
 
 
 def convert_traversable_to_gridmap(
