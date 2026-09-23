@@ -44,6 +44,7 @@ from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 # turns its refusals into status codes. GRIDMAP_BANDS_ABOVE_FLOOR is here only
 # to validate a re-convert's band overrides before the thread starts.
 from syncai_backend.services.gridmap_conversion import (
+    FLOOR_REFERENCE_DEFAULT,
     GRIDMAP_BANDS_ABOVE_FLOOR,
     GridmapConversionService,
     iso_now,
@@ -353,14 +354,31 @@ class GridRecipe(str, Enum):
     TRAVERSABILITY = "traversability"
 
 
+class FloorReference(str, Enum):
+    """Which floor the z-band recipe's bands are offsets from.
+
+    ``local`` measures the floor around every keyframe and bands each point
+    against the floor near it, so a map whose LIO trajectory drifted in z (a
+    metre across 0917_TP1F_test1) converts correctly end to end. ``global`` is
+    one floor level for the whole cloud — the pre-2026-09 behaviour, kept as
+    the escape hatch and as what ``local`` falls back to without a poses.txt.
+    Mirrors FLOOR_REFERENCES in services/gridmap_conversion.py.
+    """
+
+    LOCAL = "local"
+    GLOBAL = "global"
+
+
 class ZBandOffsets(BaseModel):
     """Per-request overrides for the z-band recipe's bands.
 
-    Offsets from the **measured** floor level, the same convention as
-    GRIDMAP_BANDS_ABOVE_FLOOR — never absolute z, which was the per-site guess
-    the offsets exist to remove. Omitted fields keep the recipe's values. The
-    ranges are sanity rails, not tuning advice: a floor band 2 m off the floor
-    or an obstacle band 8 m tall is a typo, not a site.
+    Offsets from the **floor** — the one measured around the point under
+    ``floor_reference: local``, the cloud's single measured level under
+    ``global`` — the same convention as GRIDMAP_BANDS_ABOVE_FLOOR. Never
+    absolute z, which was the per-site guess the offsets exist to remove.
+    Omitted fields keep the recipe's values. The ranges are sanity rails, not
+    tuning advice: a floor band 2 m off the floor or an obstacle band 8 m tall
+    is a typo, not a site.
     """
 
     floor_zmin: Optional[float] = Field(None, ge=-2.0, le=2.0)
@@ -396,7 +414,16 @@ class ConvertGridRequest(BaseModel):
         ),
     )
     z_band_offsets: Optional[ZBandOffsets] = Field(
-        None, description="z-band only: band offsets from the measured floor."
+        None, description="z-band only: band offsets from the floor."
+    )
+    floor_reference: Optional[FloorReference] = Field(
+        None,
+        description=(
+            "z-band only: which floor the bands are offsets from. Omitted means "
+            f"'{FLOOR_REFERENCE_DEFAULT}' (per-keyframe, follows a z-drifted "
+            "map); 'global' is one level for the whole cloud, the older "
+            "behaviour. Recorded in gridmap.recipe.json either way."
+        ),
     )
     debug: bool = Field(
         False,
@@ -1288,6 +1315,14 @@ def init_map_router(
                 "z_band_offsets tune the z-band recipe; the traversability "
                 "recipe takes gap_fill_size."
             )
+        if (
+            request.recipe is GridRecipe.TRAVERSABILITY
+            and request.floor_reference is not None
+        ):
+            raise BadRequestError(
+                "floor_reference belongs to the z-band recipe; the traversability "
+                "recipe segments the floor itself."
+            )
 
         band_overrides: Optional[Dict[str, float]] = None
         if request.z_band_offsets is not None:
@@ -1322,9 +1357,17 @@ def init_map_router(
             else None
         )
 
+        floor_reference = (
+            request.floor_reference.value
+            if request.floor_reference is not None
+            else FLOOR_REFERENCE_DEFAULT
+        )
+
         param_overrides: Dict[str, object] = {}
         if band_overrides:
             param_overrides["z_band_offsets"] = band_overrides
+        if request.floor_reference is not None:
+            param_overrides["floor_reference"] = floor_reference
         if grid_overrides:
             param_overrides.update(grid_overrides)
         override: Dict[str, object] = {
@@ -1364,6 +1407,7 @@ def init_map_router(
             name,
             map_catalog_repo.resolve_dir(name),
             recipe_request=request.recipe.value,
+            floor_reference=floor_reference,
             band_offset_overrides=band_overrides,
             grid_overrides=grid_overrides,
             debug=request.debug,

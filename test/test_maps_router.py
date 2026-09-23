@@ -1673,12 +1673,16 @@ def test_the_z_band_bands_are_recentred_on_the_measured_floor(
 
     The fixture's floor is at -0.4, so every band must come back shifted by
     roughly that much from the offsets — not at the constants the fleet's older
-    maps were built with.
+    maps were built with. No poses.txt in this fixture, so this is the
+    ``global`` fallback of the default ``local`` reference, and the sidecar
+    has to say so.
     """
     conversion_svc.start("smallmap", small_saved_map)
     _join(conversion_threads)
 
     params = _sidecar(small_saved_map)["params"]
+    assert params["floor_reference"] == "global"
+    assert "poses.txt" in params["floor_reference_fallback"]
     floor_z = params["floor_z"]
     assert floor_z == pytest.approx(-0.4, abs=0.1)
     for key, offset in conversion_module.GRIDMAP_BANDS_ABOVE_FLOOR.items():
@@ -1686,6 +1690,138 @@ def test_the_z_band_bands_are_recentred_on_the_measured_floor(
     # The floor band actually brackets the fixture's floor, which is the whole
     # point of measuring it rather than trusting the constant.
     assert params["floor_zmin"] < -0.4 < params["floor_zmax"]
+
+
+# --- the local floor reference through the conversion --------------------------
+
+
+@pytest.fixture
+def drifting_saved_map(maps_dir, make_pcd):
+    """0917_TP1F_test1 in miniature: a floor that rises 0.8 m along 40 m of x,
+    the way a LIO map drifts across a large venue, with keyframes riding it 0.5 m
+    up and a block near the low end so the obstacle band is not empty."""
+    directory = maps_dir / "drifting"
+    os.makedirs(directory)
+    xs = np.arange(0.0, 40.0, 0.2)
+    ys = np.arange(0.0, 6.0, 0.2)
+    xx, yy = np.meshgrid(xs, ys)
+    points = [(float(x), float(y), 0.02 * float(x)) for x, y in zip(xx.ravel(), yy.ravel())]
+    # Sampled at 2 cm, not the grid's 5 cm: points spaced exactly one cell apart
+    # land on cell boundaries, float32 rounding splits them unevenly, and the
+    # block comes out dashed and is despeckled away.
+    block = np.arange(0.0, 1.0, 0.02)
+    points += [
+        (1.0 + float(bx), 1.0 + float(by), 0.02 * (1.0 + float(bx)) + float(h))
+        for bx in block
+        for by in block
+        for h in (0.5, 1.0)
+    ]
+    make_pcd(directory / "map.pcd", points=points)
+    (directory / "poses.txt").write_text(
+        "".join(
+            f"{i}.pcd {x} 3.0 {0.02 * x + 0.5} 1 0 0 0\n"
+            for i, x in enumerate(np.arange(2.0, 40.0, 2.0))
+        )
+    )
+    return str(directory)
+
+
+def _cell_reader(directory):
+    grid = cv2.imread(os.path.join(directory, "gridmap.pgm"), cv2.IMREAD_UNCHANGED)
+    with open(os.path.join(directory, "gridmap.yaml"), "r", encoding="utf-8") as handle:
+        meta = yaml.safe_load(handle)
+    res, (ox, oy, _) = meta["resolution"], meta["origin"]
+
+    def cell(x, y):
+        # pgm row 0 is max y — the writer's flip.
+        return grid[grid.shape[0] - 1 - int((y - oy) / res), int((x - ox) / res)]
+
+    return cell
+
+
+def test_the_z_band_recipe_follows_a_drifting_floor_by_default(
+    conversion_svc, drifting_saved_map, fake_traversable, conversion_threads
+):
+    """The TP1F regression: half a venue's floor drifting out of a band placed
+    off one floor level. With the default reference the far, drifted end is
+    free like the near one, the bands are recorded as the plain offsets, and
+    the sidecar carries the local-floor stats that say how far the site drifted."""
+    conversion_svc.start("drifting", drifting_saved_map)
+    _join(conversion_threads)
+
+    side = _sidecar(drifting_saved_map)
+    params = side["params"]
+    assert params["floor_reference"] == "local"
+    assert "floor_reference_fallback" not in params
+    for key, offset in conversion_module.GRIDMAP_BANDS_ABOVE_FLOOR.items():
+        assert params[key] == offset
+    assert params["local_floor"]["keyframes_measured"] == 19
+    assert params["local_floor"]["pose_z_spread"] > 0.5
+    assert params["local_floor"]["lidar_height"] == pytest.approx(0.5, abs=0.1)
+    # The global estimate is still recorded, as the diagnostic it now is.
+    assert "floor_z" in params
+    # And the pose filter still ran off the same trajectory.
+    assert params["pose_filter"]["applied"] == 1
+
+    cell = _cell_reader(drifting_saved_map)
+    assert cell(2.0, 3.0) == 254
+    assert cell(38.0, 3.0) == 254, "the drifted end of the floor is not free"
+    assert cell(1.5, 1.5) == 0, "the block on the floor was lost"
+
+
+def test_floor_reference_global_bands_against_the_single_measured_floor(
+    conversion_svc, drifting_saved_map, fake_traversable, conversion_threads
+):
+    """The escape hatch is the pre-2026-09 conversion, and on this fixture it
+    reproduces the failure: the far end leaves the floor band."""
+    conversion_svc.start("drifting", drifting_saved_map, floor_reference="global")
+    _join(conversion_threads)
+
+    params = _sidecar(drifting_saved_map)["params"]
+    assert params["floor_reference"] == "global"
+    assert "floor_reference_fallback" not in params
+    assert "local_floor" not in params
+    for key, offset in conversion_module.GRIDMAP_BANDS_ABOVE_FLOOR.items():
+        assert params[key] == pytest.approx(offset + params["floor_z"], abs=0.01)
+
+    cell = _cell_reader(drifting_saved_map)
+    assert cell(2.0, 3.0) == 254
+    assert cell(38.0, 3.0) != 254
+
+
+def test_an_unmeasurable_local_floor_falls_back_to_global_and_says_so(
+    conversion_svc, drifting_saved_map, fake_traversable, conversion_threads
+):
+    """poses.txt from some other map: no keyframe sees any cloud. The map still
+    converts — against the global level — and the sidecar records why."""
+    with open(os.path.join(drifting_saved_map, "poses.txt"), "w", encoding="utf-8") as handle:
+        handle.write("0.pcd 500.0 500.0 1.0 1 0 0 0\n1.pcd 600.0 600.0 1.0 1 0 0 0\n")
+
+    conversion_svc.start("drifting", drifting_saved_map)
+    _join(conversion_threads)
+
+    side = _sidecar(drifting_saved_map)
+    assert side["status"] == "ok"
+    params = side["params"]
+    assert params["floor_reference"] == "global"
+    assert "mismatched" in params["floor_reference_fallback"]
+    assert os.path.isfile(os.path.join(drifting_saved_map, "gridmap.pgm"))
+
+
+def test_an_unknown_floor_reference_is_refused_before_anything_is_touched(
+    conversion_svc, drifting_saved_map, conversion_threads
+):
+    archived = []
+    with pytest.raises(ValueError, match="floor_reference"):
+        conversion_svc.start(
+            "drifting",
+            drifting_saved_map,
+            floor_reference="nearest",
+            archive=lambda: archived.append(1),
+        )
+
+    assert archived == []
+    assert conversion_svc.is_converting("drifting") is False
 
 
 def test_conversion_is_skipped_without_a_pcd(
@@ -1728,9 +1864,10 @@ def test_z_band_conversion_reverts_free_space_the_poses_cannot_reach(
         for h in np.arange(0.5, 1.5, 0.25)
     ]
     make_pcd(directory / "map.pcd", points=points)
+    # Keyframes ride 0.5 m above the floor, as a lidar does.
     (directory / "poses.txt").write_text(
         "".join(
-            f"{i}.pcd {x} {y} {floor_z} 1 0 0 0\n"
+            f"{i}.pcd {x} {y} {floor_z + 0.5} 1 0 0 0\n"
             for i, (x, y) in enumerate([(2.5, 2.5), (3.0, 2.0), (2.0, 3.0)])
         )
     )
@@ -1980,6 +2117,56 @@ def test_convert_endpoint_rejects_cross_recipe_parameters(client, conversion_thr
     assert z_with_gap.status_code == 400
     assert trav_with_bands.status_code == 400
     assert list(conversion_threads) == []
+
+
+def test_convert_endpoint_rejects_a_floor_reference_for_traversability(
+    client, conversion_threads
+):
+    response = _post_convert(
+        client, "full", {"recipe": "traversability", "floor_reference": "global"}
+    )
+
+    assert response.status_code == 400
+    assert "floor_reference" in response.json()["detail"]
+    assert list(conversion_threads) == []
+
+
+def test_convert_endpoint_422s_an_unknown_floor_reference(client, conversion_threads):
+    response = _post_convert(client, "full", {"floor_reference": "nearest"})
+
+    assert response.status_code == 422
+    assert list(conversion_threads) == []
+
+
+def test_convert_endpoint_records_a_requested_floor_reference(
+    client, drifting_saved_map, fake_traversable, conversion_threads
+):
+    """``global`` asked for explicitly: the conversion uses it and the override
+    record names it, so a later reader can tell a choice from a fallback."""
+    response = _post_convert(
+        client, "drifting", {"floor_reference": "global", "reason": "compare"}
+    )
+    _join(conversion_threads)
+
+    assert response.status_code == 200
+    side = _sidecar(drifting_saved_map)
+    assert side["params"]["floor_reference"] == "global"
+    assert "floor_reference_fallback" not in side["params"]
+    assert side["recipe_override"]["param_overrides"] == {"floor_reference": "global"}
+
+
+def test_convert_endpoint_defaults_the_floor_reference_to_local(
+    client, drifting_saved_map, fake_traversable, conversion_threads
+):
+    """An empty body neither names a reference nor records one as an override:
+    the default is the service's, and the sidecar's params say which ran."""
+    response = _post_convert(client, "drifting")
+    _join(conversion_threads)
+
+    assert response.status_code == 200
+    side = _sidecar(drifting_saved_map)
+    assert side["params"]["floor_reference"] == "local"
+    assert side["recipe_override"]["param_overrides"] == {}
 
 
 def test_convert_endpoint_rejects_inverted_merged_bands(client, conversion_threads):

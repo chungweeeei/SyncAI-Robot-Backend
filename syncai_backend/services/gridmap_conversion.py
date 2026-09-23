@@ -41,10 +41,11 @@ import structlog
 
 from syncai_backend.exceptions import ConflictError, UpstreamError
 from syncai_backend.helpers.pcd_to_gridmap import (
+    LocalFloorError,
     convert_pcd_to_gridmap,
     convert_traversable_to_gridmap,
     floor_level,
-    read_poses_xy,
+    read_poses_xyz,
     write_text_atomic,
 )
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
@@ -173,11 +174,11 @@ GRIDMAP_RECIPE = dict(
     fill_holes_max_size=20000,
 )
 
-# The z-band recipe's bands, as offsets from the cloud's **measured** floor
-# level rather than absolute z. These are the numbers every gridmap on the fleet
-# before 2026-08 was built with (-0.95 / -0.25 / -0.3 / 1.5 absolute), minus the
-# floor level of dp1f, the site they were picked on: -0.66. On dp1f they
-# therefore resolve to exactly what they always were.
+# The z-band recipe's bands, as offsets from the **floor** rather than absolute
+# z. These are the numbers every gridmap on the fleet before 2026-08 was built
+# with (-0.95 / -0.25 / -0.3 / 1.5 absolute), minus the floor level of dp1f, the
+# site they were picked on: -0.66. On dp1f they therefore resolve to exactly
+# what they always were.
 #
 # They are offsets because absolute they were a per-site guess by construction —
 # z=0 in a LIO map is the lidar mount height at the mapping start pose, so a
@@ -189,12 +190,33 @@ GRIDMAP_RECIPE = dict(
 # path, walled off. Recentred, that is 0 and 10. dp1f is unchanged and dp2f
 # moves by 4 cm, which is the raw-cloud estimate disagreeing with the
 # flat-points one (see pcd_to_gridmap.floor_level) and well inside the band.
+#
+# *Which* floor they are offsets from is FLOOR_REFERENCE_DEFAULT below. One
+# floor level per cloud (``global``) was enough until 0917_TP1F_test1 (2026-09):
+# a 110 x 117 m venue whose LIO trajectory drifted a metre in z across the site
+# (keyframe z -0.48 to +0.51) — the floor band is 0.7 m tall, so half the venue
+# had its floor drift out of it and into the obstacle band, and came out as
+# speckle over unknown while the other half converted fine. The three good
+# maps drift 0.03-0.46 m, which is why they never showed it. No band setting
+# fixes a map whose two halves need different ones; measuring the floor around
+# every keyframe and banding each point against the floor *near it*
+# (pcd_to_gridmap.local_floor_levels) does — TP1F's free area went from 937 to
+# 1670 m², dp2f gained two wings that had been unknown, dp1f and vis_B2 moved
+# by 1-2%, the undrifted 09172f changed by 170 cells. So ``local`` is the
+# default and the global estimate is what the conversion falls back to when
+# there is no poses.txt to measure from.
 GRIDMAP_BANDS_ABOVE_FLOOR = dict(
     floor_zmin=-0.29,
     floor_zmax=0.41,
     zmin=0.36,
     zmax=2.16,
 )
+
+# Where the z-band recipe's floor is measured: ``local`` (per keyframe, see
+# above) or ``global`` (one level for the cloud, the pre-2026-09 behaviour and
+# the fallback without poses.txt). The router's FloorReference enum mirrors it.
+FLOOR_REFERENCES = ("local", "global")
+FLOOR_REFERENCE_DEFAULT = "local"
 
 
 class CloudMeasure(NamedTuple):
@@ -212,8 +234,9 @@ def measure_cloud(
 
     This is what remains of pick_recipe (removed 2026-09): the measurements
     survived the decision. The z-band conversion needs ``floor_z`` to recentre
-    its bands, and the two areas go into the recipe sidecar as diagnostics —
-    the module comment above GRIDMAP_RECIPE records why neither is allowed to
+    its bands when its floor reference is ``global`` (no poses.txt, or asked
+    for), and the two areas go into the recipe sidecar as diagnostics — the
+    module comment above GRIDMAP_RECIPE records why neither is allowed to
     *choose* the recipe any more. ``floor_area_m2`` counts FLOOR_AREA_CELL_M
     cells covered by points inside the z-band recipe's own floor band, so it
     reads as "the floor area that recipe would call observed"; footprint is the
@@ -351,6 +374,7 @@ class GridmapConversionService:
         directory: str,
         *,
         recipe_request: str = "z-band",
+        floor_reference: str = FLOOR_REFERENCE_DEFAULT,
         band_offset_overrides: Optional[Dict[str, float]] = None,
         grid_overrides: Optional[Dict[str, object]] = None,
         debug: bool = False,
@@ -369,10 +393,17 @@ class GridmapConversionService:
         themselves, so the pipeline cannot run away.
 
         ``recipe_request`` defaults to z-band for every caller — the module comment
-        above GRIDMAP_RECIPE records why there is no automatic pick any more. The
+        above GRIDMAP_RECIPE records why there is no automatic pick any more.
+        ``floor_reference`` (z-band only) is which floor the bands are offsets
+        from: ``local`` per keyframe, the default and the fix for a z-drifted
+        map; ``global`` one level per cloud, the older behaviour. ``local``
+        degrades to ``global`` — with a warning and a ``floor_reference_fallback``
+        in the sidecar — when poses.txt is missing or unreadable, the same way the
+        pose-connectivity filter degrades, because losing the whole gridmap to a
+        missing trajectory would cost more than the drift correction saves. The
         keyword-only extras exist for the re-convert endpoint: ``band_offset_
         overrides`` merges over GRIDMAP_BANDS_ABOVE_FLOOR (still as offsets from the
-        measured floor), ``grid_overrides`` over TRAVERSABLE_GRID_RECIPE
+        floor), ``grid_overrides`` over TRAVERSABLE_GRID_RECIPE
         (gap_fill_size), ``debug`` writes the segmentation's intermediate clouds
         into the map directory, ``override`` is recorded verbatim in the sidecar,
         ``archive`` runs synchronously once the slot is held (setting the previous
@@ -397,6 +428,11 @@ class GridmapConversionService:
         if not os.path.isfile(pcd_path):
             logger.warning("Skipping gridmap conversion: no map.pcd", map=name)
             return False
+        # A programming error, not a request error: the router's enum has
+        # already narrowed the value. Checked before the slot is taken so a
+        # typo in a caller cannot archive a grid and then leave the map wedged.
+        if floor_reference not in FLOOR_REFERENCES:
+            raise ValueError(f"unknown floor_reference: {floor_reference!r}")
 
         with self._lock:
             if name in self._active:
@@ -484,44 +520,91 @@ class GridmapConversionService:
                         "grid": dict(traversable_grid),
                     }
                 else:
-                    bands = {
-                        key: round(offset + measure.floor_z, 3)
-                        for key, offset in bands_offsets.items()
-                    }
-                    bound.info(
-                        "z-band recipe bands", floor_z=round(measure.floor_z, 3), **bands
-                    )
-                    # The pose-connectivity filter needs the keyframe trajectory pgo
-                    # writes next to the pcd. Missing or unreadable poses degrade to
-                    # an unfiltered conversion with a warning, never to a failed one:
-                    # the filter is a cleanup pass, and losing the whole gridmap to a
-                    # malformed poses.txt would cost far more than the glass-leak
-                    # speckle it removes.
-                    pose_xy = None
+                    # Both z-band passes that need the keyframe trajectory — the
+                    # local floor reference and the pose-connectivity filter — read
+                    # it from the poses.txt pgo writes next to the pcd. Missing or
+                    # unreadable poses degrade the conversion with a warning, never
+                    # fail it: the filter is a cleanup pass and the local floor a
+                    # correction, and losing the whole gridmap to a malformed
+                    # poses.txt would cost far more than either saves.
+                    poses = None
                     poses_path = os.path.join(directory, "poses.txt")
                     try:
-                        pose_xy = read_poses_xy(poses_path)
+                        poses = read_poses_xyz(poses_path)
                     except (OSError, ValueError) as exc:
                         bound.warning(
-                            "converting without the pose-connectivity filter",
+                            "converting without the keyframe trajectory: no "
+                            "pose-connectivity filter, global floor reference",
                             poses=poses_path,
                             error=str(exc),
                         )
-                    pose_stats = convert_pcd_to_gridmap(
-                        bound,
-                        pcd_path,
-                        basename,
-                        **GRIDMAP_RECIPE,
-                        **bands,
-                        pose_seed_xy=pose_xy,
-                    )
+                    reference = floor_reference
+                    fallback: Optional[str] = None
+                    if reference == "local" and poses is None:
+                        reference = "global"
+                        fallback = f"poses.txt unreadable: {poses_path}"
+
+                    def _bands(reference: str) -> Dict[str, float]:
+                        if reference == "local":
+                            # Offsets applied as-is: the helper flattens every
+                            # point to its height above the floor near it, so the
+                            # bands are already relative to the floor wherever the
+                            # point is.
+                            return dict(bands_offsets)
+                        return {
+                            key: round(offset + measure.floor_z, 3)
+                            for key, offset in bands_offsets.items()
+                        }
+
+                    def _convert(reference: str) -> Dict[str, Dict[str, object]]:
+                        bands = _bands(reference)
+                        bound.info(
+                            "z-band recipe bands",
+                            floor_reference=reference,
+                            floor_z=round(measure.floor_z, 3),
+                            **bands,
+                        )
+                        return convert_pcd_to_gridmap(
+                            bound,
+                            pcd_path,
+                            basename,
+                            **GRIDMAP_RECIPE,
+                            **bands,
+                            pose_seed_xy=poses[:, :2] if poses is not None else None,
+                            floor_reference_xyz=poses if reference == "local" else None,
+                        )
+
+                    try:
+                        pass_stats = _convert(reference)
+                    except LocalFloorError as exc:
+                        # The trajectory and the cloud disagree so badly that no
+                        # keyframe has a floor under it. That is the same input
+                        # mismatch the pose filter answers by leaving the grid
+                        # unfiltered, and it gets the same answer here: the
+                        # conversion the fleet had before the local reference
+                        # existed, plus a record of why. One extra read of the
+                        # cloud, on a path that should never be taken.
+                        bound.warning(
+                            "local floor reference unusable; converting against "
+                            "the global floor level",
+                            error=str(exc),
+                        )
+                        reference = "global"
+                        fallback = str(exc)
+                        pass_stats = _convert(reference)
+                    # floor_z is recorded under both references: under ``global``
+                    # it is what the bands were recentred on, under ``local`` it is
+                    # the diagnostic that, set against local_floor's floor_min/max,
+                    # shows how far the site drifted from any one level.
                     params = {
                         **GRIDMAP_RECIPE,
-                        **bands,
+                        **_bands(reference),
+                        "floor_reference": reference,
                         "floor_z": round(measure.floor_z, 3),
+                        **pass_stats,
                     }
-                    if pose_stats is not None:
-                        params["pose_filter"] = pose_stats
+                    if fallback is not None:
+                        params["floor_reference_fallback"] = fallback
             # ValueError is a helper's own diagnosis: an empty cloud, an intensity
             # window that selected no ground, no cluster large enough to be a floor,
             # an oversized grid. OSError is the pcd or the map directory going away
@@ -531,7 +614,9 @@ class GridmapConversionService:
                     "for the traversability recipe, re-convert through "
                     "POST /api/v1/maps/{name}/grid/convert with debug: true and "
                     "read the intermediate clouds out of the map directory; the "
-                    "z-band recipe is the same endpoint with recipe: 'z-band'"
+                    "z-band recipe is the same endpoint with recipe: 'z-band', "
+                    "and floor_reference: 'global' skips the per-keyframe floor "
+                    "measurement if that is what failed"
                 )
                 logger.error(
                     "Gridmap conversion failed",
