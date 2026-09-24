@@ -70,9 +70,13 @@ class _StubWorkflowGateway:
     def __init__(self, view):
         self.view = view
         self.created = []
+        self.retriggered = []
 
     async def create_schedule(self, schedule):
         self.created.append(schedule)
+
+    async def update_schedule_trigger(self, schedule_id, trigger):
+        self.retriggered.append((schedule_id, trigger))
 
     async def get_schedule(self, schedule_id):
         return self.view
@@ -142,6 +146,30 @@ def test_create_passes_the_map_label_through(client, workflow_gw):
     )
     assert res.status_code == 200
     assert workflow_gw.created[-1].map_name == "full"
+
+
+def test_patch_passes_the_new_trigger_through(client, workflow_gw):
+    res = client.patch(
+        "/api/v1/schedules/sched-1",
+        json={"trigger": {"cron": "0 8 * * 1-5", "timezone": "Asia/Taipei"}},
+    )
+    assert res.status_code == 200
+    assert res.json()["id"] == "sched-1"
+    schedule_id, trigger = workflow_gw.retriggered[-1]
+    assert schedule_id == "sched-1"
+    assert (trigger.cron, trigger.timezone) == ("0 8 * * 1-5", "Asia/Taipei")
+    assert trigger.interval_seconds is None
+
+
+def test_patch_reuses_the_exactly_one_trigger_validator(client, workflow_gw):
+    """Same ScheduleTriggerRequest as create, so the same 422 for cron and
+    interval given together (the task_template schedule route pins the same)."""
+    res = client.patch(
+        "/api/v1/schedules/sched-1",
+        json={"trigger": {"cron": "0 8 * * *", "interval_seconds": 60}},
+    )
+    assert res.status_code == 422
+    assert workflow_gw.retriggered == []
 
 
 # --- _read_steps ------------------------------------------------------------

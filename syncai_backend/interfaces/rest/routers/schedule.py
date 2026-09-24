@@ -62,6 +62,17 @@ class ScheduleRequest(BaseModel):
     )
 
 
+class ScheduleUpdateRequest(BaseModel):
+    trigger: ScheduleTriggerRequest = Field(
+        ...,
+        description=(
+            "The new firing rule; replaces the old one whole (a cron schedule "
+            "may become an interval one and back). Steps, map_name, provenance "
+            "and the paused state are left as they are."
+        ),
+    )
+
+
 class ScheduleResponse(BaseModel):
     id: str = Field(..., description="Unique identifier of the schedule")
     message: str = Field(..., description="Additional information about the schedule")
@@ -103,7 +114,8 @@ class ScheduleStateResponse(BaseModel):
             "schedule *list* API does not carry the start-workflow arguments. "
             "Frozen at registration: later vertex edits do not reach a scheduled "
             "run, so a client comparing these against their source template is "
-            "how staleness becomes visible."
+            "how staleness becomes visible. Only the trigger is editable "
+            "(PATCH /api/v1/schedules/{id}); it never touches these."
         ),
     )
 
@@ -191,6 +203,30 @@ def init_schedule_router(
                 StepRequest(id=step.id, type=step.type, params=step.params)
                 for step in view.steps
             ],
+        )
+
+    @schedule_router.patch("/api/v1/schedules/{id}", response_model=ScheduleResponse)
+    async def update_schedule(id: str, req: ScheduleUpdateRequest):
+        """Change when an existing schedule fires, in place.
+
+        PATCH rather than PUT because the body names one facet of the resource
+        (the same partial-update shape as ``PATCH /api/v1/maps/{name}``); the
+        schedule keeps its id, its frozen steps, its provenance and its paused
+        state. The schedule id is a Temporal identity and cannot be renamed --
+        that is a delete and a create.
+        """
+        await workflow_gw.update_schedule_trigger(
+            schedule_id=id,
+            trigger=ScheduleTrigger(
+                cron=req.trigger.cron,
+                interval_seconds=req.trigger.interval_seconds,
+                timezone=req.trigger.timezone,
+            ),
+        )
+
+        return ScheduleResponse(
+            id=id,
+            message=f"Schedule {id} trigger has been updated.",
         )
 
     @schedule_router.delete("/api/v1/schedules/{id}", response_model=ScheduleResponse)
