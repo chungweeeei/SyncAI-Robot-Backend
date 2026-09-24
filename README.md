@@ -650,12 +650,114 @@ lives in the infra compose stack and is up regardless of which session exists.
 image) — and `docker-compose.yml` runs the `runtime` one as a single service.
 There is no default target; name it.
 
+#### Step by step
+
+**1. Before the first start.** Everything the service talks to must already be
+up on the host: postgres and temporal (the workspace's infra stack), syncai_tts
+(SyncAI-TTS) and the ROS side (the robot container). Compose starts none of
+them. Then:
+
 ```bash
-# syncai_common and FAST-LIO2's `interface` are both cloned by the builder
-# stage from interface.repos (HTTPS, no credentials); nothing to copy in first.
-docker compose up -d --build
-docker compose logs -f
+# The infra, if it is not up.
+docker compose -f ~/SyncAI-Robot-Workspace/docker-compose.yml up -d postgres temporal
+
+# The WebRTC worker, built in SyncAI-WebRTC-Worker and copied in by hand.
+# Optional: without it the camera stream 502s and everything else works.
+cp /path/to/libsyncai_worker.so lib/
+
+# Stop the byobu-pane backend inside the robot container first (see
+# "One backend at a time" below) — two backends on one robot is an outage.
 ```
+
+**2. Build the image.** syncai_common and FAST-LIO2's `interface` are both
+cloned by the builder stage from `interface.repos` (HTTPS, no credentials), so
+nothing needs copying in. The `base` stage is the slow one (~20 min on aarch64
+the first time); after that only a change to `requirements.txt` rebuilds it.
+
+```bash
+docker compose build                                    # tags syncai-backend, USER_UID=${UID:-1000}
+# or, without compose — name the target, there is no default:
+docker build --target runtime --build-arg USER_UID=$(id -u) -t syncai-backend .
+```
+
+`USER_UID` must match the owner of the host's `config/`, `map/` and `record/`,
+or the container user cannot write them.
+
+**3. Run it.** Compose is the supported way to run the image — it carries the
+host networking, `ipc: host`, the nvidia runtime, the camera devices, the
+mounts and the environment, each commented in `docker-compose.yml`.
+
+```bash
+docker compose up -d                # add --build to rebuild first
+docker compose logs -f              # rclpy + uvicorn + Temporal worker, one stream
+```
+
+The knobs, all optional, set in the shell or a `.env` beside the compose file:
+
+| variable | default | what it moves |
+|---|---|---|
+| `ROBOT_WS` | `~/SyncAI-Robot-Workspace` | where `config/` and `map/` come from |
+| `ROBOT_INSTANCE` | `robot01` | which `config/instances/<name>.ini` is mounted as `system.ini` |
+| `RECORD_DIR` | `./record` | where bags land on the host |
+| `WEBRTC_LIB` | `./lib/libsyncai_worker.so` | the WebRTC worker `.so` |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | `postgres` / `postgres` | the infra stack's credentials |
+| `UID` / `GID` / `VIDEO_GID` | `1000` / `1000` / `44` | container user and the host's `video` group (`getent group video`) |
+
+```bash
+ROBOT_INSTANCE=robot02 RECORD_DIR=/mnt/ssd/record docker compose up -d
+```
+
+**4. Check it.** `/health` is always 200; the body says whether it is `ok` or
+`degraded` (Temporal down, say). The container's healthcheck turns healthy
+after up to 120 s, because postgres is retried 20 × 5 s before giving up.
+
+```bash
+docker compose ps                   # STATUS: healthy
+curl http://127.0.0.1:3000/health
+docker exec syncai_backend /usr/local/bin/entrypoint.sh ros2 node list   # /<robot_id>/... present
+```
+
+If the node comes up as `default_robot`, the per-robot INI was not mounted; if
+`ros2 topic list` in here is empty, check `ROS_DOMAIN_ID` / the RMW (both
+explained below and in the compose file).
+
+**5. Stop / restart.**
+
+```bash
+docker compose restart              # e.g. after changing .env or the WebRTC .so
+docker compose down                 # stop and remove the container
+```
+
+**Without compose.** A plain `docker run` works if it reproduces what the
+compose service sets; this is the equivalent, and it drifts the moment the
+compose file changes, so prefer compose:
+
+```bash
+WS=${ROBOT_WS:-$HOME/SyncAI-Robot-Workspace}
+R=/home/syncrobotic/robot_ws
+docker run -d --name syncai_backend --restart unless-stopped \
+    --network host --ipc host --runtime nvidia \
+    --user "$(id -u):$(id -g)" --group-add "$(getent group video | cut -d: -f3)" \
+    --workdir $R --stop-timeout 30 \
+    -e ROS_DOMAIN_ID=1 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    -e CYCLONEDDS_URI=$R/config/cyclonedds.xml -e ROS_LOG_DIR=/tmp/ros_log \
+    -e POSTGRES_HOST=127.0.0.1 -e POSTGRES_PORT=5432 \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+    -e TEMPORAL_ADDRESS=127.0.0.1:7233 -e TTS_SERVICE_URL=http://127.0.0.1:9090 \
+    -e STUN_SERVERS= -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all \
+    --device /dev/video0 --device /dev/video1 --device /dev/video2 --device /dev/video3 \
+    -v /dev/syncai:/dev/syncai:ro \
+    -v $WS/config:$R/config \
+    -v $WS/config/instances/robot01.ini:$R/config/system.ini \
+    -v $WS/map:$R/map \
+    -v "$PWD/record":$R/record \
+    -v "$PWD/lib/libsyncai_worker.so":$R/lib/libsyncai_worker.so:ro \
+    --tmpfs /tmp/ros_log:size=128m,mode=1777 \
+    syncai-backend
+```
+
+Drop the `--device` lines for cameras that are not plugged in (`docker run`
+refuses a missing device), and `--runtime nvidia` off a Jetson.
 
 The INI is mounted the way the workspace's compose mounts it: the per-robot
 `config/instances/robotNN.ini` goes **over** `config/system.ini` as a single
