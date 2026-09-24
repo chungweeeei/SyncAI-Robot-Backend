@@ -26,9 +26,11 @@ from temporalio.client import (  # noqa: E402
     Schedule,
     ScheduleActionStartWorkflow,
     ScheduleAlreadyRunningError,
+    ScheduleCalendarSpec,
     ScheduleIntervalSpec,
     ScheduleOverlapPolicy,
     ScheduleSpec,
+    ScheduleUpdate,
     WorkflowExecutionStatus,
 )
 from temporalio.exceptions import WorkflowAlreadyStartedError  # noqa: E402
@@ -55,8 +57,8 @@ from syncai_backend.gateways.workflow.workflow import (  # noqa: E402
     WorkflowGateway,
     _build_schedule_spec,
     _history_query,
+    _read_trigger,
     _spec_to_trigger,
-    _trigger_from_memo,
     init_workflow_gateway,
 )
 
@@ -88,7 +90,15 @@ def _schedule(schedule_id: str = "robot01-sched-001") -> ScheduleTask:
     )
 
 
-def _own_schedule_desc(memo: dict) -> SimpleNamespace:
+def _compiled_cron(cron: str) -> ScheduleCalendarSpec:
+    """What Temporal hands back for a cron registered by _build_schedule_spec:
+    a calendar with the ranges compiled (irrelevant here) and the string it was
+    compiled from in ``comment``. A legacy cron compiles to the same with
+    ``comment=None``."""
+    return ScheduleCalendarSpec(comment=cron)
+
+
+def _own_schedule_desc(memo: dict, spec: ScheduleSpec = None) -> SimpleNamespace:
     """A described schedule owned by this robot, in the shape the gateway reads."""
     return SimpleNamespace(
         id="robot01-sched-001",
@@ -96,7 +106,7 @@ def _own_schedule_desc(memo: dict) -> SimpleNamespace:
             action=ScheduleActionStartWorkflow(
                 WORKFLOW_TYPE_NAME, args=[], id="robot01-sched-001", task_queue=OWN_QUEUE
             ),
-            spec=ScheduleSpec(),
+            spec=spec if spec is not None else ScheduleSpec(),
             state=SimpleNamespace(paused=False),
         ),
         info=SimpleNamespace(
@@ -156,6 +166,16 @@ class TestWorkflowGateway:
         handle.delete = AsyncMock()
         handle.pause = AsyncMock()
         handle.unpause = AsyncMock()
+        # The real update() describes, hands the description to the callback
+        # and sends back what the callback returns; the stub does the same
+        # minus the RPC, so a test can inspect the ScheduleUpdate.
+        handle.updates = []
+
+        async def _update(updater):
+            update = updater(SimpleNamespace(description=describe))
+            handle.updates.append(update)
+
+        handle.update = AsyncMock(side_effect=_update)
         mock_client.get_schedule_handle.return_value = handle
         return handle
 
@@ -591,13 +611,16 @@ class TestWorkflowGateway:
         # One robot does one thing at a time: a trigger must never overlap the
         # run the previous trigger started.
         assert schedule.policy.overlap == ScheduleOverlapPolicy.SKIP
-        # The memo is the list path's only readable channel: the trigger as
-        # registered, the provenance, and (since the multi-robot scope work)
-        # the owning robot.
+        # The cron rides in the spec with itself as the `#` comment: Temporal
+        # keeps the comment on the compiled calendar, which is how get/list
+        # echo the string back after the memo stopped carrying it.
+        assert schedule.spec.cron_expressions == ["*/3 * * * * # */3 * * * *"]
+        assert schedule.spec.time_zone_name == "Asia/Taipei"
+        # The memo is the list path's only readable channel for provenance and
+        # (since the multi-robot scope work) the owning robot -- and nothing
+        # else: a memo cannot be rewritten by an update, the trigger can.
         assert kwargs["memo"] == {
             "robot_id": "robot01",
-            "cron": "*/3 * * * *",
-            "timezone": "Asia/Taipei",
             "map_name": "full",
             "task_template_id": "0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55",
             "task_template_name": "Morning patrol",
@@ -621,13 +644,20 @@ class TestWorkflowGateway:
 
     # ==================== get_schedule ====================
 
-    def test_get_schedule_reads_the_trigger_from_the_memo(self, workflow_gw, mock_client):
-        # Temporal normalises cron_expressions into calendar specs, so the memo
-        # — not the spec — is what round-trips the registered string.
+    def test_get_schedule_reads_the_cron_from_the_calendar_comment(
+        self, workflow_gw, mock_client
+    ):
+        # Temporal compiles cron_expressions into calendar specs and forgets the
+        # string, but keeps the `# comment` -- that, not the memo, is what
+        # round-trips the registered cron.
         self._schedule_handle(
             mock_client,
             describe=_own_schedule_desc(
-                {"cron": "*/3 * * * *", "timezone": "Asia/Taipei", "map_name": "full"}
+                {"map_name": "full"},
+                spec=ScheduleSpec(
+                    calendars=[_compiled_cron("*/3 * * * *")],
+                    time_zone_name="Asia/Taipei",
+                ),
             ),
         )
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
@@ -639,13 +669,31 @@ class TestWorkflowGateway:
         assert view.paused is False
         assert view.next_run_times[0].tzinfo is not None
 
+    def test_get_schedule_reads_a_legacy_trigger_from_the_memo(
+        self, workflow_gw, mock_client
+    ):
+        """A cron registered before the calendar comment existed compiled to a
+        comment-less calendar, so the memo's copy is the only string left."""
+        self._schedule_handle(
+            mock_client,
+            describe=_own_schedule_desc(
+                {"cron": "*/3 * * * *", "timezone": "Asia/Taipei"},
+                spec=ScheduleSpec(calendars=[ScheduleCalendarSpec()]),
+            ),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            view = asyncio.run(workflow_gw.get_schedule("robot01-sched-001"))
+
+        assert view.trigger.cron == "*/3 * * * *"
+        assert view.trigger.timezone == "Asia/Taipei"
+
     def test_get_schedule_reads_legacy_provenance_memo_keys(
         self, workflow_gw, mock_client
     ):
         """Schedules registered before the TaskTemplate rename carry
-        saved_task_* memo keys. A memo is immutable history -- nothing can
-        rewrite the ones already in Temporal -- so the view must keep reading
-        them forever."""
+        saved_task_* memo keys. A memo is immutable on the server -- nothing
+        can rewrite the ones already in Temporal -- so the view must keep
+        reading them forever."""
         self._schedule_handle(
             mock_client,
             describe=_own_schedule_desc(
@@ -713,6 +761,102 @@ class TestWorkflowGateway:
         handle.pause.assert_not_awaited()
         handle.unpause.assert_not_awaited()
         handle.delete.assert_not_awaited()
+
+    # ==================== update_schedule_trigger ====================
+
+    def test_update_schedule_trigger_swaps_only_the_spec(
+        self, workflow_gw, mock_client
+    ):
+        """Cron -> interval, in place: the callback hands back the described
+        schedule with a new spec and everything else -- the frozen action,
+        the SKIP policy, the paused state -- exactly as described."""
+        desc = _own_schedule_desc(
+            {"map_name": "full"},
+            spec=ScheduleSpec(calendars=[_compiled_cron("*/3 * * * *")]),
+        )
+        desc.schedule.state = SimpleNamespace(paused=True, note="keep me")
+        desc.schedule.policy = SimpleNamespace(overlap=ScheduleOverlapPolicy.SKIP)
+        action_before = desc.schedule.action
+        handle = self._schedule_handle(mock_client, describe=desc)
+
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(
+                workflow_gw.update_schedule_trigger(
+                    "robot01-sched-001", ScheduleTrigger(interval_seconds=1800)
+                )
+            )
+
+        handle.update.assert_awaited_once()
+        (update,) = handle.updates
+        assert isinstance(update, ScheduleUpdate)
+        assert update.schedule.spec.intervals[0].every == timedelta(seconds=1800)
+        assert update.schedule.spec.calendars == []
+        assert update.schedule.action is action_before
+        assert update.schedule.state.paused is True
+        assert update.schedule.state.note == "keep me"
+        assert update.schedule.policy.overlap == ScheduleOverlapPolicy.SKIP
+        # No search-attribute rewrite rides along.
+        assert update.search_attributes is None
+
+    def test_update_schedule_trigger_plants_the_cron_comment(
+        self, workflow_gw, mock_client
+    ):
+        # The same `<cron> # <cron>` shape create uses, so the edited cron
+        # echoes back from the calendar comment like a freshly registered one.
+        handle = self._schedule_handle(mock_client, describe=_own_schedule_desc({}))
+
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(
+                workflow_gw.update_schedule_trigger(
+                    "robot01-sched-001",
+                    ScheduleTrigger(cron="0 8 * * 1-5", timezone="Asia/Taipei"),
+                )
+            )
+
+        (update,) = handle.updates
+        assert update.schedule.spec.cron_expressions == ["0 8 * * 1-5 # 0 8 * * 1-5"]
+        assert update.schedule.spec.time_zone_name == "Asia/Taipei"
+
+    def test_update_schedule_trigger_validates_before_any_rpc(
+        self, workflow_gw, mock_client
+    ):
+        handle = self._schedule_handle(mock_client, describe=_own_schedule_desc({}))
+
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(BadRequestError, match="either cron or intervalSeconds"):
+                asyncio.run(
+                    workflow_gw.update_schedule_trigger(
+                        "robot01-sched-001", ScheduleTrigger()
+                    )
+                )
+
+        handle.update.assert_not_awaited()
+
+    def test_update_schedule_trigger_not_found(self, workflow_gw, mock_client):
+        handle = self._schedule_handle(mock_client)
+        handle.update.side_effect = _not_found()
+
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(NotFoundError, match="not found"):
+                asyncio.run(
+                    workflow_gw.update_schedule_trigger(
+                        "missing", ScheduleTrigger(interval_seconds=60)
+                    )
+                )
+
+    def test_update_schedule_trigger_maps_other_failures_to_internal(
+        self, workflow_gw, mock_client
+    ):
+        handle = self._schedule_handle(mock_client)
+        handle.update.side_effect = RPCError("boom", RPCStatusCode.UNAVAILABLE, b"")
+
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError, match="Update schedule failed"):
+                asyncio.run(
+                    workflow_gw.update_schedule_trigger(
+                        "robot01-sched-001", ScheduleTrigger(interval_seconds=60)
+                    )
+                )
 
     # ==================== list_schedules ====================
 
@@ -791,8 +935,23 @@ class TestScheduleTriggerMapping:
         spec = _build_schedule_spec(
             ScheduleTrigger(cron="0 9 * * 1-5", timezone="Asia/Taipei")
         )
-        assert spec.cron_expressions == ["0 9 * * 1-5"]
+        # The string twice: once for Temporal to compile, once as the comment it
+        # keeps on the compiled calendar so get/list can echo it back.
+        assert spec.cron_expressions == ["0 9 * * 1-5 # 0 9 * * 1-5"]
         assert spec.time_zone_name == "Asia/Taipei"
+
+    @pytest.mark.parametrize(
+        "cron, reason",
+        [
+            ("0 9 * * * # mine", "must not contain '#'"),
+            ("CRON_TZ=UTC 0 9 * * *", "CRON_TZ=/TZ= prefix"),
+            ("TZ=UTC 0 9 * * *", "CRON_TZ=/TZ= prefix"),
+            ("@every 30m", "use intervalSeconds"),
+        ],
+    )
+    def test_build_spec_refuses_crons_that_would_break_the_echo(self, cron, reason):
+        with pytest.raises(BadRequestError, match=reason):
+            _build_schedule_spec(ScheduleTrigger(cron=cron))
 
     def test_build_spec_from_interval(self):
         spec = _build_schedule_spec(ScheduleTrigger(interval_seconds=1800))
@@ -803,8 +962,17 @@ class TestScheduleTriggerMapping:
             _build_schedule_spec(ScheduleTrigger())
 
     def test_spec_round_trips_back_to_a_trigger(self):
+        # As Temporal describes it: the compiled calendar carrying the comment.
         trigger = _spec_to_trigger(
-            ScheduleSpec(cron_expressions=["0 9 * * 1-5"], time_zone_name="Asia/Taipei")
+            ScheduleSpec(
+                calendars=[_compiled_cron("0 9 * * 1-5")], time_zone_name="Asia/Taipei"
+            )
+        )
+        assert (trigger.cron, trigger.timezone) == ("0 9 * * 1-5", "Asia/Taipei")
+
+        # As this process built it, before sending: the comment is stripped.
+        trigger = _spec_to_trigger(
+            _build_schedule_spec(ScheduleTrigger(cron="0 9 * * 1-5", timezone="Asia/Taipei"))
         )
         assert (trigger.cron, trigger.timezone) == ("0 9 * * 1-5", "Asia/Taipei")
 
@@ -813,10 +981,26 @@ class TestScheduleTriggerMapping:
         )
         assert trigger.interval_seconds == 60
 
-    def test_memo_wins_over_the_normalised_spec(self):
-        trigger = _trigger_from_memo(
-            {"cron": "*/3 * * * *"},
-            ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(seconds=1))]),
+    def test_spec_without_a_comment_yields_no_cron(self):
+        # A legacy cron, or one registered outside this API: the compiled
+        # ranges cannot be turned back into a string.
+        trigger = _spec_to_trigger(ScheduleSpec(calendars=[ScheduleCalendarSpec()]))
+        assert trigger.cron is None and trigger.interval_seconds is None
+
+    def test_spec_wins_over_a_stale_memo(self):
+        # A legacy schedule whose cron was edited to an interval: the memo still
+        # says cron, the spec says interval, and the spec is what fires.
+        trigger = _read_trigger(
+            {"cron": "*/3 * * * *", "timezone": "Asia/Taipei"},
+            ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(seconds=1800))]),
         )
-        assert trigger.cron == "*/3 * * * *"
-        assert trigger.interval_seconds is None
+        assert trigger.interval_seconds == 1800
+        assert trigger.cron is None
+        assert trigger.timezone is None
+
+    def test_memo_fills_in_for_a_legacy_calendar_without_a_comment(self):
+        trigger = _read_trigger(
+            {"cron": "*/3 * * * *", "timezone": "Asia/Taipei"},
+            ScheduleSpec(calendars=[ScheduleCalendarSpec()]),
+        )
+        assert (trigger.cron, trigger.timezone) == ("*/3 * * * *", "Asia/Taipei")

@@ -17,6 +17,8 @@ from temporalio.client import (
     ScheduleOverlapPolicy,
     SchedulePolicy,
     ScheduleSpec,
+    ScheduleUpdate,
+    ScheduleUpdateInput,
 )
 from temporalio.api.common.v1 import Payload
 from temporalio.common import SearchAttributeKey
@@ -167,10 +169,38 @@ class _ActiveSnapshot:
 
 
 def _build_schedule_spec(trigger: ScheduleTrigger) -> ScheduleSpec:
-    """Map a ScheduleTrigger (cron or interval) to a Temporal ScheduleSpec."""
+    """Map a ScheduleTrigger (cron or interval) to a Temporal ScheduleSpec.
+
+    A cron goes out as ``"<cron> # <cron>"``. Temporal compiles a cron string
+    into a StructuredCalendarSpec and forgets the string, but it copies whatever
+    follows ``#`` into that calendar's ``comment`` -- and the comment is echoed
+    back verbatim by both describe() and list_schedules(), and survives a
+    schedule *update*. That is what lets ``_read_trigger`` report the cron as
+    typed without keeping a copy in the memo, which the server does not let an
+    update rewrite (verified against 1.29.7: UpdateSchedule ignores ``memo``).
+
+    Three cron spellings are refused up front because they would break that
+    echo: a ``#`` of the caller's own (it would become the comment), a
+    ``CRON_TZ=`` / ``TZ=`` prefix (Temporal moves it into the timezone, and
+    rejects it outright when a timezone is also given -- the REST body has a
+    ``timezone`` field for this), and ``@every`` (Temporal compiles it into an
+    IntervalSpec, which has no comment; ``intervalSeconds`` is that trigger).
+    """
     if trigger.cron:
+        cron = trigger.cron.strip()
+        if "#" in cron:
+            raise BadRequestError("Cron expression must not contain '#'")
+        if cron.startswith(("CRON_TZ=", "TZ=")):
+            raise BadRequestError(
+                "Cron expression must not carry a CRON_TZ=/TZ= prefix; "
+                "use the timezone field"
+            )
+        if cron.startswith("@every"):
+            raise BadRequestError(
+                "'@every' is not a cron expression here; use intervalSeconds"
+            )
         return ScheduleSpec(
-            cron_expressions=[trigger.cron],
+            cron_expressions=[f"{cron} # {cron}"],
             time_zone_name=trigger.timezone or "",
         )
     if trigger.interval_seconds:
@@ -185,13 +215,24 @@ def _build_schedule_spec(trigger: ScheduleTrigger) -> ScheduleSpec:
 def _spec_to_trigger(spec: ScheduleSpec) -> ScheduleTrigger:
     """Reconstruct a ScheduleTrigger from a Temporal ScheduleSpec.
 
-    Fallback for schedules not created through this API. Note that Temporal
-    normalises cron_expressions into calendar specs, so a cron created
-    elsewhere will not round-trip here -- see _read_trigger / the memo path.
+    The cron comes from the first calendar's ``comment`` -- the channel
+    ``_build_schedule_spec`` writes it into -- or, for a spec this process built
+    and has not sent yet (tests, mostly), from ``cron_expressions`` with that
+    same ``# comment`` stripped. A calendar without a comment is a cron
+    registered before the comment existed, or a schedule created outside this
+    API: neither can be turned back into a string, so the trigger comes back
+    empty and ``_read_trigger`` falls through to the memo.
     """
+    if spec.calendars:
+        comment = spec.calendars[0].comment
+        if comment:
+            return ScheduleTrigger(
+                cron=comment,
+                timezone=spec.time_zone_name or None,
+            )
     if spec.cron_expressions:
         return ScheduleTrigger(
-            cron=spec.cron_expressions[0],
+            cron=spec.cron_expressions[0].split("#", 1)[0].strip(),
             timezone=spec.time_zone_name or None,
         )
     if spec.intervals:
@@ -202,14 +243,11 @@ def _spec_to_trigger(spec: ScheduleSpec) -> ScheduleTrigger:
 
 
 def _schedule_to_memo(schedule: ScheduleTask, robot_id: str) -> dict:
-    """Serialise a schedule's trigger and provenance into memo fields.
+    """Serialise a schedule's provenance into memo fields.
 
-    The trigger has to be here because Temporal normalises cron_expressions into
-    internal calendar specs, so describe() can no longer report the string that
-    was registered. The provenance rides along in the same place for a different
-    reason: the memo is readable from ``list_schedules()`` while the
-    start-workflow args are not, so this is the only channel by which the
-    collection endpoint can say which map a schedule belongs to.
+    The memo is readable from ``list_schedules()`` while the start-workflow args
+    are not, so this is the only channel by which the collection endpoint can
+    say which map a schedule belongs to.
 
     ``robot_id`` is written unconditionally, and for the same list-path reason:
     the namespace is shared by every robot on the Temporal server, and the list
@@ -219,14 +257,17 @@ def _schedule_to_memo(schedule: ScheduleTask, robot_id: str) -> dict:
     path does not need it — the full action carries ``task_queue`` there — which
     is exactly what the legacy fallback in ``list_schedules`` leans on for
     schedules written before this key existed.
+
+    The trigger is deliberately NOT here any more. It used to be (``cron`` /
+    ``interval_seconds`` / ``timezone`` keys), because Temporal forgets the cron
+    string it compiled; but a schedule memo is immutable on the server -- the
+    UpdateSchedule RPC carries a ``memo`` field and 1.29.7 ignores it -- so a
+    copy here would go stale the first time ``update_schedule_trigger`` ran.
+    The spec itself carries the string now (see ``_build_schedule_spec``);
+    ``_read_trigger`` still reads the old keys off schedules registered before
+    this change.
     """
     memo: dict = {"robot_id": robot_id}
-    if schedule.trigger.cron:
-        memo["cron"] = schedule.trigger.cron
-    if schedule.trigger.interval_seconds:
-        memo["interval_seconds"] = schedule.trigger.interval_seconds
-    if schedule.trigger.timezone:
-        memo["timezone"] = schedule.trigger.timezone
     if schedule.map_name:
         memo["map_name"] = schedule.map_name
     if schedule.task_template_id:
@@ -250,11 +291,24 @@ async def _read_memo(described) -> dict:
         return {}
 
 
-def _trigger_from_memo(memo: dict, spec: ScheduleSpec) -> ScheduleTrigger:
-    """The trigger as registered, falling back to the (normalised) spec."""
+def _read_trigger(memo: dict, spec: ScheduleSpec) -> ScheduleTrigger:
+    """The schedule's *current* trigger: the spec first, the memo as legacy.
+
+    The spec is authoritative because it is the only thing an update rewrites:
+    an interval round-trips as-is, and a cron comes back through the calendar
+    comment ``_build_schedule_spec`` planted. The memo's ``cron`` /
+    ``interval_seconds`` / ``timezone`` keys are what schedules registered
+    before that comment existed carry, and for those the compiled calendar
+    cannot be read back, so they are still honoured -- but only when the spec
+    has nothing to say. Once such a schedule's trigger is edited the spec
+    speaks and the stale memo copy is ignored, which is the whole point.
+    """
+    trigger = _spec_to_trigger(spec)
+    if trigger.cron or trigger.interval_seconds:
+        return trigger
+
     cron = memo.get("cron")
     interval_seconds = memo.get("interval_seconds")
-
     if cron or interval_seconds:
         return ScheduleTrigger(
             cron=cron,
@@ -262,7 +316,7 @@ def _trigger_from_memo(memo: dict, spec: ScheduleSpec) -> ScheduleTrigger:
             timezone=memo.get("timezone"),
         )
 
-    return _spec_to_trigger(spec)
+    return trigger
 
 
 def _schedule_task_queue(desc) -> Optional[str]:
@@ -859,9 +913,9 @@ class WorkflowGateway:
         # that can be queried via GET /api/v1/tasks/{id}.
         workflow_task = WorkflowTask(id=schedule.id, definition=schedule.definition)
 
-        # Trigger + provenance + this robot's identity into the memo, so
-        # get/list can echo the first two back and list can scope on the third.
-        # See _schedule_to_memo for why the memo and not the action args.
+        # Provenance + this robot's identity into the memo, so get/list can
+        # echo the first back and list can scope on the second. The trigger
+        # rides in the spec itself -- see _build_schedule_spec / _schedule_to_memo.
         memo = _schedule_to_memo(schedule, self._robot_id)
 
         try:
@@ -941,14 +995,15 @@ class WorkflowGateway:
 
         return ScheduleView(
             id=desc.id,
-            trigger=_trigger_from_memo(memo, desc.schedule.spec),
+            trigger=_read_trigger(memo, desc.schedule.spec),
             paused=desc.schedule.state.paused,
             next_run_times=[
                 t.astimezone(timezone.utc) for t in desc.info.next_action_times
             ],
             map_name=memo.get("map_name"),
             # Schedules registered before the TaskTemplate rename carry the old
-            # memo keys; a memo is immutable history, so read both forever.
+            # memo keys; a memo is immutable on the server (see
+            # _schedule_to_memo), so read both forever.
             task_template_id=memo.get("task_template_id", memo.get("saved_task_id")),
             task_template_name=memo.get(
                 "task_template_name", memo.get("saved_task_name")
@@ -1026,7 +1081,7 @@ class WorkflowGateway:
                 schedules.append(
                     ScheduleView(
                         id=item.id,
-                        trigger=_trigger_from_memo(memo, item.schedule.spec),
+                        trigger=_read_trigger(memo, item.schedule.spec),
                         paused=item.schedule.state.paused,
                         next_run_times=[
                             t.astimezone(timezone.utc)
@@ -1135,6 +1190,64 @@ class WorkflowGateway:
                 "[WorkflowGateway] Failed to resume schedule", error=str(err)
             )
             raise UpstreamError("Resume schedule failed")
+
+    async def update_schedule_trigger(self, schedule_id: str, trigger: ScheduleTrigger):
+        """Replace a schedule's firing rule in place, touching nothing else.
+
+        ``ScheduleHandle.update`` is describe-then-UpdateSchedule: the callback
+        gets the current description and hands back the Schedule to store. Only
+        ``spec`` is swapped; the action (the frozen WorkflowTask payload, still
+        raw), the SKIP policy and the state (paused, note) go back exactly as
+        the server described them. Because the schedule is updated rather than
+        recreated, the server keeps its record of the run a previous trigger
+        may still have going, so SKIP still holds across the edit.
+
+        The ownership gate lives inside the callback rather than in a separate
+        ``_require_owned_schedule``: the SDK's update already performs the
+        describe, so checking there costs no extra RPC, and raising out of the
+        callback aborts the update before anything is sent. 404 for a foreign
+        schedule, same as every other single-schedule verb.
+
+        The memo is left alone on purpose. It no longer carries the trigger
+        (see ``_schedule_to_memo``), and the server would ignore a new one anyway.
+        """
+        try:
+            client = await self._get_client()
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
+            )
+            raise UpstreamError("Failed to connect to Temporal server")
+
+        # Validate before any RPC: a malformed trigger is the caller's 400, not
+        # a reason to have described anything.
+        spec = _build_schedule_spec(trigger)
+
+        def _retrigger(inp: ScheduleUpdateInput) -> ScheduleUpdate:
+            if _schedule_task_queue(inp.description) != self._task_queue:
+                raise NotFoundError(f"Schedule {schedule_id} not found")
+            schedule = inp.description.schedule
+            schedule.spec = spec
+            return ScheduleUpdate(schedule=schedule)
+
+        handle = client.get_schedule_handle(schedule_id)
+
+        try:
+            await handle.update(_retrigger)
+        except NotFoundError:
+            raise
+        except RPCError as err:
+            if err.status == RPCStatusCode.NOT_FOUND:
+                raise NotFoundError(f"Schedule {schedule_id} not found")
+            self._logger.error(
+                "[WorkflowGateway] Failed to update schedule", error=str(err)
+            )
+            raise UpstreamError("Update schedule failed")
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to update schedule", error=str(err)
+            )
+            raise UpstreamError("Update schedule failed")
 
 
 def init_workflow_gateway(

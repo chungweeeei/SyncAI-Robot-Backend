@@ -212,9 +212,16 @@ does not heartbeat (one blocking HTTP call to the speech service, held open for 
 utterance) so it runs on `start_to_close` alone; that service's playback is a pollable,
 cancellable job, so this is now a choice rather than a constraint. Per-step state
 is a workflow **query**, not a table. Schedules use `SKIP` overlap; their steps are frozen
-at registration; the original cron string and `map_name`/template ids ride in the schedule
-**memo**. `ARTIFACT` steps were removed 2026-08 — stored templates carrying one fail
-validation.
+at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, an in-place
+`ScheduleHandle.update` that swaps the spec). `map_name`/template ids ride in the schedule
+**memo**; the cron string does **not** — a schedule memo cannot be rewritten by an update
+(server 1.29.7 ignores `UpdateScheduleRequest.memo`), so the cron is registered as
+`"<cron> # <cron>"` and read back from the compiled calendar's `comment`, which the server
+keeps on describe, list and update. `_build_schedule_spec` is the one gate every
+registration goes through, so the crons that would break that echo (`#`, a
+`CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
+`ARTIFACT` steps were removed 2026-08 — stored
+templates carrying one fail validation.
 
 ### Mapping-mode map cloud (`subscribers/map_cloud_subscriber.py`)
 

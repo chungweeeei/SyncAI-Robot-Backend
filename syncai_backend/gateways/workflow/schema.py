@@ -249,11 +249,11 @@ class ScheduleTask(BaseSchema):
     )
 
     # Provenance, stashed in the schedule memo rather than anywhere Temporal
-    # interprets. The memo is the established channel for "keep something so it
-    # survives a round trip" (see _trigger_to_memo) and, crucially, unlike the
-    # start-workflow args it IS readable on the *list* path -- which is what lets
-    # the collection endpoint flag a schedule whose map is no longer the active
-    # one without an extra describe per row.
+    # interprets (see _schedule_to_memo). Unlike the start-workflow args the
+    # memo IS readable on the *list* path -- which is what lets the collection
+    # endpoint flag a schedule whose map is no longer the active one without an
+    # extra describe per row. The trigger is NOT memo material: a schedule memo
+    # cannot be rewritten by an update, and the trigger can.
     map_name: Optional[str] = Field(
         default=None,
         description="Map whose frame this schedule's MOVE coordinates are in.",

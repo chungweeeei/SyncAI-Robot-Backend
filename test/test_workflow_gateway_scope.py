@@ -83,12 +83,18 @@ class _StubScheduleHandle:
         self._description = description
         self._error = error
         self.describe_calls = 0
+        self.updates = []
 
     async def describe(self):
         self.describe_calls += 1
         if self._error is not None:
             raise self._error
         return self._description
+
+    async def update(self, updater):
+        # The real one describes and hands the description to the callback;
+        # what the callback returns is what would be sent.
+        self.updates.append(updater(SimpleNamespace(description=self._description)))
 
 
 class _StubClient:
@@ -137,7 +143,8 @@ def test_schedule_memo_always_carries_robot_id():
     )
     memo = _schedule_to_memo(schedule, "robot01")
     assert memo["robot_id"] == "robot01"
-    assert memo["interval_seconds"] == 60
+    # And never the trigger: the memo cannot follow a trigger edit.
+    assert "interval_seconds" not in memo
 
 
 # --- Task ownership -----------------------------------------------------------
@@ -214,6 +221,33 @@ def test_require_owned_schedule_passes_its_own(logger):
     gw = _gateway(logger, client)
 
     assert asyncio.run(gw._require_owned_schedule(client, "robot01-sched")) is desc
+
+
+def test_update_trigger_refuses_a_foreign_schedule(logger):
+    # The gate sits inside the update callback (the SDK's update already
+    # describes, so no second RPC): raising there aborts before anything is sent.
+    handle = _StubScheduleHandle(
+        description=_schedule_desc(_start_workflow_action(FOREIGN_QUEUE))
+    )
+    gw = _gateway(logger, _StubClient(schedule_handle=handle))
+
+    with pytest.raises(NotFoundError):
+        asyncio.run(
+            gw.update_schedule_trigger("robot02-sched", ScheduleTrigger(interval_seconds=60))
+        )
+    assert handle.updates == []
+
+
+def test_update_trigger_updates_its_own_schedule(logger):
+    handle = _StubScheduleHandle(
+        description=_schedule_desc(_start_workflow_action(OWN_QUEUE))
+    )
+    gw = _gateway(logger, _StubClient(schedule_handle=handle))
+
+    asyncio.run(
+        gw.update_schedule_trigger("robot01-sched", ScheduleTrigger(interval_seconds=60))
+    )
+    assert len(handle.updates) == 1
 
 
 # --- Schedule ownership (list path) ---------------------------------------------
