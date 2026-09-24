@@ -217,7 +217,10 @@ at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, a
 **memo**; the cron string does **not** — a schedule memo cannot be rewritten by an update
 (server 1.29.7 ignores `UpdateScheduleRequest.memo`), so the cron is registered as
 `"<cron> # <cron>"` and read back from the compiled calendar's `comment`, which the server
-keeps on describe, list and update. `ARTIFACT` steps were removed 2026-08 — stored
+keeps on describe, list and update. `_build_schedule_spec` is the one gate every
+registration goes through, so the crons that would break that echo (`#`, a
+`CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
+`ARTIFACT` steps were removed 2026-08 — stored
 templates carrying one fail validation.
 
 ### Mapping-mode map cloud (`subscribers/map_cloud_subscriber.py`)
