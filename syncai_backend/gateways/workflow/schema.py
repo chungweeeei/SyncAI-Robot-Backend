@@ -198,6 +198,28 @@ class ActiveTask(BaseSchema):
     )
 
 
+class TaskHistoryEntry(BaseSchema):
+    """One execution on this robot's task queue that has finished.
+
+    The same single-visibility-query shape as ActiveTask, plus when it closed.
+    No step list for the same reason: GET /api/v1/tasks/{id} answers that for a
+    closed run too, as long as retention still has it.
+    """
+
+    id: str = Field(..., description="Workflow id, i.e. the task id")
+    run_id: str = Field(..., description="Temporal run id")
+    status: str = Field(..., description="Mapped through _WORKFLOW_STATUS_MAP")
+    started_at: datetime = Field(..., description="Execution start time (UTC)")
+    closed_at: Optional[datetime] = Field(
+        default=None, description="Execution close time (UTC)"
+    )
+    source: TaskSource = Field(..., description="Who started it")
+    schedule_id: Optional[str] = Field(
+        default=None,
+        description="The schedule that started it, when source is SCHEDULE.",
+    )
+
+
 class ScheduleTrigger(BaseSchema):
     cron: Optional[str] = Field(
         default=None,

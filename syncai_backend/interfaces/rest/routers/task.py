@@ -1,10 +1,18 @@
+import base64
+import binascii
 import structlog
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field, model_validator
 from enum import Enum
 
+from syncai_backend.exceptions import BadRequestError
+
+from syncai_backend.gateways.workflow.config import (
+    TASK_HISTORY_PAGE_SIZE_DEFAULT,
+    TASK_HISTORY_PAGE_SIZE_MAX,
+)
 from syncai_backend.gateways.workflow.schema import (
     Step,
     StepType,
@@ -135,6 +143,68 @@ class ActiveTasksResponse(BaseModel):
     )
 
 
+class TaskHistoryStatus(str, Enum):
+    """The TaskStatus values a finished run can have — the history filter."""
+
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELED = "CANCELED"
+
+
+class TaskHistoryEntryResponse(BaseModel):
+    id: str = Field(
+        ...,
+        description="Workflow id, i.e. the id GET /api/v1/tasks/{id} takes",
+        examples=["robot01-task-001"],
+    )
+    run_id: str = Field(..., description="Temporal run id")
+    status: TaskHistoryStatus = Field(..., examples=["COMPLETED"])
+    started_at: datetime = Field(..., description="Execution start time (UTC)")
+    closed_at: Optional[datetime] = Field(
+        default=None, description="Execution close time (UTC)"
+    )
+    source: TaskSource = Field(
+        ..., description="DIRECT (someone called POST /api/v1/tasks) or SCHEDULE"
+    )
+    schedule_id: Optional[str] = Field(
+        default=None, description="The schedule that started it, if any"
+    )
+
+
+class TaskHistoryResponse(BaseModel):
+    tasks: List[TaskHistoryEntryResponse] = Field(
+        ..., description="Finished executions on this robot, newest close first"
+    )
+    next_page_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "Pass back as page_token, with the same status/since, for the next "
+            "page. Absent on the last page."
+        ),
+    )
+
+
+# Temporal's page token is opaque bytes; the REST surface carries it as
+# unpadded base64url so it survives a query string untouched.
+def _encode_page_token(token: Optional[bytes]) -> Optional[str]:
+    if not token:
+        return None
+    return base64.urlsafe_b64encode(token).decode("ascii").rstrip("=")
+
+
+def _decode_page_token(token: Optional[str]) -> Optional[bytes]:
+    if not token:
+        return None
+    # validate=True: without it characters outside the alphabet are silently
+    # dropped, and a mangled token would quietly restart at page one.
+    try:
+        return base64.b64decode(
+            token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+        )
+    except (binascii.Error, ValueError):
+        raise BadRequestError("Invalid page token")
+
+
 def init_task_router(
     logger: structlog.stdlib.BoundLogger, workflow_gw: WorkflowGateway
 ) -> APIRouter:
@@ -198,6 +268,54 @@ def init_task_router(
                 for task in tasks
             ],
             as_of=as_of,
+        )
+
+    # Not /api/v1/tasks/history, for the same reason as active_tasks above.
+    #
+    # Straight from Temporal's visibility index — the database stores no runs —
+    # so it reaches back exactly as far as the namespace retention, and a run
+    # older than that is not here. Per-step detail for a row is
+    # GET /api/v1/tasks/{id}, as for a running task.
+    @task_router.get("/api/v1/task_history", response_model=TaskHistoryResponse)
+    async def list_task_history(
+        page_size: int = Query(
+            TASK_HISTORY_PAGE_SIZE_DEFAULT, ge=1, le=TASK_HISTORY_PAGE_SIZE_MAX
+        ),
+        page_token: Optional[str] = Query(
+            None, description="next_page_token from the previous page"
+        ),
+        status: Optional[TaskHistoryStatus] = Query(
+            None, description="Only runs that finished with this status"
+        ),
+        since: Optional[datetime] = Query(
+            None,
+            description="Only runs that closed at or after this time; naive is UTC",
+        ),
+    ):
+        if since is not None and since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+
+        entries, next_token = await workflow_gw.list_task_history(
+            page_size=page_size,
+            next_page_token=_decode_page_token(page_token),
+            status=status.value if status is not None else None,
+            since=since,
+        )
+
+        return TaskHistoryResponse(
+            tasks=[
+                TaskHistoryEntryResponse(
+                    id=entry.id,
+                    run_id=entry.run_id,
+                    status=TaskHistoryStatus(entry.status),
+                    started_at=entry.started_at,
+                    closed_at=entry.closed_at,
+                    source=entry.source,
+                    schedule_id=entry.schedule_id,
+                )
+                for entry in entries
+            ],
+            next_page_token=_encode_page_token(next_token),
         )
 
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)

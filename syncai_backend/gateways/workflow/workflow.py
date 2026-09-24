@@ -38,6 +38,7 @@ from syncai_backend.gateways.workflow.schema import (
     ScheduleTrigger,
     ScheduleView,
     Step,
+    TaskHistoryEntry,
     TaskSource,
     TaskState,
     WorkflowTask,
@@ -46,6 +47,7 @@ from syncai_backend.gateways.workflow.config import (
     ACTIVE_TASK_CACHE_TTL_S,
     ACTIVE_TASK_LIST_LIMIT,
     ACTIVE_TASK_RPC_TIMEOUT_S,
+    TASK_HISTORY_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
 )
 
@@ -92,6 +94,50 @@ def _active_query(task_queue: str) -> str:
         f"AND TaskQueue = '{task_queue}' "
         "AND ExecutionStatus = 'Running'"
     )
+
+
+# The inverse of _WORKFLOW_STATUS_MAP over the *closed* statuses, as the
+# visibility List Filter spells them. It is the filter vocabulary of
+# GET /api/v1/task_history: one REST status may fold several Temporal ones
+# (TimedOut reads as FAILED, Terminated as CANCELED), and the query must ask for
+# every one the response would report under that name. ContinuedAsNew is left
+# out: it maps to IN_PROGRESS, which a history of finished runs never shows.
+_CLOSED_STATUS_FILTER = {
+    "COMPLETED": ("Completed",),
+    "FAILED": ("Failed", "TimedOut"),
+    "CANCELED": ("Canceled", "Terminated"),
+}
+
+
+def _history_query(
+    task_queue: str,
+    status: Optional[str] = None,
+    since: Optional[datetime] = None,
+) -> str:
+    """The visibility List Filter behind GET /api/v1/task_history.
+
+    The same WorkflowType / TaskQueue scope as _active_query — the task queue is
+    what keeps another robot's runs on the shared namespace out of the answer.
+
+    No ORDER BY: SQL visibility rejects a custom one (that is an Elasticsearch
+    feature), and its default order is already the one a history wants — closed
+    executions newest CloseTime first.
+    """
+    if status is None:
+        statuses = tuple(s for group in _CLOSED_STATUS_FILTER.values() for s in group)
+    else:
+        statuses = _CLOSED_STATUS_FILTER[status]
+
+    query = (
+        f"WorkflowType = '{WORKFLOW_TYPE_NAME}' "
+        f"AND TaskQueue = '{task_queue}' "
+        "AND ExecutionStatus IN ({})".format(", ".join(f"'{s}'" for s in statuses))
+    )
+    if since is not None:
+        query += " AND CloseTime >= '{}'".format(
+            since.astimezone(timezone.utc).isoformat()
+        )
+    return query
 
 
 def _schedule_id_of(execution) -> Optional[str]:
@@ -658,6 +704,100 @@ class WorkflowGateway:
             "[WorkflowGateway] Active task snapshot refreshed", count=len(tasks)
         )
         return _ActiveSnapshot(fetched_at=fetched_at, as_of=as_of, tasks=tasks)
+
+    async def list_task_history(
+        self,
+        page_size: int,
+        next_page_token: Optional[bytes] = None,
+        status: Optional[str] = None,
+        since: Optional[datetime] = None,
+    ) -> Tuple[List[TaskHistoryEntry], Optional[bytes]]:
+        """One page of this robot's finished executions, newest first.
+
+        Answers the rows and the token for the page after them (None on the
+        last page). The token is Temporal's own and is only valid for the same
+        query, i.e. the same `status` / `since`.
+
+        How far back this reaches is the namespace retention and nothing else:
+        the backend stores no runs, so a run Temporal has deleted is gone.
+        """
+        # `status` arrives from a REST enum, so an unknown one is a caller bug
+        # in this process, not something to answer 400 for.
+        if status is not None and status not in _CLOSED_STATUS_FILTER:
+            raise ValueError(f"Not a closed task status: {status}")
+
+        try:
+            client = await self._get_client()
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
+            )
+            raise UpstreamError("Failed to connect to Temporal server")
+
+        query = _history_query(self._task_queue, status=status, since=since)
+        # One page and only one: iterating with `async for` would follow the
+        # token to the end of the retention window inside a single request.
+        pages = client.list_workflows(
+            query,
+            page_size=page_size,
+            next_page_token=next_page_token,
+            rpc_timeout=timedelta(seconds=TASK_HISTORY_RPC_TIMEOUT_S),
+        )
+        try:
+            await pages.fetch_next_page()
+        except RPCError as err:
+            if err.status == RPCStatusCode.INVALID_ARGUMENT:
+                if next_page_token is not None:
+                    # A token from another query (the caller changed a filter
+                    # but kept paging) or one it made up.
+                    raise BadRequestError("Invalid page token")
+                self._logger.error(
+                    "[WorkflowGateway] Visibility rejected the task-history query; "
+                    "is this server on standard visibility?",
+                    query=query,
+                    error=str(err),
+                )
+            else:
+                self._logger.error(
+                    "[WorkflowGateway] Failed to list task history", error=str(err)
+                )
+            raise UpstreamError("List task history failed")
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to list task history", error=str(err)
+            )
+            raise UpstreamError("List task history failed")
+
+        entries: List[TaskHistoryEntry] = []
+        for execution in pages.current_page or []:
+            mapped = _WORKFLOW_STATUS_MAP.get(execution.status)
+            if mapped is None:
+                # Skipped, not raised — same policy as _fetch_active_tasks.
+                self._logger.warn(
+                    "[WorkflowGateway] Unmapped status in task history",
+                    task_id=execution.id,
+                    status=str(execution.status),
+                )
+                continue
+
+            schedule_id = _schedule_id_of(execution)
+            entries.append(
+                TaskHistoryEntry(
+                    id=execution.id,
+                    run_id=execution.run_id,
+                    status=mapped,
+                    started_at=execution.start_time.astimezone(timezone.utc),
+                    closed_at=(
+                        execution.close_time.astimezone(timezone.utc)
+                        if execution.close_time is not None
+                        else None
+                    ),
+                    source=TaskSource.SCHEDULE if schedule_id else TaskSource.DIRECT,
+                    schedule_id=schedule_id,
+                )
+            )
+
+        return entries, pages.next_page_token
 
     async def cancel_task(self, task_id: str):
 

@@ -1,4 +1,4 @@
-"""Tests for /api/v1/tasks and /api/v1/active_tasks — the REST projection only.
+"""Tests for /api/v1/tasks, /active_tasks and /task_history — the REST projection only.
 
 Same pattern as ``test_schedule_router.py``: a stub gateway records what the
 router hands it and answers canned views, so these tests pin the boundary
@@ -27,6 +27,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     Step,
     StepStatus,
     StepType,
+    TaskHistoryEntry,
     TaskSource,
     TaskState,
 )
@@ -40,6 +41,20 @@ class _StubWorkflowGateway:
     def __init__(self):
         self.started = []
         self.cancelled = []
+        self.history_calls = []
+        self.history = (
+            [
+                TaskHistoryEntry(
+                    id="robot01-task-001",
+                    run_id="run-1",
+                    status="COMPLETED",
+                    started_at=datetime(2026, 8, 10, 8, 0, tzinfo=timezone.utc),
+                    closed_at=datetime(2026, 8, 10, 8, 5, tzinfo=timezone.utc),
+                    source=TaskSource.DIRECT,
+                )
+            ],
+            b"\xfftoken",
+        )
         self.state = TaskState(
             id="robot01-task-001",
             status="IN_PROGRESS",
@@ -78,6 +93,10 @@ class _StubWorkflowGateway:
 
     async def list_active_tasks(self):
         return self.active
+
+    async def list_task_history(self, **kwargs):
+        self.history_calls.append(kwargs)
+        return self.history
 
 
 @pytest.fixture
@@ -187,6 +206,64 @@ class TestActiveTasks:
 
         assert response.status_code == 200
         assert response.json()["tasks"] == []
+
+
+class TestTaskHistory:
+    def test_projects_rows_and_an_opaque_next_token(self, client, workflow_gw):
+        body = client.get("/api/v1/task_history").json()
+
+        task = body["tasks"][0]
+        assert (task["id"], task["status"], task["source"]) == (
+            "robot01-task-001",
+            "COMPLETED",
+            "DIRECT",
+        )
+        assert task["closed_at"] == "2026-08-10T08:05:00Z"
+        # base64url, unpadded: safe to put straight back into a query string.
+        assert body["next_page_token"] == "_3Rva2Vu"
+        assert workflow_gw.history_calls == [
+            {"page_size": 20, "next_page_token": None, "status": None, "since": None}
+        ]
+
+    def test_the_token_round_trips_with_the_filters(self, client, workflow_gw):
+        client.get(
+            "/api/v1/task_history",
+            params={
+                "page_token": "_3Rva2Vu",
+                "page_size": 5,
+                "status": "FAILED",
+                "since": "2026-08-10T00:00:00",
+            },
+        )
+
+        call = workflow_gw.history_calls[0]
+        assert call["next_page_token"] == b"\xfftoken"
+        assert (call["page_size"], call["status"]) == (5, "FAILED")
+        # A naive `since` is read as UTC, not as the server's local time.
+        assert call["since"] == datetime(2026, 8, 10, tzinfo=timezone.utc)
+
+    def test_last_page_has_no_token(self, client, workflow_gw):
+        workflow_gw.history = ([], None)
+
+        body = client.get("/api/v1/task_history").json()
+
+        assert body == {"tasks": [], "next_page_token": None}
+
+    def test_a_mangled_token_is_a_400(self, client, workflow_gw):
+        response = client.get("/api/v1/task_history", params={"page_token": "no!pe"})
+
+        assert response.status_code == 400
+        assert workflow_gw.history_calls == []
+
+    @pytest.mark.parametrize(
+        "params",
+        [{"status": "IN_PROGRESS"}, {"page_size": 0}, {"page_size": 101}],
+    )
+    def test_out_of_range_params_are_rejected(self, client, workflow_gw, params):
+        response = client.get("/api/v1/task_history", params=params)
+
+        assert response.status_code == 422
+        assert workflow_gw.history_calls == []
 
 
 class TestCancelTask:
