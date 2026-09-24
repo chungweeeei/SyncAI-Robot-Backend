@@ -54,6 +54,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
 from syncai_backend.gateways.workflow.workflow import (  # noqa: E402
     WorkflowGateway,
     _build_schedule_spec,
+    _history_query,
     _spec_to_trigger,
     _trigger_from_memo,
     init_workflow_gateway,
@@ -109,13 +110,15 @@ def _execution(
     task_id: str = "robot01-task-001",
     status=WorkflowExecutionStatus.RUNNING,
     schedule_id=None,
+    close_time=None,
 ) -> SimpleNamespace:
-    """One row of a visibility listing, as _fetch_active_tasks reads it."""
+    """One row of a visibility listing, as the gateway's list paths read it."""
     return SimpleNamespace(
         id=task_id,
         run_id="run-1",
         status=status,
         start_time=datetime(2026, 8, 10, 8, 0, tzinfo=timezone.utc),
+        close_time=close_time,
         typed_search_attributes=SimpleNamespace(get=lambda key: schedule_id),
     )
 
@@ -469,6 +472,109 @@ class TestWorkflowGateway:
 
         mock_client.list_workflows.assert_called_once()
 
+    # ==================== list_task_history ====================
+
+    def _history_page(self, mock_client, executions, next_token=None, error=None):
+        """Wire list_workflows to one page, the way list_task_history reads it."""
+        pages = SimpleNamespace(
+            fetch_next_page=AsyncMock(side_effect=error),
+            current_page=executions,
+            next_page_token=next_token,
+        )
+        mock_client.list_workflows.return_value = pages
+        return pages
+
+    def test_task_history_projects_one_page(self, workflow_gw, mock_client):
+        closed = datetime(2026, 8, 10, 8, 5, tzinfo=timezone.utc)
+        pages = self._history_page(
+            mock_client,
+            [
+                _execution(
+                    "robot01-task-001",
+                    status=WorkflowExecutionStatus.TIMED_OUT,
+                    close_time=closed,
+                ),
+                _execution(
+                    "robot01-sched-001-2026-08-10T09",
+                    status=WorkflowExecutionStatus.COMPLETED,
+                    schedule_id="sched-1",
+                    close_time=closed,
+                ),
+            ],
+            next_token=b"page-2",
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            entries, token = asyncio.run(
+                workflow_gw.list_task_history(page_size=2, next_page_token=b"page-1")
+            )
+
+        assert token == b"page-2"
+        failed, done = entries
+        assert (failed.status, failed.source, failed.closed_at) == (
+            "FAILED",
+            TaskSource.DIRECT,
+            closed,
+        )
+        assert (done.status, done.schedule_id) == ("COMPLETED", "sched-1")
+        # Exactly one page per request: fetched once, never iterated onward.
+        pages.fetch_next_page.assert_awaited_once()
+        kwargs = mock_client.list_workflows.call_args.kwargs
+        assert (kwargs["page_size"], kwargs["next_page_token"]) == (2, b"page-1")
+
+    def test_task_history_last_page_has_no_token(self, workflow_gw, mock_client):
+        self._history_page(mock_client, [])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            entries, token = asyncio.run(workflow_gw.list_task_history(page_size=20))
+
+        assert (entries, token) == ([], None)
+
+    def test_task_history_skips_an_unmapped_status_row(self, workflow_gw, mock_client):
+        self._history_page(
+            mock_client,
+            [
+                _execution("odd", status=None),
+                _execution("ok", status=WorkflowExecutionStatus.CANCELED),
+            ],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            entries, _ = asyncio.run(workflow_gw.list_task_history(page_size=20))
+
+        assert [e.id for e in entries] == ["ok"]
+
+    def test_task_history_bad_token_is_a_bad_request(self, workflow_gw, mock_client):
+        self._history_page(
+            mock_client,
+            [],
+            error=RPCError("bad token", RPCStatusCode.INVALID_ARGUMENT, b""),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(BadRequestError, match="page token"):
+                asyncio.run(
+                    workflow_gw.list_task_history(page_size=20, next_page_token=b"x")
+                )
+
+    def test_task_history_rejected_query_is_upstream(self, workflow_gw, mock_client):
+        # No token was sent, so INVALID_ARGUMENT is about the query itself
+        # (standard visibility) — the server's problem, not the caller's.
+        self._history_page(
+            mock_client,
+            [],
+            error=RPCError("bad query", RPCStatusCode.INVALID_ARGUMENT, b""),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError):
+                asyncio.run(workflow_gw.list_task_history(page_size=20))
+
+    def test_task_history_unavailable_is_upstream(self, workflow_gw, mock_client):
+        self._history_page(
+            mock_client,
+            [],
+            error=RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b""),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError):
+                asyncio.run(workflow_gw.list_task_history(page_size=20))
+
     # ==================== create_schedule ====================
 
     def test_create_schedule_freezes_action_policy_and_memo(
@@ -643,6 +749,39 @@ class TestWorkflowGateway:
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             with pytest.raises(UpstreamError, match="List schedules failed"):
                 asyncio.run(workflow_gw.list_schedules())
+
+
+class TestHistoryQuery:
+    def test_scopes_to_this_robot_and_closed_runs(self):
+        query = _history_query(OWN_QUEUE)
+
+        assert f"WorkflowType = '{WORKFLOW_TYPE_NAME}'" in query
+        assert f"TaskQueue = '{OWN_QUEUE}'" in query
+        for status in (
+            "Completed",
+            "Failed",
+            "TimedOut",
+            "Canceled",
+            "Terminated",
+        ):
+            assert f"'{status}'" in query
+        assert "Running" not in query
+        # SQL visibility rejects a custom ORDER BY.
+        assert "ORDER BY" not in query
+
+    def test_status_folds_every_temporal_status_it_reports_as(self):
+        query = _history_query(OWN_QUEUE, status="CANCELED")
+
+        assert "ExecutionStatus IN ('Canceled', 'Terminated')" in query
+        assert "Completed" not in query
+
+    def test_since_is_a_utc_close_time_bound(self):
+        taipei = timezone(timedelta(hours=8))
+        query = _history_query(
+            OWN_QUEUE, since=datetime(2026, 8, 10, 17, 0, tzinfo=taipei)
+        )
+
+        assert query.endswith("AND CloseTime >= '2026-08-10T09:00:00+00:00'")
 
 
 class TestScheduleTriggerMapping:

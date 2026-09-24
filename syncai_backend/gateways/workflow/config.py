@@ -33,3 +33,17 @@ ACTIVE_TASK_LIST_LIMIT = 10
 # Explicit, because the single-flight lock serialises callers: a wedged Temporal
 # frontend must not be able to hold that lock for the gRPC default timeout.
 ACTIVE_TASK_RPC_TIMEOUT_S = 3.0
+
+
+# --- "What has run" (GET /api/v1/task_history) ------------------------------
+#
+# One visibility page per request, uncached: a history page is opened and paged
+# by hand, not polled, so there is nothing for a cache to coalesce. How far back
+# it reaches is not decided here at all -- it is the namespace's retention.
+TASK_HISTORY_PAGE_SIZE_DEFAULT = 20
+TASK_HISTORY_PAGE_SIZE_MAX = 100
+
+# No lock is held, so this only bounds how long an operator stares at a spinner
+# when Temporal is wedged. Longer than the active-task one: a closed-execution
+# page is a bigger scan than the handful of Running rows.
+TASK_HISTORY_RPC_TIMEOUT_S = 5.0
