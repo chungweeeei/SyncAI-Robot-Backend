@@ -19,11 +19,6 @@
 # worse, because it fails quietly — two Temporal workers polling the same
 # <robot_id>.ROBOT_TASK_QUEUE, so a task goes to whichever one grabs it. Take
 # the backend out of the session spec before running this, or stop robot01.
-#
-# ⚠ WITHOUT the FAST-LIO2 `interface` package in the image — it is not there by
-# default — the service still comes up, but map save, new map, map switch and
-# relocalize refuse, and MapGateway logs a warning at startup. See the Dockerfile
-# header for the one-line stopgap that puts them back.
 
 services:
   backend:

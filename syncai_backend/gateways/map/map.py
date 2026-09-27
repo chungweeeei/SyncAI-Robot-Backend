@@ -31,7 +31,7 @@ from rclpy.qos import QoSProfile
 from geometry_msgs.msg import Point, Pose, PoseWithCovarianceStamped, Quaternion
 from std_msgs.msg import Header
 from nav2_msgs.srv import LoadMap
-from interface.srv import IsValid, Relocalize, ResetMapping, SaveMaps
+from syncai_common.srv import IsValid, Relocalize, ResetMapping, SaveMaps
 
 
 # LoadMap.srv carries no `message` field -- only `uint8 result` and the grid --

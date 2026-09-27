@@ -23,13 +23,12 @@ import pytest
 
 pytest.importorskip("rclpy")
 pytest.importorskip("nav2_msgs")
-# FASTLIO2_ROS2's interface package — only present once the workspace is built
-# and sourced, like syncai_common elsewhere in this suite.
-pytest.importorskip("interface")
+# syncai_common — only present once the workspace is built and sourced.
+pytest.importorskip("syncai_common")
 
 from builtin_interfaces.msg import Time  # noqa: E402
 from nav2_msgs.srv import LoadMap  # noqa: E402
-from interface.srv import ResetMapping, SaveMaps  # noqa: E402
+from syncai_common.srv import ResetMapping, SaveMaps  # noqa: E402
 
 from syncai_backend.gateways.map import map as map_module  # noqa: E402
 from syncai_backend.gateways.map.map import (  # noqa: E402

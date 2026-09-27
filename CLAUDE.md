@@ -10,25 +10,23 @@ ROS 2 `ament_python` package (`package.xml`, `setup.py`), split out of
 `SyncAI-Robot-Workspace` into its own repository with the package at the repo root.
 
 It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
-standalone. It imports generated interfaces from two other colcon packages —
+standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`;
-`SwitchMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`) and
-`interface` from the FAST-LIO2 fork (`SaveMaps`, `ResetMapping`, `Relocalize`,
-`IsValid`) — plus `rclpy`, `nav2_msgs`, `tf2_ros`. Keep those imports as they are.
-Both are named in **`interface.repos`**: `vcs import < interface.repos` from
-any colcon workspace root materialises them into `src/` beside this package,
-over HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
+`SwitchMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, and the
+map srvs `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`) — plus `rclpy`,
+`nav2_msgs`, `tf2_ros`. Keep those imports as they are. It is named in
+**`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
+colcon workspace root materialises it into `src/` beside this package, over
+HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
 `syncai_common` lives in `SyncAI-Robot-Interface` (split out of the workspace
 2026-09) — edit the messages there, never in a materialised `src/syncai_common`.
 
-`interface` has no repo of its own: the entry clones the whole `SyncAI-Fast-LIO2`
-fork (branch `dev`) to `src/third-party/FASTLIO2_ROS2` — the same path the
-workspace's `third-party.repos` uses, so vcs leaves an existing checkout alone
-instead of duplicating every FAST-LIO2 package. Build only `interface` out of
-it (`--packages-up-to syncai_backend` or `--packages-select interface`);
-fastlio2 / pgo / localizer need PCL and the livox driver. `interface` is a
-**hard** import (`gateways/map/map.py`, module level) — the 2026-09-21
-`.interface/` copy + try/except stopgap is gone; do not reintroduce it.
+The map srvs used to come from FAST-LIO2's `interface` package (the whole
+`SyncAI-Fast-LIO2` fork was cloned to build it); they moved into `syncai_common`
+2026-09 and FAST-LIO2's `dev` no longer carries `interface`. Do not import
+`interface.srv` again. The map srvs are a **hard** import
+(`gateways/map/map.py`, module level) — the 2026-09-21 `.interface/` copy +
+try/except stopgap is gone; do not reintroduce it.
 
 **Running** still happens inside the robot container (ROS 2 Humble / Python 3.10),
 in a workspace that also carries the nav stack, with this repo vcs-imported to
@@ -48,9 +46,9 @@ All of these run inside the robot container, from the **workspace root** after
 # Python deps (not rosdep-managed; requirements.txt is the single source of truth)
 pip install -r src/syncai_backend/requirements.txt
 
-# syncai_common + FAST-LIO2's interface, if not already in src/
+# syncai_common, if not already in src/
 vcs import < src/syncai_backend/interface.repos
-colcon build --packages-select syncai_common interface
+colcon build --packages-select syncai_common
 
 # Build
 colcon build --packages-select syncai_backend --symlink-install
@@ -85,11 +83,11 @@ docker compose up -d --build                        # the runtime image as a ser
 `record/` (`RECORD_DIR`) — bags are the one thing nothing else in the stack
 reads, so they are not tied to a workspace checkout — plus **`ipc: host`**, so
 this container shares the host's `/dev/shm` with the robot container (see
-*Mapping-mode map cloud* below). The builder stage vcs-imports both interface
-packages itself; nothing needs copying in. The README's *As its own container*
+*Mapping-mode map cloud* below). The builder stage vcs-imports syncai_common
+itself; nothing needs copying in. The README's *As its own container*
 and the Dockerfile header carry the rest, including why only one backend may run at a time.
 
-Test notes: tests `importorskip` `rclpy` / `syncai_common` / `interface` / `httpx` etc., so on a
+Test notes: tests `importorskip` `rclpy` / `syncai_common` / `httpx` etc., so on a
 machine without ROS most of them skip rather than fail — a green run outside the container
 proves little. The DB layer is tested against in-memory SQLite (`StaticPool`); no PostgreSQL
 needed. `test_traversable.py` needs open3d, `test_pcd_to_gridmap.py` needs scipy. The
