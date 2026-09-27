@@ -2,12 +2,11 @@
 
 > **Standalone repository of a colcon package.** This repo is the source of
 > truth for `syncai_backend`. It is a ROS 2 `ament_python` package that imports
-> `syncai_common` (msgs/srvs) and `interface` (FAST-LIO2's srvs). Both are named
-> in `interface.repos`, so `vcs import < interface.repos` from a colcon workspace
-> root fetches them over HTTPS with no `SyncAI-Robot-Workspace` checkout and no
-> credentials. `interface` has no repo of its own, so the whole FAST-LIO2 fork is
-> cloned and only that package is built (`--packages-up-to syncai_backend` or
-> `--packages-select interface`); see the `Dockerfile`.
+> `syncai_common` (msgs/srvs, including the map srvs `SaveMaps` / `ResetMapping`
+> / `Relocalize` / `IsValid` that used to live in FAST-LIO2's `interface`
+> package). It is named in `interface.repos`, so `vcs import < interface.repos`
+> from a colcon workspace root fetches it over HTTPS with no
+> `SyncAI-Robot-Workspace` checkout and no credentials; see the `Dockerfile`.
 >
 > **Running** it is the other half and still needs the rest of the robot stack
 > around it: the nav stack's topics and services, Postgres, and the workspace
@@ -690,8 +689,8 @@ cp /path/to/libsyncai_worker.so lib/
 # "One backend at a time" below) — two backends on one robot is an outage.
 ```
 
-**2. Build the image.** syncai_common and FAST-LIO2's `interface` are both
-cloned by the builder stage from `interface.repos` (HTTPS, no credentials), so
+**2. Build the image.** syncai_common is cloned by the builder stage from
+`interface.repos` (HTTPS, no credentials), so
 nothing needs copying in. The `base` stage is the slow one (~20 min on aarch64
 the first time); after that only a change to `requirements.txt` rebuilds it.
 
@@ -846,20 +845,21 @@ edit is picked up by the next run with no rebuild. Its header comment carries th
 exact commands. Two things are worth
 knowing before reading a result from it:
 
-- **Get the two interface packages in, or a third of the suite does not run.**
-  `vcs import < interface.repos` materialises both `syncai_common` and
-  FAST-LIO2's `interface` (the whole fork is cloned; build only
-  `--packages-select syncai_common interface`). Measured 2026-09-23:
+- **Get the interface package in, or a third of the suite does not run.**
+  `vcs import < interface.repos` materialises `syncai_common`; build it with
+  `--packages-select syncai_common`. Measured 2026-09-23 (when the map srvs
+  still came from FAST-LIO2's `interface` package, now folded into
+  `syncai_common`):
 
   | in the image | result |
   |---|---|
-  | both | 704 passed, 1 skipped (`test_copyright`, skipped on purpose) |
-  | neither | 315 passed, 6 skipped, **11 collection errors** — those files reach `syncai_common` or `interface` through a plain import rather than an `importorskip` |
+  | present | 704 passed, 1 skipped (`test_copyright`, skipped on purpose) |
+  | absent | 315 passed, 6 skipped, **11 collection errors** — those files reach `syncai_common` through a plain import rather than an `importorskip` |
 
-  Anything that touches a router or a gateway needs both for the run to mean
+  Anything that touches a router or a gateway needs it for the run to mean
   anything. (The `_INTERFACE_SRVS` guard and its
-  `test_map_gateway_no_interface.py` are gone: `interface` is a hard import
-  again, and an image without it fails in the builder.)
+  `test_map_gateway_no_interface.py` are gone: the map srvs are a hard import,
+  and an image without them fails in the builder.)
 - **The image runs as a non-root user on purpose.** Root bypasses file
   permission checks, so `os.access(W_OK)` answers `True` on a read-only file and
   the map router's `ini_not_writable` refusal test fails against working code.
