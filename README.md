@@ -897,9 +897,14 @@ linters (`test_copyright`, `test_flake8`, `test_pep257`).
   updates. Do not "fix" the size cliff by raising `net.core.rmem_max` and
   going back to the `PointCloud2` — that is host state on every robot, and
   16-45 MB per merge only moves the cliff.
-- `map -> pointlio_odom` only exists **after** you call `/<robot_id>/relocalize`.
-  Until then the live cloud stream is silent; the subscriber logs once on the
-  first drop and once on recovery rather than per frame, so check the log if the
-  3D view is empty.
+- `map -> pointlio_odom` exists once `syncai_localizer` has had its first
+  synced `body_cloud` + `lio_odom` pair — **not** once it has converged: it
+  broadcasts from that first sample on, starting at an identity offset, whether
+  or not a relocalize has happened. So a missing transform means the localizer
+  (or pointlio under it) is not running, and a present one proves nothing about
+  the pose — `relocalize_check` is the convergence check. Until the transform
+  exists the live cloud stream is silent; the subscriber logs once on the first
+  drop and once on recovery rather than per frame, so check the log if the 3D
+  view is empty.
 - The `sqlalchemy` session convention is per-repo: `init_map_repo` creates the
   schema and builds its own `sessionmaker` from the injected engine.
