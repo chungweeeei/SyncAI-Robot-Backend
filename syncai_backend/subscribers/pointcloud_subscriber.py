@@ -29,7 +29,7 @@ class PointCloudSubscriber:
        LIO body frame (``<robot_id>/pointlio_body``) at lidar rate. To overlay
        it on the map, each frame is transformed into ``target_frame`` (``map``)
        using the TF branch the localizer (``map -> <robot_id>/pointlio_odom``,
-       after relocalize) and the LIO node (``pointlio_odom -> pointlio_body``)
+       from its first synced cloud + odom) and the LIO node (``pointlio_odom -> pointlio_body``)
        broadcast — the source frame (and its TF parent, see
        ``_resolve_fixed_frame``) is taken from the cloud header, so a frame
        rename upstream needs no change here. That last part holds only as long
@@ -70,7 +70,7 @@ class PointCloudSubscriber:
 
         # Edge-triggered logging for the body_cloud TF lookup: None until the
         # first frame, then True/False. Lets us log once when the stream starts
-        # dropping (map->pointlio_odom missing, i.e. not relocalized) and once
+        # dropping (map->pointlio_odom missing, i.e. no localizer) and once
         # when it recovers, instead of a silent per-frame debug that hides why
         # the viewer is empty.
         self._cloud_tf_available = None
@@ -207,8 +207,8 @@ class PointCloudSubscriber:
                 if self._cloud_tf_available is not False:
                     self._logger.warning(
                         "body_cloud frames dropping: TF unavailable "
-                        "(relocalized yet? map->pointlio_odom comes from the "
-                        "localizer only after /localizer/relocalize)",
+                        "(localizer up? map->pointlio_odom comes from "
+                        "syncai_localizer once it has pointlio's cloud + odom)",
                         target_frame=self._target_frame,
                         source_frame=source_frame,
                         error=str(exc),

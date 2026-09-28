@@ -96,9 +96,10 @@ def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
 # itself; the `[initial_pose]` reset is what stops a pose measured in the old
 # map's frame from being applied as a seed in the new one.
 #
-# localizer_launch.py's read_initial_pose() reads x/y/yaw with fallback=0.0 per
-# key, so a key this does not find is already the value being written. z is here
-# because the section carries it even though the launch ignores it.
+# syncai_localizer's localizer.launch.py: its read_initial_pose() reads x/y/yaw
+# with fallback=0.0 per key, so a key this does not find is already the value
+# being written. z is here because the section carries it even though the
+# launch ignores it.
 _MAP_SECTION = "map"
 _MAP_NAME_KEY = "name"
 _INITIAL_POSE_SECTION = "initial_pose"
