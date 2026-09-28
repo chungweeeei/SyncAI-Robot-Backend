@@ -147,8 +147,8 @@ def test_it_keeps_the_files_own_delimiters(logger, ini):
 
 
 def test_a_missing_initial_pose_section_is_fine(logger, ini):
-    # localizer_launch.py reads these with fallback=0.0 per key, so a file
-    # without the section is already at the value being written.
+    # syncai_localizer's localizer.launch.py reads these with fallback=0.0 per
+    # key, so a file without the section is already at the value being written.
     path = ini("[map]\nname: dp2f\n")
 
     set_active_map("warehouse01", logger)

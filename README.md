@@ -291,8 +291,11 @@ activity can poll status and cancel.
 `set_policy_mode` (`syncai_common/srv`, served by `syncai_driver_manager`).
 `MapGateway`: `map_server/load_map` (`syncai_map_server`, so an edited or
 re-converted gridmap reaches the running map_server), `pgo/save_maps`
-(FAST-LIO2's `pgo_node`, the only thing that serialises a mapping run) and
-`pgo/reset_mapping` (the same node, the only thing that un-does one). The map
+(`syncai_mapping`'s `pgo_node`, the only thing that serialises a mapping run),
+`pgo/reset_mapping` (the same node, the only thing that un-does one) and
+`relocalize` / `relocalize_check` (`syncai_localizer`, the map switch). The
+last two are **bare** names in the robot namespace — `/<robot_id>/relocalize`,
+not `/<robot_id>/localizer/relocalize`; `gateways/map/map.py` records why. The map
 gateway is separate on purpose — the map router has no business holding a
 handle that can command the robot to move.
 
@@ -894,7 +897,7 @@ linters (`test_copyright`, `test_flake8`, `test_pep257`).
   updates. Do not "fix" the size cliff by raising `net.core.rmem_max` and
   going back to the `PointCloud2` — that is host state on every robot, and
   16-45 MB per merge only moves the cliff.
-- `map -> pointlio_odom` only exists **after** you call `/localizer/relocalize`.
+- `map -> pointlio_odom` only exists **after** you call `/<robot_id>/relocalize`.
   Until then the live cloud stream is silent; the subscriber logs once on the
   first drop and once on recovery rather than per frame, so check the log if the
   3D view is empty.

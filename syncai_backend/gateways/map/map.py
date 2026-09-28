@@ -107,7 +107,8 @@ class MapGateway:
         )
 
         # Bare names, unlike load_map's. The localizer declares these with
-        # plain `create_service("relocalize", ...)` (localizer_node.cpp:99-108),
+        # plain `create_service("relocalize", ...)` (syncai_localizer's
+        # src/localizer_node.cpp:51-59),
         # so they resolve against its *namespace* and land at
         # /<robot_id>/relocalize -- while map_server builds its own
         # `service_prefix + "load_map"`, which is why that one carries the node
