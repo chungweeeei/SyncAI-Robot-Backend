@@ -42,6 +42,7 @@ from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
 
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.mode_restart import ModeRestartService
 
 from syncai_backend.temporal.worker import TemporalWorkerHandle
 
@@ -97,6 +98,7 @@ def init_rest_server(
     recording_gw: RecordingGateway,
     recording_catalog_repo: RecordingCatalogRepo,
     conversion_svc: GridmapConversionService,
+    restart_svc: ModeRestartService,
 ) -> FastAPI:
 
     description = """
@@ -157,7 +159,12 @@ def init_rest_server(
     app.include_router(init_task_router(logger=logger, workflow_gw=workflow_gw))
     app.include_router(init_schedule_router(logger=logger, workflow_gw=workflow_gw))
     app.include_router(
-        init_robot_router(logger=logger, robot_repo=robot_repo, robot_gw=robot_gw)
+        init_robot_router(
+            logger=logger,
+            robot_repo=robot_repo,
+            robot_gw=robot_gw,
+            restart_svc=restart_svc,
+        )
     )
     app.include_router(init_network_router(logger=logger, robot_gw=robot_gw))
     # Serves /api/v1/maps/...: the catalogue on disk plus the vertex table. The
@@ -260,6 +267,7 @@ def start_rest_server(
     recording_gw: RecordingGateway,
     recording_catalog_repo: RecordingCatalogRepo,
     conversion_svc: GridmapConversionService,
+    restart_svc: ModeRestartService,
 ):
 
     app = init_rest_server(
@@ -280,6 +288,7 @@ def start_rest_server(
         recording_gw=recording_gw,
         recording_catalog_repo=recording_catalog_repo,
         conversion_svc=conversion_svc,
+        restart_svc=restart_svc,
     )
 
     def _run():
