@@ -30,6 +30,7 @@ from syncai_backend.gateways.recording.recording import init_recording_gateway
 from syncai_backend.services.gridmap_conversion import (
     init_gridmap_conversion_service,
 )
+from syncai_backend.services.mode_restart import init_mode_restart_service
 
 from syncai_backend.subscribers.robot_state_subscriber import (
     init_robot_state_subscriber,
@@ -152,6 +153,11 @@ class SyncAIBackend(Node):
         # process is the directory the catalogue repo also reads.
         conversion_svc = init_gridmap_conversion_service(logger=logger)
 
+        # The latest restart of the live mode and how it ended. Its own object
+        # because the answer outlives the POST that asked: sys_manager replies
+        # once the rebuild is over, long after the request has returned.
+        restart_svc = init_mode_restart_service(logger=logger, robot_gw=robot_gw)
+
         # One /tf + /tf_static subscription for the whole process, shared by the
         # two subscribers that need transforms. Held on self because this is the
         # object that owns it; see subscribers/tf.py for why they no longer
@@ -199,6 +205,7 @@ class SyncAIBackend(Node):
             recording_gw=recording_gw,
             recording_catalog_repo=recording_catalog_repo,
             conversion_svc=conversion_svc,
+            restart_svc=restart_svc,
         )
 
 

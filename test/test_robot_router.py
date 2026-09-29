@@ -42,6 +42,9 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
 from syncai_backend.repositories.robot.robot import init_robot_repo  # noqa: E402
+from syncai_backend.services.mode_restart import (  # noqa: E402
+    init_mode_restart_service,
+)
 
 
 class _StubRobotGateway:
@@ -63,6 +66,9 @@ class _StubRobotGateway:
         self.switch_result = (None, "Mode switch dispatched")
         self.restarts = 0
         self.restart_result = (None, "Mode restart dispatched")
+        # The late-answer callback of the last dispatched restart: a test calls
+        # it to play sys_manager answering once the rebuild is over.
+        self.restart_done = None
 
     def set_motion_key(self, key):
         self.motion_keys.append(key)
@@ -76,8 +82,10 @@ class _StubRobotGateway:
         self.switched_modes.append(mode)
         return self.switch_result
 
-    def restart_mode(self):
+    def restart_mode(self, on_done=None):
         self.restarts += 1
+        if self.restart_result[0] is None:
+            self.restart_done = on_done
         return self.restart_result
 
 
@@ -105,6 +113,7 @@ def client(logger, robot_repo, robot_gw):
             logger=logger,
             robot_repo=robot_repo,
             robot_gw=robot_gw,
+            restart_svc=init_mode_restart_service(logger=logger, robot_gw=robot_gw),
         )
     )
     return TestClient(app)
@@ -500,3 +509,74 @@ def test_restart_unreachable_is_502(client, robot_gw):
 
     assert response.status_code == 502
     assert response.json()["detail"] == "restart_mode service is not available"
+
+
+def _get_restart(client):
+    return client.get("/api/v1/robot/restart")
+
+
+def test_restart_status_is_idle_before_any_restart(client):
+    response = _get_restart(client)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "idle",
+        "message": "",
+        "started_at": None,
+        "finished_at": None,
+    }
+
+
+def test_dispatched_restart_reads_back_as_restarting_until_it_answers(
+    client, robot_gw
+):
+    """The POST cannot wait for the rebuild; GET is where its end is reported."""
+    _post_restart(client)
+
+    running = _get_restart(client).json()
+    assert running["status"] == "restarting"
+    assert running["started_at"] is not None
+    assert running["finished_at"] is None
+
+    robot_gw.restart_done(True, "Restarted AUTO (session auto)")
+
+    done = _get_restart(client).json()
+    assert done["status"] == "succeeded"
+    assert done["message"] == "Restarted AUTO (session auto)"
+    assert done["finished_at"] is not None
+
+
+def test_a_rebuild_that_went_wrong_reads_back_as_failed(client, robot_gw):
+    _post_restart(client)
+    robot_gw.restart_done(False, "Tried to restart AUTO but ended up in MAINTENANCE")
+
+    done = _get_restart(client).json()
+    assert done["status"] == "failed"
+    assert "MAINTENANCE" in done["message"]
+
+
+def test_a_second_press_while_restarting_is_409(client, robot_gw):
+    _post_restart(client)
+
+    response = _post_restart(client)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "restart_running"
+    assert robot_gw.restarts == 1
+
+
+def test_a_refused_restart_leaves_no_record(client, robot_gw):
+    """Nothing was touched, so there is nothing to report as under way."""
+    robot_gw.restart_result = (False, fail(Failure.RESTART_REFUSED, "MANUAL"))
+
+    _post_restart(client)
+
+    assert _get_restart(client).json()["status"] == "idle"
+
+
+def test_a_restart_answered_in_the_window_reads_back_as_succeeded(client, robot_gw):
+    robot_gw.restart_result = (True, "Restarted AUTO (session auto)")
+
+    _post_restart(client)
+
+    assert _get_restart(client).json()["status"] == "succeeded"

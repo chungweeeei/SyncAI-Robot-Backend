@@ -4,7 +4,7 @@ import threading
 import structlog
 from enum import Enum
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 from rclpy import qos
 from rclpy.node import Node
 from rclpy.publisher import Publisher
@@ -357,25 +357,37 @@ class RobotGateway:
         response = future.result()
         return response.success, response.message
 
-    def restart_mode(self) -> Tuple[Optional[bool], str]:
+    def restart_mode(
+        self, on_done: Optional[Callable[[bool, str], None]] = None
+    ) -> Tuple[Optional[bool], str]:
         """Ask sys_manager to rebuild the live mode's session. Three-valued.
 
-        The same contract as ``switch_mode`` and for the same reason: a
-        restart kills the byobu session this backend is a pane of, so
-        ``(None, msg)`` — no answer inside ``SWITCH_MODE_ACK_TIMEOUT`` — is
-        the EXPECTED outcome of one that goes ahead.
+        sys_manager answers only once the rebuild is over (tens of seconds of
+        byobu commands), so ``(None, msg)`` — no answer inside
+        ``SWITCH_MODE_ACK_TIMEOUT`` — is the EXPECTED outcome of one that goes
+        ahead. The window exists for the answers that come back fast.
 
-        What does come back fast is a refusal, and sys_manager refuses with
-        nothing touched in exactly three states: nothing running
-        (MAINTENANCE), both sessions up (ambiguous), and MANUAL — always,
-        since pgo_node may hold an unsaved map in RAM. So in practice this
-        restarts AUTO only. Those refusals are tagged
+        Those are refusals, and sys_manager refuses with nothing touched in
+        exactly three states: nothing running (MAINTENANCE), both sessions up
+        (ambiguous), and MANUAL — always, since pgo_node may hold an unsaved
+        map in RAM. So in practice this restarts AUTO only. They are tagged
         ``Failure.RESTART_REFUSED``: they are the robot's state, not a fault,
         and the caller's next step is a different request (switch_mode), not
         a retry. An unreachable service stays untagged.
 
-        No argument: the mode is whatever get_mode would report, so the srv
-        request is empty.
+        ``on_done`` is how the real outcome of a dispatched restart is not
+        lost. Run as its own container this process survives the teardown,
+        so sys_manager's eventual answer — "Restarted AUTO", or "ended up in
+        MAINTENANCE" — does arrive, and it is the only statement anywhere that
+        the rebuild worked. It is called once, from the executor thread, with
+        ``(success, message)`` — only when this returned ``None``; an answer
+        inside the window is the return value instead. A late failure is left
+        untagged: nothing is refused after the rebuild has begun, so it is a
+        rebuild that went wrong, not the robot's state. As a byobu pane the
+        process dies first and the callback never runs, which is the caller's
+        to account for.
+
+        No argument to the srv: the mode is whatever get_mode would report.
         """
         restart_mode_client = self._service_clients.get("restart_mode")
         if not restart_mode_client.wait_for_service(timeout_sec=5.0):
@@ -385,12 +397,28 @@ class RobotGateway:
 
         future = restart_mode_client.call_async(RestartMode.Request())
         if not _wait_for_future(future, timeout=SWITCH_MODE_ACK_TIMEOUT):
+            if on_done is not None:
+                future.add_done_callback(
+                    lambda done: on_done(*self._late_restart_outcome(done))
+                )
             return None, "Mode restart dispatched; the stack is rebuilding"
 
         response = future.result()
         if not response.success:
             return False, fail(Failure.RESTART_REFUSED, response.message)
         return True, response.message
+
+    def _late_restart_outcome(self, future) -> Tuple[bool, str]:
+        # Never raise out of a done callback: it runs on the executor thread,
+        # and an exception there would end spin() and the process.
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001 -- see above
+            self._logger.error("[RobotGateway] restart_mode failed", error=str(exc))
+            return False, "The restart did not report back."
+        if response is None:
+            return False, "The restart did not report back."
+        return bool(response.success), response.message
 
     def _make_pose_stamped(self, x: float, y: float, yaw: float) -> PoseStamped:
         return PoseStamped(

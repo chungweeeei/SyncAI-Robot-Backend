@@ -559,6 +559,34 @@ class TestRestartMode:
         assert success is None
         assert "dispatched" in message
 
+    def test_late_answer_reaches_on_done(self, robot_gw, monkeypatch):
+        """The real outcome, arriving after the ack window, is not dropped."""
+        from syncai_backend.gateways.robot import robot as robot_module
+
+        monkeypatch.setattr(robot_module, "SWITCH_MODE_ACK_TIMEOUT", 0.01)
+        client = self._service(robot_gw, completed=False)
+        outcomes = []
+
+        success, _ = robot_gw.restart_mode(on_done=lambda *o: outcomes.append(o))
+        assert success is None
+        assert outcomes == []
+
+        client.call_async.return_value.complete(
+            SimpleNamespace(success=False, message="ended up in MAINTENANCE")
+        )
+
+        assert outcomes == [(False, "ended up in MAINTENANCE")]
+        # A rebuild that went wrong, not a refusal: untagged.
+        assert failure_code(outcomes[0][1]) is None
+
+    def test_answer_inside_the_window_does_not_call_on_done(self, robot_gw):
+        self._service(robot_gw, SimpleNamespace(success=True, message="Restarted AUTO"))
+        outcomes = []
+
+        robot_gw.restart_mode(on_done=lambda *o: outcomes.append(o))
+
+        assert outcomes == []
+
     def test_service_unavailable_is_untagged(self, robot_gw):
         client = self._service(robot_gw, available=False)
 

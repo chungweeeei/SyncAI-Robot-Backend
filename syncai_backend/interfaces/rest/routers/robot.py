@@ -1,7 +1,9 @@
 import json
 import math
 import structlog
+from datetime import datetime
 from enum import Enum
+from typing import Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -11,6 +13,7 @@ from syncai_backend.exceptions import ConflictError, UpstreamError, NotFoundErro
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.services.mode_restart import ModeRestartService, RestartStatus
 
 
 # Reverse lookup: RobotMode uint8 constant -> human-readable name.
@@ -269,15 +272,39 @@ class RestartModeResponse(BaseModel):
         ...,
         description=(
             "True when the restart was dispatched and the live mode's stack is "
-            "being torn down and rebuilt — the same outcome as a real "
-            "POST /api/v1/robot/mode, including this process, so a dropped "
-            "connection right after this POST is the restart working. Poll "
-            "GET /api/v1/robot/state until it answers again. False means "
-            "sys_manager answered inside the ack window that the rebuild is "
-            "already done."
+            "being torn down and rebuilt. This process is not part of that "
+            "stack and keeps answering, so poll GET /api/v1/robot/restart for "
+            "how it ends — GET /api/v1/robot/state keeps serving the last "
+            "frame through the outage and cannot say. False means sys_manager "
+            "answered inside the ack window that the rebuild is already done."
         ),
     )
     message: str = Field(..., description="Human-readable result of the request.")
+
+
+class RestartStatusResponse(BaseModel):
+    status: RestartStatus = Field(
+        ...,
+        description=(
+            "The latest restart this process dispatched: `idle` if none has "
+            "been since it started, `restarting` while sys_manager has not "
+            "answered, then `succeeded` or `failed`. In memory, so a backend "
+            "that was itself restarted says `idle` rather than guess."
+        ),
+    )
+    message: str = Field(
+        ...,
+        description=(
+            "sys_manager's answer once there is one (empty before): the "
+            "reason, on `failed`."
+        ),
+    )
+    started_at: Optional[datetime] = Field(
+        None, description="When the restart was dispatched (UTC); null when idle."
+    )
+    finished_at: Optional[datetime] = Field(
+        None, description="When it ended (UTC); null until then."
+    )
 
 
 class SetInitialPoseRequest(BaseModel):
@@ -397,6 +424,7 @@ def init_robot_router(
     logger: structlog.stdlib.BoundLogger,
     robot_repo: RobotRepo,
     robot_gw: RobotGateway,
+    restart_svc: ModeRestartService,
 ) -> APIRouter:
     robot_router = APIRouter(prefix="", tags=["Robot"])
 
@@ -534,16 +562,18 @@ def init_robot_router(
         No body, because the mode is not the caller's to pick — sys_manager
         restarts whatever get_mode would report.
 
-        Same "outlives its server" semantics as switch_mode (read its
-        docstring), with one difference in the refusals: sys_manager refuses
-        with nothing touched in MAINTENANCE, with both sessions up, and
-        always in MANUAL (pgo_node may hold an unsaved map in RAM), so in
-        practice only AUTO restarts. Those are a 409 ``restart_refused`` with
-        sys_manager's sentence — the robot's state, answered by a different
-        request, not a broken robot. An unreachable sys_manager is the
-        uniform 502.
+        Answers within the gateway's ack window: sys_manager only replies once
+        the rebuild is over, and the outcome is kept for GET below rather than
+        held on this request. The refusals come back inside the window, with
+        nothing touched: sys_manager refuses in MAINTENANCE, with both
+        sessions up, and always in MANUAL (pgo_node may hold an unsaved map in
+        RAM), so in practice only AUTO restarts. Those are a 409
+        ``restart_refused`` with sys_manager's sentence — the robot's state,
+        answered by a different request, not a broken robot. A second press
+        while one is running is a 409 ``restart_running``. An unreachable
+        sys_manager is the uniform 502.
         """
-        success, message = robot_gw.restart_mode()
+        success, message = restart_svc.start()
 
         if success is False:
             logger.error("Failed to restart mode", message=message)
@@ -552,16 +582,28 @@ def init_robot_router(
             raise UpstreamError(message)
 
         if success is True:
-            # Only reachable when the rebuild finished inside the ack window,
-            # which a byobu-pane backend never sees (it died with the session).
             return RestartModeResponse(restarting=False, message=message)
 
         return RestartModeResponse(
             restarting=True,
             message=(
-                "Restarting the live mode. The console will lose this API "
-                "while the stack rebuilds; poll robot state."
+                "Restarting the live mode; poll GET /api/v1/robot/restart for "
+                "the outcome."
             ),
+        )
+
+    @robot_router.get("/api/v1/robot/restart", response_model=RestartStatusResponse)
+    async def get_restart_status():
+        """How the latest restart this process dispatched is going, or went.
+
+        `async` because it only reads a slot under a lock — no ROS, no I/O.
+        """
+        record = restart_svc.snapshot()
+        return RestartStatusResponse(
+            status=record.status,
+            message=record.message,
+            started_at=record.started_at,
+            finished_at=record.finished_at,
         )
 
     @robot_router.post(
