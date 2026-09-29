@@ -7,7 +7,8 @@ from pydantic import BaseModel, Field
 
 from syncai_common.msg import RobotMode, RobotState as RobotStateMsg
 
-from syncai_backend.exceptions import UpstreamError, NotFoundError
+from syncai_backend.exceptions import ConflictError, UpstreamError, NotFoundError
+from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.repositories.robot.robot import RobotRepo
 
@@ -263,6 +264,22 @@ class SwitchModeResponse(BaseModel):
     message: str = Field(..., description="Human-readable result of the request.")
 
 
+class RestartModeResponse(BaseModel):
+    restarting: bool = Field(
+        ...,
+        description=(
+            "True when the restart was dispatched and the live mode's stack is "
+            "being torn down and rebuilt — the same outcome as a real "
+            "POST /api/v1/robot/mode, including this process, so a dropped "
+            "connection right after this POST is the restart working. Poll "
+            "GET /api/v1/robot/state until it answers again. False means "
+            "sys_manager answered inside the ack window that the rebuild is "
+            "already done."
+        ),
+    )
+    message: str = Field(..., description="Human-readable result of the request.")
+
+
 class SetInitialPoseRequest(BaseModel):
     x: float = Field(..., description="The x-coordinate of the pose, in the map frame.")
     y: float = Field(..., description="The y-coordinate of the pose, in the map frame.")
@@ -505,6 +522,45 @@ def init_robot_router(
             message=(
                 f"Switching to {request.mode.value}. The console will lose "
                 "this API while the stack rebuilds; poll robot state."
+            ),
+        )
+
+    @robot_router.post("/api/v1/robot/restart", response_model=RestartModeResponse)
+    def restart_mode():
+        """Rebuild the live mode's byobu session — ``restart_mode`` on sys_manager.
+
+        The escape hatch for a wedged stack that POST /api/v1/robot/mode
+        cannot be: that route treats "switch to the live mode" as a no-op.
+        No body, because the mode is not the caller's to pick — sys_manager
+        restarts whatever get_mode would report.
+
+        Same "outlives its server" semantics as switch_mode (read its
+        docstring), with one difference in the refusals: sys_manager refuses
+        with nothing touched in MAINTENANCE, with both sessions up, and
+        always in MANUAL (pgo_node may hold an unsaved map in RAM), so in
+        practice only AUTO restarts. Those are a 409 ``restart_refused`` with
+        sys_manager's sentence — the robot's state, answered by a different
+        request, not a broken robot. An unreachable sys_manager is the
+        uniform 502.
+        """
+        success, message = robot_gw.restart_mode()
+
+        if success is False:
+            logger.error("Failed to restart mode", message=message)
+            if failure_code(message) is Failure.RESTART_REFUSED:
+                raise ConflictError(message, code=Failure.RESTART_REFUSED.value)
+            raise UpstreamError(message)
+
+        if success is True:
+            # Only reachable when the rebuild finished inside the ack window,
+            # which a byobu-pane backend never sees (it died with the session).
+            return RestartModeResponse(restarting=False, message=message)
+
+        return RestartModeResponse(
+            restarting=True,
+            message=(
+                "Restarting the live mode. The console will lose this API "
+                "while the stack rebuilds; poll robot state."
             ),
         )
 

@@ -27,6 +27,7 @@ from builtin_interfaces.msg import Time  # noqa: E402
 
 from geometry_msgs.msg import Twist  # noqa: E402
 
+from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
 from syncai_backend.gateways.robot.robot import (  # noqa: E402
     MAX_TRACKED_GOALS,
@@ -519,4 +520,50 @@ class TestSwitchMode:
 
         assert success is False
         assert "not available" in message
+        client.call_async.assert_not_called()
+
+
+class TestRestartMode:
+    """restart_mode is switch_mode's three-valued contract plus a tagged refusal."""
+
+    def _service(self, robot_gw, response=None, available=True, completed=True):
+        client = robot_gw._service_clients["restart_mode"]
+        client.wait_for_service.return_value = available
+        client.call_async.return_value = _Future(result=response, completed=completed)
+        return client
+
+    def test_quick_success_is_passed_through_untagged(self, robot_gw):
+        self._service(robot_gw, SimpleNamespace(success=True, message="Restarted AUTO"))
+
+        success, message = robot_gw.restart_mode()
+
+        assert (success, message) == (True, "Restarted AUTO")
+        assert failure_code(message) is None
+
+    def test_refusal_is_tagged(self, robot_gw):
+        self._service(robot_gw, SimpleNamespace(success=False, message="MANUAL"))
+
+        success, message = robot_gw.restart_mode()
+
+        assert (success, message) == (False, "MANUAL")
+        assert failure_code(message) is Failure.RESTART_REFUSED
+
+    def test_unanswered_restart_reports_none(self, robot_gw, monkeypatch):
+        from syncai_backend.gateways.robot import robot as robot_module
+
+        monkeypatch.setattr(robot_module, "SWITCH_MODE_ACK_TIMEOUT", 0.01)
+        self._service(robot_gw, completed=False)
+
+        success, message = robot_gw.restart_mode()
+
+        assert success is None
+        assert "dispatched" in message
+
+    def test_service_unavailable_is_untagged(self, robot_gw):
+        client = self._service(robot_gw, available=False)
+
+        success, message = robot_gw.restart_mode()
+
+        assert success is False
+        assert failure_code(message) is None
         client.call_async.assert_not_called()

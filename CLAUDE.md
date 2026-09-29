@@ -12,7 +12,7 @@ ROS 2 `ament_python` package (`package.xml`, `setup.py`), split out of
 It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`;
-`SwitchMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, and the
+`SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, and the
 map srvs `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`) — plus `rclpy`,
 `nav2_msgs`, `tf2_ros`. Keep those imports as they are. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
