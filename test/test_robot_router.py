@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from syncai_common.msg import RobotMode  # noqa: E402
 
+from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
 from syncai_backend.interfaces.rest.routers.robot import (  # noqa: E402
     RobotNetworkStatus,
@@ -60,6 +61,8 @@ class _StubRobotGateway:
         # switch_mode is three-valued, and None (dispatched, no answer inside
         # the ack window) is the outcome of every real switch.
         self.switch_result = (None, "Mode switch dispatched")
+        self.restarts = 0
+        self.restart_result = (None, "Mode restart dispatched")
 
     def set_motion_key(self, key):
         self.motion_keys.append(key)
@@ -72,6 +75,10 @@ class _StubRobotGateway:
     def switch_mode(self, mode):
         self.switched_modes.append(mode)
         return self.switch_result
+
+    def restart_mode(self):
+        self.restarts += 1
+        return self.restart_result
 
 
 @pytest.fixture
@@ -445,3 +452,51 @@ def test_unswitchable_mode_is_422_before_the_gateway(client, robot_gw, mode):
     """MAINTENANCE is derivable but not a switch target; ints are not the API."""
     assert _post_mode(client, {"mode": mode}).status_code == 422
     assert robot_gw.switched_modes == []
+
+
+# --- POST /api/v1/robot/restart ----------------------------------------------
+
+
+def _post_restart(client):
+    return client.post("/api/v1/robot/restart")
+
+
+def test_dispatched_restart_reports_restarting(client, robot_gw):
+    response = _post_restart(client)
+
+    assert response.status_code == 200
+    assert response.json()["restarting"] is True
+    assert robot_gw.restarts == 1
+
+
+def test_restart_answered_in_the_window_reports_not_restarting(client, robot_gw):
+    robot_gw.restart_result = (True, "Restarted AUTO (session auto)")
+
+    response = _post_restart(client)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "restarting": False,
+        "message": "Restarted AUTO (session auto)",
+    }
+
+
+def test_restart_refusal_is_409_with_its_code(client, robot_gw):
+    """sys_manager's refusals are the robot's state, not a broken upstream."""
+    refusal = "restart_mode is not available in MANUAL: ..."
+    robot_gw.restart_result = (False, fail(Failure.RESTART_REFUSED, refusal))
+
+    response = _post_restart(client)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == refusal
+    assert response.json()["code"] == "restart_refused"
+
+
+def test_restart_unreachable_is_502(client, robot_gw):
+    robot_gw.restart_result = (False, "restart_mode service is not available")
+
+    response = _post_restart(client)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "restart_mode service is not available"

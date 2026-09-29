@@ -17,6 +17,7 @@ from action_msgs.msg import GoalStatus
 from syncai_common.msg import WifiNetwork
 from syncai_common.srv import (
     ConnectWifiNetwork,
+    RestartMode,
     ScanWifiNetworks,
     SetMotionKey,
     SetPolicyMode,
@@ -32,6 +33,8 @@ from geometry_msgs.msg import (
     PoseWithCovarianceStamped,
     Twist,
 )
+
+from syncai_backend.gateways.failure import Failure, fail
 
 
 class MotionKey(str, Enum):
@@ -88,6 +91,8 @@ MAX_TRACKED_GOALS = 5
 # window only exists to catch the responses that do come back fast — the no-op
 # ("Already in AUTO; nothing to do") and a refusal — where reporting the real
 # outcome beats a blind "dispatched". Module-level so tests can shrink it.
+# restart_mode() shares it: the same server, the same session teardown, and
+# the same fast refusals.
 SWITCH_MODE_ACK_TIMEOUT = 2.0
 
 # How long move() waits for the NavigateToPose server, then for nav2 to accept
@@ -191,6 +196,13 @@ class RobotGateway:
             srv_name="switch_mode",
         )
 
+        # Its sibling: rebuild the session of the mode already live, which
+        # switch_mode deliberately refuses to do. Same server, same reasons.
+        restart_mode_client = self._node.create_client(
+            srv_type=RestartMode,
+            srv_name="restart_mode",
+        )
+
         self._service_clients.update(
             {
                 "scan_wifi": scan_wifi_client,
@@ -198,6 +210,7 @@ class RobotGateway:
                 "set_motion_key": set_motion_key_client,
                 "set_policy_mode": set_policy_mode_client,
                 "switch_mode": switch_mode_client,
+                "restart_mode": restart_mode_client,
             }
         )
 
@@ -343,6 +356,41 @@ class RobotGateway:
 
         response = future.result()
         return response.success, response.message
+
+    def restart_mode(self) -> Tuple[Optional[bool], str]:
+        """Ask sys_manager to rebuild the live mode's session. Three-valued.
+
+        The same contract as ``switch_mode`` and for the same reason: a
+        restart kills the byobu session this backend is a pane of, so
+        ``(None, msg)`` — no answer inside ``SWITCH_MODE_ACK_TIMEOUT`` — is
+        the EXPECTED outcome of one that goes ahead.
+
+        What does come back fast is a refusal, and sys_manager refuses with
+        nothing touched in exactly three states: nothing running
+        (MAINTENANCE), both sessions up (ambiguous), and MANUAL — always,
+        since pgo_node may hold an unsaved map in RAM. So in practice this
+        restarts AUTO only. Those refusals are tagged
+        ``Failure.RESTART_REFUSED``: they are the robot's state, not a fault,
+        and the caller's next step is a different request (switch_mode), not
+        a retry. An unreachable service stays untagged.
+
+        No argument: the mode is whatever get_mode would report, so the srv
+        request is empty.
+        """
+        restart_mode_client = self._service_clients.get("restart_mode")
+        if not restart_mode_client.wait_for_service(timeout_sec=5.0):
+            return False, "restart_mode service is not available"
+
+        self._logger.info("[RobotGateway] Restarting the live operating mode")
+
+        future = restart_mode_client.call_async(RestartMode.Request())
+        if not _wait_for_future(future, timeout=SWITCH_MODE_ACK_TIMEOUT):
+            return None, "Mode restart dispatched; the stack is rebuilding"
+
+        response = future.result()
+        if not response.success:
+            return False, fail(Failure.RESTART_REFUSED, response.message)
+        return True, response.message
 
     def _make_pose_stamped(self, x: float, y: float, yaw: float) -> PoseStamped:
         return PoseStamped(

@@ -55,6 +55,12 @@ class Failure(str, Enum):
     RECORDING_RUNNING = "recording_running"
     DISK_LOW = "disk_low"
 
+    # RobotGateway.restart_mode: sys_manager refused with nothing touched --
+    # MAINTENANCE, both sessions up, or MANUAL (an unsaved map in pgo's RAM).
+    # A 409, because the state is the robot's and the next step is switch_mode,
+    # not a retry; an unreachable sys_manager stays the uniform 502.
+    RESTART_REFUSED = "restart_refused"
+
     # WebRtcGateway: a create is mid-flight and has no session id yet, so it
     # cannot be preempted. The caller retries; everything else is a 502.
     WHEP_SESSION_PENDING = "whep_session_pending"
