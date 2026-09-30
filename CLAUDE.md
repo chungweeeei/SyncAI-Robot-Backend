@@ -119,7 +119,8 @@ Consequences:
 interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain exceptions
         │
 services/                  domain work that outlives a request: gridmap_conversion (recipes,
-        │                  the registry of running threads, the gridmap.recipe.json protocol)
+        │                  the registry of running threads, the gridmap.recipe.json protocol),
+        │                  mode_restart (the latest restart_mode dispatch and its outcome)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
@@ -175,7 +176,8 @@ TF frame names are not namespaced.
 ### Configuration
 
 Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
-`TTS_SERVICE_URL`), loaded from the cwd `.env` via python-dotenv at import time — see
+`TTS_SERVICE_URL`, `SYNCAI_WEBRTC_LIB`; the WebRTC worker's own `*_RTP_PORT` /
+`STUN_SERVERS` / `TURN_*` are only `setdefault`ed before `InitWorker`), loaded from the cwd `.env` via python-dotenv at import time — see
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
 Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
 `~/robot_ws/record`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
@@ -207,7 +209,9 @@ the only caller that passes anything else.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this
-  process runs in, so in-memory registries die with it.
+  process runs in, so in-memory registries die with it. The one deliberate exception is
+  `ModeRestartService`'s record behind `GET /api/v1/robot/restart`: it describes a rebuild
+  *this* process watched, so a backend restarted meanwhile honestly answers `idle`.
 
 ### Temporal specifics
 
@@ -247,8 +251,9 @@ raise out of the callback, it would end `spin()` and the process.
 `helpers/traversable.py` is the **only** module that imports open3d (~100 MB), and only
 inside `GridmapConversionService.start`'s conversion thread, in its `try`. Keep
 `pcd_to_gridmap.py` and `keepout.py` open3d-free. The WebRTC Go worker is lazy-loaded on
-first use, owned by exactly one gateway instance whose internal lock serialises REST and
-Temporal callers.
+first use (it can never be unloaded), owned by exactly one gateway instance that keeps one
+slot per session kind and preempts by device (camera, speaker); REST is its only caller,
+and neither of its locks is held across a call into the worker.
 The kokoro TTS model (~310 MB) used to be the other one of these; it lives in the
 syncai_tts container now and `gateways/tts` is an httpx client.
 
