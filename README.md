@@ -82,8 +82,8 @@ subscribers/               ROS topics → repositories (the ingest side) — wit
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   occupancy_grid (OccupancyGrid→PNG), pointcloud (read a binary
                            PCD, downsample / transform / pack), pgm, pcd_to_gridmap
-                           (z-band recipe), traversable (traversability recipe),
-                           system_config (INI reader)
+                           (z-band recipe), keepout (forbidden-zone mask rasteriser),
+                           traversable (traversability recipe), system_config (INI reader)
 ```
 
 `gateways/tts` is a gateway like `robot` / `map`, but its downstream is neither
