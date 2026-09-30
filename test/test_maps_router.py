@@ -74,11 +74,20 @@ class _StubMapGateway:
         self.swap_result = (True, "")
         self.services_ready = True
         self.converged = True
+        # The keepout mask's map_server. Recorded in `order` too: a switch has
+        # to reload it *after* the INI write, the commit point.
+        self.keepout_calls = []
+        self.keepout_result = (True, "")
 
     def reload_map(self, yaml_path):
         self.calls.append(yaml_path)
         self.order.append(("reload_map", yaml_path))
         return self.result
+
+    def reload_keepout(self, yaml_path):
+        self.keepout_calls.append(yaml_path)
+        self.order.append(("reload_keepout", yaml_path))
+        return self.keepout_result
 
     def save_map(self, directory):
         self.save_calls.append(directory)
@@ -688,6 +697,204 @@ def test_save_grid_accepts_a_missing_content_type(client, maps_dir):
     assert response.status_code == 200
     # The write really happened: the body is the 24 cells just sent.
     assert (maps_dir / "full" / "gridmap.pgm").read_bytes()[-24:] == b"\x00" * 24
+
+
+# --- /api/v1/maps/{name}/keepout --------------------------------------------
+
+
+_KEEPOUT_HEADER = b"P5\n6 4\n255\n"
+
+
+def _cell_centre(col, row, origin=(-6.94, -11.09), height=4, res=0.05):
+    """World coordinates of the centre of cell (col, row), row 0 = top."""
+    return {"x": origin[0] + (col + 0.5) * res, "y": origin[1] + (height - row - 0.5) * res}
+
+
+def _rect_zone(zone_id=None, cols=(1, 3), rows=(1, 2)):
+    """A rectangle over columns cols[0]..cols[1], rows rows[0]..rows[1] (inclusive)."""
+    zone = {
+        "points": [
+            _cell_centre(cols[0], rows[1]),
+            _cell_centre(cols[1], rows[1]),
+            _cell_centre(cols[1], rows[0]),
+            _cell_centre(cols[0], rows[0]),
+        ]
+    }
+    if zone_id is not None:
+        zone["id"] = zone_id
+    return zone
+
+
+def _put_keepout(client, name, zones):
+    return client.put(f"/api/v1/maps/{name}/keepout", json={"zones": zones})
+
+
+def _keepout_cells(maps_dir, name):
+    body = (maps_dir / name / "keepout.pgm").read_bytes()
+    assert body.startswith(_KEEPOUT_HEADER)
+    return np.frombuffer(body[len(_KEEPOUT_HEADER):], np.uint8).reshape(4, 6)
+
+
+def test_keepout_get_is_empty_for_a_map_never_drawn_on(client):
+    body = client.get("/api/v1/maps/full/keepout").json()
+
+    assert body == {"name": "full", "zones": [], "active": True}
+
+
+def test_keepout_get_404_for_a_missing_map(client):
+    assert client.get("/api/v1/maps/nosuchmap/keepout").status_code == 404
+
+
+def test_keepout_get_400_for_an_unsafe_name(client):
+    assert client.get("/api/v1/maps/..%2Ffull/keepout").status_code in (400, 404)
+
+
+def test_keepout_put_then_get_round_trips_in_order(client):
+    zones = [_rect_zone("north"), _rect_zone("south", cols=(4, 5), rows=(3, 3))]
+
+    saved = _put_keepout(client, "full", zones).json()
+    fetched = client.get("/api/v1/maps/full/keepout").json()
+
+    assert [zone["id"] for zone in saved["zones"]] == ["north", "south"]
+    assert fetched["zones"] == saved["zones"]
+    assert fetched["zones"][0]["points"] == zones[0]["points"]
+
+
+def test_keepout_put_fills_in_missing_ids(client):
+    body = _put_keepout(client, "full", [_rect_zone(), _rect_zone()]).json()
+
+    ids = [zone["id"] for zone in body["zones"]]
+    assert len(set(ids)) == 2
+    assert all(len(zone_id) == 32 for zone_id in ids)  # uuid4().hex
+
+
+def test_keepout_put_writes_the_three_files_and_paints_the_zone(client, maps_dir):
+    response = _put_keepout(client, "full", [_rect_zone(cols=(1, 3), rows=(1, 2))])
+
+    assert response.status_code == 200
+    directory = maps_dir / "full"
+    assert (directory / "keepout.yaml").read_text().startswith("image: keepout.pgm\n")
+    assert json.loads((directory / "keepout.json").read_text())["version"] == 1
+    cells = _keepout_cells(maps_dir, "full")
+    expected = np.full((4, 6), 205, np.uint8)
+    expected[1:3, 1:4] = 0
+    np.testing.assert_array_equal(cells, expected)
+
+
+def test_keepout_put_reloads_the_active_map(client, map_gw):
+    body = _put_keepout(client, "full", [_rect_zone()]).json()
+
+    assert body["active"] is True
+    assert body["reloaded"] is True
+    assert "reloaded the keepout filter" in body["message"]
+    assert len(map_gw.keepout_calls) == 1
+    called = map_gw.keepout_calls[0]
+    assert called.endswith("full/keepout.yaml")
+    assert called.startswith("/")
+    assert "~" not in called
+    # The gridmap's map_server is not asked to load a keepout mask.
+    assert map_gw.calls == []
+
+
+def test_keepout_put_does_not_reload_an_inactive_map(
+    client, map_gw, maps_dir, make_pgm, make_gridmap_yaml
+):
+    make_pgm(maps_dir / "rawonly" / "gridmap.pgm", 3, 2)
+    make_gridmap_yaml(maps_dir / "rawonly" / "gridmap.yaml")
+
+    body = _put_keepout(client, "rawonly", [_rect_zone(cols=(0, 1), rows=(0, 1))]).json()
+
+    assert body["active"] is False
+    assert body["reloaded"] is False
+    assert map_gw.keepout_calls == []
+    assert (maps_dir / "rawonly" / "keepout.pgm").read_bytes().startswith(b"P5\n3 2\n255\n")
+
+
+def test_keepout_put_reports_a_failed_reload_without_failing_the_save(
+    client, map_gw, maps_dir
+):
+    """The zones are on disk, so a 5xx would be a lie the operator acts on."""
+    map_gw.keepout_result = (False, "filter_mask_server/load_map is not available")
+
+    response = _put_keepout(client, "full", [_rect_zone("z")])
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["active"] is True
+    assert body["reloaded"] is False
+    assert "filter_mask_server/load_map is not available" in body["message"]
+    assert client.get("/api/v1/maps/full/keepout").json()["zones"][0]["id"] == "z"
+
+
+def test_keepout_put_empty_clears_to_an_all_unknown_mask(client, maps_dir, map_gw):
+    _put_keepout(client, "full", [_rect_zone()])
+
+    body = _put_keepout(client, "full", []).json()
+
+    assert body["zones"] == []
+    assert body["reloaded"] is True
+    assert "Saved 0 forbidden zones" in body["message"]
+    # The files stay -- deleting them would clear nothing in the running filter.
+    assert (maps_dir / "full" / "keepout.yaml").is_file()
+    assert (_keepout_cells(maps_dir, "full") == 205).all()
+    assert len(map_gw.keepout_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "zones,fragment",
+    [
+        ([{"points": [_cell_centre(0, 0), _cell_centre(1, 1)]}], "at least 3"),
+        ([_rect_zone("dup"), _rect_zone("dup")], "more than once"),
+        ([_rect_zone("")], "empty id"),
+    ],
+)
+def test_keepout_put_400s_a_bad_zone_with_a_sentence(client, maps_dir, map_gw, zones, fragment):
+    response = _put_keepout(client, "full", zones)
+
+    assert response.status_code == 400
+    assert fragment in response.json()["detail"]
+    assert not (maps_dir / "full" / "keepout.json").exists()
+    assert map_gw.keepout_calls == []
+
+
+def test_keepout_put_400s_an_infinite_coordinate(client, maps_dir, map_gw):
+    # Sent as raw JSON: 1e999 parses to inf, which no client library will
+    # encode for us on purpose.
+    response = client.put(
+        "/api/v1/maps/full/keepout",
+        content=(
+            '{"zones": [{"points": '
+            '[{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1e999, "y": 1}]}]}'
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert "finite" in response.json()["detail"]
+    assert not (maps_dir / "full" / "keepout.json").exists()
+    assert map_gw.keepout_calls == []
+
+
+def test_keepout_put_refuses_while_a_conversion_is_running(client, conversion_svc, maps_dir):
+    _mark_converting(conversion_svc, "full")
+
+    response = _put_keepout(client, "full", [_rect_zone()])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conversion_running"
+    assert not (maps_dir / "full" / "keepout.json").exists()
+
+
+def test_keepout_put_404_when_the_map_has_no_gridmap(client, maps_dir):
+    response = _put_keepout(client, "rawonly", [_rect_zone()])
+
+    assert response.status_code == 404
+    assert "grid/convert" in response.json()["detail"]
+    assert not (maps_dir / "rawonly" / "keepout.pgm").exists()
+
+
+def test_keepout_put_404_for_a_missing_map(client):
+    assert _put_keepout(client, "nosuchmap", []).status_code == 404
 
 
 # --- /api/v1/maps/{name}/pointcloud -----------------------------------------
@@ -2353,9 +2560,14 @@ def test_activate_moves_the_localizer_before_map_server(
 
     # The ordering is the contract: the localizer's failure is the clean one, so
     # it goes first.
-    assert [step for step, _ in map_gw.order] == ["swap_localizer_map", "reload_map"]
+    assert [step for step, _ in map_gw.order] == [
+        "swap_localizer_map",
+        "reload_map",
+        "reload_keepout",
+    ]
     assert map_gw.order[0][1] == str(maps_dir / "full" / "map.pcd")
     assert map_gw.order[1][1] == str(maps_dir / "full" / "gridmap.yaml")
+    assert map_gw.order[2][1] == str(maps_dir / "full" / "keepout.yaml")
     # Zeroed, not carried over from the old map's frame.
     assert map_gw.swap_calls[0][1:] == (0.0, 0.0, 0.0)
 
@@ -2492,3 +2704,80 @@ def test_activate_reports_an_unreachable_localizer_check(
     assert body["switched"] is True
     assert body["localized"] is None
     assert "could not be asked" in body["message"]
+
+
+def test_activate_writes_a_blank_mask_for_a_map_never_booted_into(
+    client, map_gw, maps_dir, monkeypatch, tmp_path
+):
+    """filter_mask_server holds the old map's zones until it is handed this one's."""
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    assert not (maps_dir / "full" / "keepout.yaml").exists()
+
+    body = _activate(client, "full").json()
+
+    assert body["switched"] is True
+    assert body["keepout_reloaded"] is True
+    assert "forbidden zone" not in body["message"]  # nothing to say about zero zones
+    # All unknown, the same blank the nav session writes at boot -- and written
+    # into the map's own directory so the next boot of it finds the pair.
+    cells = (maps_dir / "full" / "keepout.pgm").read_bytes()[len(b"P5\n6 4\n255\n"):]
+    assert cells == bytes([205]) * 24
+    assert map_gw.keepout_calls == [str(maps_dir / "full" / "keepout.yaml")]
+
+
+def test_activate_carries_zones_drawn_while_the_map_was_inactive(
+    client, map_gw, maps_dir, monkeypatch, tmp_path
+):
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _put_keepout(client, "full", [_rect_zone("a"), _rect_zone("b", cols=(5, 5), rows=(3, 3))])
+    map_gw.keepout_calls.clear()
+    written = (maps_dir / "full" / "keepout.pgm").read_bytes()
+
+    body = _activate(client, "full").json()
+
+    assert body["keepout_reloaded"] is True
+    assert "Its 2 forbidden zones are active." in body["message"]
+    assert map_gw.keepout_calls == [str(maps_dir / "full" / "keepout.yaml")]
+    # An existing mask is loaded as-is, not regenerated.
+    assert (maps_dir / "full" / "keepout.pgm").read_bytes() == written
+
+
+def test_activate_reports_a_failed_keepout_reload_without_failing_the_switch(
+    client, map_gw, monkeypatch, tmp_path
+):
+    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.keepout_result = (False, "filter_mask_server rejected keepout.yaml")
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["switched"] is True
+    assert body["keepout_reloaded"] is False
+    assert "filter_mask_server rejected keepout.yaml" in body["message"]
+    # The switch itself is recorded; the mask is the only thing left behind.
+    assert "name: full" in ini.read_text()
+
+
+def test_activate_reloads_the_keepout_only_after_the_ini_is_written(
+    client, map_gw, monkeypatch, tmp_path
+):
+    """A rolled-back switch must not hand the mask server the map it backed out of."""
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+
+    def _boom(name, logger):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(map_router_module, "set_active_map", _boom)
+
+    assert _activate(client, "full").status_code == 502
+    assert map_gw.keepout_calls == []
+    assert "reload_keepout" not in [step for step, _ in map_gw.order]
+
+
+def test_activate_noop_has_no_keepout_verdict(client, map_gw):
+    body = _activate(client, "full").json()
+
+    assert body["switched"] is False
+    assert body["keepout_reloaded"] is None
+    assert map_gw.keepout_calls == []

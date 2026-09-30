@@ -1,4 +1,4 @@
-"""Tests for MapGateway: the map router's five service clients.
+"""Tests for MapGateway: the map router's six service clients.
 
 Same seams as test_robot_gateway.py: the node is a MagicMock and futures are
 the hand-completed ``_Future`` below, so no ROS graph (or rclpy.init) is
@@ -69,6 +69,7 @@ def map_gw(logger) -> MapGateway:
     # relative names — a wrong srv_name raises KeyError right here.
     clients = {
         "map_server/load_map": MagicMock(),
+        "filter_mask_server/load_map": MagicMock(),
         "pgo/save_maps": MagicMock(),
         "pgo/reset_mapping": MagicMock(),
         "relocalize": MagicMock(),
@@ -182,6 +183,85 @@ class TestReloadMap:
         success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
 
         assert (success, message) == (False, "map_server returned result 42")
+
+
+class TestReloadKeepout:
+    """The second map_server: same LoadMap call, different node, own wording."""
+
+    def test_success_goes_to_the_mask_server_only(self, map_gw):
+        client = _arm(
+            map_gw,
+            "load_keepout",
+            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
+        )
+
+        success, message = map_gw.reload_keepout(yaml_path="~/map/full/keepout.yaml")
+
+        assert (success, message) == (True, "")
+        request = client.call_async.call_args[0][0]
+        assert request.map_url == os.path.join(
+            os.path.expanduser("~"), "map/full/keepout.yaml"
+        )
+        assert os.path.isabs(request.map_url)
+        # The gridmap's map_server must not be asked to load a keepout mask:
+        # that would replace the map the localizer and costmaps run on.
+        map_gw._service_clients["load_map"].call_async.assert_not_called()
+
+    def test_service_unavailable_says_where_the_zones_apply(self, map_gw):
+        client = _arm(map_gw, "load_keepout", available=False)
+
+        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
+
+        assert success is False
+        assert "filter_mask_server/load_map is not available" in message
+        assert "AUTO" in message
+        client.call_async.assert_not_called()
+
+    def test_timeout_reports_the_mask_server_deadline(self, map_gw, monkeypatch):
+        client = _arm(map_gw, "load_keepout", completed=False)
+        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+
+        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
+
+        assert success is False
+        assert message == "Timeout waiting for filter_mask_server/load_map response"
+        client.call_async.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "result_code,expected",
+        [
+            (
+                LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST,
+                "filter_mask_server could not find the map yaml",
+            ),
+            (
+                LoadMap.Response.RESULT_INVALID_MAP_DATA,
+                "filter_mask_server could not read keepout.pgm",
+            ),
+            (
+                LoadMap.Response.RESULT_INVALID_MAP_METADATA,
+                "filter_mask_server rejected keepout.yaml",
+            ),
+            (
+                LoadMap.Response.RESULT_UNDEFINED_FAILURE,
+                "filter_mask_server reported an undefined failure",
+            ),
+        ],
+    )
+    def test_each_failure_code_names_the_keepout_files(self, map_gw, result_code, expected):
+        # The strings must send the operator to keepout.*, not gridmap.*.
+        _arm(map_gw, "load_keepout", LoadMap.Response(result=result_code))
+
+        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
+
+        assert (success, message) == (False, expected)
+
+    def test_an_unmapped_code_falls_back_to_the_raw_result(self, map_gw):
+        _arm(map_gw, "load_keepout", SimpleNamespace(result=42))
+
+        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
+
+        assert (success, message) == (False, "filter_mask_server returned result 42")
 
 
 class TestSaveMap:
