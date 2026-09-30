@@ -11,12 +11,15 @@ evil: the alternative is handing the map router the gateway that owns
 NavigateToPose.
 
 The clients split by session, which is worth knowing before debugging any of
-them: ``map_server/load_map``, ``relocalize`` and ``relocalize_check``
-exist only in the nav (AUTO) session,
+them: ``map_server/load_map``, ``filter_mask_server/load_map``, ``relocalize``
+and ``relocalize_check`` exist only in the nav (AUTO) session,
 ``pgo/save_maps`` and ``pgo/reset_mapping`` only in the mapping (MANUAL) one. A
 "service is not available" from one of them usually means "wrong mode", not
 "broken stack" -- which is exactly what ``POST /api/v1/maps/{name}/activate``
-turns into its ``stack_not_ready`` refusal.
+turns into its ``stack_not_ready`` refusal. ``filter_mask_server`` is the
+keepout pane of that session; since the workspace's 2026-09-30 change its
+launch writes a blank mask for a map that has none, so it is up on every map
+the session boots into, not only the ones with zones drawn.
 """
 
 import math
@@ -34,23 +37,28 @@ from nav2_msgs.srv import LoadMap
 from syncai_common.srv import IsValid, Relocalize, ResetMapping, SaveMaps
 
 
-# LoadMap.srv carries no `message` field -- only `uint8 result` and the grid --
-# so every string an operator gets for a failed reload is written here.
-#
-# RESULT_UNDEFINED_FAILURE is unreachable against syncai_map_server (its
-# loadMapResponseFromYaml switches over exactly the four LOAD_MAP_STATUS values),
-# but the srv defines it and a stock nav2 map_server on the same DDS graph would
-# send it, so it is kept rather than left to the fallback.
-_LOAD_MAP_MESSAGES = {
-    LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST: (
-        "map_server could not find the map yaml"
-    ),
-    LoadMap.Response.RESULT_INVALID_MAP_DATA: ("map_server could not read gridmap.pgm"),
-    LoadMap.Response.RESULT_INVALID_MAP_METADATA: ("map_server rejected gridmap.yaml"),
-    LoadMap.Response.RESULT_UNDEFINED_FAILURE: (
-        "map_server reported an undefined failure"
-    ),
-}
+def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
+    """The operator's sentence for a failed ``LoadMap`` call.
+
+    LoadMap.srv carries no `message` field -- only `uint8 result` and the grid --
+    so every string an operator gets for a failed reload is written here. It is
+    parameterised on the server and the file names because two map_server
+    instances answer it: ``map_server`` for ``gridmap.*`` and
+    ``filter_mask_server`` for ``keepout.*``, and "map_server rejected
+    gridmap.yaml" would send the operator to the wrong file for the latter.
+
+    RESULT_UNDEFINED_FAILURE is unreachable against syncai_map_server (its
+    loadMapResponseFromYaml switches over exactly the four LOAD_MAP_STATUS
+    values), but the srv defines it and a stock nav2 map_server on the same DDS
+    graph would send it, so it is kept rather than left to the fallback.
+    """
+    messages = {
+        LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST: f"{server} could not find the map yaml",
+        LoadMap.Response.RESULT_INVALID_MAP_DATA: f"{server} could not read {image}",
+        LoadMap.Response.RESULT_INVALID_MAP_METADATA: f"{server} rejected {yaml}",
+        LoadMap.Response.RESULT_UNDEFINED_FAILURE: f"{server} reported an undefined failure",
+    }
+    return messages.get(result, f"{server} returned result {result}")
 
 
 def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
@@ -89,6 +97,15 @@ class MapGateway:
         load_map_client = self._node.create_client(
             srv_type=LoadMap,
             srv_name="map_server/load_map",
+        )
+
+        # The keepout mask's map_server: the same executable run under the name
+        # filter_mask_server by costmap_filter_info.launch.py, so its service is
+        # built the same way (`service_prefix + "load_map"`) and carries the
+        # node name just as load_map's does.
+        load_keepout_client = self._node.create_client(
+            srv_type=LoadMap,
+            srv_name="filter_mask_server/load_map",
         )
 
         save_maps_client = self._node.create_client(
@@ -131,6 +148,7 @@ class MapGateway:
         self._service_clients.update(
             {
                 "load_map": load_map_client,
+                "load_keepout": load_keepout_client,
                 "save_maps": save_maps_client,
                 "reset_mapping": reset_mapping_client,
                 "relocalize": relocalize_client,
@@ -313,8 +331,61 @@ class MapGateway:
 
         response = future.result()
         if response.result != LoadMap.Response.RESULT_SUCCESS:
-            return False, _LOAD_MAP_MESSAGES.get(
-                response.result, f"map_server returned result {response.result}"
+            return False, _load_map_failure(
+                response.result, "map_server", "gridmap.pgm", "gridmap.yaml"
+            )
+
+        return True, ""
+
+    def reload_keepout(self, yaml_path: str) -> tuple[bool, str]:
+        """Make ``filter_mask_server`` re-read a keepout mask and re-publish it.
+
+        The same ``LoadMap`` call as ``reload_map``, against the second
+        map_server instance the nav session runs for the planner's
+        KeepoutFilter. The mask topic is transient_local, so the re-published
+        grid both reaches the running filter -- which rebuilds its mask costmap
+        on arrival, no restart -- and replaces the retained sample for a
+        planner that comes up later.
+
+        Two things ``reload_map``'s docstring does not have to say:
+
+        - **A map switch does not move the mask along.** ``filter_mask_server``
+          holds whichever mask it was last handed, and the launch derives the
+          keepout path once at boot; ``map_server/load_map`` onto another map
+          leaves the *old* map's zones in force, in the old map's world
+          coordinates. ``POST /api/v1/maps/{name}/activate`` therefore calls
+          this too, with the new map's ``keepout.yaml``.
+        - **Clearing zones is a reload, not a delete.** Removing the files
+          changes nothing here; the caller writes an all-unknown mask and
+          reloads it.
+
+        "Not available" means the nav session is not up (mapping mode), or its
+        keepout pane is down -- since the workspace's 2026-09-30 change the
+        launch generates a blank mask for a map without one, so it is no longer
+        the normal state of a map that simply has no zones yet. The sentence
+        says where the zones will apply instead of pretending they are lost.
+        """
+        client = self._service_clients.get("load_keepout")
+        if not client.wait_for_service(timeout_sec=5.0):
+            return False, (
+                "filter_mask_server/load_map is not available — the keepout filter "
+                "only runs in AUTO mode; the forbidden zones apply when the nav stack "
+                "next starts on this map."
+            )
+
+        map_url = os.path.abspath(os.path.expanduser(yaml_path))
+
+        self._logger.info("[MapGateway] Reloading keepout mask", map_url=map_url)
+
+        future = client.call_async(LoadMap.Request(map_url=map_url))
+        # Same handler, same file sizes as reload_map: 20 s is ample.
+        if not _wait_for_future(future, timeout=20.0):
+            return False, "Timeout waiting for filter_mask_server/load_map response"
+
+        response = future.result()
+        if response.result != LoadMap.Response.RESULT_SUCCESS:
+            return False, _load_map_failure(
+                response.result, "filter_mask_server", "keepout.pgm", "keepout.yaml"
             )
 
         return True, ""

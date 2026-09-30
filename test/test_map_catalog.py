@@ -5,10 +5,12 @@ is redirected with monkeypatch.setenv so no test depends on the host having a
 ~/robot_ws.
 """
 
+import json
 import os
 
 import pytest
 
+pytest.importorskip("cv2")
 pytest.importorskip("yaml")
 
 from syncai_backend.exceptions import BadRequestError, NotFoundError  # noqa: E402
@@ -354,3 +356,135 @@ def test_rename_map_dir_refuses_an_existing_target(catalog_repo, maps_dir):
     assert excinfo.value.code == "name_taken"
     assert (maps_dir / "full" / "gridmap.pgm").is_file()
     assert list((maps_dir / "empty").iterdir()) == []
+
+
+# --- keepout ----------------------------------------------------------------
+
+
+def _zone(zone_id, *points):
+    from syncai_backend.repositories.map.catalog import KeepoutZone
+
+    return KeepoutZone(id=zone_id, points=tuple(points))
+
+
+def _grid_of(catalog_repo, name="full"):
+    return catalog_repo.get_map(name).grid
+
+
+def test_keepout_yaml_path_is_none_without_the_pair(catalog_repo, maps_dir, make_pgm):
+    assert catalog_repo.keepout_yaml_path("full") is None
+
+    # A yaml alone is unloadable: filter_mask_server reads the pgm through it.
+    (maps_dir / "full" / "keepout.yaml").write_text("image: keepout.pgm\n")
+    assert catalog_repo.keepout_yaml_path("full") is None
+
+    make_pgm(maps_dir / "full" / "keepout.pgm", 6, 4, fill=205)
+    path = catalog_repo.keepout_yaml_path("full")
+    assert path.endswith("full/keepout.yaml")
+    assert os.path.isabs(path)
+    assert "~" not in path
+
+
+def test_read_keepout_zones_is_empty_without_a_json(catalog_repo):
+    assert catalog_repo.read_keepout_zones("full") == []
+
+
+def test_write_keepout_writes_the_three_files_and_reads_back(catalog_repo, maps_dir):
+    zones = [_zone("a", (-6.9, -11.0), (-6.8, -11.0), (-6.8, -10.9))]
+
+    catalog_repo.write_keepout("full", zones, _grid_of(catalog_repo))
+
+    directory = maps_dir / "full"
+    pgm = (directory / "keepout.pgm").read_bytes()
+    assert pgm.startswith(b"P5\n6 4\n255\n")
+    assert len(pgm) - len(b"P5\n6 4\n255\n") == 24
+    assert (directory / "keepout.yaml").read_text().startswith("image: keepout.pgm\n")
+    assert "origin: [-6.940000, -11.090000, 0.0]" in (directory / "keepout.yaml").read_text()
+    document = json.loads((directory / "keepout.json").read_text())
+    assert document["version"] == 1
+    assert document["zones"][0]["id"] == "a"
+    assert document["zones"][0]["points"][0] == {"x": -6.9, "y": -11.0}
+
+    assert catalog_repo.read_keepout_zones("full") == zones
+    assert catalog_repo.keepout_yaml_path("full") is not None
+
+
+def test_write_keepout_with_no_zones_is_an_all_unknown_mask(catalog_repo, maps_dir):
+    catalog_repo.write_keepout("full", [], _grid_of(catalog_repo))
+
+    body = (maps_dir / "full" / "keepout.pgm").read_bytes()[len(b"P5\n6 4\n255\n"):]
+    # 205 everywhere: the same blank the nav session writes, and a no-op for
+    # the filter -- never 254, which would free every unknown cell.
+    assert body == bytes([205]) * 24
+    assert json.loads((maps_dir / "full" / "keepout.json").read_text())["zones"] == []
+
+
+def test_write_keepout_paints_the_zone_black(catalog_repo, maps_dir):
+    # Cell (col 1, row 2 from the top) of the 6x4 grid at 0.05 m: its centre.
+    x = -6.94 + 1.5 * 0.05
+    y = -11.09 + (4 - 2 - 0.5) * 0.05
+    zone = _zone("z", (x, y), (x, y), (x, y))
+    catalog_repo.write_keepout("full", [zone], _grid_of(catalog_repo))
+
+    body = (maps_dir / "full" / "keepout.pgm").read_bytes()[len(b"P5\n6 4\n255\n"):]
+    assert body[2 * 6 + 1] == 0
+    assert sum(1 for value in body if value == 0) == 1
+
+
+def test_write_keepout_rejects_an_unsafe_name(catalog_repo):
+    with pytest.raises(BadRequestError):
+        catalog_repo.write_keepout("../full", [], _grid_of(catalog_repo))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{not json",
+        '{"version": 2, "zones": []}',
+        '{"version": 1, "zones": "nope"}',
+        "[]",
+    ],
+)
+def test_read_keepout_zones_reports_nothing_for_an_unusable_json(catalog_repo, maps_dir, text):
+    (maps_dir / "full" / "keepout.json").write_text(text)
+
+    assert catalog_repo.read_keepout_zones("full") == []
+
+
+def test_read_keepout_zones_skips_malformed_entries_one_at_a_time(catalog_repo, maps_dir):
+    (maps_dir / "full" / "keepout.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zones": [
+                    {"id": "ok", "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}]},
+                    {"id": "short", "points": [{"x": 0, "y": 0}]},
+                    {"id": "", "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}]},
+                    {"points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}]},
+                    {
+                        "id": "bad",
+                        "points": [{"x": "a", "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}],
+                    },
+                    "not a zone",
+                ],
+            }
+        )
+    )
+
+    zones = catalog_repo.read_keepout_zones("full")
+
+    assert [zone.id for zone in zones] == ["ok"]
+    assert zones[0].points == ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0))
+
+
+def test_rename_map_dir_carries_the_keepout_along(catalog_repo, maps_dir):
+    zones = [_zone("a", (-6.9, -11.0), (-6.8, -11.0), (-6.8, -10.9))]
+    catalog_repo.write_keepout("full", zones, _grid_of(catalog_repo))
+    before = (maps_dir / "full" / "keepout.yaml").read_bytes()
+
+    catalog_repo.rename_map_dir("full", "hall")
+
+    # Nothing in the three files names the map, so nothing was rewritten.
+    assert (maps_dir / "hall" / "keepout.yaml").read_bytes() == before
+    assert catalog_repo.read_keepout_zones("hall") == zones
+    assert catalog_repo.keepout_yaml_path("hall").endswith("hall/keepout.yaml")

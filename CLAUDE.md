@@ -131,7 +131,8 @@ database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTem
 subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
                            names the PCD, which the subscriber reads from the shared /dev/shm)
 temporal/                  worker, RobotWorkflow, activities
-helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), traversable, system_config
+helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), keepout
+                           (forbidden-zone mask rasteriser), traversable, system_config
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/
@@ -197,6 +198,12 @@ the only caller that passes anything else.
 - Map directory name is a foreign key by convention in `map_vertices.map` and
   `task_templates.map_name` (no constraint). Rename: filesystem first, DB second, rollback
   by renaming back. Delete: DB rows first, `rmtree` last (irreversible step goes last).
+- **Forbidden zones:** `map/<name>/keepout.json` (polygons in metres) is the source of
+  truth; `keepout.pgm` + `keepout.yaml` are derived from it by `write_keepout`, in the
+  gridmap's geometry, background **205 (unknown), never 254** — a free mask cell frees
+  unknown costmap cells. Written pgm → yaml → json. The nav session writes a blank pair
+  (no json) at boot for a map that has none and never overwrites an existing one; a map
+  switch must reload the mask itself (`filter_mask_server/load_map`), which `activate` does.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this
@@ -239,8 +246,9 @@ raise out of the callback, it would end `spin()` and the process.
 
 `helpers/traversable.py` is the **only** module that imports open3d (~100 MB), and only
 inside `GridmapConversionService.start`'s conversion thread, in its `try`. Keep
-`pcd_to_gridmap.py` open3d-free. The WebRTC Go worker is lazy-loaded on first use, owned
-by exactly one gateway instance whose internal lock serialises REST and Temporal callers.
+`pcd_to_gridmap.py` and `keepout.py` open3d-free. The WebRTC Go worker is lazy-loaded on
+first use, owned by exactly one gateway instance whose internal lock serialises REST and
+Temporal callers.
 The kokoro TTS model (~310 MB) used to be the other one of these; it lives in the
 syncai_tts container now and `gateways/tts` is an httpx client.
 

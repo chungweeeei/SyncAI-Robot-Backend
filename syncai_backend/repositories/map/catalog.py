@@ -11,7 +11,8 @@ import structlog
 import yaml
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, NotFoundError
-from syncai_backend.helpers.pgm import read_pgm_size, write_pgm
+from syncai_backend.helpers.keepout import keepout_yaml_text, rasterize_zones
+from syncai_backend.helpers.pgm import read_pgm_size, write_pgm, write_text_atomic
 from syncai_backend.helpers.system_config import active_map_name
 
 
@@ -43,6 +44,22 @@ POINTCLOUD_PCD = "map.pcd"
 GRIDMAP_PREV_PGM = "gridmap_prev.pgm"
 GRIDMAP_PREV_YAML = "gridmap_prev.yaml"
 GRIDMAP_PREV_RAW_PGM = "gridmap_prev_raw.pgm"
+
+# The forbidden-zone (keepout) mask, since 2026-09. ``keepout.json`` is the
+# source of truth -- the polygons the operator drew, in map-frame metres, which
+# is what the console reads back to edit them. ``keepout.pgm`` + ``keepout.yaml``
+# are *derived* from it by ``write_keepout``: the same yaml + image format as
+# ``gridmap.*``, with the gridmap's geometry, and the pair ``filter_mask_server``
+# actually serves to the planner's KeepoutFilter. The nav session's
+# ``costmap_filter_info.launch.py`` writes a blank pgm + yaml (no json) of the
+# same geometry when it boots a map that has none, and never touches an
+# existing one -- so a map that has been booted into always has the pair, and
+# a pair without a json is "no zones drawn here yet" (or a GIMP-authored mask,
+# which the next write from the console overwrites).
+KEEPOUT_PGM = "keepout.pgm"
+KEEPOUT_YAML = "keepout.yaml"
+KEEPOUT_JSON = "keepout.json"
+KEEPOUT_JSON_VERSION = 1
 
 
 class GridRecordStatus(str, Enum):
@@ -99,6 +116,20 @@ class GridInfo:
     origin: Tuple[float, float, float]
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class KeepoutZone:
+    """One forbidden zone: a closed polygon in map-frame metres.
+
+    ``points`` are the corners in drawing order, not closed (the first is not
+    repeated at the end) -- the console's ``ZonePolygon`` shape. The id is the
+    console's handle for the zone between one save and the next; it means
+    nothing to the mask.
+    """
+
+    id: str
+    points: Tuple[Tuple[float, float], ...]
 
 
 @dataclass(frozen=True)
@@ -207,6 +238,70 @@ class MapCatalogRepo:
         """
         return self._artifact_path(name, POINTCLOUD_PCD)
 
+    def keepout_yaml_path(self, name: str) -> Optional[str]:
+        """Return the path of the map's ``keepout.yaml``, or None if unloadable.
+
+        None unless **both** the yaml and the ``keepout.pgm`` it names are there
+        -- the same "the two agree" precondition ``_read_grid`` puts on the
+        gridmap, because this path goes straight to ``filter_mask_server/
+        load_map``, which reads the pgm through the yaml and answers
+        ``RESULT_INVALID_MAP_DATA`` for a yaml whose image is missing. Absolute
+        and ``~``-free for the reasons ``gridmap_yaml_path`` gives.
+        """
+        yaml_path = self._artifact_path(name, KEEPOUT_YAML)
+        if yaml_path is None or self._artifact_path(name, KEEPOUT_PGM) is None:
+            return None
+        return yaml_path
+
+    def read_keepout_zones(self, name: str) -> List[KeepoutZone]:
+        """Return the forbidden zones recorded in ``keepout.json``, or ``[]``.
+
+        ``[]`` for a map with no json at all -- never booted into, or only
+        carrying the launch's blank mask, or a GIMP-drawn one -- and also for a
+        json this build cannot make sense of (torn write, wrong ``version``,
+        hand edit): logged as a warning, since unlike the recipe sidecar nothing
+        writes this file in the background, and answered with "no zones" rather
+        than an error, because the console's next save overwrites it anyway
+        and a 500 on the read side would lock the operator out of doing so.
+        Individual entries that are not ``{id, points: [{x, y}, ...]}`` are
+        skipped one at a time for the same reason.
+        """
+        path = os.path.join(self.resolve_dir(name), KEEPOUT_JSON)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            self.logger.warning(
+                "[MapCatalogRepo] Unreadable keepout.json; reporting no zones",
+                map=name,
+                error=str(exc),
+            )
+            return []
+
+        if (
+            not isinstance(document, dict)
+            or document.get("version") != KEEPOUT_JSON_VERSION
+            or not isinstance(document.get("zones"), list)
+        ):
+            self.logger.warning(
+                "[MapCatalogRepo] keepout.json has an unexpected shape; reporting no zones",
+                map=name,
+            )
+            return []
+
+        zones: List[KeepoutZone] = []
+        for entry in document["zones"]:
+            zone = _parse_keepout_zone(entry)
+            if zone is None:
+                self.logger.warning(
+                    "[MapCatalogRepo] Skipping a malformed zone in keepout.json", map=name
+                )
+                continue
+            zones.append(zone)
+        return zones
+
     # --- Listing ------------------------------------------------------------
 
     def list_maps(self) -> List[StoredMap]:
@@ -295,8 +390,10 @@ class MapCatalogRepo:
         basename, hand-formatted by ``helpers/pcd_to_gridmap.py`` precisely so
         map_server resolves it against the yaml's own directory), ``poses.txt``
         lists bare patch basenames, ``gridmap.recipe.json`` holds only
-        measurements and parameters. If a future sidecar ever embeds the map's
-        path, this method has to start rewriting it.
+        measurements and parameters, ``keepout.yaml`` says ``image:
+        keepout.pgm`` and ``keepout.json`` holds polygons in metres. If a
+        future sidecar ever embeds the map's path, this method has to start
+        rewriting it.
 
         What this does *not* touch, and the caller must: the ``map_vertices``
         and ``task_templates`` rows that key on the bare directory name — the
@@ -517,6 +614,71 @@ class MapCatalogRepo:
         self.logger.info("[MapCatalogRepo] Wrote gridmap", map=name, width=width, height=height)
         return written
 
+    def write_keepout(self, name: str, zones: List[KeepoutZone], grid: GridInfo) -> None:
+        """Replace the map's forbidden zones: rasterise ``zones`` and record them.
+
+        Three files, in this order, each through a temp file + rename:
+
+        1. ``keepout.pgm`` -- ``zones`` painted into a mask of ``grid``'s
+           geometry (``helpers/keepout.py``; background 205 = unknown, zones 0).
+        2. ``keepout.yaml`` -- the map-server yaml naming it, relative.
+        3. ``keepout.json`` -- the polygons themselves, the source of truth.
+
+        pgm before yaml so whoever finds the yaml finds the image it names
+        (``filter_mask_server`` resolves ``image:`` against the yaml's own
+        directory, and the launch reads the pair at boot). json *last*, so a
+        crash between the writes leaves the robot enforcing more than the
+        console shows rather than less -- the safe side of the two.
+
+        ``zones`` may be empty: that writes the all-unknown mask, which is how
+        zones are *cleared*. The files are never deleted, because deleting them
+        would change nothing in a running KeepoutFilter (it holds the last mask
+        it was sent) and the launch would only write a blank pair back at the
+        next boot.
+
+        ``grid`` comes from the caller rather than being re-read here because
+        the router has already refused a map without one; a keepout needs the
+        gridmap's geometry to line up with it cell for cell. Nothing written
+        names the map or holds an absolute path, so ``rename_map_dir`` stays
+        one ``os.rename``.
+        """
+        directory = self.resolve_dir(name)
+        mask = rasterize_zones(
+            [zone.points for zone in zones],
+            width=grid.width,
+            height=grid.height,
+            resolution=grid.resolution,
+            origin_xy=(grid.origin[0], grid.origin[1]),
+        )
+        write_pgm(
+            os.path.join(directory, KEEPOUT_PGM), grid.width, grid.height, mask.tobytes()
+        )
+        write_text_atomic(
+            os.path.join(directory, KEEPOUT_YAML),
+            keepout_yaml_text(
+                resolution=grid.resolution,
+                origin_xy=(grid.origin[0], grid.origin[1]),
+                image=KEEPOUT_PGM,
+            ),
+        )
+        document = {
+            "version": KEEPOUT_JSON_VERSION,
+            "zones": [
+                {"id": zone.id, "points": [{"x": x, "y": y} for x, y in zone.points]}
+                for zone in zones
+            ],
+        }
+        write_text_atomic(
+            os.path.join(directory, KEEPOUT_JSON), json.dumps(document, indent=2) + "\n"
+        )
+        self.logger.info(
+            "[MapCatalogRepo] Wrote keepout mask",
+            map=name,
+            zones=len(zones),
+            width=grid.width,
+            height=grid.height,
+        )
+
     # --- Internals ----------------------------------------------------------
 
     def _read(self, name: str, path: str) -> Optional[StoredMap]:
@@ -611,6 +773,29 @@ class MapCatalogRepo:
             width=width,
             height=height,
         )
+
+
+def _parse_keepout_zone(entry: object) -> Optional[KeepoutZone]:
+    """One ``keepout.json`` entry -> ``KeepoutZone``, or None if malformed."""
+    if not isinstance(entry, dict):
+        return None
+    zone_id = entry.get("id")
+    raw_points = entry.get("points")
+    if not isinstance(zone_id, str) or not zone_id or not isinstance(raw_points, list):
+        return None
+    points = []
+    for raw in raw_points:
+        if not isinstance(raw, dict):
+            return None
+        x, y = raw.get("x"), raw.get("y")
+        if isinstance(x, bool) or isinstance(y, bool):
+            return None
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+        points.append((float(x), float(y)))
+    if len(points) < 3:
+        return None
+    return KeepoutZone(id=zone_id, points=tuple(points))
 
 
 def _walk_stats(path: str) -> Tuple[int, float]:

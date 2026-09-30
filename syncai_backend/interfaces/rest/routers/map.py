@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import math
 import os
 import struct
 import uuid
@@ -32,7 +33,9 @@ from syncai_backend.helpers.pointcloud import (
     voxel_downsample,
 )
 from syncai_backend.repositories.map.catalog import (
+    GridInfo,
     GridRecordStatus,
+    KeepoutZone,
     MapCatalogRepo,
     StoredMap,
 )
@@ -338,6 +341,17 @@ class ActivateMapResponse(BaseModel):
             "only and reads true against a map the robot was never localized in."
         ),
     )
+    keepout_reloaded: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether filter_mask_server now serves this map's forbidden zones "
+            "(its keepout.yaml, written blank first if the map had none). A map "
+            "switch does not move the mask on its own, so the switch does this "
+            "too, best-effort: false means the switch succeeded but the old map's "
+            "zones may still be in force until the nav stack restarts; null on "
+            "the switched: false no-op."
+        ),
+    )
     message: str = Field(..., description="What happened, for the operator to read.")
 
 
@@ -483,7 +497,126 @@ class SaveGridmapResponse(BaseModel):
     message: str = Field(..., description="What happened, for the operator to read.")
 
 
+class ZonePoint(BaseModel):
+    """A corner of a forbidden zone, in the map frame (metres) like a vertex."""
+
+    x: float
+    y: float
+
+
+class KeepoutZoneRequest(BaseModel):
+    id: Optional[str] = Field(
+        None,
+        max_length=64,
+        description=(
+            "The console's handle for this zone. Kept as given when present, "
+            "generated when absent; ids must be unique within the request."
+        ),
+    )
+    points: List[ZonePoint] = Field(
+        ...,
+        description=(
+            "Corners in drawing order, not closed (do not repeat the first point). "
+            "At least three, all finite."
+        ),
+    )
+
+
+class KeepoutZoneResponse(BaseModel):
+    id: str
+    points: List[ZonePoint]
+
+
+class SaveKeepoutRequest(BaseModel):
+    """PUT /api/v1/maps/{name}/keepout — the whole zone list, replacing the old one."""
+
+    zones: List[KeepoutZoneRequest] = Field(
+        ...,
+        description=(
+            "Every forbidden zone of the map. An empty list clears them: the "
+            "mask is rewritten all-unknown and reloaded, the files stay."
+        ),
+    )
+
+
+class KeepoutResponse(BaseModel):
+    """GET /api/v1/maps/{name}/keepout — what keepout.json records."""
+
+    name: str = Field(..., description="The map the zones belong to.")
+    zones: List[KeepoutZoneResponse] = Field(
+        ...,
+        description=(
+            "The zones as last saved through this API. Empty for a map whose "
+            "mask was never drawn here — including one carrying only the blank "
+            "mask the nav session writes at boot, or a hand-authored one."
+        ),
+    )
+    active: bool = Field(..., description="Whether this is the map the stack is running on.")
+
+
+class SaveKeepoutResponse(BaseModel):
+    name: str = Field(..., description="The map that was written.")
+    zones: List[KeepoutZoneResponse] = Field(
+        ..., description="The zones as saved, ids filled in."
+    )
+    active: bool = Field(..., description="Whether this is the map the stack is running on.")
+    reloaded: bool = Field(
+        ...,
+        description=(
+            "Whether the running filter_mask_server re-read the mask, so the "
+            "planner enforces the new zones now. False for any map that is not "
+            "the active one, and for an active map whose reload failed — the "
+            "save itself succeeded either way and the zones apply when the nav "
+            "stack next starts on this map."
+        ),
+    )
+    message: str = Field(..., description="What happened, for the operator to read.")
+
+
 # --- Helpers ----------------------------------------------------------------
+
+
+def _validate_zones(zones: List[KeepoutZoneRequest]) -> List[KeepoutZone]:
+    """Turn the request's zones into repo zones, or raise a 400 with a sentence.
+
+    The pydantic models above are structural only (a point has an x and a y),
+    so that these four rules answer 400 with one readable sentence like every
+    other cross-field refusal in this file, instead of the 422 list a
+    ``min_length`` or ``allow_inf_nan`` constraint would produce.
+    """
+    seen: set = set()
+    result: List[KeepoutZone] = []
+    for index, zone in enumerate(zones, start=1):
+        if len(zone.points) < 3:
+            raise BadRequestError(
+                f"Zone {index} has {len(zone.points)} point"
+                f"{'' if len(zone.points) == 1 else 's'}; a forbidden zone needs at least 3."
+            )
+        for point in zone.points:
+            if not (math.isfinite(point.x) and math.isfinite(point.y)):
+                raise BadRequestError(
+                    f"Zone {index} has a corner that is not a finite coordinate."
+                )
+        zone_id = zone.id if zone.id is not None else uuid.uuid4().hex
+        if not zone_id:
+            raise BadRequestError(f"Zone {index} has an empty id.")
+        if zone_id in seen:
+            raise BadRequestError(f"Zone id {zone_id!r} appears more than once.")
+        seen.add(zone_id)
+        result.append(
+            KeepoutZone(
+                id=zone_id,
+                points=tuple((point.x, point.y) for point in zone.points),
+            )
+        )
+    return result
+
+
+def _zone_responses(zones: List[KeepoutZone]) -> List[KeepoutZoneResponse]:
+    return [
+        KeepoutZoneResponse(id=zone.id, points=[ZonePoint(x=x, y=y) for x, y in zone.points])
+        for zone in zones
+    ]
 
 
 def _vertex_response(vertex: MapPoint) -> MapVertexResponse:
@@ -982,6 +1115,50 @@ def init_map_router(
             ),
         )
 
+    def _carry_keepout(name: str, grid: GridInfo) -> Tuple[bool, str]:
+        """Point filter_mask_server at ``name``'s keepout mask; never raises.
+
+        The mask pair is written first when the map has none: a map the nav
+        session has never booted into has no ``keepout.*`` (the launch writes
+        the blank pair at boot and only then), and there is nothing else to
+        hand ``load_map`` -- the *previous* map's zones must be replaced by
+        something, and an all-unknown mask of this map's geometry is that
+        something. Rasterised from ``keepout.json`` when one exists, so a map
+        whose zones were drawn while it was inactive gets them on the first
+        switch. Writing into the target's directory is the only option (the
+        yaml's ``image:`` is relative to itself) and also what makes the next
+        boot of this map find the pair.
+
+        Returns ``(reloaded, note)``: the note is a sentence for the operator,
+        empty when there is nothing worth saying (mask reloaded, no zones).
+        """
+        zones = map_catalog_repo.read_keepout_zones(name)
+        yaml_path = map_catalog_repo.keepout_yaml_path(name)
+        if yaml_path is None:
+            try:
+                map_catalog_repo.write_keepout(name, zones, grid)
+            except OSError as exc:
+                logger.error(
+                    "Could not write the keepout mask for the new map",
+                    map=name,
+                    error=str(exc),
+                )
+                return False, f" The keepout mask could not be written: {exc}."
+            yaml_path = map_catalog_repo.keepout_yaml_path(name)
+            if yaml_path is None:
+                return False, " The keepout mask could not be written."
+
+        reloaded, detail = map_gw.reload_keepout(yaml_path)
+        if not reloaded:
+            logger.error(
+                "Switched maps but the keepout mask did not reload", map=name, error=detail
+            )
+            return False, f" The keepout mask could not be reloaded: {detail}."
+        if zones:
+            count = len(zones)
+            return True, f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
+        return True, ""
+
     @map_router.post(
         "/api/v1/maps/{name}/activate", response_model=ActivateMapResponse
     )
@@ -1240,6 +1417,16 @@ def init_map_router(
                     + restored_grid
                 )
 
+            # The switch is recorded; from here on nothing can fail it. The
+            # keepout mask is carried over best-effort *after* that commit
+            # point, on purpose: filter_mask_server still holds the previous
+            # map's zones (the launch derives the mask path once, at boot, and
+            # load_map above moved only the gridmap), so they have to be
+            # replaced with this map's -- but a mask problem is not a reason
+            # to tell the operator the switch failed when the localizer, the
+            # grid and the INI all moved. It rides in the message instead.
+            keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
+
             # Only the vertex-scoping consumers care, and they re-query; the
             # renderings are keyed by map name, so nothing cached is now stale.
             localized = map_gw.localization_converged()
@@ -1249,6 +1436,7 @@ def init_map_router(
                 map=name,
                 previous=previous,
                 localized=localized,
+                keepout_reloaded=keepout_reloaded,
             )
 
             message = f"The robot is now on '{name}'"
@@ -1263,11 +1451,13 @@ def init_map_router(
                 message += (
                     " yet." if localized is False else " and could not be asked."
                 )
+            message += keepout_note
             return ActivateMapResponse(
                 name=name,
                 previous=previous,
                 switched=True,
                 localized=localized,
+                keepout_reloaded=keepout_reloaded,
                 message=message,
             )
 
@@ -1709,6 +1899,112 @@ def init_map_router(
             active=True,
             reloaded=True,
             message=f"Saved '{name}' and reloaded.",
+        )
+
+    @map_router.get("/api/v1/maps/{name}/keepout", response_model=KeepoutResponse)
+    def get_map_keepout(name: str):
+        """The map's forbidden zones, as polygons in map-frame metres.
+
+        Read from ``keepout.json``, the source of truth this API writes, not
+        from the mask: the mask is the rasterised *result* and cannot be turned
+        back into the polygons the console edits. A map with a mask but no
+        json -- the blank pair the nav session writes at boot, or a GIMP-drawn
+        one -- therefore answers ``zones: []``; the next PUT overwrites that
+        mask with what the console drew.
+        """
+        _require(name)
+        zones = map_catalog_repo.read_keepout_zones(name)
+        return KeepoutResponse(
+            name=name,
+            zones=_zone_responses(zones),
+            active=name == map_catalog_repo.active_name(),
+        )
+
+    @map_router.put("/api/v1/maps/{name}/keepout", response_model=SaveKeepoutResponse)
+    def save_map_keepout(name: str, request: SaveKeepoutRequest):
+        """Replace the map's forbidden zones, and reload them if it is the live map.
+
+        The same shape as ``save_map_grid`` above, step for step, and for the
+        same reasons: a plain ``def`` because it fsyncs three files and then
+        parks on a ROS service for up to 25 s; a 409 while the map's gridmap is
+        being converted, because the conversion may change the geometry the
+        mask is rasterised against; a 404 for a map with no gridmap at all,
+        because there is no geometry to rasterise against; and a **200 with
+        ``reloaded: false``** when the save worked but ``filter_mask_server``
+        did not take the reload -- the files are on disk, every GET returns the
+        new zones, and they apply when the nav stack next boots this map, so a
+        5xx would tell the operator the save failed when it did not.
+
+        The body is the *whole* list. ``[]`` is a valid body and is how zones
+        are cleared: it rewrites the mask all-unknown and reloads it. Deleting
+        the files instead would clear nothing -- the running KeepoutFilter
+        keeps the last mask it was sent -- and the nav session would only write
+        a blank pair back at the next boot.
+
+        The mask is rasterised here rather than in the console because the
+        console holds polygons in metres and the two must agree cell for cell
+        with ``gridmap.pgm``; ``helpers/keepout.py`` owns that convention (and
+        the reason the background is 205, not 254).
+        """
+        stored = _require(name)
+
+        if conversion_svc.is_converting(name):
+            raise ConflictError(
+                f"A gridmap conversion for '{name}' is running; save the forbidden "
+                "zones once it has finished, so the mask matches the new grid.",
+                code="conversion_running",
+            )
+
+        if stored.grid is None:
+            raise NotFoundError(
+                f"Map '{name}' has no gridmap to draw forbidden zones on. Convert "
+                f"its map.pcd first (POST /api/v1/maps/{name}/grid/convert)."
+            )
+
+        zones = _validate_zones(request.zones)
+        map_catalog_repo.write_keepout(name, zones, stored.grid)
+
+        count = len(zones)
+        saved = f"Saved {count} forbidden zone{'s' if count != 1 else ''} for '{name}'"
+        active = name == map_catalog_repo.active_name()
+        if not active:
+            return SaveKeepoutResponse(
+                name=name,
+                zones=_zone_responses(zones),
+                active=False,
+                reloaded=False,
+                message=f"{saved}.",
+            )
+
+        # None only on a race with a delete: write_keepout just put both files
+        # there. Handled as a failed reload rather than as a None handed to the
+        # gateway to abspath().
+        yaml_path = map_catalog_repo.keepout_yaml_path(name)
+        if yaml_path is None:
+            reloaded, detail = False, "keepout.yaml is missing"
+        else:
+            reloaded, detail = map_gw.reload_keepout(yaml_path)
+
+        if not reloaded:
+            logger.error(
+                "Saved forbidden zones but filter_mask_server did not reload",
+                map=name,
+                error=detail,
+            )
+            return SaveKeepoutResponse(
+                name=name,
+                zones=_zone_responses(zones),
+                active=True,
+                reloaded=False,
+                message=f"{saved}, but the keepout filter did not reload: {detail}",
+            )
+
+        return SaveKeepoutResponse(
+            name=name,
+            zones=_zone_responses(zones),
+            active=True,
+            reloaded=True,
+            message=f"{saved} and reloaded the keepout filter.",
         )
 
     @map_router.get("/api/v1/maps/{name}/pointcloud")

@@ -46,8 +46,8 @@ from syncai_backend.helpers.pcd_to_gridmap import (
     convert_traversable_to_gridmap,
     floor_level,
     read_poses_xyz,
-    write_text_atomic,
 )
+from syncai_backend.helpers.pgm import write_text_atomic
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
 from syncai_backend.repositories.map.catalog import (
     GRIDMAP_RECIPE_SIDECAR,
