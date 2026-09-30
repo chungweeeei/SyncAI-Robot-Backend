@@ -44,7 +44,6 @@ underlying ``OSError`` — the caller decides how to report them.
 """
 
 import os
-import tempfile
 from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -52,7 +51,7 @@ import structlog
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from syncai_backend.helpers.pgm import write_pgm
+from syncai_backend.helpers.pgm import write_pgm, write_text_atomic
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
 
 
@@ -439,34 +438,6 @@ def _fill_holes(
         max_hole_size=max_hole_size,
     )
     return grid
-
-
-def write_text_atomic(path: str, content: str) -> None:
-    """Write a small text file via a temp file + rename, like ``write_pgm``.
-
-    Same reader-race rationale: the catalogue parses gridmap.yaml (and the
-    recipe sidecar) on every ``GET /api/v1/maps``, and a listing that lands
-    mid-write would see a torn file. For the yaml that degrades the map to
-    ``grid: None``; for the sidecar it makes a failed re-conversion read as
-    ``ok`` for the width of the write. The yaml is written *after* the .pgm by
-    the caller, so a reader that sees the yaml always finds the pgm it names.
-    """
-    directory = os.path.dirname(path) or "."
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", dir=directory, prefix=".gridmap-", suffix=".tmp", delete=False
-    )
-    try:
-        with handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-    except BaseException:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
-        raise
 
 
 def _write_gridmap(
