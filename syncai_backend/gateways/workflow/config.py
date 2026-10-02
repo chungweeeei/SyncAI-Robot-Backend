@@ -47,3 +47,11 @@ TASK_HISTORY_PAGE_SIZE_MAX = 100
 # when Temporal is wedged. Longer than the active-task one: a closed-execution
 # page is a bigger scan than the handful of Running rows.
 TASK_HISTORY_RPC_TIMEOUT_S = 5.0
+
+
+# --- "How did they end" (GET /api/v1/task_history/stats) --------------------
+#
+# One `count_workflows` with `GROUP BY ExecutionStatus` per call -- the one
+# GROUP BY the server allows. Uncached, like the history page it sits above:
+# the dashboard is opened and refined by hand, not polled.
+TASK_STATS_RPC_TIMEOUT_S = 5.0

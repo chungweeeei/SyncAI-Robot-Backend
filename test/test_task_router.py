@@ -28,6 +28,8 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     StepStatus,
     StepType,
     TaskHistoryEntry,
+    TaskHistoryStats,
+    TaskKind,
     TaskSource,
     TaskState,
 )
@@ -42,6 +44,7 @@ class _StubWorkflowGateway:
         self.started = []
         self.cancelled = []
         self.history_calls = []
+        self.stats_calls = []
         self.history = (
             [
                 TaskHistoryEntry(
@@ -51,9 +54,18 @@ class _StubWorkflowGateway:
                     started_at=datetime(2026, 8, 10, 8, 0, tzinfo=timezone.utc),
                     closed_at=datetime(2026, 8, 10, 8, 5, tzinfo=timezone.utc),
                     source=TaskSource.DIRECT,
+                    kind=TaskKind.TASK,
+                    name="Morning patrol",
                 )
             ],
             b"\xfftoken",
+        )
+        self.stats = TaskHistoryStats(
+            as_of=datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc),
+            total=4,
+            completed=3,
+            failed=1,
+            canceled=0,
         )
         self.state = TaskState(
             id="robot01-task-001",
@@ -82,8 +94,8 @@ class _StubWorkflowGateway:
             datetime(2026, 8, 10, 9, 0, 30, tzinfo=timezone.utc),
         )
 
-    async def start_task(self, request):
-        self.started.append(request)
+    async def start_task(self, request, provenance=None):
+        self.started.append((request, provenance))
 
     async def get_task_state(self, task_id):
         return self.state
@@ -97,6 +109,10 @@ class _StubWorkflowGateway:
     async def list_task_history(self, **kwargs):
         self.history_calls.append(kwargs)
         return self.history
+
+    async def task_history_stats(self, **kwargs):
+        self.stats_calls.append(kwargs)
+        return self.stats
 
 
 @pytest.fixture
@@ -130,11 +146,38 @@ class TestTriggerTask:
         body = client.post("/api/v1/tasks", json=_move_task()).json()
 
         assert body["status"] == "PENDING"
-        task = workflow_gw.started[0]
+        task, provenance = workflow_gw.started[0]
         assert task.id == "robot01-task-001"
         step = task.definition.steps[0]
         assert step.type is StepType.MOVE
         assert step.params == MoveParams(x=1.0, y=2.0, theta=90.0)
+        # A caller that says nothing about the run's origin (the MCP server,
+        # curl) still dispatches; the run is simply unlabelled.
+        assert (provenance.kind, provenance.name) == (None, None)
+
+    def test_post_forwards_kind_and_name_as_provenance(self, client, workflow_gw):
+        task = {**_move_task(), "kind": "goal", "name": "Morning patrol"}
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        _, provenance = workflow_gw.started[0]
+        assert (provenance.kind, provenance.name) == (TaskKind.GOAL, "Morning patrol")
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            # The backend's own kind: a direct dispatch may not pose as a
+            # scheduled run, or the dashboard's "Scheduled" row stops meaning it.
+            {"kind": "schedule"},
+            {"kind": "teleport"},
+            {"name": ""},
+            {"name": "x" * 256},
+        ],
+    )
+    def test_a_bad_kind_or_name_is_a_422(self, client, workflow_gw, extra):
+        response = client.post("/api/v1/tasks", json={**_move_task(), **extra})
+
+        assert response.status_code == 422
+        assert workflow_gw.started == []
 
     def test_a_mismatched_step_body_is_a_422(self, client, workflow_gw):
         # STANDUP takes no params; StepRequest's validator must reject this at
@@ -148,7 +191,7 @@ class TestTriggerTask:
         assert workflow_gw.started == []
 
     def test_a_duplicate_id_surfaces_as_400(self, client, workflow_gw):
-        async def _raise(request):
+        async def _raise(request, provenance=None):
             raise BadRequestError(f"Task {request.id} already exists")
 
         workflow_gw.start_task = _raise
@@ -160,7 +203,7 @@ class TestTriggerTask:
 
     def test_a_busy_robot_surfaces_as_409(self, client, workflow_gw):
         # The gateway's one-task-at-a-time gate; the router only translates.
-        async def _raise(request):
+        async def _raise(request, provenance=None):
             raise ConflictError("Robot is busy: task robot01-task-000 is running")
 
         workflow_gw.start_task = _raise
@@ -219,10 +262,19 @@ class TestTaskHistory:
             "DIRECT",
         )
         assert task["closed_at"] == "2026-08-10T08:05:00Z"
+        assert (task["kind"], task["name"]) == ("task", "Morning patrol")
         # base64url, unpadded: safe to put straight back into a query string.
         assert body["next_page_token"] == "_3Rva2Vu"
         assert workflow_gw.history_calls == [
-            {"page_size": 20, "next_page_token": None, "status": None, "since": None}
+            {
+                "page_size": 20,
+                "next_page_token": None,
+                "status": None,
+                "since": None,
+                "until": None,
+                "kind": None,
+                "name": None,
+            }
         ]
 
     def test_the_token_round_trips_with_the_filters(self, client, workflow_gw):
@@ -233,14 +285,29 @@ class TestTaskHistory:
                 "page_size": 5,
                 "status": "FAILED",
                 "since": "2026-08-10T00:00:00",
+                "until": "2026-08-11T00:00:00",
+                "kind": "schedule",
+                "name": "Morning patrol",
             },
         )
 
         call = workflow_gw.history_calls[0]
         assert call["next_page_token"] == b"\xfftoken"
         assert (call["page_size"], call["status"]) == (5, "FAILED")
-        # A naive `since` is read as UTC, not as the server's local time.
+        # A naive `since` / `until` is read as UTC, not as the server's local time.
         assert call["since"] == datetime(2026, 8, 10, tzinfo=timezone.utc)
+        assert call["until"] == datetime(2026, 8, 11, tzinfo=timezone.utc)
+        assert (call["kind"], call["name"]) == (TaskKind.SCHEDULE, "Morning patrol")
+
+    def test_an_empty_window_is_a_400_with_a_sentence(self, client, workflow_gw):
+        response = client.get(
+            "/api/v1/task_history",
+            params={"since": "2026-08-11T00:00:00", "until": "2026-08-10T00:00:00"},
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "until must not be before since"
+        assert workflow_gw.history_calls == []
 
     def test_last_page_has_no_token(self, client, workflow_gw):
         workflow_gw.history = ([], None)
@@ -257,13 +324,78 @@ class TestTaskHistory:
 
     @pytest.mark.parametrize(
         "params",
-        [{"status": "IN_PROGRESS"}, {"page_size": 0}, {"page_size": 101}],
+        [
+            {"status": "IN_PROGRESS"},
+            {"page_size": 0},
+            {"page_size": 101},
+            {"kind": "teleport"},
+            {"name": ""},
+        ],
     )
     def test_out_of_range_params_are_rejected(self, client, workflow_gw, params):
         response = client.get("/api/v1/task_history", params=params)
 
         assert response.status_code == 422
         assert workflow_gw.history_calls == []
+
+
+class TestTaskHistoryStats:
+    def test_projects_counts_and_a_success_rate(self, client, workflow_gw):
+        body = client.get("/api/v1/task_history/stats").json()
+
+        assert body["as_of"] == "2026-08-10T09:00:00Z"
+        assert body["total"] == 4
+        assert body["by_status"] == {"COMPLETED": 3, "FAILED": 1, "CANCELED": 0}
+        assert body["success_rate"] == 0.75
+        assert "by_kind" not in body
+        assert workflow_gw.stats_calls == [
+            {"status": None, "since": None, "until": None, "kind": None, "name": None}
+        ]
+
+    def test_a_rate_of_nothing_is_null_not_zero(self, client, workflow_gw):
+        workflow_gw.stats = TaskHistoryStats(
+            as_of=datetime(2026, 8, 10, tzinfo=timezone.utc),
+            total=0,
+            completed=0,
+            failed=0,
+            canceled=0,
+        )
+
+        body = client.get("/api/v1/task_history/stats").json()
+
+        assert body["success_rate"] is None
+        assert body["total"] == 0
+
+    def test_forwards_the_same_filters_as_the_list(self, client, workflow_gw):
+        client.get(
+            "/api/v1/task_history/stats",
+            params={
+                "status": "CANCELED",
+                "since": "2026-08-10T00:00:00",
+                "until": "2026-08-11T00:00:00+08:00",
+                "kind": "goal",
+                "name": "Morning patrol",
+            },
+        )
+
+        call = workflow_gw.stats_calls[0]
+        assert call["status"] == "CANCELED"
+        assert call["since"] == datetime(2026, 8, 10, tzinfo=timezone.utc)
+        assert call["until"] == datetime(2026, 8, 10, 16, tzinfo=timezone.utc)
+        assert (call["kind"], call["name"]) == (TaskKind.GOAL, "Morning patrol")
+
+    def test_an_empty_window_is_a_400(self, client, workflow_gw):
+        response = client.get(
+            "/api/v1/task_history/stats",
+            params={"since": "2026-08-11T00:00:00", "until": "2026-08-10T00:00:00"},
+        )
+
+        assert response.status_code == 400
+        assert workflow_gw.stats_calls == []
+
+    def test_a_bad_kind_is_a_422(self, client, workflow_gw):
+        assert client.get("/api/v1/task_history/stats", params={"kind": "x"}).status_code == 422
+        assert workflow_gw.stats_calls == []
 
 
 class TestCancelTask:

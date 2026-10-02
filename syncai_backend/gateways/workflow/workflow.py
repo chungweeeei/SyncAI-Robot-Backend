@@ -21,7 +21,11 @@ from temporalio.client import (
     ScheduleUpdateInput,
 )
 from temporalio.api.common.v1 import Payload
-from temporalio.common import SearchAttributeKey
+from temporalio.common import (
+    SearchAttributeKey,
+    SearchAttributePair,
+    TypedSearchAttributes,
+)
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
@@ -41,15 +45,23 @@ from syncai_backend.gateways.workflow.schema import (
     ScheduleView,
     Step,
     TaskHistoryEntry,
+    TaskHistoryStats,
+    TaskKind,
+    TaskProvenance,
     TaskSource,
     TaskState,
     WorkflowTask,
+)
+from syncai_backend.gateways.workflow.search_attributes import (
+    TASK_KIND_KEY,
+    TASK_NAME_KEY,
 )
 from syncai_backend.gateways.workflow.config import (
     ACTIVE_TASK_CACHE_TTL_S,
     ACTIVE_TASK_LIST_LIMIT,
     ACTIVE_TASK_RPC_TIMEOUT_S,
     TASK_HISTORY_RPC_TIMEOUT_S,
+    TASK_STATS_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
 )
 
@@ -68,12 +80,19 @@ _WORKFLOW_STATUS_MAP = {
 # The schedule that started a run, as Temporal itself records it.
 #
 # This is a *predefined* search attribute, written by the schedule machinery on
-# every triggered execution — this codebase sets no custom search attributes and
-# does not need to. It is also the only way the provenance is recoverable at
-# all: a scheduled run's workflow id is `<schedule_id>-<nominal ISO time>`, a
-# string the backend never forms, never stores and cannot reconstruct (it would
-# have to guess the exact nominal instant). Nothing in the memo helps either —
-# the memo belongs to the *schedule*, not to the run it starts.
+# every triggered execution, with or without anything this backend stamps. It
+# is the only way *that* provenance is recoverable at all: a scheduled run's
+# workflow id is `<schedule_id>-<nominal ISO time>`, a string the backend never
+# forms, never stores and cannot reconstruct (it would have to guess the exact
+# nominal instant). Nothing in the memo helps either — the memo belongs to the
+# *schedule*, not to the run it starts.
+#
+# The two custom attributes this backend does write (TaskKind / TaskName, in
+# search_attributes.py) are the other half of a run's provenance — what kind
+# of job it was and which template it came from — and exist because the
+# history has to filter and count on them. This key stays the authority for
+# "a schedule started it": a schedule registered before those attributes
+# existed keeps firing without them.
 _SCHEDULED_BY_KEY = SearchAttributeKey.for_keyword("TemporalScheduledById")
 
 
@@ -110,13 +129,49 @@ _CLOSED_STATUS_FILTER = {
     "CANCELED": ("Canceled", "Terminated"),
 }
 
+# The inverse again, for reading a `GROUP BY ExecutionStatus` count back into
+# the REST vocabulary: a TimedOut group is added to FAILED, Terminated to
+# CANCELED, exactly as the list reports those runs.
+_REST_STATUS_OF = {
+    temporal: rest
+    for rest, temporals in _CLOSED_STATUS_FILTER.items()
+    for temporal in temporals
+}
+
+
+def _quote(value: str) -> str:
+    r"""A List Filter string literal.
+
+    The filter parser accepts ``\'`` (and ``''``) inside a quoted value, and
+    rejects anything that is not ``column op literal`` outright -- so this is
+    for a template name that legitimately carries an apostrophe, not the only
+    thing standing between a query string and the index.
+    """
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _kind_predicate(kind: TaskKind) -> str:
+    """The List Filter clause for one kind.
+
+    SCHEDULE keys on the attribute Temporal itself stamps, not on the TaskKind
+    this backend also writes: schedules registered before the custom
+    attributes existed keep firing without them, and their runs must still
+    count as scheduled. The other kinds exist only as TaskKind.
+    """
+    if kind is TaskKind.SCHEDULE:
+        return "TemporalScheduledById IS NOT NULL"
+    return f"TaskKind = {_quote(kind.value)}"
+
 
 def _history_query(
     task_queue: str,
     status: Optional[str] = None,
     since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    kind: Optional[TaskKind] = None,
+    name: Optional[str] = None,
 ) -> str:
-    """The visibility List Filter behind GET /api/v1/task_history.
+    """The visibility List Filter behind GET /api/v1/task_history and /stats.
 
     The same WorkflowType / TaskQueue scope as _active_query — the task queue is
     what keeps another robot's runs on the shared namespace out of the answer.
@@ -139,6 +194,14 @@ def _history_query(
         query += " AND CloseTime >= '{}'".format(
             since.astimezone(timezone.utc).isoformat()
         )
+    if until is not None:
+        query += " AND CloseTime <= '{}'".format(
+            until.astimezone(timezone.utc).isoformat()
+        )
+    if kind is not None:
+        query += " AND " + _kind_predicate(kind)
+    if name is not None:
+        query += f" AND TaskName = {_quote(name)}"
     return query
 
 
@@ -151,6 +214,56 @@ def _schedule_id_of(execution) -> Optional[str]:
         # decoration, presence is the safety fact. A run whose attributes cannot
         # be decoded must still be reported as running.
         return None
+
+
+def _provenance_of(
+    execution, schedule_id: Optional[str]
+) -> Tuple[Optional[TaskKind], Optional[str]]:
+    """The run's kind and template name off its search attributes.
+
+    Same never-fatal policy as _schedule_id_of. A scheduled run registered
+    before the attributes existed carries neither, so its kind falls back to
+    SCHEDULE off TemporalScheduledById and its name to None; a direct run
+    dispatched without saying stays (None, None). An unknown kind value -- a
+    newer backend's -- reads as None rather than failing the row.
+    """
+    try:
+        attributes = execution.typed_search_attributes
+        raw_kind = attributes.get(TASK_KIND_KEY)
+        name = attributes.get(TASK_NAME_KEY)
+    except Exception:
+        raw_kind, name = None, None
+    try:
+        kind = TaskKind(raw_kind) if raw_kind is not None else None
+    except ValueError:
+        kind = None
+    if kind is None and schedule_id:
+        kind = TaskKind.SCHEDULE
+    return kind, (name or None)
+
+
+def _direct_search_attributes(provenance: TaskProvenance) -> TypedSearchAttributes:
+    """What a direct dispatch stamps on its run: only the fields it gave."""
+    pairs = []
+    if provenance.kind is not None:
+        pairs.append(SearchAttributePair(TASK_KIND_KEY, provenance.kind.value))
+    if provenance.name:
+        pairs.append(SearchAttributePair(TASK_NAME_KEY, provenance.name))
+    return TypedSearchAttributes(pairs)
+
+
+def _schedule_search_attributes(schedule: ScheduleTask) -> TypedSearchAttributes:
+    """What every run a schedule starts inherits from its action.
+
+    Always SCHEDULE -- the one kind a direct dispatch may not claim -- plus the
+    template's name when the schedule was made from one. The same name
+    _schedule_to_memo writes, carried a second time because the memo is the
+    schedule's and only the action's attributes reach the runs.
+    """
+    pairs = [SearchAttributePair(TASK_KIND_KEY, TaskKind.SCHEDULE.value)]
+    if schedule.task_template_name:
+        pairs.append(SearchAttributePair(TASK_NAME_KEY, schedule.task_template_name))
+    return TypedSearchAttributes(pairs)
 
 
 @dataclass
@@ -517,8 +630,12 @@ class WorkflowGateway:
                 f"Robot is busy: task {snapshot.tasks[0].id} is running"
             )
 
-    async def start_task(self, request: WorkflowTask):
-
+    async def start_task(
+        self, request: WorkflowTask, provenance: TaskProvenance = TaskProvenance()
+    ):
+        """Dispatch a run. `provenance` is stamped on it as search attributes
+        for the history (see _direct_search_attributes); the workflow argument
+        itself does not carry it, because nothing in the workflow reads it."""
         try:
             client = await self._get_client()
         except Exception as err:
@@ -535,6 +652,7 @@ class WorkflowGateway:
                 id=request.id,
                 args=[request],
                 task_queue=self._task_queue,
+                search_attributes=_direct_search_attributes(provenance),
             )
         except WorkflowAlreadyStartedError:
             # Workflow ids are namespace-global while task queues are
@@ -713,6 +831,7 @@ class WorkflowGateway:
                     continue
 
                 schedule_id = _schedule_id_of(execution)
+                kind, name = _provenance_of(execution, schedule_id)
                 tasks.append(
                     ActiveTask(
                         id=execution.id,
@@ -723,6 +842,8 @@ class WorkflowGateway:
                             TaskSource.SCHEDULE if schedule_id else TaskSource.DIRECT
                         ),
                         schedule_id=schedule_id,
+                        kind=kind,
+                        name=name,
                     )
                 )
         except RPCError as err:
@@ -765,12 +886,15 @@ class WorkflowGateway:
         next_page_token: Optional[bytes] = None,
         status: Optional[str] = None,
         since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        kind: Optional[TaskKind] = None,
+        name: Optional[str] = None,
     ) -> Tuple[List[TaskHistoryEntry], Optional[bytes]]:
         """One page of this robot's finished executions, newest first.
 
         Answers the rows and the token for the page after them (None on the
         last page). The token is Temporal's own and is only valid for the same
-        query, i.e. the same `status` / `since`.
+        query, i.e. the same `status` / `since` / `until` / `kind` / `name`.
 
         How far back this reaches is the namespace retention and nothing else:
         the backend stores no runs, so a run Temporal has deleted is gone.
@@ -788,7 +912,14 @@ class WorkflowGateway:
             )
             raise UpstreamError("Failed to connect to Temporal server")
 
-        query = _history_query(self._task_queue, status=status, since=since)
+        query = _history_query(
+            self._task_queue,
+            status=status,
+            since=since,
+            until=until,
+            kind=kind,
+            name=name,
+        )
         # One page and only one: iterating with `async for` would follow the
         # token to the end of the retention window inside a single request.
         pages = client.list_workflows(
@@ -807,7 +938,9 @@ class WorkflowGateway:
                     raise BadRequestError("Invalid page token")
                 self._logger.error(
                     "[WorkflowGateway] Visibility rejected the task-history query; "
-                    "is this server on standard visibility?",
+                    "is this server on standard visibility, or are the TaskKind / "
+                    "TaskName search attributes not registered (see "
+                    "ensure_search_attributes)?",
                     query=query,
                     error=str(err),
                 )
@@ -835,6 +968,7 @@ class WorkflowGateway:
                 continue
 
             schedule_id = _schedule_id_of(execution)
+            run_kind, run_name = _provenance_of(execution, schedule_id)
             entries.append(
                 TaskHistoryEntry(
                     id=execution.id,
@@ -848,10 +982,87 @@ class WorkflowGateway:
                     ),
                     source=TaskSource.SCHEDULE if schedule_id else TaskSource.DIRECT,
                     schedule_id=schedule_id,
+                    kind=run_kind,
+                    name=run_name,
                 )
             )
 
         return entries, pages.next_page_token
+
+    async def task_history_stats(
+        self,
+        status: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        kind: Optional[TaskKind] = None,
+        name: Optional[str] = None,
+    ) -> TaskHistoryStats:
+        """How this robot's finished executions under a filter ended, counted.
+
+        The same filter as list_task_history, answered by one `count_workflows`
+        with `GROUP BY ExecutionStatus` -- the one GROUP BY the server allows,
+        and the one this needs. See TASK_STATS_RPC_TIMEOUT_S for the cost.
+        """
+        if status is not None and status not in _CLOSED_STATUS_FILTER:
+            raise ValueError(f"Not a closed task status: {status}")
+
+        try:
+            client = await self._get_client()
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
+            )
+            raise UpstreamError("Failed to connect to Temporal server")
+
+        query = _history_query(
+            self._task_queue,
+            status=status,
+            since=since,
+            until=until,
+            kind=kind,
+            name=name,
+        )
+        try:
+            result = await client.count_workflows(
+                query + " GROUP BY ExecutionStatus",
+                rpc_timeout=timedelta(seconds=TASK_STATS_RPC_TIMEOUT_S),
+            )
+        except RPCError as err:
+            if err.status == RPCStatusCode.INVALID_ARGUMENT:
+                self._logger.error(
+                    "[WorkflowGateway] Visibility rejected the task-history count; "
+                    "is this server on standard visibility, or are the TaskKind / "
+                    "TaskName search attributes not registered (see "
+                    "ensure_search_attributes)?",
+                    error=str(err),
+                )
+            else:
+                self._logger.error(
+                    "[WorkflowGateway] Failed to count task history", error=str(err)
+                )
+            raise UpstreamError("Task history stats failed")
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to count task history", error=str(err)
+            )
+            raise UpstreamError("Task history stats failed")
+
+        counts = {rest: 0 for rest in _CLOSED_STATUS_FILTER}
+        for group in result.groups:
+            # A group's value is the Temporal spelling; one not in the table
+            # (a Running group, were the query ever to admit one) is simply
+            # not a finished run.
+            rest = _REST_STATUS_OF.get(str(group.group_values[0]))
+            if rest is not None:
+                counts[rest] += group.count
+
+        return TaskHistoryStats(
+            as_of=datetime.now(timezone.utc),
+            total=sum(counts.values()),
+            completed=counts["COMPLETED"],
+            failed=counts["FAILED"],
+            canceled=counts["CANCELED"],
+        )
 
     async def cancel_task(self, task_id: str):
 
@@ -927,6 +1138,12 @@ class WorkflowGateway:
                         args=[workflow_task],
                         id=schedule.id,
                         task_queue=self._task_queue,
+                        # Inherited by every run this schedule starts, on top
+                        # of the TemporalScheduledById the server stamps; the
+                        # history reads kind and name off the run from here.
+                        typed_search_attributes=_schedule_search_attributes(
+                            schedule
+                        ),
                     ),
                     spec=spec,
                     # A single robot can only do one thing at a time: never let a

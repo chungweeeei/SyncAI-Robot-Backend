@@ -171,6 +171,38 @@ class TaskSource(str, Enum):
     SCHEDULE = "SCHEDULE"
 
 
+class TaskKind(str, Enum):
+    """How a run was started, as the console mints it into the task id.
+
+    Lowercase on purpose, unlike every other enum here: these are literally
+    the second segment of ``<robot_id>-<kind>-<ts>-<seq>``, and the words the
+    history dashboard filters and counts by. SCHEDULE is the backend's own: it
+    is stamped on every run a schedule starts, and a direct POST may not claim
+    it (``TaskRequest`` refuses it at the boundary).
+    """
+
+    GOAL = "goal"
+    STANDUP = "standup"
+    LIEDOWN = "liedown"
+    TASK = "task"
+    SCHEDULE = "schedule"
+
+
+class TaskProvenance(BaseSchema):
+    """What a run carries about its origin beyond the id Temporal keeps.
+
+    Written to the run as custom search attributes (``TaskKind`` /
+    ``TaskName``, see gateways/workflow/search_attributes.py) rather than
+    the memo, because the history has to *filter and count* on them, and a
+    memo cannot be queried. Both optional: the MCP server and curl keep
+    dispatching with neither, and such a run is simply unlabelled.
+    """
+
+    kind: Optional[TaskKind] = Field(default=None)
+    # TaskTemplate.name is String(255); the bound keeps the attribute in step.
+    name: Optional[str] = Field(default=None, max_length=255)
+
+
 class ActiveTask(BaseSchema):
     """One execution that is running on this robot's task queue right now.
 
@@ -196,6 +228,13 @@ class ActiveTask(BaseSchema):
         default=None,
         description="The schedule that started it, when source is SCHEDULE.",
     )
+    kind: Optional[TaskKind] = Field(
+        default=None,
+        description="How it was started; None for a run dispatched without saying.",
+    )
+    name: Optional[str] = Field(
+        default=None, description="The template it was dispatched from, if any."
+    )
 
 
 class TaskHistoryEntry(BaseSchema):
@@ -218,6 +257,27 @@ class TaskHistoryEntry(BaseSchema):
         default=None,
         description="The schedule that started it, when source is SCHEDULE.",
     )
+    kind: Optional[TaskKind] = Field(
+        default=None,
+        description="How it was started; None for a run dispatched without saying.",
+    )
+    name: Optional[str] = Field(
+        default=None, description="The template it was dispatched from, if any."
+    )
+
+
+class TaskHistoryStats(BaseSchema):
+    """The finished runs matching a history filter, counted rather than listed.
+
+    Counted by Temporal (``count_workflows``), so the numbers are exact for
+    the whole retention window however many pages the list would take.
+    """
+
+    as_of: datetime = Field(..., description="When the counts were taken (UTC)")
+    total: int
+    completed: int
+    failed: int
+    canceled: int
 
 
 class ScheduleTrigger(BaseSchema):

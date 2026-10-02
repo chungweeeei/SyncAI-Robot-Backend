@@ -232,6 +232,10 @@ at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, a
 keeps on describe, list and update. `_build_schedule_spec` is the one gate every
 registration goes through, so the crons that would break that echo (`#`, a
 `CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
+Runs carry two custom search attributes, `TaskKind` / `TaskName` (`gateways/workflow/
+search_attributes.py`), registered idempotently by the worker at connect; the history
+list and `/stats` filter and count on them, and `kind=schedule` is answered from
+`TemporalScheduledById` so schedules that predate the attributes still count.
 `ARTIFACT` steps were removed 2026-08 — stored
 templates carrying one fail validation.
 

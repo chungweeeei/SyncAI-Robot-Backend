@@ -31,6 +31,8 @@ from temporalio.client import (  # noqa: E402
     ScheduleOverlapPolicy,
     ScheduleSpec,
     ScheduleUpdate,
+    WorkflowExecutionCount,
+    WorkflowExecutionCountAggregationGroup,
     WorkflowExecutionStatus,
 )
 from temporalio.exceptions import WorkflowAlreadyStartedError  # noqa: E402
@@ -49,9 +51,15 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     ScheduleTrigger,
     Step,
     StepType,
+    TaskKind,
+    TaskProvenance,
     TaskSource,
     WorkflowTask,
     WorkflowTaskDefinition,
+)
+from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
+    TASK_KIND_KEY,
+    TASK_NAME_KEY,
 )
 from syncai_backend.gateways.workflow.workflow import (  # noqa: E402
     WorkflowGateway,
@@ -121,15 +129,37 @@ def _execution(
     status=WorkflowExecutionStatus.RUNNING,
     schedule_id=None,
     close_time=None,
+    kind=None,
+    name=None,
 ) -> SimpleNamespace:
-    """One row of a visibility listing, as the gateway's list paths read it."""
+    """One row of a visibility listing, as the gateway's list paths read it.
+
+    The attribute stub answers by key name, the way the typed accessor does:
+    the gateway reads three keys off a row and must not be handed the
+    schedule id for all of them."""
+    attributes = {
+        "TemporalScheduledById": schedule_id,
+        TASK_KIND_KEY.name: kind,
+        TASK_NAME_KEY.name: name,
+    }
     return SimpleNamespace(
         id=task_id,
         run_id="run-1",
         status=status,
         start_time=datetime(2026, 8, 10, 8, 0, tzinfo=timezone.utc),
         close_time=close_time,
-        typed_search_attributes=SimpleNamespace(get=lambda key: schedule_id),
+        typed_search_attributes=SimpleNamespace(get=lambda key: attributes.get(key.name)),
+    )
+
+
+def _count(**groups: int) -> WorkflowExecutionCount:
+    """A `GROUP BY ExecutionStatus` answer, keyed by Temporal's spellings."""
+    return WorkflowExecutionCount(
+        count=sum(groups.values()),
+        groups=[
+            WorkflowExecutionCountAggregationGroup(count=n, group_values=[status])
+            for status, n in groups.items()
+        ],
     )
 
 
@@ -205,6 +235,41 @@ class TestWorkflowGateway:
         assert kwargs["id"] == "robot01-task-001"
         assert kwargs["args"] == [_task()]
         assert kwargs["task_queue"] == OWN_QUEUE
+        # Nothing said about the run's origin, nothing stamped on it.
+        assert list(kwargs["search_attributes"]) == []
+
+    def test_start_task_stamps_provenance_as_search_attributes(
+        self, workflow_gw, mock_client
+    ):
+        # Kind and name travel as search attributes, not in the workflow
+        # argument: the history filters and counts on them, and nothing in
+        # the workflow reads them.
+        self._listing(mock_client, [])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(
+                workflow_gw.start_task(
+                    _task(), TaskProvenance(kind=TaskKind.GOAL, name="Morning patrol")
+                )
+            )
+
+        kwargs = mock_client.start_workflow.call_args[1]
+        assert kwargs["args"] == [_task()]
+        attributes = kwargs["search_attributes"]
+        assert attributes.get(TASK_KIND_KEY) == "goal"
+        assert attributes.get(TASK_NAME_KEY) == "Morning patrol"
+
+    def test_start_task_stamps_only_the_kind_when_there_is_no_name(
+        self, workflow_gw, mock_client
+    ):
+        self._listing(mock_client, [])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(
+                workflow_gw.start_task(_task(), TaskProvenance(kind=TaskKind.STANDUP))
+            )
+
+        attributes = mock_client.start_workflow.call_args[1]["search_attributes"]
+        assert attributes.get(TASK_KIND_KEY) == "standup"
+        assert attributes.get(TASK_NAME_KEY) is None
 
     def test_start_task_maps_a_duplicate_id_to_bad_request(self, workflow_gw, mock_client):
         # Namespace-global ids: a re-post of this robot's task and a collision
@@ -513,12 +578,15 @@ class TestWorkflowGateway:
                     "robot01-task-001",
                     status=WorkflowExecutionStatus.TIMED_OUT,
                     close_time=closed,
+                    kind="goal",
                 ),
                 _execution(
                     "robot01-sched-001-2026-08-10T09",
                     status=WorkflowExecutionStatus.COMPLETED,
                     schedule_id="sched-1",
                     close_time=closed,
+                    kind="schedule",
+                    name="Morning patrol",
                 ),
             ],
             next_token=b"page-2",
@@ -535,11 +603,113 @@ class TestWorkflowGateway:
             TaskSource.DIRECT,
             closed,
         )
+        assert (failed.kind, failed.name) == (TaskKind.GOAL, None)
         assert (done.status, done.schedule_id) == ("COMPLETED", "sched-1")
+        assert (done.kind, done.name) == (TaskKind.SCHEDULE, "Morning patrol")
         # Exactly one page per request: fetched once, never iterated onward.
         pages.fetch_next_page.assert_awaited_once()
         kwargs = mock_client.list_workflows.call_args.kwargs
         assert (kwargs["page_size"], kwargs["next_page_token"]) == (2, b"page-1")
+
+    def test_task_history_reads_provenance_off_runs_that_predate_it(
+        self, workflow_gw, mock_client
+    ):
+        # A schedule registered before the attributes existed still fires; its
+        # runs are SCHEDULE off TemporalScheduledById with no name. A direct
+        # run dispatched without saying is unlabelled, and a kind this build
+        # does not know reads as none rather than failing the row.
+        self._history_page(
+            mock_client,
+            [
+                _execution("legacy-sched-2026-08-10T09", schedule_id="legacy"),
+                _execution("robot01-task-002"),
+                _execution("robot01-task-003", kind="teleport"),
+            ],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            entries, _ = asyncio.run(workflow_gw.list_task_history(page_size=3))
+
+        assert [(e.kind, e.name) for e in entries] == [
+            (TaskKind.SCHEDULE, None),
+            (None, None),
+            (None, None),
+        ]
+
+    def test_task_history_passes_every_filter_into_one_query(
+        self, workflow_gw, mock_client
+    ):
+        self._history_page(mock_client, [])
+        since = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        until = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(
+                workflow_gw.list_task_history(
+                    page_size=20,
+                    status="FAILED",
+                    since=since,
+                    until=until,
+                    kind=TaskKind.TASK,
+                    name="Morning patrol",
+                )
+            )
+
+        query = mock_client.list_workflows.call_args.args[0]
+        assert query == _history_query(
+            OWN_QUEUE,
+            status="FAILED",
+            since=since,
+            until=until,
+            kind=TaskKind.TASK,
+            name="Morning patrol",
+        )
+
+    # ==================== task_history_stats ====================
+
+    def test_task_history_stats_is_one_grouped_count(self, workflow_gw, mock_client):
+        mock_client.count_workflows = AsyncMock(
+            return_value=_count(Completed=5, Failed=1, TimedOut=1, Canceled=2, Terminated=1)
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            stats = asyncio.run(
+                workflow_gw.task_history_stats(kind=TaskKind.LIEDOWN, name="x")
+            )
+
+        # TimedOut folds into FAILED, Terminated into CANCELED, as the list does.
+        assert (stats.total, stats.completed, stats.failed, stats.canceled) == (
+            10, 5, 2, 3
+        )
+        mock_client.count_workflows.assert_awaited_once()
+        query = mock_client.count_workflows.await_args.args[0]
+        assert query.endswith(" GROUP BY ExecutionStatus")
+        assert "TaskKind = 'liedown'" in query and "TaskName = 'x'" in query
+
+    def test_task_history_stats_ignores_a_group_it_does_not_report(
+        self, workflow_gw, mock_client
+    ):
+        mock_client.count_workflows = AsyncMock(return_value=_count(Running=4, Completed=1))
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            stats = asyncio.run(workflow_gw.task_history_stats())
+
+        assert (stats.total, stats.completed) == (1, 1)
+
+    def test_task_history_stats_maps_a_rejected_query_to_upstream(
+        self, workflow_gw, mock_client
+    ):
+        # An unregistered search attribute answers INVALID_ARGUMENT; the
+        # operator sees a 502, the log says which attribute to register.
+        mock_client.count_workflows = AsyncMock(
+            side_effect=RPCError(
+                "not a valid search attribute", RPCStatusCode.INVALID_ARGUMENT, b""
+            )
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError, match="stats failed"):
+                asyncio.run(workflow_gw.task_history_stats())
+
+    def test_task_history_stats_connection_failure(self, workflow_gw):
+        with patch(CONNECT, new_callable=AsyncMock, side_effect=ConnectionError("down")):
+            with pytest.raises(UpstreamError, match="connect"):
+                asyncio.run(workflow_gw.task_history_stats())
 
     def test_task_history_last_page_has_no_token(self, workflow_gw, mock_client):
         self._history_page(mock_client, [])
@@ -625,6 +795,27 @@ class TestWorkflowGateway:
             "task_template_id": "0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55",
             "task_template_name": "Morning patrol",
         }
+        # What the *runs* carry, as opposed to the schedule: every run this
+        # action starts is stamped SCHEDULE plus the template's name, which is
+        # how the history counts them without a describe per row.
+        attributes = schedule.action.typed_search_attributes
+        assert attributes.get(TASK_KIND_KEY) == "schedule"
+        assert attributes.get(TASK_NAME_KEY) == "Morning patrol"
+
+    def test_create_schedule_without_a_template_stamps_only_the_kind(
+        self, workflow_gw, mock_client
+    ):
+        bare = ScheduleTask(
+            id="robot01-sched-002",
+            trigger=ScheduleTrigger(interval_seconds=600),
+            definition=WorkflowTaskDefinition(steps=[MOVE_STEP]),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(workflow_gw.create_schedule(bare))
+
+        attributes = mock_client.create_schedule.call_args.args[1].action.typed_search_attributes
+        assert attributes.get(TASK_KIND_KEY) == "schedule"
+        assert attributes.get(TASK_NAME_KEY) is None
 
     def test_create_schedule_maps_a_duplicate_to_bad_request(
         self, workflow_gw, mock_client
@@ -918,6 +1109,52 @@ class TestHistoryQuery:
 
         assert "ExecutionStatus IN ('Canceled', 'Terminated')" in query
         assert "Completed" not in query
+
+    def test_until_is_a_utc_close_time_upper_bound(self):
+        taipei = timezone(timedelta(hours=8))
+        query = _history_query(
+            OWN_QUEUE, until=datetime(2026, 8, 11, 8, 0, tzinfo=taipei)
+        )
+
+        assert query.endswith("AND CloseTime <= '2026-08-11T00:00:00+00:00'")
+
+    def test_a_direct_kind_is_the_custom_attribute(self):
+        query = _history_query(OWN_QUEUE, kind=TaskKind.GOAL)
+
+        assert query.endswith("AND TaskKind = 'goal'")
+
+    def test_the_scheduled_kind_keys_on_temporals_own_attribute(self):
+        # So schedules registered before TaskKind existed still count.
+        query = _history_query(OWN_QUEUE, kind=TaskKind.SCHEDULE)
+
+        assert query.endswith("AND TemporalScheduledById IS NOT NULL")
+        assert "TaskKind" not in query
+
+    def test_a_name_is_quoted_for_the_filter_parser(self):
+        query = _history_query(OWN_QUEUE, name="O'Brien's \\ round")
+
+        assert query.endswith("AND TaskName = 'O\\'Brien\\'s \\\\ round'")
+
+    def test_every_filter_composes_in_a_fixed_order(self):
+        since = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        until = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        query = _history_query(
+            OWN_QUEUE,
+            status="FAILED",
+            since=since,
+            until=until,
+            kind=TaskKind.TASK,
+            name="patrol",
+        )
+
+        assert query == (
+            f"WorkflowType = '{WORKFLOW_TYPE_NAME}' AND TaskQueue = '{OWN_QUEUE}' "
+            "AND ExecutionStatus IN ('Failed', 'TimedOut') "
+            "AND CloseTime >= '2026-08-10T00:00:00+00:00' "
+            "AND CloseTime <= '2026-08-11T00:00:00+00:00' "
+            "AND TaskKind = 'task' AND TaskName = 'patrol'"
+        )
+        assert "ORDER BY" not in query
 
     def test_since_is_a_utc_close_time_bound(self):
         taipei = timezone(timedelta(hours=8))
