@@ -462,6 +462,20 @@ Two properties of the recorder are load-bearing and easy to undo by accident:
   recorder at 64 KiB; inherited, `rosbag2_recorder`'s lines land in the backend's
   multilog (`log/stack/<robot_id>/backend/current`).
 
+**A topic is only recorded if its type is installed here.** `ros2 bag record`
+subscribes generically, but it still looks the type's package up in the ament
+index and loads its `rosidl_typesupport_cpp` library; a type it cannot find is
+skipped with a warning in the log, and the bag simply has no such topic.
+`syncai_common/msg/*` is covered by the install space the backend runs from.
+`livox/lidar` is a `livox_ros_driver2/msg/CustomMsg` (`xfer_format: 1` in the
+bringup), and the real driver package needs Livox-SDK2 to build, so the image
+builds `docker/livox_ros_driver2` instead — the two messages and nothing else,
+under the same package name and with byte-identical `.msg` files, because DDS
+matches on the type name and the bag records it for replay against the real
+driver. A type from any other package needs the same treatment. Running from a
+robot workspace instead of the image, the real driver's install space already
+provides it.
+
 `interrupted` in the catalogue is derived, never stored: a directory with no
 `metadata.yaml` and no live process behind it. That is what a bag looks like
 when the backend went away mid-recording, and it is the same

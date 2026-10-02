@@ -84,7 +84,10 @@ docker compose up -d --build                        # the runtime image as a ser
 reads, so they are not tied to a workspace checkout — plus **`ipc: host`**, so
 this container shares the host's `/dev/shm` with the robot container (see
 *Mapping-mode map cloud* below). The builder stage vcs-imports syncai_common
-itself; nothing needs copying in. The README's *As its own container*
+itself; nothing needs copying in. It also builds `docker/livox_ros_driver2`, a
+messages-only stand-in for the Livox driver that exists solely so `ros2 bag
+record` can subscribe to `livox/lidar` (CustomMsg); keep its name and `.msg`
+files identical to upstream. The README's *As its own container*
 and the Dockerfile header carry the rest, including why only one backend may run at a time.
 
 Test notes: tests `importorskip` `rclpy` / `syncai_common` / `httpx` etc., so on a

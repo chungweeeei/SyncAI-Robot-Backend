@@ -35,6 +35,12 @@
 # cloning the whole SyncAI-Fast-LIO2 fork to build one package. They moved
 # into syncai_common 2026-09; that clone is gone.)
 #
+# A second interface package rides along for the recorder rather than for any
+# import: docker/livox_ros_driver2, the Livox CustomMsg/CustomPoint messages
+# with none of the driver. `ros2 bag record` has to load a topic's type support
+# to subscribe to it, and livox/lidar is a CustomMsg. syncai_common/msg topics
+# need nothing extra — that package is in the install space already.
+#
 # ── dev image usage ──────────────────────────────────────────────────────────
 #
 # The source is NOT copied into the dev stage. It is bind-mounted, so an edit on
@@ -170,18 +176,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /ros2_ws
 COPY . /ros2_ws/src/syncai_backend
+COPY docker/livox_ros_driver2 /ros2_ws/src/livox_ros_driver2
 
-# Two packages, both required:
+# Three packages, all required:
 #
-#   syncai_common  cloned by vcs from interface.repos.
-#   syncai_backend this repo.
+#   syncai_common     cloned by vcs from interface.repos.
+#   livox_ros_driver2 the Livox messages alone (docker/livox_ros_driver2 —
+#                     no driver, no Livox-SDK2). Nothing here imports it;
+#                     `ros2 bag record` needs it to subscribe to livox/lidar,
+#                     which is a CustomMsg. Without it the recorder skips the
+#                     topic and every bag comes out lidar-less. It is copied
+#                     out to src/ explicitly because colcon never looks inside
+#                     a package (syncai_backend) for another one.
+#   syncai_backend    this repo.
 #
 # No --symlink-install: that flag is what disables setup.py's InstallNoSource,
 # and the whole point of the runtime image is that it ships bytecode rather
 # than source. Do not add it here to "make rebuilds faster".
 RUN source /opt/ros/humble/setup.bash \
     && vcs import < src/syncai_backend/interface.repos \
-    && colcon build --install-base /ros2_ws/install --packages-up-to syncai_backend \
+    && colcon build --install-base /ros2_ws/install --packages-up-to syncai_backend livox_ros_driver2 \
     && rm -rf build log src
 
 # =============================================================================
