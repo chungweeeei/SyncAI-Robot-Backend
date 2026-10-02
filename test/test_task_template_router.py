@@ -349,7 +349,8 @@ def test_schedule_freezes_the_current_resolution(client, workflow_gw, dock):
     move = registered.definition.steps[0]
     # The vertex's current pose, not the snapshot.
     assert (move.params.x, move.params.y, move.params.theta) == (3.0, -1.5, 90.0)
-    # Provenance rides in the memo, never in the Temporal step schema.
+    # Provenance rides in the memo (and the name on the runs' search
+    # attributes), never in the Temporal step schema.
     assert registered.map_name == "full"
     assert registered.task_template_id == task_id
     assert registered.task_template_name == "patrol"

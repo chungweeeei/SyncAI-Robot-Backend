@@ -16,8 +16,13 @@ without ever reimplementing that rule. The rejected alternative was a
 server-side ``POST /api/v1/task_templates/{id}/dispatch``: it would have to
 either refuse or silently substitute, where this lets the operator *see* the
 resolved numbers and the "vertex was deleted" warning before committing. It also
-keeps ``POST /api/v1/tasks`` the single dispatch path, and keeps a template's
-provenance out of everything Temporal persists.
+keeps ``POST /api/v1/tasks`` the single dispatch path. What Temporal persists
+about a template is deliberately **a label, not a reference**: a run carries
+the template's *name* (the ``TaskName`` search attribute the history dashboard
+filters and counts on, sent by the client as ``name``) and a schedule carries
+name and id in its memo, but no step ever carries a ``vertex_id`` -- so nothing
+in Temporal can point back into the map tables and go stale when a vertex is
+edited or deleted.
 
 **The path is ``/api/v1/task_templates``, not ``/api/v1/tasks/templates``.**
 ``GET /api/v1/tasks/{id}`` takes an unconstrained ``str`` (it is a Temporal
@@ -678,7 +683,10 @@ def init_task_template_router(
                         "remove the step first."
                     )
                 # Note what is NOT carried over: vertex_id / vertex_name. A
-                # template's provenance never enters the Temporal schema.
+                # vertex reference never enters the Temporal step schema; the
+                # template's *name* does, through the schedule's search
+                # attributes (see create_schedule), because that is what the
+                # history reports a run as.
                 steps.append(
                     Step(
                         id=stored.id,
