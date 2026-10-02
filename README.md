@@ -507,8 +507,10 @@ stored as a plain string.
 ### Task templates
 
 `POST /api/v1/tasks` creates *and dispatches* and persists nothing, and Temporal
-is not a library: namespace `default` retains closed workflows for **one day** with
-no archival, so a dispatched step list is gone by tomorrow. `task_templates` is
+is not a library: namespace `default` keeps closed workflows only for its
+retention (a day on a fresh install — see *Task orchestration* for lengthening
+it) with no archival, so a dispatched step list is gone once that passes.
+`task_templates` is
 where the operator's re-dispatchable step lists live. The prefix is
 `/api/v1/task_templates`, not `/api/v1/tasks/templates`, because the latter
 would collide with `/api/v1/tasks/{id}` (see the include order note in
