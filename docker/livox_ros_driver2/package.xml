@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <!--
+    The messages of Livox's livox_ros_driver2, and nothing else: no driver, no
+    Livox-SDK2, no PCL. It exists so the backend image can `ros2 bag record`
+    livox/lidar, which the bringup publishes as livox_ros_driver2/msg/CustomMsg
+    (xfer_format: 1). rosbag2 subscribes generically, but it still has to find
+    the type's package in the ament index and dlopen its
+    rosidl_typesupport_cpp library; without them the topic is skipped and the
+    bag holds no lidar.
+
+    The name must stay `livox_ros_driver2` and msg/ must stay byte-identical to
+    upstream: DDS matches the publisher on the type name
+    (livox_ros_driver2::msg::dds_::CustomMsg_), and the bag records that name
+    for replay against the real driver.
+
+    Built only by the Dockerfile's builder stage, which copies it into src/.
+    colcon does not descend into a directory once it has found a package, so
+    vcs-importing this repo into the robot workspace does not make it a second
+    livox_ros_driver2 beside the real one.
+  -->
+  <name>livox_ros_driver2</name>
+  <version>1.0.0</version>
+  <description>Message definitions of livox_ros_driver2 (CustomMsg, CustomPoint) only, for recording them</description>
+  <maintainer email="chungweeeei@gmail.com">ros</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>std_msgs</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
