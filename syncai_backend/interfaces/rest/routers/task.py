@@ -228,17 +228,6 @@ class TaskHistoryResponse(BaseModel):
     )
 
 
-class TaskKindCountResponse(BaseModel):
-    kind: Optional[TaskKind] = Field(
-        default=None,
-        description="null for runs that carry no kind (dispatched without one)",
-    )
-    total: int
-    completed: int
-    failed: int
-    canceled: int
-
-
 class TaskHistoryStatsResponse(BaseModel):
     as_of: datetime = Field(..., description="When the counts were taken (UTC)")
     total: int = Field(..., description="Finished runs matching the filter")
@@ -248,13 +237,6 @@ class TaskHistoryStatsResponse(BaseModel):
     success_rate: Optional[float] = Field(
         default=None,
         description="COMPLETED over total; null when nothing finished",
-    )
-    by_kind: List[TaskKindCountResponse] = Field(
-        ...,
-        description=(
-            "Every kind in a fixed order plus the null row, or exactly one row "
-            "when the filter names a kind"
-        ),
     )
 
 
@@ -432,8 +414,9 @@ def init_task_router(
         )
 
     # The same filter as task_history, counted instead of listed: the numbers
-    # the history dashboard shows above its list. Declared as its own static
-    # path -- `task_history` has no path parameter, so nothing shadows it.
+    # the history dashboard shows above its list. One visibility count RPC.
+    # Declared as its own static path -- `task_history` has no path parameter,
+    # so nothing shadows it.
     @task_router.get(
         "/api/v1/task_history/stats", response_model=TaskHistoryStatsResponse
     )
@@ -482,16 +465,6 @@ def init_task_router(
             # Computed here, once, so no client has to agree with another about
             # what a rate of nothing is: it is null, never 0.
             success_rate=stats.completed / stats.total if stats.total else None,
-            by_kind=[
-                TaskKindCountResponse(
-                    kind=row.kind,
-                    total=row.total,
-                    completed=row.completed,
-                    failed=row.failed,
-                    canceled=row.canceled,
-                )
-                for row in stats.by_kind
-            ],
         )
 
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)

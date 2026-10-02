@@ -266,22 +266,6 @@ class TaskHistoryEntry(BaseSchema):
     )
 
 
-class TaskKindCount(BaseSchema):
-    """One kind's finished runs over a filter, by outcome.
-
-    ``kind`` is None for the runs that carry no kind at all -- dispatched
-    before the attribute existed, or by a caller that did not say. That row is
-    computed as the remainder, never queried, since there is no predicate for
-    "attribute absent" that this codebase has tested.
-    """
-
-    kind: Optional[TaskKind] = Field(default=None)
-    total: int
-    completed: int
-    failed: int
-    canceled: int
-
-
 class TaskHistoryStats(BaseSchema):
     """The finished runs matching a history filter, counted rather than listed.
 
@@ -294,7 +278,6 @@ class TaskHistoryStats(BaseSchema):
     completed: int
     failed: int
     canceled: int
-    by_kind: List[TaskKindCount]
 
 
 class ScheduleTrigger(BaseSchema):

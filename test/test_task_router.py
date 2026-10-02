@@ -30,7 +30,6 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     TaskHistoryEntry,
     TaskHistoryStats,
     TaskKind,
-    TaskKindCount,
     TaskSource,
     TaskState,
 )
@@ -67,10 +66,6 @@ class _StubWorkflowGateway:
             completed=3,
             failed=1,
             canceled=0,
-            by_kind=[
-                TaskKindCount(kind=TaskKind.GOAL, total=3, completed=3, failed=0, canceled=0),
-                TaskKindCount(kind=None, total=1, completed=0, failed=1, canceled=0),
-            ],
         )
         self.state = TaskState(
             id="robot01-task-001",
@@ -352,10 +347,7 @@ class TestTaskHistoryStats:
         assert body["total"] == 4
         assert body["by_status"] == {"COMPLETED": 3, "FAILED": 1, "CANCELED": 0}
         assert body["success_rate"] == 0.75
-        assert body["by_kind"] == [
-            {"kind": "goal", "total": 3, "completed": 3, "failed": 0, "canceled": 0},
-            {"kind": None, "total": 1, "completed": 0, "failed": 1, "canceled": 0},
-        ]
+        assert "by_kind" not in body
         assert workflow_gw.stats_calls == [
             {"status": None, "since": None, "until": None, "kind": None, "name": None}
         ]
@@ -367,7 +359,6 @@ class TestTaskHistoryStats:
             completed=0,
             failed=0,
             canceled=0,
-            by_kind=[],
         )
 
         body = client.get("/api/v1/task_history/stats").json()

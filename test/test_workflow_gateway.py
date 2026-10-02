@@ -665,59 +665,32 @@ class TestWorkflowGateway:
 
     # ==================== task_history_stats ====================
 
-    def test_task_history_stats_counts_every_kind_and_the_remainder(
-        self, workflow_gw, mock_client
-    ):
-        # Six counts: the filter as a whole, then one per kind; the runs no
-        # kind claims are the difference, never a seventh query.
-        def by_query(query, **_):
-            if "TaskKind = 'goal'" in query:
-                return _count(Completed=4, TimedOut=1)
-            if "TemporalScheduledById IS NOT NULL" in query:
-                return _count(Canceled=2, Terminated=1)
-            if "TaskKind" in query:
-                return _count()
-            return _count(Completed=5, Failed=1, TimedOut=1, Canceled=2, Terminated=1)
-
-        mock_client.count_workflows = AsyncMock(side_effect=by_query)
-        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
-            stats = asyncio.run(workflow_gw.task_history_stats())
-
-        assert (stats.total, stats.completed, stats.failed, stats.canceled) == (
-            10, 5, 2, 3
+    def test_task_history_stats_is_one_grouped_count(self, workflow_gw, mock_client):
+        mock_client.count_workflows = AsyncMock(
+            return_value=_count(Completed=5, Failed=1, TimedOut=1, Canceled=2, Terminated=1)
         )
-        assert mock_client.count_workflows.await_count == 6
-        for call in mock_client.count_workflows.await_args_list:
-            assert call.args[0].endswith(" GROUP BY ExecutionStatus")
-        rows = {row.kind: row for row in stats.by_kind}
-        assert [row.kind for row in stats.by_kind] == [*TaskKind, None]
-        # TimedOut folds into FAILED, Terminated into CANCELED, as the list does.
-        goal = rows[TaskKind.GOAL]
-        assert (goal.total, goal.completed, goal.failed, goal.canceled) == (5, 4, 1, 0)
-        scheduled = rows[TaskKind.SCHEDULE]
-        assert (scheduled.total, scheduled.canceled) == (3, 3)
-        other = rows[None]
-        assert (other.total, other.completed, other.failed, other.canceled) == (
-            2, 1, 1, 0
-        )
-
-    def test_task_history_stats_for_one_kind_is_one_count(
-        self, workflow_gw, mock_client
-    ):
-        mock_client.count_workflows = AsyncMock(return_value=_count(Completed=3))
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             stats = asyncio.run(
                 workflow_gw.task_history_stats(kind=TaskKind.LIEDOWN, name="x")
             )
 
-        # The filter already names the kind, so the total and the row are one
-        # and the same query -- but asked once each, which is the one place
-        # a second RPC is still spent; cheap, and it keeps the code one path.
-        assert mock_client.count_workflows.await_count == 2
-        query = mock_client.count_workflows.await_args_list[0].args[0]
+        # TimedOut folds into FAILED, Terminated into CANCELED, as the list does.
+        assert (stats.total, stats.completed, stats.failed, stats.canceled) == (
+            10, 5, 2, 3
+        )
+        mock_client.count_workflows.assert_awaited_once()
+        query = mock_client.count_workflows.await_args.args[0]
+        assert query.endswith(" GROUP BY ExecutionStatus")
         assert "TaskKind = 'liedown'" in query and "TaskName = 'x'" in query
-        assert [row.kind for row in stats.by_kind] == [TaskKind.LIEDOWN]
-        assert stats.by_kind[0].total == 3 == stats.total
+
+    def test_task_history_stats_ignores_a_group_it_does_not_report(
+        self, workflow_gw, mock_client
+    ):
+        mock_client.count_workflows = AsyncMock(return_value=_count(Running=4, Completed=1))
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            stats = asyncio.run(workflow_gw.task_history_stats())
+
+        assert (stats.total, stats.completed) == (1, 1)
 
     def test_task_history_stats_maps_a_rejected_query_to_upstream(
         self, workflow_gw, mock_client

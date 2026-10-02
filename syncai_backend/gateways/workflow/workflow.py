@@ -47,7 +47,6 @@ from syncai_backend.gateways.workflow.schema import (
     TaskHistoryEntry,
     TaskHistoryStats,
     TaskKind,
-    TaskKindCount,
     TaskProvenance,
     TaskSource,
     TaskState,
@@ -1000,12 +999,9 @@ class WorkflowGateway:
     ) -> TaskHistoryStats:
         """How this robot's finished executions under a filter ended, counted.
 
-        The same filter as list_task_history, answered by `count_workflows`
-        with `GROUP BY ExecutionStatus` -- the one GROUP BY the server allows
-        -- so the per-kind rows are one count per kind, in flight together.
-        Without a `kind` that is 1 + len(TaskKind) RPCs and a remainder row
-        for runs that carry no kind; with one it is a single RPC and one row.
-        See TASK_STATS_RPC_TIMEOUT_S for the cost model.
+        The same filter as list_task_history, answered by one `count_workflows`
+        with `GROUP BY ExecutionStatus` -- the one GROUP BY the server allows,
+        and the one this needs. See TASK_STATS_RPC_TIMEOUT_S for the cost.
         """
         if status is not None and status not in _CLOSED_STATUS_FILTER:
             raise ValueError(f"Not a closed task status: {status}")
@@ -1018,33 +1014,18 @@ class WorkflowGateway:
             )
             raise UpstreamError("Failed to connect to Temporal server")
 
-        async def count(for_kind: Optional[TaskKind]) -> dict:
-            query = _history_query(
-                self._task_queue,
-                status=status,
-                since=since,
-                until=until,
-                kind=for_kind,
-                name=name,
-            )
+        query = _history_query(
+            self._task_queue,
+            status=status,
+            since=since,
+            until=until,
+            kind=kind,
+            name=name,
+        )
+        try:
             result = await client.count_workflows(
                 query + " GROUP BY ExecutionStatus",
                 rpc_timeout=timedelta(seconds=TASK_STATS_RPC_TIMEOUT_S),
-            )
-            counts = {rest: 0 for rest in _CLOSED_STATUS_FILTER}
-            for group in result.groups:
-                # A group's value is the Temporal spelling; one not in the
-                # table (a Running group, were the query ever to admit one)
-                # is simply not a finished run.
-                rest = _REST_STATUS_OF.get(str(group.group_values[0]))
-                if rest is not None:
-                    counts[rest] += group.count
-            return counts
-
-        kinds: List[Optional[TaskKind]] = [kind] if kind is not None else list(TaskKind)
-        try:
-            total, *per_kind = await asyncio.gather(
-                count(kind), *(count(k) for k in kinds)
             )
         except RPCError as err:
             if err.status == RPCStatusCode.INVALID_ARGUMENT:
@@ -1066,37 +1047,21 @@ class WorkflowGateway:
             )
             raise UpstreamError("Task history stats failed")
 
-        def row(for_kind: Optional[TaskKind], counts: dict) -> TaskKindCount:
-            return TaskKindCount(
-                kind=for_kind,
-                total=sum(counts.values()),
-                completed=counts["COMPLETED"],
-                failed=counts["FAILED"],
-                canceled=counts["CANCELED"],
-            )
-
-        rows = [row(k, counts) for k, counts in zip(kinds, per_kind)]
-        if kind is None:
-            # The runs no kind claims: dispatched before the attribute existed
-            # or by a caller that did not say. A remainder rather than a query,
-            # since nothing here has tested a predicate for "attribute absent".
-            rows.append(
-                row(
-                    None,
-                    {
-                        rest: total[rest] - sum(counts[rest] for counts in per_kind)
-                        for rest in total
-                    },
-                )
-            )
+        counts = {rest: 0 for rest in _CLOSED_STATUS_FILTER}
+        for group in result.groups:
+            # A group's value is the Temporal spelling; one not in the table
+            # (a Running group, were the query ever to admit one) is simply
+            # not a finished run.
+            rest = _REST_STATUS_OF.get(str(group.group_values[0]))
+            if rest is not None:
+                counts[rest] += group.count
 
         return TaskHistoryStats(
             as_of=datetime.now(timezone.utc),
-            total=sum(total.values()),
-            completed=total["COMPLETED"],
-            failed=total["FAILED"],
-            canceled=total["CANCELED"],
-            by_kind=rows,
+            total=sum(counts.values()),
+            completed=counts["COMPLETED"],
+            failed=counts["FAILED"],
+            canceled=counts["CANCELED"],
         )
 
     async def cancel_task(self, task_id: str):
