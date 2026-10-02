@@ -12,6 +12,9 @@ from temporalio.worker import Worker
 from syncai_backend.temporal.shared import temporal_server_url
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
+from syncai_backend.gateways.workflow.search_attributes import (
+    ensure_search_attributes,
+)
 
 from syncai_backend.gateways.robot.robot import RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
@@ -101,6 +104,12 @@ async def run_worker(
                 )
                 return
             await asyncio.sleep(RETRY_INTERVAL)
+
+    # Here rather than in the gateway's lazy connect: this is the one place
+    # that already waits for Temporal to be up, and the attributes have to
+    # exist before the first run is stamped with them. Non-fatal -- see the
+    # module; a worker without them still runs every task.
+    await ensure_search_attributes(client, logger)
 
     worker = Worker(
         client,

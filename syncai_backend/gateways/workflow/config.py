@@ -47,3 +47,14 @@ TASK_HISTORY_PAGE_SIZE_MAX = 100
 # when Temporal is wedged. Longer than the active-task one: a closed-execution
 # page is a bigger scan than the handful of Running rows.
 TASK_HISTORY_RPC_TIMEOUT_S = 5.0
+
+
+# --- "How did they end" (GET /api/v1/task_history/stats) --------------------
+#
+# Answered by `count_workflows` with `GROUP BY ExecutionStatus` -- the one
+# GROUP BY the server allows -- so a per-kind breakdown is one count per kind,
+# issued concurrently: at most 1 + len(TaskKind) = 6 RPCs per call, or one when
+# the filter names a kind. Uncached, like the history page it sits above: the
+# dashboard is opened and refined by hand, not polled. Each RPC carries its own
+# timeout, so the fan-out is bounded without a lock.
+TASK_STATS_RPC_TIMEOUT_S = 5.0

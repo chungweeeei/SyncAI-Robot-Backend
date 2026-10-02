@@ -64,13 +64,27 @@ class _StubWorker:
             raise _StubWorker.run_error
 
 
+_registered: list = []
+
+
+async def _stub_ensure_search_attributes(client, logger) -> bool:
+    _registered.append(client)
+    return True
+
+
 @pytest.fixture(autouse=True)
 def _stub_temporal(monkeypatch):
     _StubClient.reset(failures=0)
     _StubWorker.run_error = None
+    _registered.clear()
     monkeypatch.setattr(worker_mod, "Client", _StubClient)
     monkeypatch.setattr(worker_mod, "Worker", _StubWorker)
     monkeypatch.setattr(worker_mod, "RETRY_INTERVAL", 0)
+    # The real one talks to the operator service; its own behaviour is pinned
+    # in test_search_attributes.py. Here only *that it runs* matters.
+    monkeypatch.setattr(
+        worker_mod, "ensure_search_attributes", _stub_ensure_search_attributes
+    )
 
 
 def _activities():
@@ -93,6 +107,9 @@ def test_connect_retries_then_runs():
     assert _StubClient.calls == 3
     assert handle.snapshot() == (TemporalWorkerHandle.STATUS_RUNNING, None)
     assert ready.is_set()
+    # The history's search attributes are registered on the connection that
+    # finally succeeded, before the worker polls -- once, not per attempt.
+    assert len(_registered) == 1
 
 
 def test_connect_exhaustion_marks_dead_without_raising(monkeypatch):
