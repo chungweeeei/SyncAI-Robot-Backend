@@ -4,7 +4,7 @@ import structlog
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from enum import Enum
 
 from syncai_backend.exceptions import BadRequestError
@@ -18,6 +18,8 @@ from syncai_backend.gateways.workflow.schema import (
     StepType,
     StepStatus,
     StepParams,
+    TaskKind,
+    TaskProvenance,
     TaskSource,
     WorkflowTask,
     WorkflowTaskDefinition,
@@ -73,6 +75,31 @@ class TaskRequest(BaseModel):
     steps: List[StepRequest] = Field(
         ..., description="List of steps to be executed", examples=[]
     )
+    # Both optional, so the MCP server and curl keep dispatching unchanged;
+    # such a run is simply unlabelled in the history.
+    kind: Optional[TaskKind] = Field(
+        default=None,
+        description=(
+            "How the task was started: goal / standup / liedown / task. Recorded "
+            "on the run for GET /api/v1/task_history and its /stats. 'schedule' "
+            "is reserved for runs a schedule starts."
+        ),
+        examples=["goal"],
+    )
+    name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="The task template this dispatch came from, if any.",
+        examples=["Morning patrol"],
+    )
+
+    @field_validator("kind")
+    @classmethod
+    def _direct_kind_only(cls, value: Optional[TaskKind]) -> Optional[TaskKind]:
+        if value is TaskKind.SCHEDULE:
+            raise ValueError("kind 'schedule' is set by the backend for scheduled runs")
+        return value
 
 
 class TaskResponse(BaseModel):
@@ -127,6 +154,13 @@ class ActiveTaskResponse(BaseModel):
     schedule_id: Optional[str] = Field(
         default=None, description="The schedule that started it, if any"
     )
+    kind: Optional[TaskKind] = Field(
+        default=None,
+        description="How it was started; null for a run dispatched without saying",
+    )
+    name: Optional[str] = Field(
+        default=None, description="The task template it was dispatched from, if any"
+    )
 
 
 class ActiveTasksResponse(BaseModel):
@@ -169,6 +203,16 @@ class TaskHistoryEntryResponse(BaseModel):
     schedule_id: Optional[str] = Field(
         default=None, description="The schedule that started it, if any"
     )
+    kind: Optional[TaskKind] = Field(
+        default=None,
+        description=(
+            "How it was started: goal / standup / liedown / task / schedule; "
+            "null for a run dispatched without saying"
+        ),
+    )
+    name: Optional[str] = Field(
+        default=None, description="The task template it was dispatched from, if any"
+    )
 
 
 class TaskHistoryResponse(BaseModel):
@@ -178,10 +222,55 @@ class TaskHistoryResponse(BaseModel):
     next_page_token: Optional[str] = Field(
         default=None,
         description=(
-            "Pass back as page_token, with the same status/since, for the next "
-            "page. Absent on the last page."
+            "Pass back as page_token, with the same status/since/until/kind/name, "
+            "for the next page. Absent on the last page."
         ),
     )
+
+
+class TaskKindCountResponse(BaseModel):
+    kind: Optional[TaskKind] = Field(
+        default=None,
+        description="null for runs that carry no kind (dispatched without one)",
+    )
+    total: int
+    completed: int
+    failed: int
+    canceled: int
+
+
+class TaskHistoryStatsResponse(BaseModel):
+    as_of: datetime = Field(..., description="When the counts were taken (UTC)")
+    total: int = Field(..., description="Finished runs matching the filter")
+    by_status: dict[TaskHistoryStatus, int] = Field(
+        ..., description="The same runs, by how they ended"
+    )
+    success_rate: Optional[float] = Field(
+        default=None,
+        description="COMPLETED over total; null when nothing finished",
+    )
+    by_kind: List[TaskKindCountResponse] = Field(
+        ...,
+        description=(
+            "Every kind in a fixed order plus the null row, or exactly one row "
+            "when the filter names a kind"
+        ),
+    )
+
+
+def _utc(moment: Optional[datetime]) -> Optional[datetime]:
+    """A naive query datetime is UTC, not the server's local time."""
+    if moment is not None and moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _check_window(since: Optional[datetime], until: Optional[datetime]) -> None:
+    # Cross-field, so not a pydantic bound: the house rule is a 400 with a
+    # sentence (see CLAUDE.md), and an empty window is a caller mistake, not
+    # a query to send.
+    if since is not None and until is not None and until < since:
+        raise BadRequestError("until must not be before since")
 
 
 # Temporal's page token is opaque bytes; the REST surface carries it as
@@ -227,7 +316,10 @@ def init_task_router(
             ),
         )
 
-        await workflow_gw.start_task(request=workflow_task)
+        await workflow_gw.start_task(
+            request=workflow_task,
+            provenance=TaskProvenance(kind=req.kind, name=req.name),
+        )
 
         return TaskResponse(
             id=req.id,
@@ -264,6 +356,8 @@ def init_task_router(
                     started_at=task.started_at,
                     source=task.source,
                     schedule_id=task.schedule_id,
+                    kind=task.kind,
+                    name=task.name,
                 )
                 for task in tasks
             ],
@@ -291,15 +385,32 @@ def init_task_router(
             None,
             description="Only runs that closed at or after this time; naive is UTC",
         ),
+        until: Optional[datetime] = Query(
+            None,
+            description="Only runs that closed at or before this time; naive is UTC",
+        ),
+        kind: Optional[TaskKind] = Query(
+            None,
+            description="Only runs started this way: goal / standup / liedown / task / schedule",
+        ),
+        name: Optional[str] = Query(
+            None,
+            min_length=1,
+            max_length=255,
+            description="Only runs dispatched from the task template with this exact name",
+        ),
     ):
-        if since is not None and since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
+        since, until = _utc(since), _utc(until)
+        _check_window(since, until)
 
         entries, next_token = await workflow_gw.list_task_history(
             page_size=page_size,
             next_page_token=_decode_page_token(page_token),
             status=status.value if status is not None else None,
             since=since,
+            until=until,
+            kind=kind,
+            name=name,
         )
 
         return TaskHistoryResponse(
@@ -312,10 +423,75 @@ def init_task_router(
                     closed_at=entry.closed_at,
                     source=entry.source,
                     schedule_id=entry.schedule_id,
+                    kind=entry.kind,
+                    name=entry.name,
                 )
                 for entry in entries
             ],
             next_page_token=_encode_page_token(next_token),
+        )
+
+    # The same filter as task_history, counted instead of listed: the numbers
+    # the history dashboard shows above its list. Declared as its own static
+    # path -- `task_history` has no path parameter, so nothing shadows it.
+    @task_router.get(
+        "/api/v1/task_history/stats", response_model=TaskHistoryStatsResponse
+    )
+    async def task_history_stats(
+        status: Optional[TaskHistoryStatus] = Query(
+            None, description="Only runs that finished with this status"
+        ),
+        since: Optional[datetime] = Query(
+            None,
+            description="Only runs that closed at or after this time; naive is UTC",
+        ),
+        until: Optional[datetime] = Query(
+            None,
+            description="Only runs that closed at or before this time; naive is UTC",
+        ),
+        kind: Optional[TaskKind] = Query(
+            None,
+            description="Only runs started this way: goal / standup / liedown / task / schedule",
+        ),
+        name: Optional[str] = Query(
+            None,
+            min_length=1,
+            max_length=255,
+            description="Only runs dispatched from the task template with this exact name",
+        ),
+    ):
+        since, until = _utc(since), _utc(until)
+        _check_window(since, until)
+
+        stats = await workflow_gw.task_history_stats(
+            status=status.value if status is not None else None,
+            since=since,
+            until=until,
+            kind=kind,
+            name=name,
+        )
+
+        return TaskHistoryStatsResponse(
+            as_of=stats.as_of,
+            total=stats.total,
+            by_status={
+                TaskHistoryStatus.COMPLETED: stats.completed,
+                TaskHistoryStatus.FAILED: stats.failed,
+                TaskHistoryStatus.CANCELED: stats.canceled,
+            },
+            # Computed here, once, so no client has to agree with another about
+            # what a rate of nothing is: it is null, never 0.
+            success_rate=stats.completed / stats.total if stats.total else None,
+            by_kind=[
+                TaskKindCountResponse(
+                    kind=row.kind,
+                    total=row.total,
+                    completed=row.completed,
+                    failed=row.failed,
+                    canceled=row.canceled,
+                )
+                for row in stats.by_kind
+            ],
         )
 
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)
