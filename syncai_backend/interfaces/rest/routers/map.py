@@ -1153,8 +1153,11 @@ def init_map_router(
                     if vertices_deleted
                     else "."
                 )
-                + " Its gridmap, if any, came with it; "
-                f"POST /api/v1/maps/{target}/grid/convert rebuilds one."
+                # Operator copy: the console shows this sentence as-is, so it
+                # names the page, not the endpoint (the convert route's own
+                # docs say which call that is).
+                + " Its floor plan, if any, came with it; rebuild one from the "
+                "Maps page if it needs it."
             ),
         )
 

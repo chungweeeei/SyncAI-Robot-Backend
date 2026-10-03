@@ -3259,3 +3259,11 @@ def test_pointcloud_serves_a_single_point_cloud(client):
     count, points = _unpack_cloud(response.content)
     assert count == 1
     assert points.shape == (1, 3)
+
+
+def test_import_message_names_no_endpoint(client):
+    """The console shows the sentence as-is; operator copy names pages, not routes."""
+    body = _import(client, _handmade(name="bare")).json()
+
+    assert "/api/" not in body["message"]
+    assert "Maps page" in body["message"]
