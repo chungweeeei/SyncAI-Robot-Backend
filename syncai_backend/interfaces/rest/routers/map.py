@@ -3,6 +3,7 @@ import hashlib
 import math
 import os
 import struct
+import time
 import uuid
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
@@ -956,6 +957,7 @@ def init_map_router(
             {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta}
             for v in map_repo.list_vertices(map=name)
         ]
+        started = time.perf_counter()
         data = build_archive(
             map_catalog_repo.resolve_dir(name),
             name,
@@ -971,6 +973,7 @@ def init_map_router(
             format=format.value,
             bytes=len(data),
             vertices=len(vertices),
+            build_ms=round((time.perf_counter() - started) * 1000),
         )
         return Response(
             content=data,
@@ -1029,10 +1032,15 @@ def init_map_router(
         No conversion is started and an imported ``gridmap.recipe.json`` is
         kept as it came: the archive is the map as its source robot had it.
         """
+        # Three phase timings ride on the success log line, so whether this
+        # route should ever go asynchronous is a question the journal answers
+        # from a real map on a real robot rather than an estimate.
+        started = time.perf_counter()
         try:
             inspected = inspect_archive(payload)
         except MapArchiveError as exc:
             raise BadRequestError(str(exc))
+        inspect_ms = round((time.perf_counter() - started) * 1000)
         manifest = inspected.manifest
 
         if POINTCLOUD_PCD not in manifest.files:
@@ -1081,6 +1089,7 @@ def init_map_router(
         ]
 
         staging = map_catalog_repo.begin_import(target)
+        started = time.perf_counter()
         try:
             written = extract_archive(payload, inspected, staging)
             _, displaced = map_catalog_repo.commit_import(target, staging)
@@ -1090,7 +1099,9 @@ def init_map_router(
         except BaseException:
             map_catalog_repo.abort_import(staging)
             raise
+        extract_ms = round((time.perf_counter() - started) * 1000)
 
+        started = time.perf_counter()
         try:
             with map_repo.transaction(op="import_map") as session:
                 vertices_deleted = map_repo.delete_vertices(target, session=session)
@@ -1115,6 +1126,7 @@ def init_map_router(
                     else "The map directory was removed again; nothing was imported."
                 )
             )
+        db_ms = round((time.perf_counter() - started) * 1000)
 
         # The irreversible step last, once everything that could fail has
         # succeeded -- the rule delete_map states.
@@ -1131,10 +1143,14 @@ def init_map_router(
             "Imported map",
             map=target,
             replaced=replacing,
+            format=inspected.format.value,
             files=len(manifest.files),
             bytes=written,
             vertices_created=len(created),
             vertices_deleted=vertices_deleted,
+            inspect_ms=inspect_ms,
+            extract_ms=extract_ms,
+            db_ms=db_ms,
         )
         return ImportMapResponse(
             name=target,

@@ -3267,3 +3267,13 @@ def test_import_message_names_no_endpoint(client):
 
     assert "/api/" not in body["message"]
     assert "Maps page" in body["message"]
+
+
+def test_import_logs_its_phase_timings(client, capsys):
+    """The journal, not an estimate, is what decides whether import goes async."""
+    assert _import(client, _handmade(name="bare")).status_code == 201
+
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if "Imported map" in line)
+    for field in ("inspect_ms=", "extract_ms=", "db_ms="):
+        assert field in line
