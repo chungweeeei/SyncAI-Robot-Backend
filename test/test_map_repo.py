@@ -299,3 +299,53 @@ def test_move_vertices_of_an_unknown_map_moves_nothing(map_repo):
 
     assert map_repo.move_vertices("ghost", "new") == 0
     assert len(map_repo.list_vertices(map="warehouse")) == 1
+
+
+def test_delete_vertices_in_a_failed_transaction_is_rolled_back(map_repo):
+    created = _create(map_repo, map="old")
+
+    with pytest.raises(RuntimeError):
+        with map_repo.transaction(op="test") as session:
+            assert map_repo.delete_vertices("old", session=session) == 1
+            raise RuntimeError("the insert that followed failed")
+
+    assert map_repo.get_vertex(created.id) is not None
+
+
+def test_create_vertices_in_a_failed_transaction_is_rolled_back(map_repo):
+    with pytest.raises(RuntimeError):
+        with map_repo.transaction(op="test") as session:
+            rows = map_repo.create_vertices(map="new", vertices=[
+                {"name": "a", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+            ], session=session)
+            assert len(rows) == 1
+            raise RuntimeError("the step after the insert failed")
+
+    assert map_repo.list_vertices(map="new") == []
+
+
+def test_replace_vertices_in_one_transaction(map_repo):
+    """The import's delete-then-create: both land, or neither."""
+    old = _create(map_repo, name="old", map="m")
+
+    with map_repo.transaction(op="test") as session:
+        assert map_repo.delete_vertices("m", session=session) == 1
+        map_repo.create_vertices(map="m", vertices=[
+            {"name": "new", "type": "HOME", "x": 1.0, "y": 1.0, "theta": 0.0},
+        ], session=session)
+
+    assert map_repo.get_vertex(old.id) is None
+    assert [v.name for v in map_repo.list_vertices(map="m")] == ["new"]
+
+
+def test_create_vertices_with_a_session_reports_a_duplicate_as_conflict(map_repo):
+    _create(map_repo, name="dock", map="m")
+
+    with pytest.raises(ConflictError) as caught:
+        with map_repo.transaction(op="test") as session:
+            map_repo.create_vertices(map="m", vertices=[
+                {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+            ], session=session)
+
+    assert caught.value.code == "vertex_name_taken"
+    assert len(map_repo.list_vertices(map="m")) == 1

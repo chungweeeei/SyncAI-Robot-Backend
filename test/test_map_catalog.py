@@ -488,3 +488,116 @@ def test_rename_map_dir_carries_the_keepout_along(catalog_repo, maps_dir):
     assert (maps_dir / "hall" / "keepout.yaml").read_bytes() == before
     assert catalog_repo.read_keepout_zones("hall") == zones
     assert catalog_repo.keepout_yaml_path("hall").endswith("hall/keepout.yaml")
+
+
+# --- import staging ---------------------------------------------------------
+
+
+def _hidden(maps_dir):
+    return sorted(p.name for p in maps_dir.iterdir() if p.name.startswith(".import-"))
+
+
+def test_list_maps_ignores_import_staging_directories(catalog_repo, maps_dir):
+    (maps_dir / ".import-abc123").mkdir()
+    (maps_dir / ".import-abc123" / "map.pcd").write_bytes(b"half unpacked")
+
+    assert _names(catalog_repo.list_maps()) == ["full", "rawonly"]
+
+
+def test_resolve_dir_refuses_a_staging_name(catalog_repo):
+    with pytest.raises(BadRequestError):
+        catalog_repo.resolve_dir(".import-abc123")
+
+
+def test_begin_import_makes_a_hidden_directory_under_maps_dir(catalog_repo, maps_dir):
+    staging = catalog_repo.begin_import("copy")
+
+    assert os.path.dirname(staging) == str(maps_dir)
+    assert os.path.basename(staging).startswith(".import-")
+    assert os.path.isdir(staging)
+    assert _names(catalog_repo.list_maps()) == ["full", "rawonly"]
+
+
+def test_begin_import_validates_the_name_only(catalog_repo):
+    # An existing name is allowed -- an import may replace a map.
+    assert os.path.isdir(catalog_repo.begin_import("full"))
+
+    with pytest.raises(BadRequestError):
+        catalog_repo.begin_import("../escape")
+
+
+def test_commit_import_publishes_a_new_map(catalog_repo, maps_dir):
+    staging = catalog_repo.begin_import("copy")
+    (maps_dir / os.path.basename(staging) / "map.pcd").write_bytes(b"new")
+
+    target, displaced = catalog_repo.commit_import("copy", staging)
+
+    assert displaced is None
+    assert target == str(maps_dir / "copy")
+    assert (maps_dir / "copy" / "map.pcd").read_bytes() == b"new"
+    assert _hidden(maps_dir) == []
+
+
+def test_commit_import_parks_the_map_it_replaces(catalog_repo, maps_dir):
+    before = (maps_dir / "rawonly" / "map.pcd").read_bytes()
+    staging = catalog_repo.begin_import("rawonly")
+    (maps_dir / os.path.basename(staging) / "map.pcd").write_bytes(b"new")
+
+    target, displaced = catalog_repo.commit_import("rawonly", staging)
+
+    assert (maps_dir / "rawonly" / "map.pcd").read_bytes() == b"new"
+    assert os.path.basename(displaced).startswith(".import-old-")
+    assert (maps_dir / os.path.basename(displaced) / "map.pcd").read_bytes() == before
+    assert _names(catalog_repo.list_maps()) == ["full", "rawonly"]
+
+
+def test_commit_import_refuses_a_path_that_is_not_staging(catalog_repo, maps_dir):
+    with pytest.raises(BadRequestError):
+        catalog_repo.commit_import("copy", str(maps_dir / "full"))
+
+    assert (maps_dir / "full").is_dir()
+    assert not (maps_dir / "copy").exists()
+
+
+def test_undo_import_restores_the_previous_map(catalog_repo, maps_dir):
+    before = (maps_dir / "rawonly" / "map.pcd").read_bytes()
+    staging = catalog_repo.begin_import("rawonly")
+    (maps_dir / os.path.basename(staging) / "map.pcd").write_bytes(b"new")
+    _, displaced = catalog_repo.commit_import("rawonly", staging)
+
+    catalog_repo.undo_import("rawonly", displaced)
+
+    assert (maps_dir / "rawonly" / "map.pcd").read_bytes() == before
+    assert _hidden(maps_dir) == []
+
+
+def test_undo_import_of_a_new_map_removes_it(catalog_repo, maps_dir):
+    staging = catalog_repo.begin_import("copy")
+    (maps_dir / os.path.basename(staging) / "map.pcd").write_bytes(b"new")
+    catalog_repo.commit_import("copy", staging)
+
+    catalog_repo.undo_import("copy", None)
+
+    assert not (maps_dir / "copy").exists()
+    assert _hidden(maps_dir) == []
+
+
+def test_abort_import_removes_a_staging_directory(catalog_repo, maps_dir):
+    staging = catalog_repo.begin_import("copy")
+    (maps_dir / os.path.basename(staging) / "map.pcd").write_bytes(b"half")
+
+    catalog_repo.abort_import(staging)
+
+    assert _hidden(maps_dir) == []
+
+
+def test_abort_import_leaves_anything_that_is_not_staging_alone(catalog_repo, maps_dir, tmp_path):
+    catalog_repo.abort_import(str(maps_dir / "full"))
+    catalog_repo.abort_import(str(tmp_path))
+
+    assert (maps_dir / "full" / "map.pcd").is_file()
+    assert tmp_path.is_dir()
+
+
+def test_free_bytes_is_positive(catalog_repo):
+    assert catalog_repo.free_bytes() > 0

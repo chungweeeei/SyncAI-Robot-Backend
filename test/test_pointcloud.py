@@ -81,3 +81,17 @@ def test_read_pcd_binary_roundtrip(tmp_path):
     xyz = read_pcd_xyz(str(path))
     assert xyz.shape == (2, 3)
     assert np.allclose(xyz, pts)
+
+
+def test_read_pcd_ascii_with_a_single_point(tmp_path, make_pcd):
+    """One row must still come back as an (N, 3) array, not a bare vector.
+
+    numpy.loadtxt collapses a single row of a structured dtype to a 0-d array;
+    the catalogue's /pointcloud route used to answer 404 for such a map.
+    """
+    path = make_pcd(tmp_path / "map.pcd", points=((1.0, 2.0, 3.0),))
+
+    xyz = read_pcd_xyz(str(path))
+
+    assert xyz.shape == (1, 3)
+    assert xyz.tolist() == [[1.0, 2.0, 3.0]]
