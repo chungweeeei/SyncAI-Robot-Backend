@@ -69,28 +69,49 @@ class MapRepo:
             yield session
             session.commit()
 
-    def create_vertices(self, map: str, vertices: list[VertexFields]) -> list[MapPoint]:
+    def create_vertices(
+        self,
+        map: str,
+        vertices: list[VertexFields],
+        session: Optional[Session] = None,
+    ) -> list[MapPoint]:
         """Batch-insert vertices in a single transaction.
 
         Each dict carries the column values (name/type/x/y/theta).
         All rows are committed together, so a failure inserts none of them.
 
+        With ``session`` given, the rows are flushed into the caller's
+        transaction and *not* committed here -- see ``transaction``. The map
+        import uses that to replace a map's vertices atomically: its
+        ``delete_vertices`` and this insert either both land or neither does.
+
         Raises ConflictError when a name is already taken on this map, or when
         the batch repeats one within itself — ``uq_map_vertices_map_name``
         cannot tell those apart, and neither answer differs to the caller.
         """
-        with self._session(op="create_vertices") as session:
-            rows = [MapPoint(map=map, **fields) for fields in vertices]
+        rows = [MapPoint(map=map, **fields) for fields in vertices]
+        names = [fields["name"] for fields in vertices]
+
+        if session is not None:
             session.add_all(rows)
             try:
-                session.commit()
+                session.flush()
+            except IntegrityError as exc:
+                raise ConflictError(
+                    self._name_taken_detail(map, names), code="vertex_name_taken"
+                ) from exc
+            return rows
+
+        with self._session(op="create_vertices") as own:
+            own.add_all(rows)
+            try:
+                own.commit()
             except IntegrityError as exc:
                 # The constraint is the check; this only translates it. A
                 # SELECT-then-INSERT here would race, and would have to be
                 # repeated in update_vertex -- see MapPoint.__table_args__.
                 raise ConflictError(
-                    self._name_taken_detail(map, [fields["name"] for fields in vertices]),
-                    code="vertex_name_taken",
+                    self._name_taken_detail(map, names), code="vertex_name_taken"
                 ) from exc
             return rows
 
@@ -284,8 +305,12 @@ class MapRepo:
             own.commit()
             return result.rowcount
 
-    def delete_vertices(self, map: str) -> int:
+    def delete_vertices(self, map: str, session: Optional[Session] = None) -> int:
         """Delete every vertex of ``map``; return how many rows went.
+
+        With ``session`` given, the DELETE runs inside the caller's transaction
+        and is *not* committed here -- see ``transaction`` and the import note
+        on ``create_vertices``. Without it, the method is its own transaction.
 
         The cascade half of a map delete, and the counterpart to
         ``move_vertices``: ``map_vertices.map`` holds the bare directory name
@@ -301,9 +326,13 @@ class MapRepo:
         holding a half-deleted map while it runs. No ``updated_at`` to set —
         the rows are gone, not changed.
         """
-        with self._session(op="delete_vertices") as session:
-            result = session.execute(delete(MapPoint).where(MapPoint.map == map))
-            session.commit()
+        statement = delete(MapPoint).where(MapPoint.map == map)
+        if session is not None:
+            return session.execute(statement).rowcount
+
+        with self._session(op="delete_vertices") as own:
+            result = own.execute(statement)
+            own.commit()
             return result.rowcount
 
 

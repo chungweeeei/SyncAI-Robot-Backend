@@ -11,12 +11,17 @@ in-memory SQLite.
 """
 
 import builtins
+import hashlib
+import io
 import json
 import os
+import shutil
 import struct
 import sys
+import tarfile
 import threading
 import types
+import zipfile
 
 import pytest
 
@@ -2781,3 +2786,470 @@ def test_activate_noop_has_no_keepout_verdict(client, map_gw):
     assert body["switched"] is False
     assert body["keepout_reloaded"] is None
     assert map_gw.keepout_calls == []
+
+
+# --- export / import ------------------------------------------------------------
+#
+# Same fixture geometry as rename and delete: 'full' is the active map, so
+# 'rawonly' is the one an import is allowed to replace.
+
+_MANIFEST = "syncai_map.json"
+
+
+def _export(client, name, fmt=None):
+    query = "" if fmt is None else f"?format={fmt}"
+    return client.get(f"/api/v1/maps/{name}/export{query}")
+
+
+def _import(client, data, name=None):
+    query = "" if name is None else f"?name={name}"
+    return client.post(f"/api/v1/maps/import{query}", content=data, headers=_OCTET)
+
+
+def _hidden_dirs(maps_dir):
+    return sorted(p.name for p in maps_dir.iterdir() if p.name.startswith(".import-"))
+
+
+def _tree(directory):
+    """{relpath: bytes} of every file under ``directory``."""
+    out = {}
+    for dirpath, _dirs, files in os.walk(directory):
+        for filename in files:
+            full = os.path.join(dirpath, filename)
+            out[os.path.relpath(full, directory)] = open(full, "rb").read()
+    return out
+
+
+def _zip_of(files, manifest):
+    """A hand-built zip: ``files`` is {relpath: bytes}; manifest a dict or None."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for rel, data in files.items():
+            archive.writestr(rel, data)
+        if manifest is not None:
+            archive.writestr(_MANIFEST, json.dumps(manifest))
+    return buffer.getvalue()
+
+
+def _manifest_for(files, name="handmade", vertices=()):
+    return {
+        "format": "syncai-map",
+        "version": 1,
+        "name": name,
+        "exported_at": "2026-10-03T00:00:00Z",
+        "files": {rel: hashlib.md5(data, usedforsecurity=False).hexdigest()
+                  for rel, data in files.items()},
+        "vertices": list(vertices),
+    }
+
+
+def _handmade(files=None, name="handmade", vertices=(), manifest=True):
+    files = {"map.pcd": b"# .PCD\nDATA ascii\n0 0 0\n"} if files is None else files
+    return _zip_of(files, _manifest_for(files, name, vertices) if manifest else None)
+
+
+@pytest.fixture
+def exportable(maps_dir, map_repo, make_pcd):
+    """'full' with a patch, a debug cloud and two vertices -- a real-looking map."""
+    (maps_dir / "full" / "patches").mkdir()
+    make_pcd(maps_dir / "full" / "patches" / "000001.pcd")
+    (maps_dir / "full" / "traversable_debug").mkdir()
+    (maps_dir / "full" / "traversable_debug" / "step1.pcd").write_bytes(b"debug")
+    map_repo.create_vertices(map="full", vertices=[
+        {"name": "dock", "type": "CHARGER", "x": 1.5, "y": -2.0, "theta": 90.0},
+        {"name": "home", "type": "HOME", "x": 0.0, "y": 0.0, "theta": 0.0},
+    ])
+    return maps_dir / "full"
+
+
+@pytest.mark.parametrize("fmt, media, opener", [
+    ("zip", "application/zip", lambda b: zipfile.ZipFile(io.BytesIO(b)).namelist()),
+    ("tar.gz", "application/gzip",
+     lambda b: tarfile.open(fileobj=io.BytesIO(b), mode="r:gz").getnames()),
+])
+def test_export_round_trips_through_import(client, maps_dir, map_repo, exportable,
+                                           fmt, media, opener):
+    response = _export(client, "full", fmt)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == media
+    assert response.headers["content-disposition"] == f'attachment; filename="full.{fmt}"'
+    names = opener(response.content)
+    assert names[-1] == _MANIFEST
+    assert "patches/000001.pcd" in names
+    assert not any(n.startswith("traversable_debug") for n in names)
+
+    imported = _import(client, response.content, name="copy")
+
+    assert imported.status_code == 201, imported.text
+    body = imported.json()
+    assert body["name"] == "copy"
+    assert body["replaced"] is False
+    assert body["files"] == 4  # map.pcd, gridmap.pgm, gridmap.yaml, the patch
+    assert body["vertices_created"] == 2
+    assert body["vertices_deleted"] == 0
+    assert "Imported 'copy'" in body["message"]
+
+    expected = {k: v for k, v in _tree(exportable).items()
+                if not k.startswith("traversable_debug")}
+    assert _tree(maps_dir / "copy") == expected
+    assert _hidden_dirs(maps_dir) == []
+
+    copied = {v.name: v for v in map_repo.list_vertices(map="copy")}
+    originals = {v.name: v for v in map_repo.list_vertices(map="full")}
+    assert set(copied) == {"dock", "home"}
+    for name, vertex in copied.items():
+        assert vertex.id != originals[name].id
+        assert (vertex.type, vertex.x, vertex.y, vertex.theta) == (
+            originals[name].type, originals[name].x, originals[name].y,
+            originals[name].theta)
+
+    listing = _by_name(client.get("/api/v1/maps").json())
+    assert listing["copy"]["vertex_count"] == 2
+    assert listing["copy"]["active"] is False
+
+
+def test_export_defaults_to_zip(client):
+    response = _export(client, "full")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.content[:2] == b"PK"
+
+
+def test_export_unknown_format_is_422(client):
+    assert _export(client, "full", "rar").status_code == 422
+
+
+def test_export_404_for_a_missing_map(client):
+    assert _export(client, "nosuchmap").status_code == 404
+
+
+def test_export_refuses_while_a_conversion_is_running(client, conversion_svc):
+    _mark_converting(conversion_svc, "rawonly")
+
+    response = _export(client, "rawonly")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conversion_running"
+
+
+def test_export_of_the_active_map_is_allowed(client):
+    assert _export(client, "full").status_code == 200
+
+
+def test_export_manifest_carries_md5s_and_vertices(client, exportable):
+    payload = _export(client, "full").content
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        manifest = json.loads(archive.read(_MANIFEST))
+        pcd = archive.read("map.pcd")
+
+    assert manifest["format"] == "syncai-map"
+    assert manifest["version"] == 1
+    assert manifest["name"] == "full"
+    assert manifest["files"]["map.pcd"] == hashlib.md5(pcd, usedforsecurity=False).hexdigest()
+    assert _MANIFEST not in manifest["files"]
+    assert {v["name"] for v in manifest["vertices"]} == {"dock", "home"}
+    assert all("id" not in v for v in manifest["vertices"])
+
+
+# import refusals: each leaves the maps tree exactly as it was.
+
+
+def _assert_untouched(maps_dir, names=("full", "rawonly")):
+    assert sorted(p.name for p in maps_dir.iterdir() if p.is_dir()) == sorted(names)
+    assert _hidden_dirs(maps_dir) == []
+
+
+def test_import_without_a_manifest_is_400(client, maps_dir):
+    response = _import(client, _handmade(manifest=False))
+
+    assert response.status_code == 400
+    assert _MANIFEST in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_an_md5_mismatch_is_400_and_sweeps_the_staging_dir(client, maps_dir):
+    files = {"map.pcd": b"original"}
+    manifest = _manifest_for(files)
+    payload = _zip_of({"map.pcd": b"tampered"}, manifest)
+
+    response = _import(client, payload)
+
+    assert response.status_code == 400
+    assert "md5 mismatch for 'map.pcd'" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_an_unlisted_file_is_400(client, maps_dir):
+    files = {"map.pcd": b"pcd"}
+    payload = _zip_of(dict(files, **{"extra.sh": b"#!/bin/sh"}), _manifest_for(files))
+
+    response = _import(client, payload)
+
+    assert response.status_code == 400
+    assert "Not listed in the manifest: 'extra.sh'" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_a_listed_file_missing_is_400(client, maps_dir):
+    files = {"map.pcd": b"pcd", "gridmap.pgm": b"pgm"}
+    payload = _zip_of({"map.pcd": b"pcd"}, _manifest_for(files))
+
+    response = _import(client, payload)
+
+    assert response.status_code == 400
+    assert "missing from the archive: 'gridmap.pgm'" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_a_traversing_member_is_400(client, maps_dir):
+    files = {"map.pcd": b"pcd", "../evil": b"x"}
+    response = _import(client, _zip_of(files, _manifest_for({"map.pcd": b"pcd"})))
+
+    assert response.status_code == 400
+    assert "../evil" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+    assert not (maps_dir.parent / "evil").exists()
+
+
+def test_import_with_a_symlink_member_is_400(client, maps_dir):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("map.pcd")
+        info.size = 3
+        archive.addfile(info, io.BytesIO(b"pcd"))
+        link = tarfile.TarInfo("link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        archive.addfile(link)
+        manifest = json.dumps(_manifest_for({"map.pcd": b"pcd"})).encode()
+        info = tarfile.TarInfo(_MANIFEST)
+        info.size = len(manifest)
+        archive.addfile(info, io.BytesIO(manifest))
+
+    response = _import(client, buffer.getvalue())
+
+    assert response.status_code == 400
+    assert "link" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_of_an_unsupported_container_is_400(client, maps_dir):
+    response = _import(client, b"this is not an archive")
+
+    assert response.status_code == 400
+    assert "Unsupported archive" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_without_a_pointcloud_is_400(client, maps_dir):
+    response = _import(client, _handmade(files={"gridmap.pgm": b"P5"}))
+
+    assert response.status_code == 400
+    assert "map.pcd" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_a_bad_name_override_is_400(client, maps_dir):
+    response = _import(client, _handmade(), name="../escape")
+
+    assert response.status_code == 400
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_a_bad_manifest_name_and_no_override_is_400(client, maps_dir):
+    response = _import(client, _handmade(name="has space"))
+
+    assert response.status_code == 400
+    assert "Invalid map name" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_with_an_unknown_vertex_type_is_400(client, maps_dir):
+    vertices = [{"name": "x", "type": "TELEPORTER", "x": 0, "y": 0, "theta": 0}]
+    response = _import(client, _handmade(vertices=vertices))
+
+    assert response.status_code == 400
+    assert "TELEPORTER" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+
+
+def test_import_refuses_when_the_disk_is_too_full(client, maps_dir, catalog_repo, monkeypatch):
+    monkeypatch.setattr(catalog_repo, "free_bytes", lambda: 0)
+
+    response = _import(client, _handmade())
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "disk_low"
+    _assert_untouched(maps_dir)
+
+
+def test_import_without_a_name_uses_the_manifest_name(client, maps_dir, map_repo):
+    map_repo.create_vertices(map="rawonly", vertices=[
+        {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+    ])
+    payload = _export(client, "rawonly").content
+    before = _tree(maps_dir / "rawonly")
+    shutil.rmtree(maps_dir / "rawonly")
+    map_repo.delete_vertices("rawonly")
+
+    response = _import(client, payload)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["name"] == "rawonly"
+    assert response.json()["replaced"] is False
+    assert _tree(maps_dir / "rawonly") == before
+    assert [v.name for v in map_repo.list_vertices(map="rawonly")] == ["dock"]
+
+
+def test_import_with_no_vertices_creates_none(client, maps_dir, map_repo):
+    response = _import(client, _handmade(name="bare"))
+
+    assert response.status_code == 201, response.text
+    assert response.json()["vertices_created"] == 0
+    assert map_repo.list_vertices(map="bare") == []
+    assert (maps_dir / "bare" / "map.pcd").is_file()
+
+
+def test_import_sweeps_orphaned_vertex_rows_of_a_deleted_directory(client, map_repo):
+    map_repo.create_vertices(map="ghost", vertices=[
+        {"name": "stale", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+    ])
+    vertices = [{"name": "fresh", "type": "HOME", "x": 1.0, "y": 1.0, "theta": 0.0}]
+
+    response = _import(client, _handmade(name="ghost", vertices=vertices))
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["replaced"] is False
+    assert body["vertices_deleted"] == 1
+    assert [v.name for v in map_repo.list_vertices(map="ghost")] == ["fresh"]
+
+
+# replacing an existing map
+
+
+def test_import_replaces_an_existing_map(client, maps_dir, map_repo, exportable):
+    map_repo.create_vertices(map="rawonly", vertices=[
+        {"name": "old1", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "old2", "type": "GENERAL", "x": 1.0, "y": 0.0, "theta": 0.0},
+        {"name": "old3", "type": "GENERAL", "x": 2.0, "y": 0.0, "theta": 0.0},
+    ])
+    (maps_dir / "rawonly" / "poses.txt").write_text("stale\n")
+    payload = _export(client, "full").content
+
+    response = _import(client, payload, name="rawonly")
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["name"] == "rawonly"
+    assert body["replaced"] is True
+    assert body["vertices_created"] == 2
+    assert body["vertices_deleted"] == 3
+    assert "Replaced 'rawonly'" in body["message"]
+    assert "3 previous vertices removed" in body["message"]
+
+    expected = {k: v for k, v in _tree(exportable).items()
+                if not k.startswith("traversable_debug")}
+    assert _tree(maps_dir / "rawonly") == expected  # poses.txt is gone
+    assert _hidden_dirs(maps_dir) == []
+    assert {v.name for v in map_repo.list_vertices(map="rawonly")} == {"dock", "home"}
+    # The source map is untouched.
+    assert len(map_repo.list_vertices(map="full")) == 2
+
+
+def test_import_refuses_to_replace_the_active_map(client, maps_dir):
+    before = _tree(maps_dir / "full")
+
+    response = _import(client, _handmade(), name="full")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "map_active"
+    assert "replaced" in response.json()["detail"]
+    assert _tree(maps_dir / "full") == before
+    _assert_untouched(maps_dir)
+
+
+def test_import_refuses_to_replace_a_converting_map(client, maps_dir, conversion_svc):
+    _mark_converting(conversion_svc, "rawonly")
+
+    response = _import(client, _handmade(), name="rawonly")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "conversion_running"
+    _assert_untouched(maps_dir)
+
+
+def test_import_refuses_to_replace_a_template_bound_map(client, maps_dir, task_template_repo):
+    task_template_repo.create_task_template(
+        name="patrol", description="", map_name="rawonly", steps=[]
+    )
+    before = _tree(maps_dir / "rawonly")
+
+    response = _import(client, _handmade(), name="rawonly")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "template_bound"
+    assert "'patrol'" in response.json()["detail"]
+    assert _tree(maps_dir / "rawonly") == before
+    _assert_untouched(maps_dir)
+
+
+def test_import_rolls_a_new_map_back_when_the_vertex_insert_fails(
+    client, maps_dir, map_repo, monkeypatch
+):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("database away")
+
+    monkeypatch.setattr(map_repo, "create_vertices", _boom)
+    vertices = [{"name": "v", "type": "GENERAL", "x": 0, "y": 0, "theta": 0}]
+
+    response = _import(client, _handmade(name="copy", vertices=vertices))
+
+    assert response.status_code == 502
+    assert "removed again" in response.json()["detail"]
+    _assert_untouched(maps_dir)
+    assert map_repo.list_vertices(map="copy") == []
+
+
+def test_import_puts_the_previous_map_back_when_the_vertex_insert_fails(
+    client, maps_dir, map_repo, monkeypatch
+):
+    map_repo.create_vertices(map="rawonly", vertices=[
+        {"name": "keep", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+    ])
+    before = _tree(maps_dir / "rawonly")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("database away")
+
+    monkeypatch.setattr(map_repo, "create_vertices", _boom)
+    vertices = [{"name": "v", "type": "GENERAL", "x": 0, "y": 0, "theta": 0}]
+
+    response = _import(client, _handmade(name="rawonly", vertices=vertices))
+
+    assert response.status_code == 502
+    assert "put back" in response.json()["detail"]
+    assert _tree(maps_dir / "rawonly") == before
+    _assert_untouched(maps_dir)
+    # The DELETE was in the same transaction as the failed insert.
+    assert [v.name for v in map_repo.list_vertices(map="rawonly")] == ["keep"]
+
+
+def test_import_drops_the_cached_pointcloud_of_the_map_it_replaces(
+    client, maps_dir, make_pcd, tmp_path
+):
+    # Two points rather than the fixture's one: the reader chokes on a
+    # single-point cloud, which is not what this test is about.
+    make_pcd(maps_dir / "rawonly" / "map.pcd", points=((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)))
+    first = client.get("/api/v1/maps/rawonly/pointcloud").content
+    assert struct.unpack("<I", first[:4])[0] == 2
+
+    other = tmp_path / "other.pcd"
+    make_pcd(other, points=((0.0, 0.0, 0.0), (5.0, 5.0, 5.0), (9.0, 9.0, 9.0)))
+    response = _import(client, _handmade(files={"map.pcd": other.read_bytes()}), name="rawonly")
+    assert response.status_code == 201, response.text
+
+    second = client.get("/api/v1/maps/rawonly/pointcloud").content
+    assert struct.unpack("<I", second[:4])[0] == 3

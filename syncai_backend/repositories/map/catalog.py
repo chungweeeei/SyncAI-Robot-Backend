@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -60,6 +61,17 @@ KEEPOUT_PGM = "keepout.pgm"
 KEEPOUT_YAML = "keepout.yaml"
 KEEPOUT_JSON = "keepout.json"
 KEEPOUT_JSON_VERSION = 1
+
+# Directories a map import works in, since 2026-10: an archive is unpacked and
+# verified in ``map/.import-<token>/`` and the map it replaces (if any) is
+# parked as ``map/.import-old-<token>/`` until the database has agreed. Both
+# live *inside* ``maps_dir`` because ``map/`` is a bind mount (docker-compose)
+# — a sibling path is another filesystem and the one-``os.rename`` publish
+# would become a copy. The shared prefix is what keeps them invisible:
+# ``list_maps`` skips it and ``resolve_dir`` refuses it, so no route can see a
+# half-unpacked map or address one by name. ``_NAME_RE`` admits a leading dot,
+# which is why the refusal has to be explicit.
+IMPORT_STAGING_PREFIX = ".import-"
 
 
 class GridRecordStatus(str, Enum):
@@ -183,7 +195,11 @@ class MapCatalogRepo:
         realpath comparison catches a symlink inside ``maps_dir`` that points
         out of it (the pattern cannot see through a link).
         """
-        if not _NAME_RE.match(name) or name in (".", ".."):
+        if (
+            not _NAME_RE.match(name)
+            or name in (".", "..")
+            or name.startswith(IMPORT_STAGING_PREFIX)
+        ):
             raise BadRequestError(f"Invalid map name: {name!r}")
 
         candidate = os.path.realpath(os.path.join(self.maps_dir, name))
@@ -321,7 +337,7 @@ class MapCatalogRepo:
 
         maps: List[StoredMap] = []
         for entry in entries:
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.name.startswith(IMPORT_STAGING_PREFIX):
                 continue
             stored = self._read(entry.name, entry.path)
             if stored is not None:
@@ -460,6 +476,129 @@ class MapCatalogRepo:
 
         shutil.rmtree(path)
         self.logger.info("[MapCatalogRepo] Deleted map directory", map=name)
+
+    # --- Importing ----------------------------------------------------------
+    #
+    # Four steps the router strings together, split so each one is a single
+    # filesystem fact: ``begin_import`` makes the staging directory the archive
+    # unpacks into, ``commit_import`` publishes it under the map's name (parking
+    # the map it replaces), ``undo_import`` reverses that publish when the
+    # database then refuses, and ``abort_import`` removes whichever hidden
+    # directory is no longer wanted. Every path they touch is confined to the
+    # ``IMPORT_STAGING_PREFIX`` family under ``maps_dir`` by ``_check_staging``,
+    # so an ``rmtree`` here can never reach a real map, whatever the caller
+    # hands in.
+
+    def _check_staging(self, path: str) -> str:
+        """Return ``path`` if it is a hidden import directory of ours, else raise."""
+        real = os.path.realpath(path)
+        if (
+            os.path.dirname(real) != os.path.realpath(self.maps_dir)
+            or not os.path.basename(real).startswith(IMPORT_STAGING_PREFIX)
+        ):
+            raise BadRequestError(f"Not an import staging directory: {path!r}")
+        return real
+
+    def begin_import(self, name: str) -> str:
+        """Create and return a fresh staging directory for an import of ``name``.
+
+        ``name`` is only *validated* here — not reserved and not checked for a
+        clash, because an import may replace an existing map; the router
+        decides whether that is allowed. ``mkdtemp`` gives the directory a
+        token nobody else can guess and 0o700, inside ``maps_dir`` for the
+        same-filesystem reason the prefix's comment gives.
+        """
+        self.resolve_dir(name)
+        os.makedirs(self.maps_dir, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix=IMPORT_STAGING_PREFIX, dir=self.maps_dir)
+        self.logger.info("[MapCatalogRepo] Staging a map import", map=name, path=staging)
+        return staging
+
+    def commit_import(self, name: str, staging: str) -> Tuple[str, Optional[str]]:
+        """Publish ``staging`` as ``map/<name>/``; return ``(path, displaced)``.
+
+        When a map of that name exists it is moved aside first, to a fresh
+        ``.import-old-<token>`` directory this returns as ``displaced`` so the
+        caller can either remove it once the database has followed or hand it
+        back to ``undo_import``. ``None`` when there was nothing to displace.
+
+        Two renames rather than one when replacing — POSIX ``rename`` onto a
+        non-empty directory fails, and onto an *empty* one quietly succeeds,
+        so a park-then-publish is the only sequence that works for both. The
+        map's name is absent for the instant between them; the router only
+        gets here for a map that is not active and not converting, and no
+        route can see a ``.import-*`` directory, so nothing observes it.
+        """
+        target = self.resolve_dir(name)
+        staging = self._check_staging(staging)
+
+        displaced: Optional[str] = None
+        if os.path.exists(target):
+            # mkdtemp for the unique, hidden name; rmdir so rename can take it.
+            displaced = tempfile.mkdtemp(prefix=IMPORT_STAGING_PREFIX + "old-", dir=self.maps_dir)
+            os.rmdir(displaced)
+            os.rename(target, displaced)
+
+        os.rename(staging, target)
+        self.logger.info(
+            "[MapCatalogRepo] Published an imported map",
+            map=name,
+            replaced=displaced is not None,
+        )
+        return target, displaced
+
+    def undo_import(self, name: str, displaced: Optional[str]) -> None:
+        """Reverse ``commit_import`` after the database refused to follow it.
+
+        The published directory is parked and removed; the displaced one, if
+        any, goes back under the map's name. Each step that fails is logged
+        and the next is still attempted — this runs while the caller is
+        raising, and the operator needs its sentence, not a second traceback
+        over the first.
+        """
+        target = self.resolve_dir(name)
+        try:
+            parked = tempfile.mkdtemp(prefix=IMPORT_STAGING_PREFIX + "undo-", dir=self.maps_dir)
+            os.rmdir(parked)
+            os.rename(target, parked)
+            shutil.rmtree(parked, ignore_errors=True)
+        except OSError as exc:
+            self.logger.error(
+                "[MapCatalogRepo] Could not remove the imported directory",
+                map=name,
+                error=str(exc),
+            )
+        if displaced is not None:
+            try:
+                os.rename(self._check_staging(displaced), target)
+            except (OSError, BadRequestError) as exc:
+                self.logger.error(
+                    "[MapCatalogRepo] Could not put the previous map back",
+                    map=name,
+                    displaced=displaced,
+                    error=str(exc),
+                )
+
+    def abort_import(self, path: str) -> None:
+        """Remove a hidden import directory. Never raises — it runs on error paths.
+
+        For a staging directory whose archive failed verification, and for the
+        displaced previous map once the database has accepted its replacement.
+        ``_check_staging`` is what makes an ``rmtree`` here safe to call with
+        anything: a path outside the ``.import-*`` family is logged and left.
+        """
+        try:
+            shutil.rmtree(self._check_staging(path), ignore_errors=True)
+        except BadRequestError as exc:
+            self.logger.error(
+                "[MapCatalogRepo] Refusing to remove a path that is not an import directory",
+                path=path,
+                error=str(exc),
+            )
+
+    def free_bytes(self) -> int:
+        """Free space on the filesystem that holds the maps, in bytes."""
+        return shutil.disk_usage(self.maps_dir).free
 
     def gridmap_edited(self, name: str) -> bool:
         """Report whether this map's gridmap carries hand edits.
