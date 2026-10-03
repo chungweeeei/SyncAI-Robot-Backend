@@ -3237,19 +3237,25 @@ def test_import_puts_the_previous_map_back_when_the_vertex_insert_fails(
     assert [v.name for v in map_repo.list_vertices(map="rawonly")] == ["keep"]
 
 
-def test_import_drops_the_cached_pointcloud_of_the_map_it_replaces(
-    client, maps_dir, make_pcd, tmp_path
-):
-    # Two points rather than the fixture's one: the reader chokes on a
-    # single-point cloud, which is not what this test is about.
-    make_pcd(maps_dir / "rawonly" / "map.pcd", points=((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)))
+def test_import_drops_the_cached_pointcloud_of_the_map_it_replaces(client, make_pcd, tmp_path):
+    # The fixture's rawonly cloud holds a single point.
     first = client.get("/api/v1/maps/rawonly/pointcloud").content
-    assert struct.unpack("<I", first[:4])[0] == 2
+    assert struct.unpack("<I", first[:4])[0] == 1
 
     other = tmp_path / "other.pcd"
-    make_pcd(other, points=((0.0, 0.0, 0.0), (5.0, 5.0, 5.0), (9.0, 9.0, 9.0)))
+    make_pcd(other, points=((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)))
     response = _import(client, _handmade(files={"map.pcd": other.read_bytes()}), name="rawonly")
     assert response.status_code == 201, response.text
 
     second = client.get("/api/v1/maps/rawonly/pointcloud").content
-    assert struct.unpack("<I", second[:4])[0] == 3
+    assert struct.unpack("<I", second[:4])[0] == 2
+
+
+def test_pointcloud_serves_a_single_point_cloud(client):
+    """rawonly's fixture cloud is one point; it used to 404 on a reshape error."""
+    response = client.get("/api/v1/maps/rawonly/pointcloud")
+
+    assert response.status_code == 200
+    count, points = _unpack_cloud(response.content)
+    assert count == 1
+    assert points.shape == (1, 3)
