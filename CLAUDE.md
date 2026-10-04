@@ -243,10 +243,14 @@ at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, a
 keeps on describe, list and update. `_build_schedule_spec` is the one gate every
 registration goes through, so the crons that would break that echo (`#`, a
 `CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
-Runs carry two custom search attributes, `TaskKind` / `TaskName` (`gateways/workflow/
+Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`gateways/workflow/
 search_attributes.py`), registered idempotently by the worker at connect; the history
-list and `/stats` filter and count on them, and `kind=schedule` is answered from
-`TemporalScheduledById` so schedules that predate the attributes still count.
+list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
+`TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`
+is the map a run's MOVE positions are in: stamped by the backend (the loaded map at
+dispatch, a schedule's `map_name`), never taken from the caller, and an attribute rather
+than memo because a scheduled run inherits only its action's attributes. Dispatch and
+`execute_move` both check it against the loaded map through `helpers/move_guard.py`.
 `ARTIFACT` steps were removed 2026-08 — stored
 templates carrying one fail validation.
 
