@@ -115,17 +115,56 @@ class _StubWorkflowGateway:
         return self.stats
 
 
+class _StubCatalog:
+    def __init__(self):
+        self.active = "lab"
+        self.reads = 0
+
+    def active_name(self):
+        self.reads += 1
+        return self.active
+
+
+class _StubConversions:
+    def __init__(self):
+        self.converting = set()
+
+    def is_converting(self, name):
+        return name in self.converting
+
+
 @pytest.fixture
 def workflow_gw():
     return _StubWorkflowGateway()
 
 
 @pytest.fixture
-def client(logger, workflow_gw):
+def catalog():
+    return _StubCatalog()
+
+
+@pytest.fixture
+def conversions():
+    return _StubConversions()
+
+
+@pytest.fixture
+def client(logger, workflow_gw, catalog, conversions):
     app = FastAPI()
     register_exception_handlers(app)
-    app.include_router(init_task_router(logger=logger, workflow_gw=workflow_gw))
+    app.include_router(
+        init_task_router(
+            logger=logger,
+            workflow_gw=workflow_gw,
+            map_catalog_repo=catalog,
+            conversion_svc=conversions,
+        )
+    )
     return TestClient(app)
+
+
+def _stand_task(task_id="robot01-standup-001"):
+    return {"id": task_id, "kind": "standup", "steps": [{"id": "s1", "type": "STANDUP"}]}
 
 
 def _move_task(task_id="robot01-task-001"):
@@ -214,6 +253,65 @@ class TestTriggerTask:
         assert "robot01-task-000" in response.json()["detail"]
 
 
+class TestJobMap:
+    """Which map a dispatched job is stamped with, and when it may not drive."""
+
+    def test_a_job_that_drives_is_stamped_with_the_loaded_map(
+        self, client, workflow_gw
+    ):
+        assert client.post("/api/v1/tasks", json=_move_task()).status_code == 200
+
+        _, provenance = workflow_gw.started[0]
+        assert provenance.map_name == "lab"
+
+    def test_a_posture_job_holds_no_map(self, client, workflow_gw):
+        assert client.post("/api/v1/tasks", json=_stand_task()).status_code == 200
+
+        _, provenance = workflow_gw.started[0]
+        assert provenance.map_name is None
+
+    def test_the_callers_map_is_checked_not_recorded(self, client, workflow_gw):
+        task = {**_move_task(), "map_name": "lab"}
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        assert workflow_gw.started[0][1].map_name == "lab"
+
+    def test_positions_from_another_map_are_refused(self, client, workflow_gw):
+        task = {**_move_task(), "map_name": "warehouse"}
+
+        response = client.post("/api/v1/tasks", json=task)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "map_mismatch"
+        assert "'warehouse'" in response.json()["detail"]
+        assert workflow_gw.started == []
+
+    def test_a_rebuilding_floor_plan_refuses_a_job_that_drives(
+        self, client, workflow_gw, conversions
+    ):
+        conversions.converting.add("lab")
+
+        response = client.post("/api/v1/tasks", json=_move_task())
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "conversion_running"
+        assert workflow_gw.started == []
+
+    def test_a_rebuilding_floor_plan_still_lets_the_robot_stand(
+        self, client, workflow_gw, conversions
+    ):
+        conversions.converting.add("lab")
+
+        assert client.post("/api/v1/tasks", json=_stand_task()).status_code == 200
+
+    def test_another_maps_rebuild_does_not_matter(
+        self, client, workflow_gw, conversions
+    ):
+        conversions.converting.add("warehouse")
+
+        assert client.post("/api/v1/tasks", json=_move_task()).status_code == 200
+
+
 class TestTaskState:
     def test_get_projects_step_status_only(self, client):
         body = client.get("/api/v1/tasks/robot01-task-001").json()
@@ -242,6 +340,31 @@ class TestActiveTasks:
         assert task["source"] == "SCHEDULE"
         assert task["schedule_id"] == "robot01-sched-001"
 
+    def test_a_run_reports_the_map_it_was_stamped_with(
+        self, client, workflow_gw, catalog
+    ):
+        workflow_gw.active[0][0].map_name = "warehouse"
+
+        task = client.get("/api/v1/active_tasks").json()["tasks"][0]
+
+        assert task["map_name"] == "warehouse"
+        # Stamped runs need no INI read on the console's 2 s poll.
+        assert catalog.reads == 0
+
+    def test_a_run_older_than_the_stamp_holds_the_loaded_map(self, client):
+        # The fixture's scheduled run carries no map: it can only be driving
+        # on the map loaded now, because a switch is refused while it runs.
+        task = client.get("/api/v1/active_tasks").json()["tasks"][0]
+
+        assert task["map_name"] == "lab"
+
+    def test_an_unstamped_posture_run_holds_no_map(self, client, workflow_gw):
+        workflow_gw.active[0][0].kind = TaskKind.STANDUP
+
+        task = client.get("/api/v1/active_tasks").json()["tasks"][0]
+
+        assert task["map_name"] is None
+
     def test_nothing_running_is_an_empty_list_not_a_404(self, client, workflow_gw):
         workflow_gw.active = ([], datetime(2026, 8, 10, tzinfo=timezone.utc))
 
@@ -263,6 +386,8 @@ class TestTaskHistory:
         )
         assert task["closed_at"] == "2026-08-10T08:05:00Z"
         assert (task["kind"], task["name"]) == ("task", "Morning patrol")
+        # History has no fallback: a closed run's map is whatever it stamped.
+        assert task["map_name"] is None
         # base64url, unpadded: safe to put straight back into a query string.
         assert body["next_page_token"] == "_3Rva2Vu"
         assert workflow_gw.history_calls == [

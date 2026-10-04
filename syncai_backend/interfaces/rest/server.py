@@ -156,7 +156,16 @@ def init_rest_server(
             "task_server_error": worker_error,
         }
 
-    app.include_router(init_task_router(logger=logger, workflow_gw=workflow_gw))
+    # The catalogue and the conversion registry answer which map a dispatched
+    # job is stamped with, and whether it may drive on it at all.
+    app.include_router(
+        init_task_router(
+            logger=logger,
+            workflow_gw=workflow_gw,
+            map_catalog_repo=map_catalog_repo,
+            conversion_svc=conversion_svc,
+        )
+    )
     app.include_router(init_schedule_router(logger=logger, workflow_gw=workflow_gw))
     app.include_router(
         init_robot_router(
