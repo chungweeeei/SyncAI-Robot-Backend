@@ -185,7 +185,12 @@ class SyncAIBackend(Node):
         init_path_subscriber(logger=logger, node=self, telemetry_repo=telemetry_repo)
 
         worker_handle = start_temporal_worker(
-            logger=logger, robot_id=robot_id, robot_gw=robot_gw, tts_gw=tts_gw
+            logger=logger,
+            robot_id=robot_id,
+            robot_gw=robot_gw,
+            tts_gw=tts_gw,
+            map_catalog_repo=map_catalog_repo,
+            conversion_svc=conversion_svc,
         )
         start_rest_server(
             logger=logger,

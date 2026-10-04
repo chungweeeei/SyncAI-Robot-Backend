@@ -1,5 +1,7 @@
 import math
 import time
+from typing import Optional
+
 import structlog
 from pydantic import BaseModel
 
@@ -11,6 +13,10 @@ from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
+
+from syncai_backend.helpers.move_guard import move_refusal
+from syncai_backend.repositories.map.catalog import MapCatalogRepo
+from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 
 class ActivityResult(BaseModel):
@@ -25,10 +31,18 @@ class RobotActivities:
         logger: structlog.stdlib.BoundLogger,
         robot_gw: RobotGateway,
         tts_gw: TtsGateway,
+        map_catalog_repo: MapCatalogRepo,
+        conversion_svc: GridmapConversionService,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
         self._tts_gw = tts_gw
+        # Read-only here: which map is loaded and whether its floor plan is
+        # being rebuilt, for the check at the top of execute_move. The worker
+        # shares this process with the REST server, so it is the same
+        # conversion registry the map routes write -- one answer, not two.
+        self._map_catalog_repo = map_catalog_repo
+        self._conversion_svc = conversion_svc
 
     def _wait_for_nav_goal(self, goal_id: str) -> str:
         """Poll a navigation goal to a terminal state, heartbeating each round."""
@@ -44,14 +58,37 @@ class RobotActivities:
             time.sleep(1.0)
 
     @activity.defn
-    def execute_move(self, params: MoveParams) -> ActivityResult:
+    def execute_move(
+        self, params: MoveParams, expected_map: Optional[str] = None
+    ) -> ActivityResult:
         """Send a NavigateToPose goal and supervise it to a terminal state.
+
+        ``expected_map`` is the run's ``TaskMap``, handed over by the workflow
+        when the run carries one. Before anything is sent the goal is checked
+        against the loaded map (helpers/move_guard.py, the same rule
+        POST /api/v1/tasks applies): coordinates from another map are a real
+        place on this one, just the wrong place, and a floor plan being
+        rebuilt is about to be replaced under the planner. Both refusals are
+        non-retryable, because three attempts five seconds apart fix neither
+        -- and a schedule that fired after a map switch is exactly the run
+        no dispatch-time check ever saw.
 
         This runs in a synchronous (threaded) activity. On cancellation Temporal
         *throws* CancelledError into this thread wherever it happens to be --
         inside time.sleep, or inside move() while nav2 is still deciding -- so
         cleanup lives in the except clause below, not in an is_cancelled() poll.
         """
+        active_map = self._map_catalog_repo.active_name()
+        refusal = move_refusal(
+            expected_map,
+            active_map,
+            active_map is not None and self._conversion_svc.is_converting(active_map),
+        )
+        if refusal is not None:
+            raise ApplicationError(
+                refusal.message, type=refusal.code, non_retryable=True
+            )
+
         yaw = math.radians(params.theta)
 
         # The heartbeat_timeout clock starts when the activity starts, not at
