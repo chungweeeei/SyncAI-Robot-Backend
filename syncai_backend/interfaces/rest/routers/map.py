@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
 import structlog
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,7 @@ from syncai_backend.exceptions import (
 )
 from syncai_backend.database.models import MapPoint
 from syncai_backend.gateways.map.map import MapGateway
+from syncai_backend.gateways.workflow.schema import ActiveTask
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.pgm import render_png, render_thumbnail
 from syncai_backend.helpers.system_config import (
@@ -822,6 +823,71 @@ def init_map_router(
             raise NotFoundError(f"No map named '{name}' on this robot.")
         return stored
 
+    async def _running_tasks(change: str) -> List[ActiveTask]:
+        """What is running now, or a 409 if that cannot be known.
+
+        Refuse rather than assume idle. The gateway caches for
+        ACTIVE_TASK_CACHE_TTL_S, failures included, so an error here is a real
+        outage, and changing the map under a robot that might be mid-navigation
+        is not something to do on an unverified guess. ``change`` names what was
+        refused, for the sentence.
+        """
+        try:
+            tasks, _ = await workflow_gw.list_active_tasks()
+        except Exception as exc:
+            logger.warning(
+                "Could not confirm the robot is idle before changing a map",
+                change=change,
+                error=str(exc),
+            )
+            raise ConflictError(
+                "Could not confirm that no job is running, and "
+                f"{change} under a moving robot is not safe to guess at. Check "
+                "the Tasks page and try again.",
+                code="tasks_unknown",
+            )
+        return tasks
+
+    async def _refuse_while_a_job_holds(name: str) -> None:
+        """409 ``task_running`` while a running job's positions are on ``name``.
+
+        Mounted as a dependency on every route that edits what the planner,
+        the costmaps or a job's waypoints read: the vertices, the floor plan,
+        its rebuild and the forbidden zones. Each of those reloads into the
+        running stack (or rewrites the rows a job's MOVE steps were resolved
+        from) when the map is the loaded one, which mid-run means changing the
+        map under a robot that is driving on it.
+
+        An async dependency in front of plain ``def`` routes: FastAPI awaits it
+        on the event loop, where the Temporal client lives, and still runs the
+        blocking route in its threadpool -- the split activate has to do by
+        hand, for free.
+
+        A map other than the loaded one is let through without asking Temporal.
+        Activate refuses while anything runs, and a run is stamped with the map
+        loaded when it started, so a running job can only hold the loaded map;
+        asking anyway would only make editing an idle map depend on Temporal
+        being up.
+
+        Check-then-act, not a lock: a schedule that fires between this check and
+        the write still gets its map changed under it. The window is the active
+        task cache's TTL plus the write itself, and closing it would take a
+        lock both this route and the worker honour; execute_move's own check
+        is what stops the run from driving if the write was a rebuild.
+        """
+        active = map_catalog_repo.active_name()
+        if name != active:
+            return
+        tasks = await _running_tasks("changing the map in use")
+        if any(task.map_in_use(active) == name for task in tasks):
+            raise ConflictError(
+                "The robot is running a job on this map. Cancel it or wait for "
+                "it to finish before changing the map.",
+                code="task_running",
+            )
+
+    job_lock = [Depends(_refuse_while_a_job_holds)]
+
     def _refuse_if_in_use(name: str, *, verb: str, template_consequence: str) -> None:
         """The three 409s that guard destroying a map's contents, in order.
 
@@ -1588,24 +1654,10 @@ def init_map_router(
                 code="ini_not_writable",
             )
 
-        try:
-            active_tasks, _ = await workflow_gw.list_active_tasks()
-        except Exception as exc:
-            # Refuse rather than assume idle. The gateway caches for
-            # ACTIVE_TASK_CACHE_TTL_S, so this is a real Temporal outage, and
-            # swapping the map under a robot that might be mid-navigation is not
-            # something to do on an unverified guess.
-            logger.warning(
-                "Could not confirm the robot is idle before a map switch",
-                map=name,
-                error=str(exc),
-            )
-            raise ConflictError(
-                "Could not reach Temporal to confirm no task is running, and a "
-                "map switch under a moving robot is not safe to guess at. Check "
-                "the Tasks page and try again.",
-                code="tasks_unknown",
-            )
+        # Any job, not only one holding a map: a switch re-points the localizer,
+        # and a robot standing up or speaking is still a robot that should not
+        # lose its position mid-job. Stricter than _refuse_while_a_job_holds.
+        active_tasks = await _running_tasks("a map switch")
 
         if active_tasks:
             running = ", ".join(task.id for task in active_tasks)
@@ -1781,7 +1833,9 @@ def init_map_router(
         return await asyncio.to_thread(_switch)
 
     @map_router.post(
-        "/api/v1/maps/{name}/grid/convert", response_model=ConvertGridResponse
+        "/api/v1/maps/{name}/grid/convert",
+        response_model=ConvertGridResponse,
+        dependencies=job_lock,
     )
     def convert_map_grid(name: str, request: ConvertGridRequest):
         """(Re)build a map's 2D gridmap from its map.pcd, in the background.
@@ -1952,7 +2006,11 @@ def init_map_router(
         vertices = map_repo.list_vertices(map=name, type=type.value if type else None)
         return [_vertex_response(vertex) for vertex in vertices]
 
-    @map_router.post("/api/v1/maps/{name}/vertices", response_model=List[MapVertexResponse])
+    @map_router.post(
+        "/api/v1/maps/{name}/vertices",
+        response_model=List[MapVertexResponse],
+        dependencies=job_lock,
+    )
     def create_map_vertices(name: str, reqs: List[MapVertexRequest] = Body(..., min_length=1)):
         _require(name)
         vertices = map_repo.create_vertices(
@@ -1993,7 +2051,11 @@ def init_map_router(
     def get_map_vertex(name: str, id: uuid.UUID):
         return _vertex_response(_require_vertex(name, id))
 
-    @map_router.put("/api/v1/maps/{name}/vertices/{id}", response_model=MapVertexResponse)
+    @map_router.put(
+        "/api/v1/maps/{name}/vertices/{id}",
+        response_model=MapVertexResponse,
+        dependencies=job_lock,
+    )
     def update_map_vertex(name: str, id: uuid.UUID, req: MapVertexUpdateRequest):
         _require_vertex(name, id)
 
@@ -2006,7 +2068,11 @@ def init_map_router(
             raise NotFoundError(f"Map vertex {id} was not found in '{name}'.")
         return _vertex_response(vertex)
 
-    @map_router.delete("/api/v1/maps/{name}/vertices/{id}", response_model=DeleteResponse)
+    @map_router.delete(
+        "/api/v1/maps/{name}/vertices/{id}",
+        response_model=DeleteResponse,
+        dependencies=job_lock,
+    )
     def delete_map_vertex(name: str, id: uuid.UUID):
         _require_vertex(name, id)
         map_repo.delete_vertex(vertex_id=id)
@@ -2084,7 +2150,11 @@ def init_map_router(
     def get_map_thumbnail(name: str, request: Request):
         return _png_response(name, request, thumbnail_cache, render_thumbnail, "thumbnail")
 
-    @map_router.put("/api/v1/maps/{name}/grid", response_model=SaveGridmapResponse)
+    @map_router.put(
+        "/api/v1/maps/{name}/grid",
+        response_model=SaveGridmapResponse,
+        dependencies=job_lock,
+    )
     def save_map_grid(
         name: str,
         response: Response,
@@ -2237,7 +2307,11 @@ def init_map_router(
             active=name == map_catalog_repo.active_name(),
         )
 
-    @map_router.put("/api/v1/maps/{name}/keepout", response_model=SaveKeepoutResponse)
+    @map_router.put(
+        "/api/v1/maps/{name}/keepout",
+        response_model=SaveKeepoutResponse,
+        dependencies=job_lock,
+    )
     def save_map_keepout(name: str, request: SaveKeepoutRequest):
         """Replace the map's forbidden zones, and reload them if it is the live map.
 

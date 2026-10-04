@@ -36,6 +36,7 @@ import yaml  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from syncai_backend.gateways.workflow.schema import TaskKind  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers import map as map_router_module  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
@@ -2533,6 +2534,87 @@ def test_activate_refuses_when_temporal_cannot_be_reached(
     assert response.status_code == 409
     assert response.json()["code"] == "tasks_unknown"
     assert map_gw.order == []
+
+
+# --- The map a running job holds ----------------------------------------------
+
+
+def _job(map_name=None, kind=None):
+    from datetime import datetime, timezone
+
+    from syncai_backend.gateways.workflow.schema import ActiveTask, TaskSource
+
+    return ActiveTask(
+        id="robot01-task-9",
+        run_id="run-9",
+        status="IN_PROGRESS",
+        started_at=datetime(2026, 10, 4, tzinfo=timezone.utc),
+        source=TaskSource.DIRECT,
+        kind=kind,
+        map_name=map_name,
+    )
+
+
+# Every edit the planner, the costmaps or a job's MOVE steps read from, each
+# on 'full' -- the client fixture's loaded map.
+_EDITS = {
+    "floor plan": lambda client: _put_grid(client, "full", b"\x00" * 24),
+    "forbidden zones": lambda client: _put_keepout(client, "full", [_rect_zone()]),
+    "rebuild": lambda client: _post_convert(client, "full"),
+}
+
+
+@pytest.mark.parametrize("edit", list(_EDITS))
+def test_an_edit_waits_for_the_job_driving_on_the_map(client, map_gw, workflow_gw, edit):
+    workflow_gw.tasks = [_job(map_name="full")]
+
+    response = _EDITS[edit](client)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "task_running"
+    assert "running a job on this map" in response.json()["detail"]
+    # Refused before anything reached the running stack.
+    assert map_gw.calls == []
+
+
+def test_a_run_older_than_the_stamp_holds_the_loaded_map(client, map_gw, workflow_gw):
+    workflow_gw.tasks = [_job(map_name=None, kind=None)]
+
+    response = _put_grid(client, "full", b"\x00" * 24)
+
+    assert response.json()["code"] == "task_running"
+
+
+def test_a_job_that_drives_nowhere_does_not_hold_the_map(
+    client, map_gw, workflow_gw
+):
+    workflow_gw.tasks = [_job(map_name=None, kind=TaskKind.STANDUP)]
+
+    assert _put_grid(client, "full", b"\x00" * 24).status_code == 200
+
+
+def test_an_edit_is_refused_when_running_jobs_cannot_be_known(
+    client, map_gw, workflow_gw
+):
+    workflow_gw.error = RuntimeError("connection refused")
+
+    response = _put_keepout(client, "full", [_rect_zone()])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "tasks_unknown"
+    assert map_gw.calls == []
+
+
+def test_a_map_that_is_not_loaded_is_edited_without_asking(
+    client, maps_dir, workflow_gw, make_pgm, make_gridmap_yaml
+):
+    # A running job can only hold the loaded map (activate refuses while one
+    # runs), so an outage of the task service must not block this edit.
+    make_pgm(maps_dir / "rawonly" / "gridmap.pgm", 3, 2)
+    make_gridmap_yaml(maps_dir / "rawonly" / "gridmap.yaml")
+    workflow_gw.error = RuntimeError("connection refused")
+
+    assert _put_grid(client, "rawonly", b"\x00" * 6).status_code == 200
 
 
 def test_activate_refuses_when_the_nav_stack_is_not_up(
