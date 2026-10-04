@@ -1,16 +1,24 @@
 """The custom search attributes this backend stamps on every run it starts.
 
-Two Keyword attributes: ``TaskKind`` (how the run was started -- see
-``TaskKind`` in schema.py) and ``TaskName`` (the template it came from). They
-exist for one consumer, ``GET /api/v1/task_history`` and its ``/stats``
-sibling, which filter and count on them -- the memo cannot be queried, and
-the workflow id only carries the kind for runs the console itself minted.
+Three Keyword attributes: ``TaskKind`` (how the run was started -- see
+``TaskKind`` in schema.py) and ``TaskName`` (the template it came from) exist
+for ``GET /api/v1/task_history`` and its ``/stats`` sibling, which filter and
+count on them -- the memo cannot be queried, and the workflow id only carries
+the kind for runs the console itself minted.
+
+``TaskMap`` is the map a run's MOVE coordinates are in. It is an attribute
+rather than memo for a different reason: a *scheduled* run inherits its
+schedule action's search attributes and nothing of the schedule's memo, so
+this is the only place both kinds of run can carry it. Two readers: the
+active-task list (which map a running job holds, so the map routes can refuse
+to edit it) and the workflow itself (which checks it against the loaded map
+before driving -- see RobotActivities.execute_move).
 
 Keyword rather than Text: the filters are exact matches, and SQL visibility
 only allows ``=`` / ``IN`` / ``STARTS_WITH`` on Keyword columns (Text is
 full-text, no equality). On the pinned server (auto-setup 1.29.7 on Postgres)
 Keyword attributes map onto the pre-allocated ``Keyword01..10`` columns; the
-auto-setup image's own test set takes one of them, these take two more.
+auto-setup image's own test set takes one of them, these take three more.
 
 Registration is a namespace-level operation the backend has to do itself:
 ``temporalio/auto-setup`` registers custom attributes only on a fresh
@@ -32,11 +40,13 @@ from temporalio.common import SearchAttributeKey
 
 TASK_KIND_KEY = SearchAttributeKey.for_keyword("TaskKind")
 TASK_NAME_KEY = SearchAttributeKey.for_keyword("TaskName")
+TASK_MAP_KEY = SearchAttributeKey.for_keyword("TaskMap")
 
 # Name -> type, the shape AddSearchAttributesRequest takes.
 CUSTOM_SEARCH_ATTRIBUTES: Dict[str, "IndexedValueType.ValueType"] = {
     TASK_KIND_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
     TASK_NAME_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+    TASK_MAP_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
 }
 
 
