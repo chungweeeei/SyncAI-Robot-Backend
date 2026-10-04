@@ -19,6 +19,9 @@ from syncai_backend.gateways.workflow.search_attributes import (
 from syncai_backend.gateways.robot.robot import RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
 
+from syncai_backend.repositories.map.catalog import MapCatalogRepo
+from syncai_backend.services.gridmap_conversion import GridmapConversionService
+
 # Mirrors database/postgres.py: same bounded-retry shape for the same reason —
 # on a robot boot the shared docker-compose services (postgres, temporal) may
 # come up after the backend does. The difference is what happens when the
@@ -153,6 +156,8 @@ def start_temporal_worker(
     robot_id: str,
     robot_gw: RobotGateway,
     tts_gw: TtsGateway,
+    map_catalog_repo: MapCatalogRepo,
+    conversion_svc: GridmapConversionService,
 ) -> TemporalWorkerHandle:
 
     ready = threading.Event()
@@ -163,7 +168,13 @@ def start_temporal_worker(
         # mid-flight — must land in the handle, or we are back to the silent
         # dead thread this exists to prevent.
         try:
-            activities = RobotActivities(logger=logger, robot_gw=robot_gw, tts_gw=tts_gw)
+            activities = RobotActivities(
+                logger=logger,
+                robot_gw=robot_gw,
+                tts_gw=tts_gw,
+                map_catalog_repo=map_catalog_repo,
+                conversion_svc=conversion_svc,
+            )
             asyncio.run(
                 run_worker(
                     logger,

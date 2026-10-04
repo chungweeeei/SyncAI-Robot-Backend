@@ -201,6 +201,16 @@ class TaskProvenance(BaseSchema):
     kind: Optional[TaskKind] = Field(default=None)
     # TaskTemplate.name is String(255); the bound keeps the attribute in step.
     name: Optional[str] = Field(default=None, max_length=255)
+    # The map the run's MOVE coordinates are in, stamped as ``TaskMap``. Set
+    # by the task router from the map that is loaded at dispatch -- never
+    # taken from the caller, whose own idea of the map is only checked
+    # against it -- and None for a run with no MOVE step, which needs no map.
+    map_name: Optional[str] = Field(default=None)
+
+
+# The kinds that never drive anywhere, so never hold a map. Used only to read
+# a run that predates ``TaskMap``: see ActiveTask.map_in_use.
+POSTURE_KINDS = frozenset({TaskKind.STANDUP, TaskKind.LIEDOWN})
 
 
 class ActiveTask(BaseSchema):
@@ -235,6 +245,31 @@ class ActiveTask(BaseSchema):
     name: Optional[str] = Field(
         default=None, description="The template it was dispatched from, if any."
     )
+    map_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "The map its MOVE coordinates are in, off the TaskMap attribute; "
+            "None for a run that stamped none. Read it through map_in_use."
+        ),
+    )
+
+    def map_in_use(self, active_map: Optional[str]) -> Optional[str]:
+        """The map this run holds while it runs, or None if it holds none.
+
+        The attribute when the run carries one. A run without it either drives
+        nowhere -- a posture dispatch -- or predates ``TaskMap`` (a schedule
+        registered before it, or a run started by an older backend), and the
+        second kind is answered with the map loaded *now*. That is not a guess:
+        a run can only drive on the loaded map, and activate refuses to switch
+        while anything runs, so the map it started on is still the loaded one.
+        It over-claims for a map-less job of another kind (a SPEAK-only task),
+        which costs an edit that waits for the job, never an edit under one.
+        """
+        if self.map_name:
+            return self.map_name
+        if self.kind in POSTURE_KINDS:
+            return None
+        return active_map
 
 
 class TaskHistoryEntry(BaseSchema):
@@ -263,6 +298,10 @@ class TaskHistoryEntry(BaseSchema):
     )
     name: Optional[str] = Field(
         default=None, description="The template it was dispatched from, if any."
+    )
+    map_name: Optional[str] = Field(
+        default=None,
+        description="The map its MOVE coordinates were in; None if it stamped none.",
     )
 
 
