@@ -137,7 +137,8 @@ subscribers/               ROS topics → repositories (ingest side; the map clo
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), keepout
                            (forbidden-zone mask rasteriser), traversable, system_config,
-                           map_archive (checksummed zip / tar.gz of a map dir)
+                           map_archive (checksummed zip / tar.gz of a map dir),
+                           move_guard (a run's TaskMap against the loaded map)
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/
@@ -214,6 +215,15 @@ the only caller that passes anything else.
   metadata and never lands in the map directory. Replacing is refused for the same reasons
   delete is (`map_active` / `conversion_running` / `template_bound`, shared in
   `_refuse_if_in_use`).
+- **A running job locks the map it is on.** Every route that edits what the planner,
+  the costmaps or a job's waypoints read — vertex create/update/delete, `PUT …/grid`,
+  `PUT …/keepout`, `POST …/grid/convert` — sits behind `_refuse_while_a_job_holds`
+  (an **async** dependency in front of plain `def` routes, so the Temporal call runs on
+  the event loop and the route still runs in the threadpool): 409 `task_running` while a
+  run's `TaskMap` is the loaded map, 409 `tasks_unknown` when Temporal cannot be asked —
+  refuse, never assume idle. A map other than the loaded one is let through without
+  asking. Check-then-act, not a lock; `execute_move`'s own check is what stops a run
+  that slipped through the window.
 - **Forbidden zones:** `map/<name>/keepout.json` (polygons in metres) is the source of
   truth; `keepout.pgm` + `keepout.yaml` are derived from it by `write_keepout`, in the
   gridmap's geometry, background **205 (unknown), never 254** — a free mask cell frees
@@ -234,7 +244,20 @@ thread — cleanup goes in `except CancelledError`, not an `is_cancelled()` poll
 does not heartbeat (one blocking HTTP call to the speech service, held open for the
 utterance) so it runs on `start_to_close` alone; that service's playback is a pollable,
 cancellable job, so this is now a choice rather than a constraint. Per-step state
-is a workflow **query**, not a table. Schedules use `SKIP` overlap; their steps are frozen
+is a workflow **query**, not a table — and the task-level `PAUSED` is derived from it,
+because **Temporal has no paused status**: `pause`/`resume` are two idempotent workflow
+**signals** plus a flag the run checks before every step, parking that step as `PAUSED`
+in a `wait_condition`, and `get_task_state` reads the hold off the held step rather than
+asking a second time. A held run stays *running* to everything else (`active_tasks`,
+`_require_idle`, the map activation gate). Only a `MOVE` is cut short — the pause cancels
+the in-flight activity handle, which lands in `execute_move`'s `except CancelledError`
+and cancels the nav2 goal — and is re-sent from scratch on resume;
+`workflow.cancellation_reason()` (SDK 1.33) is what tells a real cancel apart from that
+interruption. `WAIT` is the one step that is **not** an activity: a durable timer inside
+`RobotWorkflow._run_wait` (`wait_condition` with a timeout, remainder measured on
+`workflow.now()` so replay sees the same numbers), so it takes no slot of the one-thread
+activity executor, needs no heartbeat, and survives a worker restart with the time
+already served. Schedules use `SKIP` overlap; their steps are frozen
 at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, an in-place
 `ScheduleHandle.update` that swaps the spec). `map_name`/template ids ride in the schedule
 **memo**; the cron string does **not** — a schedule memo cannot be rewritten by an update
