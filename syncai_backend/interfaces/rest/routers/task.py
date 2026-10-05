@@ -61,7 +61,7 @@ class StepRequest(BaseModel):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE and SPEAK"
+            "Omitted for STANDUP/LIEDOWN, required for MOVE, SPEAK and WAIT"
         ),
     )
 
@@ -512,8 +512,9 @@ def init_task_router(
     # DELETE they answer with what was asked, not with what the robot is doing:
     # PAUSING here, and PAUSED only from GET once the workflow has actually
     # stopped. A MOVE is interrupted at once (its nav goal is cancelled and
-    # re-sent on resume); a SPEAK or posture step finishes first and the run
-    # holds before the next one. 409 `task_not_running` once the run is closed.
+    # re-sent on resume), a WAIT's countdown freezes (and resumes with what was
+    # left); a SPEAK or posture step finishes first and the run holds before
+    # the next one. 409 `task_not_running` once the run is closed.
     @task_router.post("/api/v1/tasks/{id}/pause", response_model=TaskResponse)
     async def pause_task(id: str):
         await workflow_gw.pause_task(task_id=id)
@@ -522,8 +523,8 @@ def init_task_router(
             id=id,
             status=TaskStatus.PAUSING,
             message=(
-                f"Pause of task {id} requested; a MOVE stops now, any other step "
-                f"finishes first. Poll GET /api/v1/tasks/{id} for PAUSED."
+                f"Pause of task {id} requested; a MOVE or WAIT stops now, any "
+                f"other step finishes first. Poll GET /api/v1/tasks/{id} for PAUSED."
             ),
         )
 

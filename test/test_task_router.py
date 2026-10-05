@@ -32,6 +32,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     TaskKind,
     TaskSource,
     TaskState,
+    WaitParams,
 )
 from syncai_backend.interfaces.rest.routers.task import init_task_router  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
@@ -194,6 +195,26 @@ class TestTriggerTask:
         task["steps"] = [
             {"id": "s1", "type": "STANDUP", "params": {"x": 0.0, "y": 0.0, "theta": 0.0}}
         ]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
+    def test_a_wait_step_carries_its_seconds_through(self, client, workflow_gw):
+        task = _move_task()
+        task["steps"] = [{"id": "s1", "type": "WAIT", "params": {"seconds": 12.5}}]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        step = workflow_gw.started[0][0].definition.steps[0]
+        assert step.type is StepType.WAIT
+        assert step.params == WaitParams(seconds=12.5)
+
+    @pytest.mark.parametrize(
+        "params",
+        [None, {"seconds": 0}, {"seconds": -1}, {"seconds": 3601}, {"x": 0, "y": 0, "theta": 0}],
+    )
+    def test_a_bad_wait_step_is_a_422(self, client, workflow_gw, params):
+        task = _move_task()
+        task["steps"] = [{"id": "s1", "type": "WAIT", "params": params}]
 
         assert client.post("/api/v1/tasks", json=task).status_code == 422
         assert workflow_gw.started == []

@@ -36,6 +36,9 @@ What is pinned:
   and re-sent as a fresh activity on resume; any other step finishes and the
   run holds before the next one; the held step reads PAUSED while it waits;
   a pause with nothing left to hold lets the run complete.
+* WAIT is a workflow timer, not an activity: a pause freezes it and the
+  resume starts a second timer for only the remainder (read off the run's
+  history), and a cancel during it is CANCELED / "Task canceled".
 
 Deliberately not covered: the unknown-step-type guard in the dispatch table.
 ``Step`` validation rejects anything outside ``StepType`` before a task can
@@ -72,6 +75,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     Step,
     StepStatus,
     StepType,
+    WaitParams,
     WorkflowTask,
     WorkflowTaskDefinition,
 )
@@ -82,20 +86,23 @@ from syncai_backend.temporal.workflows import RobotWorkflow  # noqa: E402
 # arbitrary here since client and worker share it within one test.
 TASK_QUEUE = "robot01.ROBOT_TASK_QUEUE"
 
+# Ten minutes: long enough that a test finishing in real time proves the
+# time-skipping server skipped it, and that a pause lands well inside it.
+WAIT_SECONDS = 600.0
+
 
 def _task(task_id: str, *step_types: StepType) -> WorkflowTask:
     steps = [
         Step(
             id=f"step-{i}",
             type=step_type,
-            # Schema contract: MOVE carries params, the posture steps carry
-            # none (Step validation enforces it, the workflow relies on it
-            # for its empty-args special case).
-            params=(
-                MoveParams(x=1.5, y=-2.5, theta=90.0)
-                if step_type is StepType.MOVE
-                else None
-            ),
+            # Schema contract: MOVE and WAIT carry params, the posture steps
+            # carry none (Step validation enforces it, the workflow relies on
+            # it for its empty-args special case).
+            params={
+                StepType.MOVE: MoveParams(x=1.5, y=-2.5, theta=90.0),
+                StepType.WAIT: WaitParams(seconds=WAIT_SECONDS),
+            }.get(step_type),
         )
         for i, step_type in enumerate(step_types)
     ]
@@ -564,3 +571,94 @@ def test_a_pause_with_nothing_left_to_hold_lets_the_run_complete():
     steps = asyncio.run(scenario())
 
     assert [step.status for step in steps] == [StepStatus.COMPLETED]
+
+
+# --- WAIT ---------------------------------------------------------------------
+
+
+async def _timer_durations(handle) -> list:
+    """The ``start_to_fire_timeout`` of every timer the run started, in seconds."""
+    history = await handle.fetch_history()
+    return [
+        event.timer_started_event_attributes.start_to_fire_timeout.ToTimedelta().total_seconds()
+        for event in history.events
+        if event.HasField("timer_started_event_attributes")
+    ]
+
+
+def test_a_wait_is_a_timer_not_an_activity_and_the_run_goes_on():
+    async def scenario():
+        calls: list = []
+        task = _task("task-wait", StepType.STANDUP, StepType.WAIT, StepType.LIEDOWN)
+
+        async with _worker(_instant_activities(calls)) as client:
+            handle = await _start(client, task)
+            # Time skipping: ten minutes of timer, well under ten real seconds.
+            await asyncio.wait_for(handle.result(), timeout=10)
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return calls, steps, await _timer_durations(handle)
+
+    calls, steps, timers = asyncio.run(scenario())
+
+    # No activity for the WAIT, and the steps either side of it ran in order.
+    assert [name for name, _ in calls] == ["execute_stand", "execute_lie_down"]
+    assert [step.status for step in steps] == [StepStatus.COMPLETED] * 3
+    assert timers == [WAIT_SECONDS]
+
+
+def test_pause_freezes_a_wait_and_resume_waits_out_only_the_rest():
+    async def scenario():
+        calls: list = []
+        task = _task("task-pause-wait", StepType.WAIT, StepType.STANDUP)
+
+        async with _worker(_instant_activities(calls)) as client:
+            handle = await _start(client, task)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.IN_PROGRESS)
+            # Real time passes here (nothing is awaiting the result, so the
+            # server does not skip); the remainder must account for it.
+            await asyncio.sleep(0.5)
+
+            await handle.signal(RobotWorkflow.pause)
+            held = await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            await asyncio.sleep(0.3)
+            calls_while_held = list(calls)
+
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return held, calls_while_held, calls, await _timer_durations(handle)
+
+    held, calls_while_held, calls, timers = asyncio.run(scenario())
+
+    assert held == [StepStatus.PAUSED, StepStatus.PENDING]
+    assert calls_while_held == []
+    assert [name for name, _ in calls] == ["execute_stand"]
+    # Two timers: the full wait, then — after the hold — only what was left
+    # of it, not a fresh ten minutes.
+    assert len(timers) == 2
+    assert timers[0] == WAIT_SECONDS
+    assert 0 < timers[1] < WAIT_SECONDS
+
+
+def test_cancel_during_a_wait_ends_the_run_canceled_and_the_step_canceled():
+    async def scenario():
+        calls: list = []
+        task = _task("task-cancel-wait", StepType.WAIT, StepType.STANDUP)
+
+        async with _worker(_instant_activities(calls)) as client:
+            handle = await _start(client, task)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.IN_PROGRESS)
+
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+            return exc_info.value, await handle.query(RobotWorkflow.get_step_states), calls
+
+    err, steps, calls = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    # No activity to wrap the cancel in an ActivityError, so this is the
+    # honest CANCELED / "Task canceled" — unlike a cancel mid-MOVE.
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[0].error_msg == "Task canceled"
+    assert steps[1].status is StepStatus.PENDING
+    assert calls == []

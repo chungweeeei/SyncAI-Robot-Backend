@@ -10,6 +10,7 @@ with workflow.unsafe.imports_passed_through():
         Step,
         StepStatus,
         StepType,
+        WaitParams,
         WorkflowTask,
     )
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
@@ -100,8 +101,10 @@ class RobotWorkflow:
         }
 
         for step in self._steps:
+            # WAIT is the one step that is not an activity: it is a timer in
+            # the workflow itself (see _run_wait), so it has no entry here.
             activity_fn = activity_map.get(step.type)
-            if activity_fn is None:
+            if activity_fn is None and step.type is not StepType.WAIT:
                 step.status = StepStatus.FAILED
                 step.error_msg = f"Unknown step type: {step.type}"
                 raise ApplicationError(
@@ -168,7 +171,8 @@ class RobotWorkflow:
             # or between the two) holds here, before anything is dispatched.
             # This is the whole of the hold for SPEAK and the posture steps:
             # they are never interrupted, they finish and the run stops at
-            # the next boundary. Only a MOVE is cut short, below.
+            # the next boundary. A MOVE is cut short and a WAIT's countdown
+            # frozen, below.
             try:
                 await self._hold(step)
             except asyncio.CancelledError:
@@ -178,7 +182,10 @@ class RobotWorkflow:
 
             step.status = StepStatus.IN_PROGRESS
             try:
-                if step.type is StepType.MOVE:
+                if step.type is StepType.WAIT:
+                    await self._run_wait(step, step.params)
+                    result = None
+                elif step.type is StepType.MOVE:
                     result = await self._run_move(step, activity_fn, activity_options)
                 else:
                     result = await workflow.execute_activity(activity_fn, **activity_options)
@@ -191,7 +198,7 @@ class RobotWorkflow:
                 step.error_msg = str(err.cause or err)
                 raise
 
-            if not result.success:
+            if result is not None and not result.success:
                 step.status = StepStatus.FAILED
                 step.error_msg = "activity failed"
                 raise ApplicationError("activity failed", non_retryable=True)
@@ -231,4 +238,29 @@ class RobotWorkflow:
 
             # A resume that beat the cancellation's completion makes this a
             # no-op and the goal is simply re-sent.
+            await self._hold(step)
+
+    async def _run_wait(self, step: Step, params: WaitParams) -> None:
+        """Wait ``params.seconds``, with the countdown frozen while held.
+
+        A durable timer rather than a ``time.sleep`` activity, on purpose: it
+        occupies no slot of the single-thread activity executor, needs no
+        heartbeat, and survives a worker restart -- the server owns the timer,
+        so a backend restarted mid-wait picks the step up with the time already
+        served. A pause interrupts it at once (no activity to cancel, the
+        wait_condition simply returns) and the resume waits out only what was
+        left, measured on ``workflow.now()`` so replay sees the same numbers. A
+        task cancel lands as asyncio.CancelledError and the caller marks the
+        step CANCELED / "Task canceled", like a cancel during a hold.
+        """
+        remaining = timedelta(seconds=params.seconds)
+        while remaining > timedelta(0):
+            started = workflow.now()
+            try:
+                await workflow.wait_condition(
+                    lambda: self._pause_requested, timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                return
+            remaining -= workflow.now() - started
             await self._hold(step)
