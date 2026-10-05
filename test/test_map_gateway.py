@@ -1,4 +1,4 @@
-"""Tests for MapGateway: the map router's six service clients.
+"""Tests for MapGateway: the map router's seven service clients.
 
 Same seams as test_robot_gateway.py: the node is a MagicMock and futures are
 the hand-completed ``_Future`` below, so no ROS graph (or rclpy.init) is
@@ -28,7 +28,7 @@ pytest.importorskip("syncai_common")
 
 from builtin_interfaces.msg import Time  # noqa: E402
 from nav2_msgs.srv import LoadMap  # noqa: E402
-from syncai_common.srv import ResetMapping, SaveMaps  # noqa: E402
+from syncai_common.srv import ResetMapping, SaveMaps, StartMapping  # noqa: E402
 
 from syncai_backend.gateways.map import map as map_module  # noqa: E402
 from syncai_backend.gateways.map.map import (  # noqa: E402
@@ -72,6 +72,7 @@ def map_gw(logger) -> MapGateway:
         "filter_mask_server/load_map": MagicMock(),
         "pgo/save_maps": MagicMock(),
         "pgo/reset_mapping": MagicMock(),
+        "pgo/start_mapping": MagicMock(),
         "relocalize": MagicMock(),
         "relocalize_check": MagicMock(),
     }
@@ -425,6 +426,98 @@ class TestResetMapping:
         map_gw.reset_mapping()
 
         map_gw._service_clients["save_maps"].call_async.assert_not_called()
+
+
+class TestStartMapping:
+    """The entry into a run: pgo comes up idle and banks nothing until this."""
+
+    @staticmethod
+    def _started(
+        message="Mapping started. Keep the robot still until the lidar has re-levelled.",
+    ):
+        return SimpleNamespace(success=True, message=message, lio_last_odom_time=1234.5)
+
+    def test_success_passes_pgos_answer_through(self, map_gw):
+        client = _arm(map_gw, "start_mapping", self._started())
+
+        success, message = map_gw.start_mapping()
+
+        # The backend adds nothing: pgo's sentence carries the stillness
+        # warning and the console renders it verbatim.
+        assert (success, message) == (
+            True,
+            "Mapping started. Keep the robot still until the lidar has re-levelled.",
+        )
+        request = client.call_async.call_args[0][0]
+        assert isinstance(request, StartMapping.Request)
+
+    def test_resets_the_lio_front_end_by_default(self, map_gw):
+        # Same reason as the reset: the map's origin is the odometry origin, so
+        # only a LIO reset starts the map where the robot stands.
+        client = _arm(map_gw, "start_mapping", self._started())
+
+        map_gw.start_mapping()
+
+        assert client.call_async.call_args[0][0].reset_lio is True
+
+    def test_graph_only_start_is_still_reachable(self, map_gw):
+        client = _arm(map_gw, "start_mapping", self._started())
+
+        map_gw.start_mapping(reset_lio=False)
+
+        assert client.call_async.call_args[0][0].reset_lio is False
+
+    def test_pgo_refusal_passes_through_verbatim(self, map_gw):
+        # pgo refuses while already mapping (a stale console tab must not be
+        # able to discard a run with the wrong button) and when the LIO round
+        # trip fails; either way nothing changed and the sentence is the whole
+        # diagnosis.
+        _arm(
+            map_gw,
+            "start_mapping",
+            SimpleNamespace(
+                success=False,
+                message=(
+                    "Already mapping: use reset_mapping to start over, or save_maps to finish."
+                ),
+                lio_last_odom_time=0.0,
+            ),
+        )
+
+        assert map_gw.start_mapping() == (
+            False,
+            "Already mapping: use reset_mapping to start over, or save_maps to finish.",
+        )
+
+    def test_service_unavailable_blames_the_mode(self, map_gw):
+        client = _arm(map_gw, "start_mapping", available=False)
+
+        success, message = map_gw.start_mapping()
+
+        assert success is False
+        assert "not available" in message
+        assert "MANUAL" in message
+        client.call_async.assert_not_called()
+
+    def test_timeout_reports_the_start_deadline(self, map_gw, monkeypatch):
+        client = _arm(map_gw, "start_mapping", completed=False)
+        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+
+        success, message = map_gw.start_mapping()
+
+        assert success is False
+        assert message == "Timeout waiting for pgo/start_mapping response"
+        client.call_async.assert_called_once()
+
+    def test_a_start_touches_neither_save_maps_nor_reset_mapping(self, map_gw):
+        # Three separate acts on three distinct clients, which is what makes
+        # this provable.
+        _arm(map_gw, "start_mapping", self._started())
+
+        map_gw.start_mapping()
+
+        map_gw._service_clients["save_maps"].call_async.assert_not_called()
+        map_gw._service_clients["reset_mapping"].call_async.assert_not_called()
 
 
 class TestSwapLocalizerMap:

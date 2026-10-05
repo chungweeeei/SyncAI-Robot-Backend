@@ -1,7 +1,8 @@
 repositories:
   # syncai_common: every generated interface this package imports, including
-  # the map gateway's SaveMaps / ResetMapping / Relocalize / IsValid, which
-  # used to come from SyncAI-Fast-LIO2's `interface` package.
+  # the map gateway's StartMapping / SaveMaps / ResetMapping / Relocalize /
+  # IsValid (the first four used to come from SyncAI-Fast-LIO2's `interface`
+  # package) and the MappingStatus message behind GET /api/v1/mapping.
   src/syncai_common:
     type: git
     url: https://github.com/chungweeeei/SyncAI-Robot-Interface.git

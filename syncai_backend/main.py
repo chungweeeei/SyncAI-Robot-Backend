@@ -17,6 +17,7 @@ from syncai_backend.repositories.map.map import init_map_repo
 from syncai_backend.repositories.task.task_template import init_task_template_repo
 from syncai_backend.repositories.map.catalog import init_map_catalog_repo
 from syncai_backend.repositories.pointcloud.pointcloud import init_pointcloud_repo
+from syncai_backend.repositories.mapping.mapping import init_mapping_status_repo
 from syncai_backend.repositories.telemetry.telemetry import init_telemetry_repo
 from syncai_backend.repositories.recording.catalog import init_recording_catalog_repo
 
@@ -40,6 +41,9 @@ from syncai_backend.subscribers.pointcloud_subscriber import (
 )
 from syncai_backend.subscribers.map_cloud_subscriber import (
     init_map_cloud_subscriber,
+)
+from syncai_backend.subscribers.mapping_status_subscriber import (
+    init_mapping_status_subscriber,
 )
 from syncai_backend.subscribers.telemetry_subscriber import (
     init_telemetry_subscriber,
@@ -87,6 +91,13 @@ class SyncAIBackend(Node):
         # — and no reset hook needed, because this process restarts with every
         # mapping session.
         map_cloud_repo = init_pointcloud_repo(logger=logger)
+        # The third pgo surface, and the one REST reads back: its latched run
+        # state (idle / mapping / resetting), so GET /api/v1/mapping can answer
+        # after a console reload and the run routes can refuse with a code
+        # instead of relaying pgo's refusal as a 502. Unlike the two slots
+        # above it ages its sample out, because this container outlives the
+        # mapping session that published it.
+        mapping_status_repo = init_mapping_status_repo(logger=logger)
         # Single-slot pose/joints cache feeding the internal telemetry WS
         # (the high-rate channel the 3D viewer uses instead of the frozen,
         # whole-second-resolution GET /api/v1/robot/state contract).
@@ -174,6 +185,9 @@ class SyncAIBackend(Node):
         # pgo's merged map cloud arrives already in the map frame, so unlike
         # the live cloud above this needs no tf_buffer.
         init_map_cloud_subscriber(logger=logger, node=self, map_cloud_repo=map_cloud_repo)
+        init_mapping_status_subscriber(
+            logger=logger, node=self, mapping_status_repo=mapping_status_repo
+        )
         init_telemetry_subscriber(
             logger=logger,
             node=self,
@@ -211,6 +225,7 @@ class SyncAIBackend(Node):
             recording_catalog_repo=recording_catalog_repo,
             conversion_svc=conversion_svc,
             restart_svc=restart_svc,
+            mapping_status_repo=mapping_status_repo,
         )
 
 

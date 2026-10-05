@@ -33,6 +33,9 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
+from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
+    init_mapping_status_repo,
+)
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
@@ -110,6 +113,8 @@ def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
             # A real one: the vertex routes never start a conversion, but the
             # catalogue projection asks it whether one is running.
             conversion_svc=GridmapConversionService(logger=logger),
+            # Real and empty: the vertex routes never read the run state.
+            mapping_status_repo=init_mapping_status_repo(logger=logger),
         )
     )
     return TestClient(app)
