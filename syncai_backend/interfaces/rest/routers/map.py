@@ -50,6 +50,10 @@ from syncai_backend.repositories.map.catalog import (
     StoredMap,
 )
 from syncai_backend.repositories.map.map import MapRepo
+from syncai_backend.repositories.mapping.mapping import (
+    MappingState,
+    MappingStatusRepo,
+)
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 
 # The conversion itself -- recipes, the running-thread registry and the sidecar
@@ -287,6 +291,47 @@ class ResetMappingResponse(BaseModel):
         ),
     )
     message: str = Field(..., description="What happened, for the operator to read.")
+
+
+class StartMappingResponse(BaseModel):
+    started: bool = Field(
+        ...,
+        description=(
+            "True on any 200 — pgo is building a map from where the robot "
+            "stands and the LIO front end is re-initialising. A failure is a "
+            "502 (or a 409 while already mapping), never a 200 with false."
+        ),
+    )
+    message: str = Field(..., description="What happened, for the operator to read.")
+
+
+class MappingRunState(str, Enum):
+    """The run state as REST reports it.
+
+    The repo's three states plus ``unknown``, which the repo represents as
+    *no sample* rather than a fourth value: no pgo has reported since this
+    process started (every navigating robot), or the last report is older than
+    its TTL (the mapping session is gone).
+    """
+
+    IDLE = "idle"
+    MAPPING = "mapping"
+    RESETTING = "resetting"
+    UNKNOWN = "unknown"
+
+
+class MappingStatusResponse(BaseModel):
+    state: MappingRunState = Field(
+        ...,
+        description=(
+            "idle: in mapping mode with nothing banked — press Start. "
+            "mapping: keyframes accumulating. resetting: a start or reset is "
+            "in flight (seconds). unknown: pgo has not reported, which is the "
+            "answer on every navigating robot."
+        ),
+    )
+    key_poses: int = Field(..., description="Keyframes in pgo's graph; 0 unless mapping.")
+    loop_closures: int = Field(..., description="Loop closures the graph has accepted.")
 
 
 class RenameMapRequest(BaseModel):
@@ -787,9 +832,38 @@ def init_map_router(
     task_template_repo: TaskTemplateRepo,
     workflow_gw: WorkflowGateway,
     conversion_svc: GridmapConversionService,
+    mapping_status_repo: MappingStatusRepo,
 ) -> APIRouter:
 
     map_router = APIRouter(prefix="", tags=["Map"])
+
+    # pgo's latched run state (IDLE / MAPPING / RESETTING, or None when it has
+    # not reported). The three run routes read it to answer the refusal pgo
+    # would give as a 409 with a code instead of a 502 with a sentence --
+    # check-then-act, not a lock: pgo's own precondition is what holds if the
+    # state moves between the read and the call, and its sentence then comes
+    # back as the uniform 502. None lets pgo answer, so a backend that never
+    # heard pgo behaves exactly as before the status existed.
+    def _run_state() -> Optional[MappingState]:
+        status = mapping_status_repo.get()
+        return None if status is None else status.state
+
+    def _refuse_while_resetting():
+        if _run_state() is MappingState.RESETTING:
+            raise ConflictError(
+                "The robot is starting or resetting a map right now; try again "
+                "in a moment.",
+                code="mapping_busy",
+            )
+
+    def _refuse_while_idle(nothing_to: str):
+        state = _run_state()
+        if state is MappingState.IDLE:
+            raise ConflictError(
+                f"There is no map to {nothing_to} — mapping has not been started.",
+                code="mapping_idle",
+            )
+        _refuse_while_resetting()
 
     # --- The loaded map -----------------------------------------------------
 
@@ -962,6 +1036,22 @@ def init_map_router(
 
     @map_router.post("/api/v1/maps", response_model=CreateMapResponse)
     def create_map(request: CreateMapRequest):
+        """Save the run as a new map -- and end it.
+
+        Since 2026-10 a successful ``pgo/save_maps`` returns pgo to IDLE: the
+        keyframes are freed, the empty map-cloud notice goes out (which is
+        what clears the console's "map so far" and the shared ``/dev/shm``;
+        this process deletes nothing there) and the next run waits for
+        ``POST /api/v1/mapping/start``. The conversion below reads ``map.pcd``
+        from the directory, so it does not care.
+
+        A save while pgo is IDLE is refused here as 409 ``mapping_idle``
+        before any directory is created: under the state machine IDLE means
+        "nothing banked" by definition, and pgo's own ``NO POSES!`` as a 502
+        would say the robot is broken when the operator simply has not
+        pressed Start. Unknown lets pgo answer, as it always did.
+        """
+        _refuse_while_idle("save")
 
         directory = map_catalog_repo.create_map_dir(request.name)
 
@@ -978,7 +1068,8 @@ def init_map_router(
             has_pointcloud=True,
             grid_pending=grid_pending,
             message=(
-                f"Saved '{request.name}'."
+                f"Saved '{request.name}'. Mapping has stopped — start it again "
+                "for another map."
                 + (
                     " Converting to a 2D gridmap in the background."
                     if grid_pending
@@ -1261,14 +1352,84 @@ def init_map_router(
 
         Failures are 502 with pgo's own sentence, same as a failed save. The
         one an operator actually hits is the wrong mode — pgo only exists in a
-        mapping session — and the gateway words it that way.
+        mapping session — and the gateway words it that way. While pgo is
+        IDLE there is nothing to discard and pgo refuses; that one is answered
+        here as 409 ``mapping_idle`` from the latched status, so the console
+        can tell "press Start" from "the stack is broken".
         """
+        _refuse_while_idle("discard")
+
         ok, detail = map_gw.reset_mapping()
         if not ok:
             logger.error("Failed to reset the mapping run", error=detail)
             raise UpstreamError(detail)
 
         return ResetMappingResponse(reset=True, message=detail)
+
+    @map_router.post("/api/v1/mapping/start", response_model=StartMappingResponse)
+    def start_mapping():
+        """Begin a mapping run: ``pgo/start_mapping``, IDLE -> MAPPING.
+
+        The opening bracket of a run (2026-10): a mapping session comes up
+        with pgo idle and banking nothing, so the drive from wherever the
+        robot was powered on to the site's starting point is not part of any
+        map, and a save (``POST /api/v1/maps``) closes the run and leaves pgo
+        idle for the next one. Under ``/api/v1/mapping/`` like the reset: it
+        is about the run, touches no file, and leaves a client nothing to
+        invalidate but the run status.
+
+        No body. pgo's ``reset_lio`` is always true from here, for the reason
+        the reset route gives: the map's origin is the odometry origin, so
+        only a LIO reset starts the map where the robot stands. That re-init
+        is static and gravity-aligning, so the robot must be **stationary**
+        until the live scan returns; pgo's sentence says so and is rendered
+        verbatim.
+
+        409 ``mapping_running`` while the latched status says a run is on
+        (pgo would refuse too — a stale console tab must not be able to
+        discard a run with the wrong button), 409 ``mapping_busy`` while a
+        start or reset is in flight, otherwise pgo answers and a refusal or
+        absence is the uniform 502. This handler does not write the status
+        slot: the state travels the latched topic so every console and rviz
+        agree, the same reason the reset handler leaves the map-cloud repo
+        alone.
+        """
+        if _run_state() is MappingState.MAPPING:
+            raise ConflictError(
+                "The robot is already building a map. Save it, or start a new "
+                "one with a reset.",
+                code="mapping_running",
+            )
+        _refuse_while_resetting()
+
+        ok, detail = map_gw.start_mapping()
+        if not ok:
+            logger.error("Failed to start the mapping run", error=detail)
+            raise UpstreamError(detail)
+
+        return StartMappingResponse(started=True, message=detail)
+
+    @map_router.get("/api/v1/mapping", response_model=MappingStatusResponse)
+    async def get_mapping_status():
+        """pgo's run state, as it last reported it.
+
+        ``async`` because it only reads a slot under a lock — no ROS, no I/O
+        (the ``GET /api/v1/robot/restart`` precedent). ``unknown`` is a real
+        answer, not an error: it is what every navigating robot says, since
+        pgo exists only in a mapping session, and what a mapping robot says
+        for the first second after pgo comes up or once it has gone quiet for
+        longer than the repo's TTL.
+        """
+        status = mapping_status_repo.get()
+        if status is None:
+            return MappingStatusResponse(
+                state=MappingRunState.UNKNOWN, key_poses=0, loop_closures=0
+            )
+        return MappingStatusResponse(
+            state=MappingRunState(status.state.value),
+            key_poses=status.key_poses,
+            loop_closures=status.loop_closures,
+        )
 
     @map_router.patch("/api/v1/maps/{name}", response_model=RenameMapResponse)
     def rename_map(name: str, request: RenameMapRequest):

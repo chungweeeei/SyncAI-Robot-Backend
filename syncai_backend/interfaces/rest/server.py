@@ -30,6 +30,7 @@ from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.map.map import MapRepo
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.pointcloud.pointcloud import PointCloudRepo
+from syncai_backend.repositories.mapping.mapping import MappingStatusRepo
 from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 from syncai_backend.repositories.recording.catalog import RecordingCatalogRepo
@@ -99,6 +100,7 @@ def init_rest_server(
     recording_catalog_repo: RecordingCatalogRepo,
     conversion_svc: GridmapConversionService,
     restart_svc: ModeRestartService,
+    mapping_status_repo: MappingStatusRepo,
 ) -> FastAPI:
 
     description = """
@@ -184,6 +186,8 @@ def init_rest_server(
     # its name has to carry its templates with it. workflow_gw is here for one
     # question the map router cannot answer alone — "is a task running right
     # now" — which is what stops a map switch landing under a moving robot.
+    # mapping_status_repo is pgo's latched run state, so /api/v1/mapping can
+    # answer after a console reload and the run routes can refuse with a code.
     app.include_router(
         init_map_router(
             logger=logger,
@@ -193,6 +197,7 @@ def init_rest_server(
             task_template_repo=task_template_repo,
             workflow_gw=workflow_gw,
             conversion_svc=conversion_svc,
+            mapping_status_repo=mapping_status_repo,
         )
     )
     # Serves /api/v1/task_templates: the operator's library of re-dispatchable
@@ -277,6 +282,7 @@ def start_rest_server(
     recording_catalog_repo: RecordingCatalogRepo,
     conversion_svc: GridmapConversionService,
     restart_svc: ModeRestartService,
+    mapping_status_repo: MappingStatusRepo,
 ):
 
     app = init_rest_server(
@@ -298,6 +304,7 @@ def start_rest_server(
         recording_catalog_repo=recording_catalog_repo,
         conversion_svc=conversion_svc,
         restart_svc=restart_svc,
+        mapping_status_repo=mapping_status_repo,
     )
 
     def _run():

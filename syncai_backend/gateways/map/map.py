@@ -13,7 +13,8 @@ NavigateToPose.
 The clients split by session, which is worth knowing before debugging any of
 them: ``map_server/load_map``, ``filter_mask_server/load_map``, ``relocalize``
 and ``relocalize_check`` exist only in the nav (AUTO) session,
-``pgo/save_maps`` and ``pgo/reset_mapping`` only in the mapping (MANUAL) one. A
+``pgo/start_mapping``, ``pgo/save_maps`` and ``pgo/reset_mapping`` only in the
+mapping (MANUAL) one. A
 "service is not available" from one of them usually means "wrong mode", not
 "broken stack" -- which is exactly what ``POST /api/v1/maps/{name}/activate``
 turns into its ``stack_not_ready`` refusal. ``filter_mask_server`` is the
@@ -34,7 +35,7 @@ from rclpy.qos import QoSProfile
 from geometry_msgs.msg import Point, Pose, PoseWithCovarianceStamped, Quaternion
 from std_msgs.msg import Header
 from nav2_msgs.srv import LoadMap
-from syncai_common.srv import IsValid, Relocalize, ResetMapping, SaveMaps
+from syncai_common.srv import IsValid, Relocalize, ResetMapping, SaveMaps, StartMapping
 
 
 def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
@@ -123,6 +124,14 @@ class MapGateway:
             srv_name="pgo/reset_mapping",
         )
 
+        # The third pgo service, declared the same way (2026-10): what moves
+        # pgo from IDLE to MAPPING, since a mapping session comes up banking
+        # nothing.
+        start_mapping_client = self._node.create_client(
+            srv_type=StartMapping,
+            srv_name="pgo/start_mapping",
+        )
+
         # Bare names, unlike load_map's. The localizer declares these with
         # plain `create_service("relocalize", ...)` (syncai_localizer's
         # src/localizer_node.cpp:51-59),
@@ -151,6 +160,7 @@ class MapGateway:
                 "load_keepout": load_keepout_client,
                 "save_maps": save_maps_client,
                 "reset_mapping": reset_mapping_client,
+                "start_mapping": start_mapping_client,
                 "relocalize": relocalize_client,
                 "relocalize_check": relocalize_check_client,
             }
@@ -467,6 +477,52 @@ class MapGateway:
             self._logger.info(
                 "[MapGateway] Mapping run reset",
                 dropped_key_poses=response.dropped_key_poses,
+                lio_last_odom_time=response.lio_last_odom_time,
+            )
+        return response.success, response.message
+
+    def start_mapping(self, reset_lio: bool = True) -> tuple[bool, str]:
+        """Begin a mapping run: pgo from IDLE to MAPPING.
+
+        The opening bracket of a run, where ``save_map`` is the closing one
+        (2026-10): a mapping session comes up with pgo idle and banking
+        nothing, so until this is called the drive to the starting point is
+        not part of any map, and a successful save returns pgo to idle for the
+        next one. pgo runs the same sequence as a reset from the other
+        precondition -- pause, reset the LIO front end, fresh pose graph, gate
+        on the boundary timestamp -- and refuses while already mapping, so a
+        stale console tab cannot discard a run with the wrong button.
+
+        ``reset_lio`` is True for every operator-facing call, as for a reset
+        and for the same reason: the graph's origin is the odometry origin,
+        so only a LIO reset starts the map where the robot stands. The robot
+        must be stationary through pointlio's re-initialisation; pgo's
+        ``message`` says so and is rendered verbatim.
+
+        The deadline is the reset's: pgo's own 5 s cap on the pointlio round
+        trip plus margin, and nothing to free since an idle pgo holds no
+        keyframes. No ``Failure`` code: the srv carries none, prose is not
+        matched (gateways/failure.py), and the router pre-empts the one
+        discriminable refusal -- already mapping -- from the latched status.
+        """
+        start_client = self._service_clients.get("start_mapping")
+        if not start_client.wait_for_service(timeout_sec=5.0):
+            return False, (
+                "pgo/start_mapping is not available — starting mapping needs "
+                "the robot in MANUAL (mapping) mode."
+            )
+
+        self._logger.info("[MapGateway] Starting the mapping run", reset_lio=reset_lio)
+
+        future = start_client.call_async(StartMapping.Request(reset_lio=reset_lio))
+
+        if not _wait_for_future(future, timeout=30.0):
+            return False, "Timeout waiting for pgo/start_mapping response"
+
+        response = future.result()
+        if response.success:
+            self._logger.info(
+                "[MapGateway] Mapping run started",
                 lio_last_odom_time=response.lio_last_odom_time,
             )
         return response.success, response.message

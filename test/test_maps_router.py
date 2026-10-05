@@ -40,6 +40,11 @@ from syncai_backend.gateways.workflow.schema import TaskKind  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers import map as map_router_module  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
+from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
+    MAPPING_STATUS_TTL_S,
+    MappingState,
+    init_mapping_status_repo,
+)
 from syncai_backend.services import gridmap_conversion as conversion_module  # noqa: E402
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
@@ -70,6 +75,12 @@ class _StubMapGateway:
             True,
             "Map discarded. The new one starts building once the lidar has "
             "re-levelled.",
+        )
+        # The third run act, separate for the same reason.
+        self.start_calls = []
+        self.start_result = (
+            True,
+            "Mapping started. Keep the robot still until the lidar has re-levelled.",
         )
         # The map-switch surface. `order` records every ROS step across both
         # clients in sequence, because for a switch the ordering *is* the
@@ -102,6 +113,10 @@ class _StubMapGateway:
     def reset_mapping(self, reset_lio=True):
         self.reset_calls.append(reset_lio)
         return self.reset_result
+
+    def start_mapping(self, reset_lio=True):
+        self.start_calls.append(reset_lio)
+        return self.start_result
 
     def nav_services_ready(self, timeout_sec=2.0):
         return self.services_ready
@@ -166,6 +181,33 @@ def _clear_converting(conversion_svc, name):
         conversion_svc._active.discard(name)
 
 
+class _Clock:
+    """The monotonic clock the status repo ages its sample on, moved by hand."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def clock():
+    return _Clock()
+
+
+@pytest.fixture
+def mapping_status_repo(logger, clock):
+    """pgo's latched run state, as the router sees it. Empty (unknown) unless
+    a test latches a sample with ``_latch``."""
+    return init_mapping_status_repo(logger=logger, now=clock)
+
+
+def _latch(repo, state, key_poses=0, loop_closures=0):
+    """Pretend pgo published ``state``, as the subscriber would."""
+    repo.update(state=state, key_poses=key_poses, loop_closures=loop_closures, stamp=1.0)
+
+
 @pytest.fixture
 def client(
     logger,
@@ -175,6 +217,7 @@ def client(
     workflow_gw,
     task_template_repo,
     conversion_svc,
+    mapping_status_repo,
     tmp_path,
     monkeypatch,
 ):
@@ -194,6 +237,7 @@ def client(
             task_template_repo=task_template_repo,
             workflow_gw=workflow_gw,
             conversion_svc=conversion_svc,
+            mapping_status_repo=mapping_status_repo,
         )
     )
     return TestClient(app)
@@ -1032,6 +1076,50 @@ def test_create_map_does_not_reset_the_run(client, map_gw):
     assert map_gw.reset_calls == []
 
 
+def test_create_map_says_mapping_has_stopped(client):
+    # A successful save ends the run on pgo's side (it goes idle and clears
+    # /dev/shm itself); the sentence the console renders has to say so, or an
+    # operator drives on into a map that is no longer being built.
+    body = _post_map(client, {"name": "newmap"}).json()
+
+    assert "Mapping has stopped" in body["message"]
+
+
+def test_create_map_is_refused_while_idle(client, map_gw, catalog_repo, mapping_status_repo):
+    # IDLE means "nothing banked" by definition under the state machine, so
+    # this is a 409 with a code the console can act on ("press Start"), not
+    # pgo's NO POSES! as a 502 that reads as a broken robot. Before any
+    # directory is created.
+    _latch(mapping_status_repo, MappingState.IDLE)
+
+    response = _post_map(client, {"name": "newmap"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_idle"
+    assert map_gw.save_calls == []
+    assert not os.path.exists(catalog_repo.resolve_dir("newmap"))
+
+
+def test_create_map_is_refused_mid_transition(client, map_gw, mapping_status_repo):
+    _latch(mapping_status_repo, MappingState.RESETTING)
+
+    response = _post_map(client, {"name": "newmap"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_busy"
+    assert map_gw.save_calls == []
+
+
+def test_create_map_asks_pgo_while_mapping_or_unknown(client, map_gw, mapping_status_repo):
+    # Unknown (no sample) is the pre-status behaviour: pgo answers. MAPPING is
+    # the normal case.
+    assert _post_map(client, {"name": "one"}).status_code == 200
+    _latch(mapping_status_repo, MappingState.MAPPING, key_poses=12)
+    assert _post_map(client, {"name": "two"}).status_code == 200
+
+    assert len(map_gw.save_calls) == 2
+
+
 # --- POST /api/v1/mapping/reset -----------------------------------------------
 
 
@@ -1081,6 +1169,141 @@ def test_reset_mapping_does_not_touch_the_catalogue(client, map_gw, catalog_repo
 
     assert {entry.name for entry in catalog_repo.list_maps()} == before
     assert map_gw.save_calls == []
+
+
+def test_reset_mapping_is_refused_while_idle(client, map_gw, mapping_status_repo):
+    # Nothing to discard: pgo would refuse too, but from the latched status
+    # the console gets a code it can act on rather than a 502.
+    _latch(mapping_status_repo, MappingState.IDLE)
+
+    response = client.post("/api/v1/mapping/reset")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_idle"
+    assert map_gw.reset_calls == []
+
+
+# --- POST /api/v1/mapping/start -----------------------------------------------
+
+
+def test_start_mapping_calls_the_gateway(client, map_gw):
+    response = client.post("/api/v1/mapping/start")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["started"] is True
+    # pgo's sentence carries the stillness warning; the backend adds nothing.
+    assert body["message"] == (
+        "Mapping started. Keep the robot still until the lidar has re-levelled."
+    )
+    # Always with the LIO front end: the map's origin is the odometry origin.
+    assert map_gw.start_calls == [True]
+
+
+def test_start_mapping_takes_no_body(client, map_gw):
+    assert client.post("/api/v1/mapping/start").status_code == 200
+    assert map_gw.start_calls == [True]
+
+
+def test_start_mapping_reports_the_gateway_refusal(client, map_gw):
+    map_gw.start_result = (
+        False,
+        "pgo/start_mapping is not available — starting mapping needs the robot "
+        "in MANUAL (mapping) mode.",
+    )
+
+    response = client.post("/api/v1/mapping/start")
+
+    assert response.status_code == 502
+    assert "MANUAL" in response.json()["detail"]
+
+
+def test_start_mapping_is_refused_while_already_mapping(client, map_gw, mapping_status_repo):
+    # pgo refuses this too; answering it from the latched status is what lets
+    # the console disable the button instead of showing a 502.
+    _latch(mapping_status_repo, MappingState.MAPPING, key_poses=3)
+
+    response = client.post("/api/v1/mapping/start")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_running"
+    assert map_gw.start_calls == []
+
+
+def test_start_mapping_is_refused_mid_transition(client, map_gw, mapping_status_repo):
+    _latch(mapping_status_repo, MappingState.RESETTING)
+
+    response = client.post("/api/v1/mapping/start")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_busy"
+    assert map_gw.start_calls == []
+
+
+def test_start_mapping_asks_pgo_when_the_state_is_unknown_or_idle(
+    client, map_gw, mapping_status_repo
+):
+    assert client.post("/api/v1/mapping/start").status_code == 200
+    _latch(mapping_status_repo, MappingState.IDLE)
+    assert client.post("/api/v1/mapping/start").status_code == 200
+
+    assert map_gw.start_calls == [True, True]
+
+
+def test_start_mapping_asks_pgo_once_the_latched_state_is_stale(
+    client, map_gw, mapping_status_repo, clock
+):
+    # A MAPPING sample from a pgo that has since gone quiet (the session was
+    # torn down) must not refuse forever: past the TTL the router lets pgo
+    # answer, and pgo being absent is then the honest 502.
+    _latch(mapping_status_repo, MappingState.MAPPING)
+    clock.now += MAPPING_STATUS_TTL_S + 1.0
+
+    assert client.post("/api/v1/mapping/start").status_code == 200
+    assert map_gw.start_calls == [True]
+
+
+def test_start_mapping_touches_nothing_else(client, map_gw, catalog_repo):
+    before = {entry.name for entry in catalog_repo.list_maps()}
+
+    assert client.post("/api/v1/mapping/start").status_code == 200
+
+    assert {entry.name for entry in catalog_repo.list_maps()} == before
+    assert map_gw.save_calls == []
+    assert map_gw.reset_calls == []
+
+
+# --- GET /api/v1/mapping ------------------------------------------------------
+
+
+def test_mapping_status_is_unknown_before_pgo_has_said_anything(client):
+    # The answer on every navigating robot: pgo exists only in a mapping
+    # session. Not an error.
+    response = client.get("/api/v1/mapping")
+
+    assert response.status_code == 200
+    assert response.json() == {"state": "unknown", "key_poses": 0, "loop_closures": 0}
+
+
+def test_mapping_status_reports_the_latched_sample(client, mapping_status_repo):
+    _latch(mapping_status_repo, MappingState.MAPPING, key_poses=42, loop_closures=3)
+
+    assert client.get("/api/v1/mapping").json() == {
+        "state": "mapping",
+        "key_poses": 42,
+        "loop_closures": 3,
+    }
+
+
+def test_mapping_status_goes_unknown_once_the_sample_is_stale(
+    client, mapping_status_repo, clock
+):
+    _latch(mapping_status_repo, MappingState.IDLE)
+    assert client.get("/api/v1/mapping").json()["state"] == "idle"
+
+    clock.now += MAPPING_STATUS_TTL_S + 1.0
+
+    assert client.get("/api/v1/mapping").json()["state"] == "unknown"
 
 
 # --- PATCH /api/v1/maps/{name} ------------------------------------------------

@@ -11,9 +11,9 @@ ROS 2 `ament_python` package (`package.xml`, `setup.py`), split out of
 
 It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
-`syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`;
+`syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, and the
-map srvs `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`) — plus `rclpy`,
+map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`) — plus `rclpy`,
 `nav2_msgs`, `tf2_ros`. Keep those imports as they are. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
 colcon workspace root materialises it into `src/` beside this package, over
@@ -128,7 +128,8 @@ services/                  domain work that outlives a request: gridmap_conversi
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
-repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry),
+repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
+        │                  mapping — pgo's latched run state, aged out after 5 s),
         │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
 database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate)
 
@@ -294,7 +295,10 @@ default UDP receive buffer over CycloneDDS; do not go back to it or "fix" it wit
 arrive and every read is ENOENT. An empty notice (`points: 0`, `path: ""`) clears
 the slot (pgo's reset signal); every other failure (missing file, bad JSON, path
 outside `/dev/shm`, bad PCD) is a warning that leaves the slot untouched — never
-raise out of the callback, it would end `spin()` and the process.
+raise out of the callback, it would end `spin()` and the process. A successful `save_maps` sends the same empty notice
+(2026-10): pgo ends the run, goes idle and clears `/dev/shm` itself — this
+process deletes nothing there. Its run state is latched on `pgo/mapping_status`
+(`MappingStatusRepo`); `POST /api/v1/mapping/start` is what begins a run.
 
 ### Heavy imports
 
