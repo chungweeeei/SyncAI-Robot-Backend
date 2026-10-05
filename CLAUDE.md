@@ -257,7 +257,7 @@ The MOVE wait is `workflow.wait_condition` on `handle.done() or paused`, **never
 `await handle`**: that is what keeps a task cancel arriving as `asyncio.CancelledError`
 instead of being swallowed into the activity's `ActivityError`, so a cancel is never
 mistaken for the pause's own interruption and needs no `workflow.cancellation_reason()`
-(which the unpinned `temporalio` may not have). A cancelled step reads `CANCELED` / `Task
+(an SDK version detail the hold should not hang on). A cancelled step reads `CANCELED` / `Task
 canceled` whatever it was doing. `WAIT` is the one step that is **not** an activity: a durable timer inside
 `RobotWorkflow._run_wait` (`wait_condition` with a timeout, remainder measured on
 `workflow.now()` so replay sees the same numbers), so it takes no slot of the one-thread

@@ -692,8 +692,8 @@ Details that matter when editing this path:
     `ActivityError(cause=CancelledError)` can only be the pause's own
     interruption. A pause and a cancel landing in the same breath therefore
     end the run canceled, never held — without depending on
-    `workflow.cancellation_reason()`, which the unpinned `temporalio` may
-    not have.
+    `workflow.cancellation_reason()`. (`temporalio` is floored at 1.33 in
+    `requirements.txt`; the suite pins this behaviour on 1.34.)
   - **Replay of runs started before the hold existed is safe** as long as
     nobody pauses them: the happy path emits the same commands as before (one
     activity per step; `wait_condition` emits none).
