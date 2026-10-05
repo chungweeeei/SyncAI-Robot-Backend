@@ -2,6 +2,14 @@
 # and WorkflowGateway).
 WORKFLOW_TYPE_NAME = "RobotWorkflow"
 
+# The two signals RobotWorkflow accepts, by the names that cross the wire. The
+# workflow declares its handlers under these and the gateway sends them, so
+# a rename has to land in both places -- which is why neither side spells
+# the string itself. Both are idempotent flags, not events: a second pause
+# while paused, or a resume while running, is accepted and changes nothing.
+PAUSE_SIGNAL = "pause"
+RESUME_SIGNAL = "resume"
+
 
 # --- "What is running right now" (GET /api/v1/active_tasks) -----------------
 #

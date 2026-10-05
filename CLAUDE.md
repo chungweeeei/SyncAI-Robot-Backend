@@ -246,14 +246,19 @@ utterance) so it runs on `start_to_close` alone; that service's playback is a po
 cancellable job, so this is now a choice rather than a constraint. Per-step state
 is a workflow **query**, not a table — and the task-level `PAUSED` is derived from it,
 because **Temporal has no paused status**: `pause`/`resume` are two idempotent workflow
-**signals** plus a flag the run checks before every step, parking that step as `PAUSED`
-in a `wait_condition`, and `get_task_state` reads the hold off the held step rather than
-asking a second time. A held run stays *running* to everything else (`active_tasks`,
-`_require_idle`, the map activation gate). Only a `MOVE` is cut short — the pause cancels
-the in-flight activity handle, which lands in `execute_move`'s `except CancelledError`
-and cancels the nav2 goal — and is re-sent from scratch on resume;
-`workflow.cancellation_reason()` (SDK 1.33) is what tells a real cancel apart from that
-interruption. `WAIT` is the one step that is **not** an activity: a durable timer inside
+**signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `gateways/workflow/config.py`, shared by
+the workflow and the gateway) plus a flag the run checks before every step, parking that
+step as `PAUSED` in a `wait_condition`, and `get_task_state` reads the hold off the held
+step rather than asking a second time. A held run stays *running* to everything else
+(`active_tasks`, `_require_idle`, the map activation gate). Only a `MOVE` is cut short —
+`_run_move` cancels the in-flight activity handle, which lands in `execute_move`'s
+`except CancelledError` and cancels the nav2 goal — and is re-sent from scratch on resume.
+The MOVE wait is `workflow.wait_condition` on `handle.done() or paused`, **never a direct
+`await handle`**: that is what keeps a task cancel arriving as `asyncio.CancelledError`
+instead of being swallowed into the activity's `ActivityError`, so a cancel is never
+mistaken for the pause's own interruption and needs no `workflow.cancellation_reason()`
+(which the unpinned `temporalio` may not have). A cancelled step reads `CANCELED` / `Task
+canceled` whatever it was doing. `WAIT` is the one step that is **not** an activity: a durable timer inside
 `RobotWorkflow._run_wait` (`wait_condition` with a timeout, remainder measured on
 `workflow.now()` so replay sees the same numbers), so it takes no slot of the one-thread
 activity executor, needs no heartbeat, and survives a worker restart with the time

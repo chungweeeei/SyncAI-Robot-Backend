@@ -681,14 +681,19 @@ Details that matter when editing this path:
   - **Teleop opens up during a hold.** The MOVE's goal is gone, so
     `_autonomous_move_active()` is false and `cmd_vel` is accepted; the resume
     re-sends the goal from wherever the operator drove to.
-  - **A cancel while held** surfaces from `wait_condition` as
-    `asyncio.CancelledError`, so the held step ends `CANCELED` / "Task
-    canceled" — the one path on which that branch of the workflow runs (a
-    cancel mid-MOVE still ends the step `FAILED` / "Cancelled", as before). A
-    cancel that lands in the same breath as a pause is told apart from the
-    pause's own interruption by `workflow.cancellation_reason()` (SDK 1.33;
-    an older worker falls back to treating it as a pause, which would hold a
-    run the operator meant to cancel until a second cancel or a resume).
+  - **A cancelled step reads `CANCELED` / "Task canceled"** whatever it was
+    doing — held, waiting, mid-MOVE or mid-posture. It used to read `FAILED` /
+    "Cancelled" mid-step, when the SDK delivered the cancel wrapped in the
+    activity's `ActivityError`; the workflow now folds that shape too.
+  - **The MOVE wait never `await`s the activity handle.** `_run_move` waits
+    on `workflow.wait_condition(handle.done() or paused)`, so a task cancel
+    always reaches the run as `asyncio.CancelledError` (the activity is then
+    cancelled and waited out, `WAIT_CANCELLATION_COMPLETED`), and an
+    `ActivityError(cause=CancelledError)` can only be the pause's own
+    interruption. A pause and a cancel landing in the same breath therefore
+    end the run canceled, never held — without depending on
+    `workflow.cancellation_reason()`, which the unpinned `temporalio` may
+    not have.
   - **Replay of runs started before the hold existed is safe** as long as
     nobody pauses them: the happy path emits the same commands as before (one
     activity per step; `wait_condition` emits none).

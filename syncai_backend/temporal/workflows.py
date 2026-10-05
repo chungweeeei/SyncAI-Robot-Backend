@@ -6,6 +6,7 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
 with workflow.unsafe.imports_passed_through():
+    from syncai_backend.gateways.workflow.config import PAUSE_SIGNAL, RESUME_SIGNAL
     from syncai_backend.gateways.workflow.schema import (
         Step,
         StepStatus,
@@ -40,22 +41,6 @@ def _own_map() -> str | None:
         return None
 
 
-def _cancel_requested() -> bool:
-    """Whether the server has asked this workflow to cancel.
-
-    Needed in exactly one place: a MOVE that comes back cancelled while a
-    pause is pending could owe that to the pause *or* to a task cancel that
-    landed in the same breath, and only the former may hold -- a hold after a
-    cancel would park the run for good, because the SDK delivers a workflow
-    cancel once and ``wait_condition`` lets code that caught it keep going.
-    ``workflow.cancellation_reason`` is the SDK's answer (1.33); an older
-    worker without it falls back to "no", which keeps every ordinary pause
-    working and leaves only that same-breath race to a second cancel.
-    """
-    reason = getattr(workflow, "cancellation_reason", None)
-    return reason is not None and reason() is not None
-
-
 @workflow.defn
 class RobotWorkflow:
     def __init__(self) -> None:
@@ -64,28 +49,19 @@ class RobotWorkflow:
         # event because both signals are idempotent: a second pause while
         # held, or a resume while running, must change nothing.
         self._pause_requested: bool = False
-        # The MOVE activity in flight, if any -- the one thing a pause
-        # interrupts rather than waits out -- and whether the pause did so.
-        self._move_handle: workflow.ActivityHandle | None = None
-        self._move_interrupted: bool = False
 
     @workflow.query
     def get_step_states(self) -> list[Step]:
         return self._steps
 
-    @workflow.signal
+    # The handlers only flip the flag. What a pause interrupts is decided by
+    # the code waiting on it: _run_move cancels an in-flight MOVE, _run_wait
+    # freezes its countdown, and every other step is waited out (see run()).
+    @workflow.signal(name=PAUSE_SIGNAL)
     def pause(self) -> None:
         self._pause_requested = True
-        # A MOVE is interrupted at once: cancelling its handle lands in
-        # execute_move's ``except CancelledError``, which cancels the nav2 goal
-        # -- the same path a task cancel takes, shield and all. Nothing is in
-        # flight here for any other step type; those finish and the run holds
-        # before the next one (see run()).
-        if self._move_handle is not None and not self._move_handle.done():
-            self._move_interrupted = True
-            self._move_handle.cancel()
 
-    @workflow.signal
+    @workflow.signal(name=RESUME_SIGNAL)
     def resume(self) -> None:
         self._pause_requested = False
 
@@ -217,6 +193,18 @@ class RobotWorkflow:
                 step.error_msg = "Task canceled"
                 raise
             except ActivityError as err:
+                if isinstance(err.cause, CancelledError):
+                    # A cancel of the whole run that reached us through the
+                    # activity: execute_activity (SPEAK, the posture steps)
+                    # answers the run's cancel by cancelling the activity and
+                    # handing back its resolution, so the run's own
+                    # asyncio.CancelledError never surfaces. A cancel is the
+                    # only thing that resolves an activity with this cause
+                    # (timeouts are TimeoutError), so it is named for what it
+                    # is -- the same CANCELED a MOVE, a WAIT or a hold ends in.
+                    step.status = StepStatus.CANCELED
+                    step.error_msg = "Task canceled"
+                    raise
                 step.status = StepStatus.FAILED
                 step.error_msg = str(err.cause or err)
                 raise
@@ -233,34 +221,64 @@ class RobotWorkflow:
     async def _run_move(self, step: Step, activity_fn, activity_options: dict) -> ActivityResult:
         """Run a MOVE, letting a pause interrupt it and a resume re-send it.
 
-        Awaiting the handle is exactly what ``execute_activity`` does, so a
-        task cancel behaves as it always has: the activity is cancelled, the
-        nav goal with it, and the attempt surfaces as
-        ActivityError(cause=CancelledError) -> FAILED / "Cancelled". The pause
-        signal cancels the same handle, so its interruption arrives in the
-        same shape; ``_move_interrupted`` is what tells the two apart (with
-        ``_cancel_requested`` as the tie-breaker for the pause-then-cancel
-        race). On resume the step is dispatched again from scratch -- same
-        target, fresh attempts, from wherever the robot is now.
+        Never ``await handle`` directly here. Awaiting the activity task is what
+        lets a cancel of the whole run be swallowed by the activity's own
+        resolution: asyncio cancels the awaited task, the activity answers with
+        ActivityError(cause=CancelledError), and the run's CancelledError is
+        spent -- indistinguishable, from inside this method, from the
+        cancellation a pause asked for. Waiting on a condition instead keeps
+        the run's cancel addressed to the run: it always arrives as
+        asyncio.CancelledError out of ``wait_condition``, so an
+        ActivityError(cause=CancelledError) seen below can only be the
+        pause's own, and no SDK help (``workflow.cancellation_reason``) is
+        needed to tell the two apart. start_activity + wait_condition issues
+        exactly the command execute_activity did, so histories recorded before
+        the hold existed replay unchanged.
+
+        On resume the step is dispatched again from scratch -- same target,
+        fresh attempts, from wherever the robot is now.
         """
         while True:
-            self._move_handle = workflow.start_activity(activity_fn, **activity_options)
+            handle = workflow.start_activity(activity_fn, **activity_options)
+            interrupted = False
             try:
-                return await self._move_handle
-            except ActivityError as err:
-                paused = (
-                    self._move_interrupted
-                    and isinstance(err.cause, CancelledError)
-                    and not _cancel_requested()
+                await workflow.wait_condition(
+                    lambda: handle.done() or self._pause_requested
                 )
-                if not paused:
-                    raise
-            finally:
-                self._move_handle = None
-                self._move_interrupted = False
+                if not handle.done():
+                    # The pause: cancelling the handle lands in
+                    # execute_move's ``except CancelledError``, which cancels
+                    # the nav2 goal -- the same path a task cancel takes.
+                    # WAIT_CANCELLATION_COMPLETED, so wait for it to finish.
+                    interrupted = True
+                    handle.cancel()
+                    await workflow.wait_condition(handle.done)
+            except asyncio.CancelledError:
+                # The whole run is being cancelled with a MOVE in flight. The
+                # activity has to be cancelled too and allowed to finish its
+                # cleanup (the robot stops) before the run closes, which is
+                # what execute_activity guaranteed. The run's cancel has been
+                # consumed by this except, so this await sees only the
+                # activity's outcome; the caller marks the step CANCELED.
+                handle.cancel()
+                try:
+                    await handle
+                except ActivityError:
+                    pass
+                raise
 
-            # A resume that beat the cancellation's completion makes this a
-            # no-op and the goal is simply re-sent.
+            try:
+                return handle.result()
+            except ActivityError as err:
+                # A real failure that raced the pause, or any failure with no
+                # pause at all, is the step's to report.
+                if not (interrupted and isinstance(err.cause, CancelledError)):
+                    raise
+            # Either it ran to the end in the gap between the pause and the
+            # cancel landing (returned above: the result stands and the hold
+            # happens before the next step), or it was interrupted and holds
+            # here. A resume that beat the cancellation's completion makes this
+            # a no-op and the goal is simply re-sent.
             await self._hold(step)
 
     async def _run_wait(self, step: Step, params: WaitParams) -> None:
