@@ -27,15 +27,15 @@ What is pinned:
 * The retry policy is 3 attempts of the *same* step, not a re-run of the
   workflow. Time skipping is what makes the two 5 s backoffs free.
 * ``handle.cancel()`` closes the run as canceled, and only the in-flight
-  step is touched — but that step ends FAILED / "Cancelled", *not* the
-  CANCELED / "Task canceled" the workflow's ``except asyncio.CancelledError``
-  branch would write. See the cancellation test for why that branch is
-  bypassed; this suite pins what actually happens, deliberately. The one
-  path on which that branch *is* reached is a cancel during a hold.
+  step is touched: it ends CANCELED / "Task canceled" whatever it was doing —
+  mid-MOVE, mid-posture (where the cancel arrives wrapped in an
+  ActivityError), held, or waiting — so the console never reads a cancel as
+  a failure.
 * The hold (``pause`` / ``resume`` signals): a MOVE is interrupted at once
   and re-sent as a fresh activity on resume; any other step finishes and the
   run holds before the next one; the held step reads PAUSED while it waits;
-  a pause with nothing left to hold lets the run complete.
+  a pause with nothing left to hold lets the run complete; a pause and a
+  cancel landing together end the run canceled rather than held.
 * WAIT is a workflow timer, not an activity: a pause freezes it and the
   resume starts a second timer for only the remainder (read off the run's
   history), and a cancel during it is CANCELED / "Task canceled".
@@ -400,7 +400,7 @@ def test_a_retryable_failure_gets_three_attempts_of_the_same_step():
     assert steps[0].status is StepStatus.FAILED
 
 
-def test_cancellation_ends_the_run_canceled_and_fails_the_in_flight_step():
+def test_cancellation_mid_move_ends_the_run_and_the_step_canceled():
     async def scenario():
         started, release = asyncio.Event(), asyncio.Event()
         calls: list = []
@@ -421,25 +421,42 @@ def test_cancellation_ends_the_run_canceled_and_fails_the_in_flight_step():
     # The run itself closes as canceled: WorkflowFailureError with a bare
     # CancelledError cause is the canceled-workflow shape, not the failed one.
     assert isinstance(err.cause, CancelledError)
-    # The in-flight step, however, ends FAILED / "Cancelled" — NOT the
-    # CANCELED / "Task canceled" that the workflow's
-    # ``except asyncio.CancelledError`` branch would write. Under SDK 1.31
-    # with WAIT_CANCELLATION_COMPLETED, the cancelled activity surfaces from
-    # ``workflow.execute_activity`` as ActivityError(cause=CancelledError),
-    # so the ``except ActivityError`` branch runs first and the
-    # asyncio.CancelledError branch is unreachable on this path. Pinned
-    # as-observed rather than "fixed" in the test: if the workflow is ever
-    # amended to catch the ActivityError-wrapped cancel (so the console can
-    # tell "canceled" from "failed"), this is the assertion that should
-    # break. (The branch is reachable on one other path — a cancel while the
-    # run is *held* — pinned in test_cancel_while_held below; the hold did
-    # not change this one.)
-    assert steps[0].status is StepStatus.FAILED
-    assert steps[0].error_msg == "Cancelled"
+    # So does the in-flight step. _run_move waits on a condition rather than
+    # awaiting the activity, so the run's cancel arrives as
+    # asyncio.CancelledError (not swallowed into the activity's
+    # ActivityError) and the step reads CANCELED / "Task canceled" — not the
+    # FAILED / "Cancelled" it read before the hold, which the console could
+    # not tell apart from a real failure.
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[0].error_msg == "Task canceled"
     # The step that never started stays PENDING and its activity never ran —
     # "interrupted here" and "never got there" must stay distinguishable.
     assert steps[1].status is StepStatus.PENDING
     assert calls == []
+
+
+def test_cancellation_mid_posture_ends_the_step_canceled_too():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        # release is never set: the STANDUP parks until the cancel arrives.
+        task = _task("task-canceled-stand", StepType.STANDUP)
+
+        async with _worker([_gated_stand(started, release)]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+            return exc_info.value, await handle.query(RobotWorkflow.get_step_states)
+
+    err, steps = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    # execute_activity hands the run's cancel back as the activity's
+    # ActivityError(cause=CancelledError); the workflow folds that shape to
+    # the same CANCELED a MOVE ends in, rather than FAILED.
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[0].error_msg == "Task canceled"
 
 
 # --- The hold -----------------------------------------------------------------
@@ -610,11 +627,9 @@ def test_cancel_while_held_ends_the_run_canceled_and_the_held_step_canceled():
     err, steps, calls = asyncio.run(scenario())
 
     assert isinstance(err.cause, CancelledError)
-    # This is the one path on which the workflow's ``except
-    # asyncio.CancelledError`` branch runs: nothing was in flight to wrap the
-    # cancel in an ActivityError, so the held step is CANCELED / "Task
-    # canceled" — distinguishable from the FAILED / "Cancelled" of a cancel
-    # that lands mid-MOVE (pinned above).
+    # Nothing was in flight, so the cancel lands in the hold's
+    # wait_condition and the held step is CANCELED / "Task canceled" — the
+    # same as a cancel that lands mid-MOVE (pinned above).
     assert steps[0].status is StepStatus.CANCELED
     assert steps[0].error_msg == "Task canceled"
     assert steps[1].status is StepStatus.PENDING
@@ -640,6 +655,38 @@ def test_a_pause_with_nothing_left_to_hold_lets_the_run_complete():
     steps = asyncio.run(scenario())
 
     assert [step.status for step in steps] == [StepStatus.COMPLETED]
+
+
+def test_a_pause_and_a_cancel_together_end_the_run_canceled_not_held():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        calls: list = []
+        activities = [_recording_move(started, release, dispatches, cancels)]
+        activities += _instant_activities(calls)[1:]
+        task = _task("task-pause-and-cancel", StepType.MOVE, StepType.STANDUP)
+
+        async with _worker(activities) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            # Back to back, so both are very likely delivered in one
+            # workflow task: the pause's interruption and the run's cancel
+            # race for the same in-flight MOVE.
+            await handle.signal(RobotWorkflow.pause)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=10)
+            return exc_info.value, await handle.query(RobotWorkflow.get_step_states), calls
+
+    err, steps, calls = asyncio.run(scenario())
+
+    # The run closed — it did not park PAUSED waiting for a resume that the
+    # operator, having cancelled, will never send.
+    assert isinstance(err.cause, CancelledError)
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[1].status is StepStatus.PENDING
+    assert calls == []
 
 
 # --- WAIT ---------------------------------------------------------------------
@@ -725,8 +772,8 @@ def test_cancel_during_a_wait_ends_the_run_canceled_and_the_step_canceled():
     err, steps, calls = asyncio.run(scenario())
 
     assert isinstance(err.cause, CancelledError)
-    # No activity to wrap the cancel in an ActivityError, so this is the
-    # honest CANCELED / "Task canceled" — unlike a cancel mid-MOVE.
+    # A timer, not an activity: the cancel lands in its wait_condition and
+    # the step is CANCELED / "Task canceled", like every other cancel.
     assert steps[0].status is StepStatus.CANCELED
     assert steps[0].error_msg == "Task canceled"
     assert steps[1].status is StepStatus.PENDING

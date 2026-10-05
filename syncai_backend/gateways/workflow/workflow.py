@@ -62,6 +62,8 @@ from syncai_backend.gateways.workflow.config import (
     ACTIVE_TASK_CACHE_TTL_S,
     ACTIVE_TASK_LIST_LIMIT,
     ACTIVE_TASK_RPC_TIMEOUT_S,
+    PAUSE_SIGNAL,
+    RESUME_SIGNAL,
     TASK_HISTORY_RPC_TIMEOUT_S,
     TASK_STATS_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
@@ -1139,11 +1141,11 @@ class WorkflowGateway:
 
     async def pause_task(self, task_id: str):
         """Ask the running workflow to hold (POST /api/v1/tasks/{id}/pause)."""
-        await self._signal_running_task(task_id, "pause", "Pause workflow failed")
+        await self._signal_running_task(task_id, PAUSE_SIGNAL, "Pause workflow failed")
 
     async def resume_task(self, task_id: str):
         """Release a held workflow (POST /api/v1/tasks/{id}/resume)."""
-        await self._signal_running_task(task_id, "resume", "Resume workflow failed")
+        await self._signal_running_task(task_id, RESUME_SIGNAL, "Resume workflow failed")
 
     async def _signal_running_task(self, task_id: str, signal: str, failure_message: str):
         """Deliver ``signal`` to ``task_id`` if it is this robot's and still open.

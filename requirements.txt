@@ -7,7 +7,12 @@ structlog  # logger.py / all modules log through structlog
 python-dotenv  # main.py `import dotenv` (.env loading in dev)
 uvicorn[standard]
 pydantic>=2.11  # validate_by_name / validate_by_alias need 2.11+
-temporalio
+# temporalio: floored rather than left open. RobotWorkflow's pause / cancel
+# handling (temporal/workflows.py) leans on the SDK's cancellation semantics --
+# how a workflow cancel reaches a wait_condition and an in-flight activity --
+# and test_workflows.py pins them on 1.34; an image that resolved an older SDK
+# would run the hold on behaviour nobody tested.
+temporalio>=1.33
 sqlalchemy>=2.0  # ORM (declarative models) + engine for robot_db
 sqlalchemy-utils  # create_database / database_exists in database/postgres.py
 psycopg2-binary  # PostgreSQL driver used by SQLAlchemy engine
