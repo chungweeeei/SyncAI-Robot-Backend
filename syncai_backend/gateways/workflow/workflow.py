@@ -44,6 +44,7 @@ from syncai_backend.gateways.workflow.schema import (
     ScheduleTrigger,
     ScheduleView,
     Step,
+    StepStatus,
     TaskHistoryEntry,
     TaskHistoryStats,
     TaskKind,
@@ -67,6 +68,11 @@ from syncai_backend.gateways.workflow.config import (
 )
 
 
+# Temporal's execution statuses, folded to the task statuses the REST layer
+# answers. One task status has no Temporal counterpart: PAUSED. A held run is
+# still RUNNING to the server, so get_task_state derives PAUSED from the step
+# list the workflow query returns (the held step carries StepStatus.PAUSED) --
+# which also keeps the console's poll at one query per read.
 _WORKFLOW_STATUS_MAP = {
     WorkflowExecutionStatus.RUNNING: "IN_PROGRESS",
     WorkflowExecutionStatus.CONTINUED_AS_NEW: "IN_PROGRESS",
@@ -693,8 +699,23 @@ class WorkflowGateway:
 
         self._last_started_task_id = request.id
 
-    async def get_task_state(self, task_id: str) -> TaskState:
+    async def _describe_owned_task(self, task_id: str, failure_message: str):
+        """Connect, describe ``task_id`` and refuse it unless it is this robot's.
 
+        Every single-task verb (read, cancel, pause, resume) starts here.
+        Workflow ids are namespace-global; the task queue is what scopes an
+        execution to this robot (the predicate _active_query already uses).
+        Without this check a console pointed at robot01 could read — and
+        cancel — robot02's runs through nothing more than an id. 404 rather
+        than 403, the same reasoning as the map router's _require_vertex: from
+        this robot's URL space the task genuinely is not there, and "belongs to
+        another robot" would confirm the id exists to a caller who addressed
+        the wrong robot.
+
+        ``failure_message`` names the verb in the UpstreamError a failed
+        describe raises, so the operator reads "Cancel workflow failed" rather
+        than a describe they never asked for.
+        """
         try:
             client = await self._get_client()
         except Exception as err:
@@ -713,18 +734,17 @@ class WorkflowGateway:
             self._logger.error(
                 "[WorkflowGateway] Failed to describe workflow", error=str(err)
             )
-            raise UpstreamError("Describe workflow failed")
+            raise UpstreamError(failure_message)
 
-        # Workflow ids are namespace-global; the task queue is what scopes an
-        # execution to this robot (the predicate _active_query already uses).
-        # Without this check a console pointed at robot01 could read — and,
-        # below in cancel_task, cancel — robot02's runs through nothing more
-        # than an id. 404 rather than 403, the same reasoning as the map
-        # router's _require_vertex: from this robot's URL space the task
-        # genuinely is not there, and "belongs to another robot" would confirm
-        # the id exists to a caller who addressed the wrong robot.
         if description.task_queue != self._task_queue:
             raise NotFoundError(f"Task {task_id} not found")
+
+        return handle, description
+
+    async def get_task_state(self, task_id: str) -> TaskState:
+        handle, description = await self._describe_owned_task(
+            task_id, "Describe workflow failed"
+        )
 
         status = _WORKFLOW_STATUS_MAP.get(description.status)
         if status is None:
@@ -748,6 +768,15 @@ class WorkflowGateway:
                 error=str(err),
             )
             steps = []
+
+        # A held run is still RUNNING to Temporal; the workflow marks the step
+        # it is holding at PAUSED (see RobotWorkflow._hold), and that is the
+        # whole of what "the task is paused" means. When the query failed
+        # above the hold cannot be seen, and IN_PROGRESS is the honest answer.
+        if status == "IN_PROGRESS" and any(
+            step.status is StepStatus.PAUSED for step in steps
+        ):
+            status = "PAUSED"
 
         return TaskState(id=task_id, status=status, steps=steps)
 
@@ -1089,17 +1118,6 @@ class WorkflowGateway:
         )
 
     async def cancel_task(self, task_id: str):
-
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
-
-        handle = client.get_workflow_handle(task_id)
-
         # Describe before cancelling, purely for the ownership check: cancel is
         # the request that made the missing scope dangerous (an id is all it
         # took to stop another robot mid-run), so it must not act until the
@@ -1107,19 +1125,7 @@ class WorkflowGateway:
         # on a rare, operator-initiated call. The describe→cancel race is
         # benign — a workflow that closes in between makes cancel a no-op, and
         # one that is deleted answers NOT_FOUND, handled below either way.
-        try:
-            description = await handle.describe()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Task {task_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to describe workflow", error=str(err)
-            )
-            raise UpstreamError("Cancel workflow failed")
-
-        # 404, not 403 — see get_task_state.
-        if description.task_queue != self._task_queue:
-            raise NotFoundError(f"Task {task_id} not found")
+        handle, _ = await self._describe_owned_task(task_id, "Cancel workflow failed")
 
         try:
             await handle.cancel()
@@ -1130,6 +1136,48 @@ class WorkflowGateway:
                 "[WorkflowGateway] Failed to cancel workflow", error=str(err)
             )
             raise UpstreamError("Cancel workflow failed")
+
+    async def pause_task(self, task_id: str):
+        """Ask the running workflow to hold (POST /api/v1/tasks/{id}/pause)."""
+        await self._signal_running_task(task_id, "pause", "Pause workflow failed")
+
+    async def resume_task(self, task_id: str):
+        """Release a held workflow (POST /api/v1/tasks/{id}/resume)."""
+        await self._signal_running_task(task_id, "resume", "Resume workflow failed")
+
+    async def _signal_running_task(self, task_id: str, signal: str, failure_message: str):
+        """Deliver ``signal`` to ``task_id`` if it is this robot's and still open.
+
+        The signal is addressed by *name*, as the step-state query is, so this
+        module does not import the workflow class. Both signals are fire-and-
+        forget on the Temporal side and idempotent in the workflow, which is
+        why the REST ack is only a claim about the request — the hold itself is
+        read back from GET /api/v1/tasks/{id}.
+
+        A closed run answers 409 ``task_not_running`` rather than letting the
+        server's own "already completed" error surface as a 502: a console
+        whose last poll still showed the run open will send a pause a moment
+        after it finished, and that is a conflict with the state, not a
+        failure of the orchestrator. The describe→signal race is the same
+        benign one cancel_task has.
+        """
+        handle, description = await self._describe_owned_task(task_id, failure_message)
+
+        if description.status is not WorkflowExecutionStatus.RUNNING:
+            raise ConflictError(f"Task {task_id} is not running", code="task_not_running")
+
+        try:
+            await handle.signal(signal)
+        except RPCError as err:
+            if err.status == RPCStatusCode.NOT_FOUND:
+                raise NotFoundError(f"Task {task_id} not found")
+            self._logger.error(
+                "[WorkflowGateway] Failed to signal workflow",
+                task_id=task_id,
+                signal=signal,
+                error=str(err),
+            )
+            raise UpstreamError(failure_message)
 
     async def create_schedule(self, schedule: ScheduleTask):
 

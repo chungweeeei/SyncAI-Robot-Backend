@@ -16,6 +16,12 @@ class BaseSchema(BaseModel):
 class StepStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    # The run is holding at this step (POST /api/v1/tasks/{id}/pause): either
+    # the step was interrupted (a MOVE, whose goal is cancelled and re-sent on
+    # resume) or it has not started yet because the hold landed before it. At
+    # most one step carries it at a time, and the gateway reads the task-level
+    # PAUSED off it, so the console's poll stays one query.
+    PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
@@ -32,6 +38,7 @@ class StepType(str, Enum):
     STANDUP = "STANDUP"
     LIEDOWN = "LIEDOWN"
     SPEAK = "SPEAK"
+    WAIT = "WAIT"
 
 
 class MoveParams(BaseSchema):
@@ -73,11 +80,26 @@ class SpeakParams(BaseSchema):
     )
 
 
+# A WAIT step is a durable Temporal timer in the workflow, not an activity
+# (see RobotWorkflow._run_wait), so the bound is not an activity timeout: it is
+# there so a typo in the console (3600 typed as minutes) cannot park the robot
+# for days while /tasks answers 409 task_running to everything else.
+class WaitParams(BaseSchema):
+    seconds: float = Field(
+        ...,
+        gt=0,
+        le=3600,
+        description="How long to wait before the next step, in seconds (max 1 hour).",
+        examples=[10.0],
+    )
+
+
 # Re-widened when SPEAK arrived (it was a single-member alias after the
-# ARTIFACT removal). Pydantic's smart union tells the members apart by their
-# required fields — MoveParams needs x/y/theta, SpeakParams needs text, with
-# no overlap — so no discriminator field is necessary.
-StepParams = MoveParams | SpeakParams
+# ARTIFACT removal), and again for WAIT. Pydantic's smart union tells the
+# members apart by their required fields — MoveParams needs x/y/theta,
+# SpeakParams needs text, WaitParams needs seconds, with no overlap — so no
+# discriminator field is necessary.
+StepParams = MoveParams | SpeakParams | WaitParams
 
 
 # Which params model each step type expects; None means the step takes no
@@ -91,6 +113,7 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.STANDUP: None,
     StepType.LIEDOWN: None,
     StepType.SPEAK: SpeakParams,
+    StepType.WAIT: WaitParams,
 }
 
 
@@ -119,7 +142,7 @@ class Step(BaseSchema):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE and SPEAK"
+            "Omitted for STANDUP/LIEDOWN, required for MOVE, SPEAK and WAIT"
         ),
     )
     status: StepStatus = Field(

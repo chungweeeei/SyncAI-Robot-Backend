@@ -35,6 +35,16 @@ from syncai_backend.services.gridmap_conversion import GridmapConversionService
 class TaskStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    # The run is holding (POST /tasks/{id}/pause took effect). Not terminal:
+    # to the orchestrator a held run is still running, which is also why
+    # /active_tasks keeps listing it as IN_PROGRESS — the list cannot see
+    # inside the run, GET /tasks/{id} can.
+    PAUSED = "PAUSED"
+    # Only ever answered by POST /tasks/{id}/pause, never by the status
+    # mapping — the same reasoning as CANCELING below: a pause is a *request*,
+    # and a step that cannot be interrupted (SPEAK, a posture) finishes before
+    # the run holds. PAUSED is what GET says once it has.
+    PAUSING = "PAUSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
@@ -55,7 +65,7 @@ class StepRequest(BaseModel):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE and SPEAK"
+            "Omitted for STANDUP/LIEDOWN, required for MOVE, SPEAK and WAIT"
         ),
     )
 
@@ -557,6 +567,39 @@ def init_task_router(
             message=(
                 f"Cancellation of task {id} requested; poll "
                 f"GET /api/v1/tasks/{id} for the final state."
+            ),
+        )
+
+    # The hold. Both verbs are requests delivered as workflow signals, so like
+    # DELETE they answer with what was asked, not with what the robot is doing:
+    # PAUSING here, and PAUSED only from GET once the workflow has actually
+    # stopped. A MOVE is interrupted at once (its nav goal is cancelled and
+    # re-sent on resume), a WAIT's countdown freezes (and resumes with what was
+    # left); a SPEAK or posture step finishes first and the run holds before
+    # the next one. 409 `task_not_running` once the run is closed.
+    @task_router.post("/api/v1/tasks/{id}/pause", response_model=TaskResponse)
+    async def pause_task(id: str):
+        await workflow_gw.pause_task(task_id=id)
+
+        return TaskResponse(
+            id=id,
+            status=TaskStatus.PAUSING,
+            message=(
+                f"Pause of task {id} requested; a MOVE or WAIT stops now, any "
+                f"other step finishes first. Poll GET /api/v1/tasks/{id} for PAUSED."
+            ),
+        )
+
+    @task_router.post("/api/v1/tasks/{id}/resume", response_model=TaskResponse)
+    async def resume_task(id: str):
+        await workflow_gw.resume_task(task_id=id)
+
+        return TaskResponse(
+            id=id,
+            status=TaskStatus.IN_PROGRESS,
+            message=(
+                f"Resume of task {id} requested; poll GET /api/v1/tasks/{id} "
+                f"for the step picking back up."
             ),
         )
 
