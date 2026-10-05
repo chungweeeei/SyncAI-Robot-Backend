@@ -136,7 +136,8 @@ subscribers/               ROS topics → repositories (ingest side; the map clo
                            names the PCD, which the subscriber reads from the shared /dev/shm)
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), keepout
-                           (forbidden-zone mask rasteriser), traversable, system_config
+                           (forbidden-zone mask rasteriser), traversable, system_config,
+                           map_archive (checksummed zip / tar.gz of a map dir)
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/
@@ -203,6 +204,16 @@ the only caller that passes anything else.
 - Map directory name is a foreign key by convention in `map_vertices.map` and
   `task_templates.map_name` (no constraint). Rename: filesystem first, DB second, rollback
   by renaming back. Delete: DB rows first, `rmtree` last (irreversible step goes last).
+- **Map import** (`POST /api/v1/maps/import`) unpacks and md5-verifies into
+  `map/.import-<token>/`, parks a same-named map as `map/.import-old-<token>/`, publishes
+  with one `os.rename`, then deletes + inserts the vertex rows in **one** transaction
+  (`create_vertices` / `delete_vertices` take `session=`); DB failure swaps the directories
+  back, DB success is what finally `rmtree`s the parked one. Staging stays *inside* `map/`
+  because it is a bind mount (a sibling path is another filesystem). `.import-*` is refused
+  by `resolve_dir` and skipped by `list_maps`; the manifest `syncai_map.json` is archive
+  metadata and never lands in the map directory. Replacing is refused for the same reasons
+  delete is (`map_active` / `conversion_running` / `template_bound`, shared in
+  `_refuse_if_in_use`).
 - **Forbidden zones:** `map/<name>/keepout.json` (polygons in metres) is the source of
   truth; `keepout.pgm` + `keepout.yaml` are derived from it by `write_keepout`, in the
   gridmap's geometry, background **205 (unknown), never 254** — a free mask cell frees
@@ -232,10 +243,14 @@ at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, a
 keeps on describe, list and update. `_build_schedule_spec` is the one gate every
 registration goes through, so the crons that would break that echo (`#`, a
 `CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
-Runs carry two custom search attributes, `TaskKind` / `TaskName` (`gateways/workflow/
+Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`gateways/workflow/
 search_attributes.py`), registered idempotently by the worker at connect; the history
-list and `/stats` filter and count on them, and `kind=schedule` is answered from
-`TemporalScheduledById` so schedules that predate the attributes still count.
+list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
+`TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`
+is the map a run's MOVE positions are in: stamped by the backend (the loaded map at
+dispatch, a schedule's `map_name`), never taken from the caller, and an attribute rather
+than memo because a scheduled run inherits only its action's attributes. Dispatch and
+`execute_move` both check it against the loaded map through `helpers/move_guard.py`.
 `ARTIFACT` steps were removed 2026-08 — stored
 templates carrying one fail validation.
 

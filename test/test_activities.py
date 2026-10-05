@@ -43,8 +43,30 @@ def tts_gw():
 
 
 @pytest.fixture
-def activities(logger, robot_gw, tts_gw) -> RobotActivities:
-    return RobotActivities(logger=logger, robot_gw=robot_gw, tts_gw=tts_gw)
+def map_catalog_repo():
+    repo = MagicMock()
+    repo.active_name.return_value = "lab"
+    return repo
+
+
+@pytest.fixture
+def conversion_svc():
+    svc = MagicMock()
+    svc.is_converting.return_value = False
+    return svc
+
+
+@pytest.fixture
+def activities(
+    logger, robot_gw, tts_gw, map_catalog_repo, conversion_svc
+) -> RobotActivities:
+    return RobotActivities(
+        logger=logger,
+        robot_gw=robot_gw,
+        tts_gw=tts_gw,
+        map_catalog_repo=map_catalog_repo,
+        conversion_svc=conversion_svc,
+    )
 
 
 @pytest.fixture
@@ -149,6 +171,60 @@ class TestExecuteMove:
             env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
 
         robot_gw.cancel_active_moves.assert_called_once()
+
+
+class TestMoveMapCheck:
+    """The same rule POST /api/v1/tasks applies, asked again before driving --
+    the only check a scheduled run ever meets."""
+
+    def test_a_run_on_the_loaded_map_drives(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(
+            activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab"
+        )
+
+        assert result.success is True
+
+    def test_a_run_from_another_map_never_sends_a_goal(
+        self, env, activities, robot_gw
+    ):
+        with pytest.raises(ApplicationError, match="'warehouse'") as exc_info:
+            env.run(
+                activities.execute_move,
+                MoveParams(x=0.0, y=0.0, theta=0.0),
+                "warehouse",
+            )
+
+        # Retrying cannot switch the map back; the run fails with the reason.
+        assert exc_info.value.non_retryable is True
+        assert exc_info.value.type == "map_mismatch"
+        robot_gw.move.assert_not_called()
+
+    def test_a_run_with_no_map_is_not_refused(self, env, activities, robot_gw):
+        # A schedule older than TaskMap: it drives as it always did.
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert result.success is True
+
+    def test_a_rebuilding_floor_plan_stops_the_move(
+        self, env, activities, robot_gw, conversion_svc
+    ):
+        conversion_svc.is_converting.return_value = True
+
+        with pytest.raises(ApplicationError, match="being rebuilt") as exc_info:
+            env.run(
+                activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab"
+            )
+
+        assert exc_info.value.non_retryable is True
+        assert exc_info.value.type == "conversion_running"
+        conversion_svc.is_converting.assert_called_with("lab")
+        robot_gw.move.assert_not_called()
 
 
 class TestPostureActivities:

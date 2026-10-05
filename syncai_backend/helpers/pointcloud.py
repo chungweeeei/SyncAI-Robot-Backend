@@ -73,7 +73,11 @@ def read_pcd_xyz(path: str) -> np.ndarray:
             buf = fh.read(dtype.itemsize * points_count)
             arr = np.frombuffer(buf, dtype=dtype, count=points_count)
         else:
-            arr = np.loadtxt(fh, dtype=dtype, max_rows=points_count)
+            # loadtxt collapses a single row of a structured dtype to a 0-d
+            # array, which would make the stack below a (3,) vector and the
+            # finite-row mask fail on axis 1. A one-point cloud is a legitimate
+            # file (a mapping run saved the instant it started), not an error.
+            arr = np.atleast_1d(np.loadtxt(fh, dtype=dtype, max_rows=points_count))
 
     xyz = np.stack([arr["x"], arr["y"], arr["z"]], axis=-1).astype(np.float64)
     # Drop NaN/inf rows LIO occasionally leaves in the saved map.

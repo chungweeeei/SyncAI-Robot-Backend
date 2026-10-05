@@ -60,7 +60,15 @@ import pytest
 pytest.importorskip("temporalio")
 
 from temporalio import activity  # noqa: E402
+from temporalio.api.enums.v1 import IndexedValueType  # noqa: E402
+from temporalio.api.operatorservice.v1 import (  # noqa: E402
+    AddSearchAttributesRequest,
+)
 from temporalio.client import WorkflowFailureError  # noqa: E402
+from temporalio.common import (  # noqa: E402
+    SearchAttributePair,
+    TypedSearchAttributes,
+)
 from temporalio.contrib.pydantic import pydantic_data_converter  # noqa: E402
 from temporalio.exceptions import (  # noqa: E402
     ActivityError,
@@ -78,6 +86,9 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     WaitParams,
     WorkflowTask,
     WorkflowTaskDefinition,
+)
+from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
+    TASK_MAP_KEY,
 )
 from syncai_backend.temporal.activities import ActivityResult  # noqa: E402
 from syncai_backend.temporal.workflows import RobotWorkflow  # noqa: E402
@@ -210,6 +221,64 @@ def test_steps_run_in_order_and_all_complete():
     move_params = calls[0][1]
     assert (move_params.x, move_params.y, move_params.theta) == (1.5, -2.5, 90.0)
     assert [step.status for step in steps] == [StepStatus.COMPLETED] * 3
+
+
+def test_a_runs_map_is_handed_to_every_move():
+    """The run's TaskMap is the second MOVE argument, and only MOVE's: the
+    posture activities take no argument, and execute_move checks the map
+    against the loaded one before driving (pinned in test_activities.py)."""
+
+    async def scenario():
+        calls: list = []
+
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams, expected_map=None) -> ActivityResult:
+            calls.append(("execute_move", expected_map))
+            return ActivityResult(success=True, state="succeeded")
+
+        activities = [execute_move] + _instant_activities(calls)[1:]
+        task = _task("task-map", StepType.MOVE, StepType.STANDUP, StepType.MOVE)
+
+        async with _worker(activities) as client:
+            await client.operator_service.add_search_attributes(
+                AddSearchAttributesRequest(
+                    namespace=client.namespace,
+                    search_attributes={
+                        TASK_MAP_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD
+                    },
+                )
+            )
+            handle = await client.start_workflow(
+                RobotWorkflow.run,
+                task,
+                id=task.id,
+                task_queue=TASK_QUEUE,
+                search_attributes=TypedSearchAttributes(
+                    [SearchAttributePair(TASK_MAP_KEY, "lab")]
+                ),
+            )
+            await handle.result()
+        return calls
+
+    assert asyncio.run(scenario()) == [
+        ("execute_move", "lab"),
+        ("execute_stand", None),
+        ("execute_move", "lab"),
+    ]
+
+
+def test_a_run_without_a_map_hands_move_one_argument():
+    # A schedule older than TaskMap: the one-argument call an older worker
+    # made, which _instant_activities' one-parameter stand-in would reject
+    # if a None were appended.
+    async def scenario():
+        calls: list = []
+        async with _worker(_instant_activities(calls)) as client:
+            handle = await _start(client, _task("task-nomap", StepType.MOVE))
+            await handle.result()
+        return calls
+
+    assert [name for name, _ in asyncio.run(scenario())] == ["execute_move"]
 
 
 def test_query_reports_per_step_state_mid_run():

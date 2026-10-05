@@ -13,6 +13,7 @@ with workflow.unsafe.imports_passed_through():
         WaitParams,
         WorkflowTask,
     )
+    from syncai_backend.gateways.workflow.search_attributes import TASK_MAP_KEY
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
 
 
@@ -22,6 +23,21 @@ with workflow.unsafe.imports_passed_through():
 # NAV_GOAL_SEND_BUDGET_S, and test_activities.py checks that this stays above
 # it. Tighten either side and the other has to follow.
 MOVE_HEARTBEAT_TIMEOUT = timedelta(seconds=3)
+
+
+def _own_map() -> str | None:
+    """The map this run's coordinates are in, off its own ``TaskMap``.
+
+    Read from the run's attributes rather than its argument because a
+    scheduled run's argument was frozen when the schedule was registered and
+    carries no map, while the schedule action's attributes reach every run.
+    Never fatal: a run without the attribute (a schedule older than it) skips
+    the map check and drives as it always did.
+    """
+    try:
+        return workflow.info().typed_search_attributes.get(TASK_MAP_KEY) or None
+    except Exception:
+        return None
 
 
 def _cancel_requested() -> bool:
@@ -92,6 +108,7 @@ class RobotWorkflow:
     @workflow.run
     async def run(self, task: WorkflowTask):
         self._steps = task.definition.steps
+        own_map = _own_map()
 
         activity_map = {
             StepType.MOVE: RobotActivities.execute_move,
@@ -116,6 +133,12 @@ class RobotWorkflow:
             # None would fail the worker's argument-count check. The schema
             # guarantees params is None for exactly those step types.
             args = [] if step.params is None else [step.params]
+            # The map rides as a second argument to MOVE only, and only when
+            # there is one: execute_move defaults it to None, so a run that
+            # started under an older worker (one argument in its history) and
+            # a run without the attribute look the same to it.
+            if step.type is StepType.MOVE and own_map is not None:
+                args.append(own_map)
 
             # SPEAK cannot heartbeat: execute_speak sits in a single blocking
             # gateway call -- one HTTP request to the speech service, held open

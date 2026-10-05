@@ -10,6 +10,7 @@ needed.
 """
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -22,6 +23,12 @@ pytest.importorskip("yaml")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+    ActiveTask,
+    TaskKind,
+    TaskSource,
+)
+from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
@@ -65,14 +72,31 @@ class _StubMapGateway:
 
 
 class _StubWorkflowGateway:
-    """Only the map switch asks this anything, and that route is not tested here."""
+    """What is running, for the guard that keeps a job's map unedited.
+
+    ``error`` stands for an outage: list_active_tasks raises for real then,
+    and the guard must not read that as "nothing is running".
+    """
+
+    def __init__(self):
+        self.tasks = []
+        self.error = None
+        self.asked = 0
 
     async def list_active_tasks(self):
-        raise AssertionError("the vertex routes must not query Temporal")
+        self.asked += 1
+        if self.error is not None:
+            raise self.error
+        return self.tasks, None
 
 
 @pytest.fixture
-def client(logger, map_repo, catalog_repo, task_template_repo):
+def workflow_gw():
+    return _StubWorkflowGateway()
+
+
+@pytest.fixture
+def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -82,7 +106,7 @@ def client(logger, map_repo, catalog_repo, task_template_repo):
             map_catalog_repo=catalog_repo,
             map_gw=_StubMapGateway(),
             task_template_repo=task_template_repo,
-            workflow_gw=_StubWorkflowGateway(),
+            workflow_gw=workflow_gw,
             # A real one: the vertex routes never start a conversion, but the
             # catalogue projection asks it whether one is running.
             conversion_svc=GridmapConversionService(logger=logger),
@@ -282,3 +306,80 @@ def test_vertex_is_not_reachable_through_another_map(client):
 
 def test_vertex_under_an_unknown_map_returns_404(client):
     assert client.get(f"/api/v1/maps/nope/vertices/{_MISSING_ID}").status_code == 404
+
+
+# --- The map a running job holds -------------------------------------------
+
+
+@pytest.fixture
+def loaded(tmp_path, monkeypatch):
+    """Make _MAP the loaded map. Without it no map is loaded, so nothing is
+    held and the tests above never ask the task service anything."""
+    ini = tmp_path / "system.ini"
+    ini.write_text(f"[system]\nrobot_id: robot01\n\n[map]\nname: {_MAP}\n")
+    monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+
+
+def _job(map_name):
+    return ActiveTask(
+        id="robot01-goal-1",
+        run_id="run-1",
+        status="IN_PROGRESS",
+        started_at=datetime(2026, 10, 4, tzinfo=timezone.utc),
+        source=TaskSource.DIRECT,
+        kind=TaskKind.GOAL,
+        map_name=map_name,
+    )
+
+
+def test_a_waypoint_cannot_be_added_under_a_running_job(client, loaded, workflow_gw):
+    workflow_gw.tasks = [_job(_MAP)]
+
+    resp = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX])
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "task_running"
+    assert client.get(f"/api/v1/maps/{_MAP}/vertices").json() == []
+
+
+def test_a_waypoint_cannot_be_moved_or_removed_under_a_running_job(
+    client, loaded, workflow_gw
+):
+    created = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX]).json()[0]
+    workflow_gw.tasks = [_job(_MAP)]
+
+    moved = client.put(
+        f"/api/v1/maps/{_MAP}/vertices/{created['id']}", json={"x": 9.0}
+    )
+    removed = client.delete(f"/api/v1/maps/{_MAP}/vertices/{created['id']}")
+
+    assert (moved.status_code, removed.status_code) == (409, 409)
+    still = client.get(f"/api/v1/maps/{_MAP}/vertices/{created['id']}").json()
+    assert still["x"] == 3.0
+
+
+def test_waypoints_are_refused_when_running_jobs_cannot_be_known(
+    client, loaded, workflow_gw
+):
+    workflow_gw.error = RuntimeError("connection refused")
+
+    resp = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX])
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "tasks_unknown"
+
+
+def test_the_waypoints_of_a_map_not_loaded_are_free(client, loaded, workflow_gw):
+    workflow_gw.tasks = [_job(_MAP)]
+
+    resp = client.post(f"/api/v1/maps/{_OTHER_MAP}/vertices", json=[_VERTEX])
+
+    assert resp.status_code == 200
+    # Not even asked: a job can only hold the loaded map.
+    assert workflow_gw.asked == 0
+
+
+def test_reading_waypoints_is_never_refused(client, loaded, workflow_gw):
+    workflow_gw.tasks = [_job(_MAP)]
+
+    assert client.get(f"/api/v1/maps/{_MAP}/vertices").status_code == 200

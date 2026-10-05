@@ -55,6 +55,7 @@ from syncai_backend.gateways.workflow.schema import (
 )
 from syncai_backend.gateways.workflow.search_attributes import (
     TASK_KIND_KEY,
+    TASK_MAP_KEY,
     TASK_NAME_KEY,
 )
 from syncai_backend.gateways.workflow.config import (
@@ -248,6 +249,19 @@ def _provenance_of(
     return kind, (name or None)
 
 
+def _map_of(execution) -> Optional[str]:
+    """The run's ``TaskMap``, or None. Same never-fatal policy as the two above.
+
+    None is ambiguous on purpose -- no MOVE step, or a run older than the
+    attribute -- and ActiveTask.map_in_use is the one place that tells them
+    apart, because only the reader knows which map is loaded now.
+    """
+    try:
+        return execution.typed_search_attributes.get(TASK_MAP_KEY) or None
+    except Exception:
+        return None
+
+
 def _direct_search_attributes(provenance: TaskProvenance) -> TypedSearchAttributes:
     """What a direct dispatch stamps on its run: only the fields it gave."""
     pairs = []
@@ -255,6 +269,8 @@ def _direct_search_attributes(provenance: TaskProvenance) -> TypedSearchAttribut
         pairs.append(SearchAttributePair(TASK_KIND_KEY, provenance.kind.value))
     if provenance.name:
         pairs.append(SearchAttributePair(TASK_NAME_KEY, provenance.name))
+    if provenance.map_name:
+        pairs.append(SearchAttributePair(TASK_MAP_KEY, provenance.map_name))
     return TypedSearchAttributes(pairs)
 
 
@@ -262,13 +278,17 @@ def _schedule_search_attributes(schedule: ScheduleTask) -> TypedSearchAttributes
     """What every run a schedule starts inherits from its action.
 
     Always SCHEDULE -- the one kind a direct dispatch may not claim -- plus the
-    template's name when the schedule was made from one. The same name
-    _schedule_to_memo writes, carried a second time because the memo is the
-    schedule's and only the action's attributes reach the runs.
+    template's name when the schedule was made from one, and the map its
+    frozen coordinates are in. The same name and map _schedule_to_memo writes,
+    carried a second time because the memo is the schedule's and only the
+    action's attributes reach the runs. The map is what lets a run that fires
+    after the robot moved to another map refuse to drive (execute_move).
     """
     pairs = [SearchAttributePair(TASK_KIND_KEY, TaskKind.SCHEDULE.value)]
     if schedule.task_template_name:
         pairs.append(SearchAttributePair(TASK_NAME_KEY, schedule.task_template_name))
+    if schedule.map_name:
+        pairs.append(SearchAttributePair(TASK_MAP_KEY, schedule.map_name))
     return TypedSearchAttributes(pairs)
 
 
@@ -640,8 +660,10 @@ class WorkflowGateway:
         self, request: WorkflowTask, provenance: TaskProvenance = TaskProvenance()
     ):
         """Dispatch a run. `provenance` is stamped on it as search attributes
-        for the history (see _direct_search_attributes); the workflow argument
-        itself does not carry it, because nothing in the workflow reads it."""
+        (see _direct_search_attributes) rather than carried in the workflow
+        argument: the history filters on them, and the one field the workflow
+        does read -- the map -- has to reach scheduled runs too, which only
+        attributes do. The workflow reads it back off its own info."""
         try:
             client = await self._get_client()
         except Exception as err:
@@ -873,6 +895,7 @@ class WorkflowGateway:
                         schedule_id=schedule_id,
                         kind=kind,
                         name=name,
+                        map_name=_map_of(execution),
                     )
                 )
         except RPCError as err:
@@ -1013,6 +1036,7 @@ class WorkflowGateway:
                     schedule_id=schedule_id,
                     kind=run_kind,
                     name=run_name,
+                    map_name=_map_of(execution),
                 )
             )
 

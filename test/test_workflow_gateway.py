@@ -60,6 +60,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
 )
 from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
     TASK_KIND_KEY,
+    TASK_MAP_KEY,
     TASK_NAME_KEY,
 )
 from syncai_backend.gateways.workflow.workflow import (  # noqa: E402
@@ -132,16 +133,18 @@ def _execution(
     close_time=None,
     kind=None,
     name=None,
+    map_name=None,
 ) -> SimpleNamespace:
     """One row of a visibility listing, as the gateway's list paths read it.
 
     The attribute stub answers by key name, the way the typed accessor does:
-    the gateway reads three keys off a row and must not be handed the
+    the gateway reads four keys off a row and must not be handed the
     schedule id for all of them."""
     attributes = {
         "TemporalScheduledById": schedule_id,
         TASK_KIND_KEY.name: kind,
         TASK_NAME_KEY.name: name,
+        TASK_MAP_KEY.name: map_name,
     }
     return SimpleNamespace(
         id=task_id,
@@ -243,14 +246,17 @@ class TestWorkflowGateway:
     def test_start_task_stamps_provenance_as_search_attributes(
         self, workflow_gw, mock_client
     ):
-        # Kind and name travel as search attributes, not in the workflow
-        # argument: the history filters and counts on them, and nothing in
-        # the workflow reads them.
+        # Kind, name and map travel as search attributes, not in the workflow
+        # argument: the history filters and counts on them, and the map has
+        # to reach scheduled runs too, which only attributes do.
         self._listing(mock_client, [])
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             asyncio.run(
                 workflow_gw.start_task(
-                    _task(), TaskProvenance(kind=TaskKind.GOAL, name="Morning patrol")
+                    _task(),
+                    TaskProvenance(
+                        kind=TaskKind.GOAL, name="Morning patrol", map_name="lab"
+                    ),
                 )
             )
 
@@ -259,6 +265,7 @@ class TestWorkflowGateway:
         attributes = kwargs["search_attributes"]
         assert attributes.get(TASK_KIND_KEY) == "goal"
         assert attributes.get(TASK_NAME_KEY) == "Morning patrol"
+        assert attributes.get(TASK_MAP_KEY) == "lab"
 
     def test_start_task_stamps_only_the_kind_when_there_is_no_name(
         self, workflow_gw, mock_client
@@ -272,6 +279,8 @@ class TestWorkflowGateway:
         attributes = mock_client.start_workflow.call_args[1]["search_attributes"]
         assert attributes.get(TASK_KIND_KEY) == "standup"
         assert attributes.get(TASK_NAME_KEY) is None
+        # A job that drives nowhere holds no map.
+        assert attributes.get(TASK_MAP_KEY) is None
 
     def test_start_task_maps_a_duplicate_id_to_bad_request(self, workflow_gw, mock_client):
         # Namespace-global ids: a re-post of this robot's task and a collision
@@ -616,7 +625,7 @@ class TestWorkflowGateway:
         self._listing(
             mock_client,
             [
-                _execution("robot01-task-001"),
+                _execution("robot01-task-001", map_name="lab"),
                 _execution("robot01-sched-001-2026-08-10T09", schedule_id="sched-1"),
             ],
         )
@@ -630,6 +639,9 @@ class TestWorkflowGateway:
             TaskSource.SCHEDULE,
             "sched-1",
         )
+        # The attribute as stamped, or None: filling in the loaded map for a
+        # run older than it is the reader's call (ActiveTask.map_in_use).
+        assert (direct.map_name, scheduled.map_name) == ("lab", None)
 
     def test_active_tasks_skips_an_unmapped_status_row(self, workflow_gw, mock_client):
         self._listing(
@@ -761,10 +773,10 @@ class TestWorkflowGateway:
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             entries, _ = asyncio.run(workflow_gw.list_task_history(page_size=3))
 
-        assert [(e.kind, e.name) for e in entries] == [
-            (TaskKind.SCHEDULE, None),
-            (None, None),
-            (None, None),
+        assert [(e.kind, e.name, e.map_name) for e in entries] == [
+            (TaskKind.SCHEDULE, None, None),
+            (None, None, None),
+            (None, None, None),
         ]
 
     def test_task_history_passes_every_filter_into_one_query(
@@ -933,6 +945,9 @@ class TestWorkflowGateway:
         attributes = schedule.action.typed_search_attributes
         assert attributes.get(TASK_KIND_KEY) == "schedule"
         assert attributes.get(TASK_NAME_KEY) == "Morning patrol"
+        # And the map its frozen positions are on, which the memo cannot hand
+        # a run: what lets a run that fires after a map switch refuse to drive.
+        assert attributes.get(TASK_MAP_KEY) == "full"
 
     def test_create_schedule_without_a_template_stamps_only_the_kind(
         self, workflow_gw, mock_client
@@ -948,6 +963,7 @@ class TestWorkflowGateway:
         attributes = mock_client.create_schedule.call_args.args[1].action.typed_search_attributes
         assert attributes.get(TASK_KIND_KEY) == "schedule"
         assert attributes.get(TASK_NAME_KEY) is None
+        assert attributes.get(TASK_MAP_KEY) is None
 
     def test_create_schedule_maps_a_duplicate_to_bad_request(
         self, workflow_gw, mock_client

@@ -21,6 +21,7 @@ from temporalio.api.enums.v1 import IndexedValueType  # noqa: E402
 from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
     CUSTOM_SEARCH_ATTRIBUTES,
     TASK_KIND_KEY,
+    TASK_MAP_KEY,
     TASK_NAME_KEY,
     ensure_search_attributes,
 )
@@ -38,14 +39,19 @@ def _client(existing: dict) -> SimpleNamespace:
     return SimpleNamespace(namespace="default", operator_service=operator)
 
 
-def test_the_two_keys_are_keyword_attributes():
+def test_the_three_keys_are_keyword_attributes():
     # Keyword, because the filters are equality and SQL visibility has no
     # equality on Text.
     assert CUSTOM_SEARCH_ATTRIBUTES == {
         "TaskKind": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
         "TaskName": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+        "TaskMap": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
     }
-    assert (TASK_KIND_KEY.name, TASK_NAME_KEY.name) == ("TaskKind", "TaskName")
+    assert (TASK_KIND_KEY.name, TASK_NAME_KEY.name, TASK_MAP_KEY.name) == (
+        "TaskKind",
+        "TaskName",
+        "TaskMap",
+    )
 
 
 def test_adds_only_what_the_namespace_lacks():
@@ -56,7 +62,8 @@ def test_adds_only_what_the_namespace_lacks():
     request = client.operator_service.add_search_attributes.await_args.args[0]
     assert request.namespace == "default"
     assert dict(request.search_attributes) == {
-        "TaskName": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD
+        "TaskName": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+        "TaskMap": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
     }
 
 

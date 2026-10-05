@@ -140,7 +140,12 @@ def test_worker_run_dying_marks_dead():
     _StubWorker.run_error = RuntimeError("poller exploded")
 
     handle = start_temporal_worker(
-        logger, robot_id="robot01", robot_gw=MagicMock(), tts_gw=MagicMock()
+        logger,
+        robot_id="robot01",
+        robot_gw=MagicMock(),
+        tts_gw=MagicMock(),
+        map_catalog_repo=MagicMock(),
+        conversion_svc=MagicMock(),
     )
     handle.thread.join(timeout=10)
 

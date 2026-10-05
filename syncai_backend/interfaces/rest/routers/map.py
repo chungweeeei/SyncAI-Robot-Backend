@@ -3,12 +3,13 @@ import hashlib
 import math
 import os
 import struct
+import time
 import uuid
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
 import structlog
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,7 @@ from syncai_backend.exceptions import (
 )
 from syncai_backend.database.models import MapPoint
 from syncai_backend.gateways.map.map import MapGateway
+from syncai_backend.gateways.workflow.schema import ActiveTask
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.pgm import render_png, render_thumbnail
 from syncai_backend.helpers.system_config import (
@@ -32,7 +34,15 @@ from syncai_backend.helpers.pointcloud import (
     read_pcd_xyz,
     voxel_downsample,
 )
+from syncai_backend.helpers.map_archive import (
+    ArchiveFormat,
+    MapArchiveError,
+    build_archive,
+    extract_archive,
+    inspect_archive,
+)
 from syncai_backend.repositories.map.catalog import (
+    POINTCLOUD_PCD,
     GridInfo,
     GridRecordStatus,
     KeepoutZone,
@@ -49,6 +59,7 @@ from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 from syncai_backend.services.gridmap_conversion import (
     FLOOR_REFERENCE_DEFAULT,
     GRIDMAP_BANDS_ABOVE_FLOOR,
+    TRAVERSABLE_DEBUG_SUBDIR_NAME,
     GridmapConversionService,
     iso_now,
 )
@@ -313,6 +324,30 @@ class DeleteMapResponse(BaseModel):
     name: str = Field(..., description="The map that was deleted.")
     vertices_deleted: int = Field(
         ..., description="Stored vertices removed along with the map directory."
+    )
+    message: str = Field(..., description="What happened, for the operator to read.")
+
+
+class ImportMapResponse(BaseModel):
+    """POST /api/v1/maps/import — what landed on this robot."""
+
+    name: str = Field(..., description="The map directory the archive became.")
+    replaced: bool = Field(
+        ..., description="True when a map of that name existed and was replaced."
+    )
+    files: int = Field(
+        ..., description="Files written under map/<name>/, every one md5-verified."
+    )
+    bytes: int = Field(..., description="Total bytes written.")
+    vertices_created: int = Field(
+        ..., description="Vertices recreated from the archive's manifest."
+    )
+    vertices_deleted: int = Field(
+        ...,
+        description=(
+            "Vertices that named this map before the import and were removed — "
+            "the replaced map's, or rows orphaned by an earlier hand-deleted directory."
+        ),
     )
     message: str = Field(..., description="What happened, for the operator to read.")
 
@@ -788,6 +823,125 @@ def init_map_router(
             raise NotFoundError(f"No map named '{name}' on this robot.")
         return stored
 
+    async def _running_tasks(change: str) -> List[ActiveTask]:
+        """What is running now, or a 409 if that cannot be known.
+
+        Refuse rather than assume idle. The gateway caches for
+        ACTIVE_TASK_CACHE_TTL_S, failures included, so an error here is a real
+        outage, and changing the map under a robot that might be mid-navigation
+        is not something to do on an unverified guess. ``change`` names what was
+        refused, for the sentence.
+        """
+        try:
+            tasks, _ = await workflow_gw.list_active_tasks()
+        except Exception as exc:
+            logger.warning(
+                "Could not confirm the robot is idle before changing a map",
+                change=change,
+                error=str(exc),
+            )
+            raise ConflictError(
+                "Could not confirm that no job is running, and "
+                f"{change} under a moving robot is not safe to guess at. Check "
+                "the Tasks page and try again.",
+                code="tasks_unknown",
+            )
+        return tasks
+
+    async def _refuse_while_a_job_holds(name: str) -> None:
+        """409 ``task_running`` while a running job's positions are on ``name``.
+
+        Mounted as a dependency on every route that edits what the planner,
+        the costmaps or a job's waypoints read: the vertices, the floor plan,
+        its rebuild and the forbidden zones. Each of those reloads into the
+        running stack (or rewrites the rows a job's MOVE steps were resolved
+        from) when the map is the loaded one, which mid-run means changing the
+        map under a robot that is driving on it.
+
+        An async dependency in front of plain ``def`` routes: FastAPI awaits it
+        on the event loop, where the Temporal client lives, and still runs the
+        blocking route in its threadpool -- the split activate has to do by
+        hand, for free.
+
+        A map other than the loaded one is let through without asking Temporal.
+        Activate refuses while anything runs, and a run is stamped with the map
+        loaded when it started, so a running job can only hold the loaded map;
+        asking anyway would only make editing an idle map depend on Temporal
+        being up.
+
+        Check-then-act, not a lock: a schedule that fires between this check and
+        the write still gets its map changed under it. The window is the active
+        task cache's TTL plus the write itself, and closing it would take a
+        lock both this route and the worker honour; execute_move's own check
+        is what stops the run from driving if the write was a rebuild.
+        """
+        active = map_catalog_repo.active_name()
+        if name != active:
+            return
+        tasks = await _running_tasks("changing the map in use")
+        if any(task.map_in_use(active) == name for task in tasks):
+            raise ConflictError(
+                "The robot is running a job on this map. Cancel it or wait for "
+                "it to finish before changing the map.",
+                code="task_running",
+            )
+
+    job_lock = [Depends(_refuse_while_a_job_holds)]
+
+    def _refuse_if_in_use(name: str, *, verb: str, template_consequence: str) -> None:
+        """The three 409s that guard destroying a map's contents, in order.
+
+        Shared by delete and by an import that replaces an existing map, which
+        destroys the same things (the directory and the vertex rows) and so has
+        to be refused for the same reasons:
+
+        - ``map_active``: map_server and the localizer opened ``map/<name>/…``
+          at launch; pulling the directory out from under them leaves them
+          holding nothing. Switching away with ``…/activate`` lifts this.
+        - ``conversion_running``: the conversion thread closed over the
+          directory path and would die writing its sidecar into a directory
+          that is gone (or, worse, into the *new* one).
+        - ``template_bound``: a template holding MOVE steps names this map's
+          vertices by id. Delete leaves it pointing at a map that is gone;
+          replace leaves it pointing at ids the new rows do not have. Either
+          way it can neither run nor be edited back into shape, and deleting
+          the templates instead would take saved work the operator never
+          mentioned — so the map is kept and the operator is told which
+          templates to unbind first, the one refusal that asks for work rather
+          than a map switch. ``include_map_independent=False`` leaves the
+          ``map_name IS NULL`` rows alone: a posture-only template runs
+          anywhere and this map going away means nothing to it.
+        """
+        if name == map_catalog_repo.active_name():
+            raise ConflictError(
+                f"'{name}' is the map the stack is running on and cannot be "
+                f"{verb} while it is in use. Switch the robot to another map "
+                "first.",
+                code="map_active",
+            )
+        if conversion_svc.is_converting(name):
+            raise ConflictError(
+                f"A gridmap conversion for '{name}' is running; try again "
+                "once the conversion has finished.",
+                code="conversion_running",
+            )
+
+        bound = task_template_repo.list_task_templates(
+            map_name=name, include_map_independent=False
+        )
+        if bound:
+            names = ", ".join(sorted(f"'{row.name}'" for row in bound))
+            raise ConflictError(
+                f"{len(bound)} task "
+                f"{'template' if len(bound) == 1 else 'templates'} still "
+                f"{'targets' if len(bound) == 1 else 'target'} '{name}' "
+                f"({names}). Point {'it' if len(bound) == 1 else 'them'} at "
+                "another map or delete "
+                f"{'it' if len(bound) == 1 else 'them'} first — "
+                f"{template_consequence}",
+                code="template_bound",
+            )
+
     @map_router.get("/api/v1/maps", response_model=List[MapSummaryResponse])
     def list_maps():
         active_name = map_catalog_repo.active_name()
@@ -833,6 +987,259 @@ def init_map_router(
                         f"POST /api/v1/maps/{request.name}/grid/convert."
                     )
                 )
+            ),
+        )
+
+    @map_router.get("/api/v1/maps/{name}/export")
+    def export_map(name: str, format: ArchiveFormat = ArchiveFormat.ZIP):
+        """The map directory as one archive, with its vertices and an md5 manifest.
+
+        What goes in: every regular file under ``map/<name>/`` relative to the
+        map root — no top-level folder, since the name is an import-time
+        choice — except ``traversable_debug/`` (conversion intermediates,
+        hundreds of MB, nothing reads them back), plus ``syncai_map.json``
+        carrying the name, the vertices (name/type/x/y/theta, **not** ids: they
+        are regenerated on import) and an md5 per file. ``helpers/map_archive``
+        owns the layout.
+
+        409 ``conversion_running``: the conversion thread is about to
+        ``os.replace`` ``gridmap.*``, so the archive would hold a grid whose md5
+        disagrees with the file a moment later. The *active* map is fine to
+        export — reading it disturbs nothing.
+
+        Built in memory, like the ``/pointcloud`` response: a map is tens of MB
+        at most and the body is one ``Response``. Plain ``def`` because that
+        build is disk and zlib work.
+        """
+        _require(name)
+        if conversion_svc.is_converting(name):
+            raise ConflictError(
+                f"A gridmap conversion for '{name}' is running; export it once "
+                "the conversion has finished.",
+                code="conversion_running",
+            )
+
+        vertices = [
+            {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta}
+            for v in map_repo.list_vertices(map=name)
+        ]
+        started = time.perf_counter()
+        data = build_archive(
+            map_catalog_repo.resolve_dir(name),
+            name,
+            vertices,
+            format,
+            exported_at=iso_now(),
+            exclude_dirs=(TRAVERSABLE_DEBUG_SUBDIR_NAME,),
+        )
+
+        logger.info(
+            "Exported map",
+            map=name,
+            format=format.value,
+            bytes=len(data),
+            vertices=len(vertices),
+            build_ms=round((time.perf_counter() - started) * 1000),
+        )
+        return Response(
+            content=data,
+            media_type=format.media_type,
+            headers={
+                # No quoting needed: _NAME_RE admits only [A-Za-z0-9._-].
+                "Content-Disposition": f'attachment; filename="{name}.{format.extension}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @map_router.post(
+        "/api/v1/maps/import", status_code=201, response_model=ImportMapResponse
+    )
+    def import_map(
+        name: Optional[str] = None,
+        payload: bytes = Body(..., media_type="application/octet-stream"),
+    ):
+        """Create — or replace — a map from an archive ``export_map`` produced.
+
+        The body is the archive itself, zip or tar.gz told apart by magic
+        bytes; raw rather than multipart for the reason ``save_map_grid``
+        gives, and because this process ships no multipart parser. The target
+        name is ``?name=`` when given, else the manifest's.
+
+        **Nothing is written until the archive has been judged.** The manifest
+        is required — an archive without one, or whose files do not match it
+        (a listed file missing, an unlisted file present, an md5 that
+        disagrees), is a 400 with the sentence from ``helpers/map_archive``,
+        as is any member that is a link or escapes its directory. Then this
+        route's own policy: ``map.pcd`` must be in it (no pointcloud, no map to
+        localise on), every vertex ``type`` must be one this API knows, and
+        the name must pass ``resolve_dir``.
+
+        A map of that name already on the robot is **replaced**, under the
+        refusals a delete has — 409 ``map_active`` / ``conversion_running`` /
+        ``template_bound`` — because a replace destroys the same things. And
+        409 ``disk_low`` when the unpacked size exceeds the free space on the
+        maps filesystem: the body is already in memory (caps are middleware's
+        job, see ``save_map_grid``), but what lands on the robot's disk is
+        bounded here, since ``map/`` filling up takes the nav stack's own
+        writes down with it. The replaced map's space is not counted as free —
+        it is only released once the database has followed.
+
+        Then, in order: unpack and verify into ``map/.import-<token>/``; one
+        ``os.rename`` publishes it (parking the replaced directory as
+        ``.import-old-<token>``); one database transaction deletes whatever
+        rows name the map and inserts the manifest's vertices; only then is
+        the parked directory removed. A database failure puts the directories
+        back the way they were — the compensation ``rename_map`` has, with the
+        ``rmtree`` kept for last the way ``delete_map`` keeps it. The DELETE
+        runs even when nothing was replaced: rows orphaned by a hand-deleted
+        directory would otherwise be adopted by the import, and the count is
+        reported so that is visible.
+
+        No conversion is started and an imported ``gridmap.recipe.json`` is
+        kept as it came: the archive is the map as its source robot had it.
+        """
+        # Three phase timings ride on the success log line, so whether this
+        # route should ever go asynchronous is a question the journal answers
+        # from a real map on a real robot rather than an estimate.
+        started = time.perf_counter()
+        try:
+            inspected = inspect_archive(payload)
+        except MapArchiveError as exc:
+            raise BadRequestError(str(exc))
+        inspect_ms = round((time.perf_counter() - started) * 1000)
+        manifest = inspected.manifest
+
+        if POINTCLOUD_PCD not in manifest.files:
+            raise BadRequestError(
+                f"The archive has no {POINTCLOUD_PCD}; it is not a map this robot "
+                "can localise on."
+            )
+        known_types = {member.value for member in VertexType}
+        unknown = sorted(
+            {str(v["type"]) for v in manifest.vertices if v["type"] not in known_types}
+        )
+        if unknown:
+            raise BadRequestError(
+                f"Unknown vertex type(s) in the manifest: {', '.join(unknown)}."
+            )
+
+        target = name if name is not None else manifest.name
+        map_catalog_repo.resolve_dir(target)
+        replacing = map_catalog_repo.get_map(target) is not None
+        if replacing:
+            _refuse_if_in_use(
+                target,
+                verb="replaced",
+                template_consequence=(
+                    "its MOVE steps point at this map's current vertices, which the "
+                    "import replaces."
+                ),
+            )
+
+        if inspected.total_bytes > map_catalog_repo.free_bytes():
+            raise ConflictError(
+                f"Not enough disk for '{target}': the archive unpacks to "
+                f"{inspected.total_bytes} bytes.",
+                code="disk_low",
+            )
+
+        new_vertices = [
+            {
+                "name": v["name"],
+                "type": v["type"],
+                "x": float(v["x"]),
+                "y": float(v["y"]),
+                "theta": float(v["theta"]),
+            }
+            for v in manifest.vertices
+        ]
+
+        staging = map_catalog_repo.begin_import(target)
+        started = time.perf_counter()
+        try:
+            written = extract_archive(payload, inspected, staging)
+            _, displaced = map_catalog_repo.commit_import(target, staging)
+        except MapArchiveError as exc:
+            map_catalog_repo.abort_import(staging)
+            raise BadRequestError(str(exc))
+        except BaseException:
+            map_catalog_repo.abort_import(staging)
+            raise
+        extract_ms = round((time.perf_counter() - started) * 1000)
+
+        started = time.perf_counter()
+        try:
+            with map_repo.transaction(op="import_map") as session:
+                vertices_deleted = map_repo.delete_vertices(target, session=session)
+                created = (
+                    map_repo.create_vertices(target, new_vertices, session=session)
+                    if new_vertices
+                    else []
+                )
+        except Exception as exc:
+            map_catalog_repo.undo_import(target, displaced)
+            logger.error(
+                "Map import failed while writing its vertices",
+                map=target,
+                replaced=replacing,
+                error=str(exc),
+            )
+            raise UpstreamError(
+                f"Could not store the vertices for '{target}': {exc}. "
+                + (
+                    "The previous map was put back."
+                    if replacing
+                    else "The map directory was removed again; nothing was imported."
+                )
+            )
+        db_ms = round((time.perf_counter() - started) * 1000)
+
+        # The irreversible step last, once everything that could fail has
+        # succeeded -- the rule delete_map states.
+        if displaced is not None:
+            map_catalog_repo.abort_import(displaced)
+
+        # Keyed by name: whatever a map of this name looked like earlier in
+        # this process's life, these renderings no longer describe it.
+        thumbnail_cache.pop(target, None)
+        image_cache.pop(target, None)
+        cloud_cache.pop(target, None)
+
+        logger.info(
+            "Imported map",
+            map=target,
+            replaced=replacing,
+            format=inspected.format.value,
+            files=len(manifest.files),
+            bytes=written,
+            vertices_created=len(created),
+            vertices_deleted=vertices_deleted,
+            inspect_ms=inspect_ms,
+            extract_ms=extract_ms,
+            db_ms=db_ms,
+        )
+        return ImportMapResponse(
+            name=target,
+            replaced=replacing,
+            files=len(manifest.files),
+            bytes=written,
+            vertices_created=len(created),
+            vertices_deleted=vertices_deleted,
+            message=(
+                f"{'Replaced' if replacing else 'Imported'} '{target}': "
+                f"{len(manifest.files)} files and {len(created)} "
+                f"{'vertex' if len(created) == 1 else 'vertices'}"
+                + (
+                    f" ({vertices_deleted} previous "
+                    f"{'vertex' if vertices_deleted == 1 else 'vertices'} removed)."
+                    if vertices_deleted
+                    else "."
+                )
+                # Operator copy: the console shows this sentence as-is, so it
+                # names the page, not the endpoint (the convert route's own
+                # docs say which call that is).
+                + " Its floor plan, if any, came with it; rebuild one from the "
+                "Maps page if it needs it."
             ),
         )
 
@@ -1019,6 +1426,9 @@ def init_map_router(
           which templates to unbind first — the one refusal that asks for work
           rather than a map switch.
 
+        All three live in ``_refuse_if_in_use``, shared with the import route
+        for the case where an archive replaces an existing map.
+
         **Database first, filesystem last — the inverse of rename, on purpose.**
         A rename puts the directory first because ``os.rename`` back is a real
         compensation; ``shutil.rmtree`` has none, so here the irreversible step
@@ -1044,40 +1454,13 @@ def init_map_router(
         It is a sentence in the response instead.
         """
         _require(name)
-
-        active_name = map_catalog_repo.active_name()
-        if name == active_name:
-            raise ConflictError(
-                f"'{name}' is the map the stack is running on and cannot be "
-                "deleted while it is in use. Switch the robot to another map "
-                "first.",
-                code="map_active",
-            )
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; delete it "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
-
-        # Strictly this map's templates: include_map_independent=False leaves
-        # the map_name IS NULL rows alone, because a posture-only template runs
-        # anywhere and a map going away means nothing to it.
-        bound = task_template_repo.list_task_templates(
-            map_name=name, include_map_independent=False
+        _refuse_if_in_use(
+            name,
+            verb="deleted",
+            template_consequence=(
+                "a template bound to a map that is gone can neither run nor be edited."
+            ),
         )
-        if bound:
-            names = ", ".join(sorted(f"'{row.name}'" for row in bound))
-            raise ConflictError(
-                f"{len(bound)} task "
-                f"{'template' if len(bound) == 1 else 'templates'} still "
-                f"{'targets' if len(bound) == 1 else 'target'} '{name}' "
-                f"({names}). Point {'it' if len(bound) == 1 else 'them'} at "
-                "another map or delete "
-                f"{'it' if len(bound) == 1 else 'them'} first — a template "
-                "bound to a map that is gone can neither run nor be edited.",
-                code="template_bound",
-            )
 
         try:
             vertices_deleted = map_repo.delete_vertices(name)
@@ -1271,24 +1654,10 @@ def init_map_router(
                 code="ini_not_writable",
             )
 
-        try:
-            active_tasks, _ = await workflow_gw.list_active_tasks()
-        except Exception as exc:
-            # Refuse rather than assume idle. The gateway caches for
-            # ACTIVE_TASK_CACHE_TTL_S, so this is a real Temporal outage, and
-            # swapping the map under a robot that might be mid-navigation is not
-            # something to do on an unverified guess.
-            logger.warning(
-                "Could not confirm the robot is idle before a map switch",
-                map=name,
-                error=str(exc),
-            )
-            raise ConflictError(
-                "Could not reach Temporal to confirm no task is running, and a "
-                "map switch under a moving robot is not safe to guess at. Check "
-                "the Tasks page and try again.",
-                code="tasks_unknown",
-            )
+        # Any job, not only one holding a map: a switch re-points the localizer,
+        # and a robot standing up or speaking is still a robot that should not
+        # lose its position mid-job. Stricter than _refuse_while_a_job_holds.
+        active_tasks = await _running_tasks("a map switch")
 
         if active_tasks:
             running = ", ".join(task.id for task in active_tasks)
@@ -1464,7 +1833,9 @@ def init_map_router(
         return await asyncio.to_thread(_switch)
 
     @map_router.post(
-        "/api/v1/maps/{name}/grid/convert", response_model=ConvertGridResponse
+        "/api/v1/maps/{name}/grid/convert",
+        response_model=ConvertGridResponse,
+        dependencies=job_lock,
     )
     def convert_map_grid(name: str, request: ConvertGridRequest):
         """(Re)build a map's 2D gridmap from its map.pcd, in the background.
@@ -1635,7 +2006,11 @@ def init_map_router(
         vertices = map_repo.list_vertices(map=name, type=type.value if type else None)
         return [_vertex_response(vertex) for vertex in vertices]
 
-    @map_router.post("/api/v1/maps/{name}/vertices", response_model=List[MapVertexResponse])
+    @map_router.post(
+        "/api/v1/maps/{name}/vertices",
+        response_model=List[MapVertexResponse],
+        dependencies=job_lock,
+    )
     def create_map_vertices(name: str, reqs: List[MapVertexRequest] = Body(..., min_length=1)):
         _require(name)
         vertices = map_repo.create_vertices(
@@ -1676,7 +2051,11 @@ def init_map_router(
     def get_map_vertex(name: str, id: uuid.UUID):
         return _vertex_response(_require_vertex(name, id))
 
-    @map_router.put("/api/v1/maps/{name}/vertices/{id}", response_model=MapVertexResponse)
+    @map_router.put(
+        "/api/v1/maps/{name}/vertices/{id}",
+        response_model=MapVertexResponse,
+        dependencies=job_lock,
+    )
     def update_map_vertex(name: str, id: uuid.UUID, req: MapVertexUpdateRequest):
         _require_vertex(name, id)
 
@@ -1689,7 +2068,11 @@ def init_map_router(
             raise NotFoundError(f"Map vertex {id} was not found in '{name}'.")
         return _vertex_response(vertex)
 
-    @map_router.delete("/api/v1/maps/{name}/vertices/{id}", response_model=DeleteResponse)
+    @map_router.delete(
+        "/api/v1/maps/{name}/vertices/{id}",
+        response_model=DeleteResponse,
+        dependencies=job_lock,
+    )
     def delete_map_vertex(name: str, id: uuid.UUID):
         _require_vertex(name, id)
         map_repo.delete_vertex(vertex_id=id)
@@ -1767,7 +2150,11 @@ def init_map_router(
     def get_map_thumbnail(name: str, request: Request):
         return _png_response(name, request, thumbnail_cache, render_thumbnail, "thumbnail")
 
-    @map_router.put("/api/v1/maps/{name}/grid", response_model=SaveGridmapResponse)
+    @map_router.put(
+        "/api/v1/maps/{name}/grid",
+        response_model=SaveGridmapResponse,
+        dependencies=job_lock,
+    )
     def save_map_grid(
         name: str,
         response: Response,
@@ -1920,7 +2307,11 @@ def init_map_router(
             active=name == map_catalog_repo.active_name(),
         )
 
-    @map_router.put("/api/v1/maps/{name}/keepout", response_model=SaveKeepoutResponse)
+    @map_router.put(
+        "/api/v1/maps/{name}/keepout",
+        response_model=SaveKeepoutResponse,
+        dependencies=job_lock,
+    )
     def save_map_keepout(name: str, request: SaveKeepoutRequest):
         """Replace the map's forbidden zones, and reload them if it is the live map.
 

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from enum import Enum
 
-from syncai_backend.exceptions import BadRequestError
+from syncai_backend.exceptions import BadRequestError, ConflictError
 
 from syncai_backend.gateways.workflow.config import (
     TASK_HISTORY_PAGE_SIZE_DEFAULT,
@@ -26,6 +26,10 @@ from syncai_backend.gateways.workflow.schema import (
     validate_step_params,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
+
+from syncai_backend.helpers.move_guard import move_refusal
+from syncai_backend.repositories.map.catalog import MapCatalogRepo
+from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 
 class TaskStatus(str, Enum):
@@ -103,6 +107,20 @@ class TaskRequest(BaseModel):
         description="The task template this dispatch came from, if any.",
         examples=["Morning patrol"],
     )
+    # The caller's expectation, not the record. The map a run is stamped with
+    # is the one loaded when it is accepted, read here; this only lets a
+    # caller say "these positions were planned on X" and be refused when the
+    # robot has moved to Y since the screen was drawn. Optional for the same
+    # callers as kind/name.
+    map_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "The map the MOVE positions were planned on. Refused with 409 "
+            "map_mismatch when it is not the map the robot is using."
+        ),
+        examples=["lab"],
+    )
 
     @field_validator("kind")
     @classmethod
@@ -171,6 +189,14 @@ class ActiveTaskResponse(BaseModel):
     name: Optional[str] = Field(
         default=None, description="The task template it was dispatched from, if any"
     )
+    map_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "The map this run holds while it runs -- its positions are on it, "
+            "and the map routes refuse to change it until the run ends. Null "
+            "for a run that drives nowhere (stand, lie down)."
+        ),
+    )
 
 
 class ActiveTasksResponse(BaseModel):
@@ -222,6 +248,13 @@ class TaskHistoryEntryResponse(BaseModel):
     )
     name: Optional[str] = Field(
         default=None, description="The task template it was dispatched from, if any"
+    )
+    map_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "The map its positions were on; null for a run with no MOVE step "
+            "or one older than the field."
+        ),
     )
 
 
@@ -287,12 +320,32 @@ def _decode_page_token(token: Optional[str]) -> Optional[bytes]:
 
 
 def init_task_router(
-    logger: structlog.stdlib.BoundLogger, workflow_gw: WorkflowGateway
+    logger: structlog.stdlib.BoundLogger,
+    workflow_gw: WorkflowGateway,
+    map_catalog_repo: MapCatalogRepo,
+    conversion_svc: GridmapConversionService,
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
 
     @task_router.post("/api/v1/tasks", response_model=TaskResponse)
     async def trigger_task(req: TaskRequest):
+
+        # A job that drives is stamped with the map that is loaded now, the
+        # map its positions are about to be read in -- that is the record the
+        # map routes lock on and the history shows. A job that does not drive
+        # holds no map, so it is neither stamped nor refused for one: standing
+        # the robot up mid-rebuild, or on the "wrong" map, is harmless.
+        map_name: Optional[str] = None
+        if any(step.type is StepType.MOVE for step in req.steps):
+            active = map_catalog_repo.active_name()
+            refusal = move_refusal(
+                req.map_name,
+                active,
+                active is not None and conversion_svc.is_converting(active),
+            )
+            if refusal is not None:
+                raise ConflictError(refusal.message, code=refusal.code)
+            map_name = active
 
         workflow_task = WorkflowTask(
             id=req.id,
@@ -310,7 +363,7 @@ def init_task_router(
 
         await workflow_gw.start_task(
             request=workflow_task,
-            provenance=TaskProvenance(kind=req.kind, name=req.name),
+            provenance=TaskProvenance(kind=req.kind, name=req.name, map_name=map_name),
         )
 
         return TaskResponse(
@@ -338,6 +391,13 @@ def init_task_router(
     @task_router.get("/api/v1/active_tasks", response_model=ActiveTasksResponse)
     async def list_active_tasks():
         tasks, as_of = await workflow_gw.list_active_tasks()
+        # Only read when some run lacks the attribute (see map_in_use), so the
+        # console's 2 s poll of an idle or up-to-date robot costs no INI read.
+        active = (
+            map_catalog_repo.active_name()
+            if any(not task.map_name for task in tasks)
+            else None
+        )
 
         return ActiveTasksResponse(
             tasks=[
@@ -350,6 +410,7 @@ def init_task_router(
                     schedule_id=task.schedule_id,
                     kind=task.kind,
                     name=task.name,
+                    map_name=task.map_in_use(active),
                 )
                 for task in tasks
             ],
@@ -417,6 +478,7 @@ def init_task_router(
                     schedule_id=entry.schedule_id,
                     kind=entry.kind,
                     name=entry.name,
+                    map_name=entry.map_name,
                 )
                 for entry in entries
             ],
