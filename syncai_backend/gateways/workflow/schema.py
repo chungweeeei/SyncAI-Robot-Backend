@@ -16,6 +16,12 @@ class BaseSchema(BaseModel):
 class StepStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    # The run is holding at this step (POST /api/v1/tasks/{id}/pause): either
+    # the step was interrupted (a MOVE, whose goal is cancelled and re-sent on
+    # resume) or it has not started yet because the hold landed before it. At
+    # most one step carries it at a time, and the gateway reads the task-level
+    # PAUSED off it, so the console's poll stays one query.
+    PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"

@@ -30,7 +30,12 @@ What is pinned:
   step is touched — but that step ends FAILED / "Cancelled", *not* the
   CANCELED / "Task canceled" the workflow's ``except asyncio.CancelledError``
   branch would write. See the cancellation test for why that branch is
-  bypassed; this suite pins what actually happens, deliberately.
+  bypassed; this suite pins what actually happens, deliberately. The one
+  path on which that branch *is* reached is a cancel during a hold.
+* The hold (``pause`` / ``resume`` signals): a MOVE is interrupted at once
+  and re-sent as a fresh activity on resume; any other step finishes and the
+  run holds before the next one; the held step reads PAUSED while it waits;
+  a pause with nothing left to hold lets the run complete.
 
 Deliberately not covered: the unknown-step-type guard in the dispatch table.
 ``Step`` validation rejects anything outside ``StepType`` before a task can
@@ -350,10 +355,212 @@ def test_cancellation_ends_the_run_canceled_and_fails_the_in_flight_step():
     # as-observed rather than "fixed" in the test: if the workflow is ever
     # amended to catch the ActivityError-wrapped cancel (so the console can
     # tell "canceled" from "failed"), this is the assertion that should
-    # break.
+    # break. (The branch is reachable on one other path — a cancel while the
+    # run is *held* — pinned in test_cancel_while_held below; the hold did
+    # not change this one.)
     assert steps[0].status is StepStatus.FAILED
     assert steps[0].error_msg == "Cancelled"
     # The step that never started stays PENDING and its activity never ran —
     # "interrupted here" and "never got there" must stay distinguishable.
     assert steps[1].status is StepStatus.PENDING
     assert calls == []
+
+
+# --- The hold -----------------------------------------------------------------
+
+
+def _recording_move(
+    started: asyncio.Event, release: asyncio.Event, dispatches: list, cancels: list
+):
+    """``_gated_move`` that also records each dispatch and each cancel it receives.
+
+    ``dispatches`` collects ``activity.info().attempt`` so a test can tell a
+    *re-sent* MOVE (two activities, each attempt 1) from a *retried* one.
+    """
+
+    @activity.defn(name="execute_move")
+    async def execute_move(params: MoveParams) -> ActivityResult:
+        dispatches.append(activity.info().attempt)
+        started.set()
+        try:
+            while not release.is_set():
+                activity.heartbeat()
+                try:
+                    await asyncio.wait_for(release.wait(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            cancels.append(True)
+            raise
+        return ActivityResult(success=True, state="succeeded")
+
+    return execute_move
+
+
+def _gated_stand(started: asyncio.Event, release: asyncio.Event):
+    """A STANDUP activity that parks until released — the uninterruptible kind."""
+
+    @activity.defn(name="execute_stand")
+    async def execute_stand() -> ActivityResult:
+        started.set()
+        while not release.is_set():
+            activity.heartbeat()
+            try:
+                await asyncio.wait_for(release.wait(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass
+        return ActivityResult(success=True, state="succeeded")
+
+    return execute_stand
+
+
+async def _statuses_until(handle, predicate, timeout: float = 10.0):
+    """Poll the step-state query until ``predicate(statuses)`` holds."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        steps = await handle.query(RobotWorkflow.get_step_states)
+        statuses = [step.status for step in steps]
+        if predicate(statuses):
+            return statuses
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"step states never reached the expected shape: {statuses}")
+        await asyncio.sleep(0.05)
+
+
+def test_pause_interrupts_a_move_and_resume_re_sends_it():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        calls: list = []
+        activities = [_recording_move(started, release, dispatches, cancels)]
+        activities += _instant_activities(calls)[1:]
+        task = _task("task-pause-move", StepType.MOVE, StepType.STANDUP)
+
+        async with _worker(activities) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            started.clear()
+
+            await handle.signal(RobotWorkflow.pause)
+            held = await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            # The hold is a hold: nothing is dispatched while it lasts.
+            await asyncio.sleep(0.5)
+            dispatches_while_held = list(dispatches)
+
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            resumed = await handle.query(RobotWorkflow.get_step_states)
+            release.set()
+            await handle.result()
+            return dispatches, dispatches_while_held, cancels, held, resumed, calls
+
+    dispatches, dispatches_while_held, cancels, held, resumed, calls = asyncio.run(scenario())
+
+    # The in-flight MOVE received the cancel — in production that is the
+    # ``except CancelledError`` that cancels the nav2 goal — and the step
+    # read PAUSED while the run waited; the next step was never touched.
+    assert cancels == [True]
+    assert held == [StepStatus.PAUSED, StepStatus.PENDING]
+    assert dispatches_while_held == [1]
+    # Resume re-sent the MOVE as a *new* activity (attempt 1 again, not a
+    # retry's attempt 2), and the step went back to IN_PROGRESS for it.
+    assert dispatches == [1, 1]
+    assert [step.status for step in resumed] == [StepStatus.IN_PROGRESS, StepStatus.PENDING]
+    # Then the run went on to the end.
+    assert calls == [("execute_stand", None)]
+
+
+def test_pause_during_an_uninterruptible_step_holds_before_the_next():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        calls: list = []
+        # STANDUP is gated; MOVE is the instant mock, which must NOT run while
+        # the run is held.
+        activities = [_gated_stand(started, release)] + [_instant_activities(calls)[0]]
+        task = _task("task-pause-stand", StepType.STANDUP, StepType.MOVE)
+
+        async with _worker(activities) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+
+            await handle.signal(RobotWorkflow.pause)
+            # The posture finishes regardless of the pause...
+            await asyncio.sleep(0.3)
+            during = await handle.query(RobotWorkflow.get_step_states)
+            release.set()
+            # ...and the run holds at the boundary, with the next step PAUSED.
+            held = await _statuses_until(handle, lambda s: s[1] is StepStatus.PAUSED)
+            await asyncio.sleep(0.3)
+            calls_while_held = list(calls)
+
+            await handle.signal(RobotWorkflow.resume)
+            await handle.result()
+            return during, held, calls_while_held, calls
+
+    during, held, calls_while_held, calls = asyncio.run(scenario())
+
+    # A pause does not interrupt a posture step: it stayed IN_PROGRESS.
+    assert [step.status for step in during] == [StepStatus.IN_PROGRESS, StepStatus.PENDING]
+    # The hold lands before the next step starts — PAUSED, not PENDING, so
+    # the console can see where the run is holding — and that step's
+    # activity is not dispatched until the resume.
+    assert held == [StepStatus.COMPLETED, StepStatus.PAUSED]
+    assert calls_while_held == []
+    assert [name for name, _ in calls] == ["execute_move"]
+
+
+def test_cancel_while_held_ends_the_run_canceled_and_the_held_step_canceled():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        calls: list = []
+        activities = [_recording_move(started, release, dispatches, cancels)]
+        activities += _instant_activities(calls)[1:]
+        task = _task("task-cancel-held", StepType.MOVE, StepType.STANDUP)
+
+        async with _worker(activities) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await handle.signal(RobotWorkflow.pause)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+            return exc_info.value, await handle.query(RobotWorkflow.get_step_states), calls
+
+    err, steps, calls = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    # This is the one path on which the workflow's ``except
+    # asyncio.CancelledError`` branch runs: nothing was in flight to wrap the
+    # cancel in an ActivityError, so the held step is CANCELED / "Task
+    # canceled" — distinguishable from the FAILED / "Cancelled" of a cancel
+    # that lands mid-MOVE (pinned above).
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[0].error_msg == "Task canceled"
+    assert steps[1].status is StepStatus.PENDING
+    assert calls == []
+
+
+def test_a_pause_with_nothing_left_to_hold_lets_the_run_complete():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        task = _task("task-pause-last", StepType.STANDUP)
+
+        async with _worker([_gated_stand(started, release)]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            # A resume on a running task is a no-op; a pause during the last
+            # step has no boundary left to hold at.
+            await handle.signal(RobotWorkflow.resume)
+            await handle.signal(RobotWorkflow.pause)
+            release.set()
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return await handle.query(RobotWorkflow.get_step_states)
+
+    steps = asyncio.run(scenario())
+
+    assert [step.status for step in steps] == [StepStatus.COMPLETED]

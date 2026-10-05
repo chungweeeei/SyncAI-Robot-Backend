@@ -50,6 +50,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     ScheduleTask,
     ScheduleTrigger,
     Step,
+    StepStatus,
     StepType,
     TaskKind,
     TaskProvenance,
@@ -187,6 +188,7 @@ class TestWorkflowGateway:
         handle.describe = AsyncMock(return_value=describe)
         handle.query = AsyncMock(return_value=steps if steps is not None else [])
         handle.cancel = AsyncMock()
+        handle.signal = AsyncMock()
         mock_client.get_workflow_handle.return_value = handle
         return handle
 
@@ -410,6 +412,53 @@ class TestWorkflowGateway:
         assert state.status == "IN_PROGRESS"
         assert state.steps == []
 
+    def test_get_task_state_reads_paused_off_the_held_step(self, workflow_gw, mock_client):
+        # Temporal has no paused status — a held run is RUNNING to it. The
+        # workflow marks the step it is holding at PAUSED, and that one fact
+        # is folded into the task status here, with no second query.
+        self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+            ),
+            steps=[
+                Step(id="step1", type=StepType.STANDUP, status=StepStatus.COMPLETED),
+                Step(
+                    id="step2",
+                    type=StepType.MOVE,
+                    params=MoveParams(x=1.0, y=2.0, theta=90.0),
+                    status=StepStatus.PAUSED,
+                ),
+            ],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            state = asyncio.run(workflow_gw.get_task_state("robot01-task-001"))
+
+        assert state.status == "PAUSED"
+        assert [s.status for s in state.steps] == [StepStatus.COMPLETED, StepStatus.PAUSED]
+
+    def test_get_task_state_a_closed_run_is_never_paused(self, workflow_gw, mock_client):
+        # Terminated while held: the step still reads PAUSED on replay, but
+        # the run is over and the Temporal status wins.
+        self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.TERMINATED, task_queue=OWN_QUEUE
+            ),
+            steps=[
+                Step(
+                    id="step1",
+                    type=StepType.MOVE,
+                    params=MoveParams(x=1.0, y=2.0, theta=90.0),
+                    status=StepStatus.PAUSED,
+                )
+            ],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            state = asyncio.run(workflow_gw.get_task_state("robot01-task-001"))
+
+        assert state.status == "CANCELED"
+
     def test_get_task_state_rejects_an_unmapped_status(self, workflow_gw, mock_client):
         self._workflow_handle(
             mock_client, describe=SimpleNamespace(status=None, task_queue=OWN_QUEUE)
@@ -463,6 +512,89 @@ class TestWorkflowGateway:
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             with pytest.raises(UpstreamError, match="Cancel workflow failed"):
                 asyncio.run(workflow_gw.cancel_task("robot01-task-001"))
+
+    # ==================== pause_task / resume_task ====================
+
+    def test_pause_task_signals_after_the_ownership_describe(self, workflow_gw, mock_client):
+        handle = self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+            ),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(workflow_gw.pause_task("robot01-task-001"))
+
+        handle.describe.assert_awaited_once()
+        # By name, like the step-state query: the gateway never imports the
+        # workflow class.
+        handle.signal.assert_awaited_once_with("pause")
+
+    def test_resume_task_signals_resume(self, workflow_gw, mock_client):
+        handle = self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+            ),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(workflow_gw.resume_task("robot01-task-001"))
+
+        handle.signal.assert_awaited_once_with("resume")
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            WorkflowExecutionStatus.COMPLETED,
+            WorkflowExecutionStatus.FAILED,
+            WorkflowExecutionStatus.CANCELED,
+            WorkflowExecutionStatus.TERMINATED,
+        ],
+    )
+    def test_hold_verbs_refuse_a_closed_run_with_a_code(self, workflow_gw, mock_client, status):
+        # A pause sent a moment after the run closed is a 409 with a stable
+        # code — not the server's own "already completed" error as a 502.
+        handle = self._workflow_handle(
+            mock_client, describe=SimpleNamespace(status=status, task_queue=OWN_QUEUE)
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(ConflictError, match="not running") as exc_info:
+                asyncio.run(workflow_gw.pause_task("robot01-task-001"))
+            with pytest.raises(ConflictError):
+                asyncio.run(workflow_gw.resume_task("robot01-task-001"))
+
+        assert exc_info.value.code == "task_not_running"
+        handle.signal.assert_not_awaited()
+
+    def test_pause_task_not_found(self, workflow_gw, mock_client):
+        handle = self._workflow_handle(mock_client)
+        handle.describe.side_effect = _not_found()
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(NotFoundError, match="not found"):
+                asyncio.run(workflow_gw.pause_task("missing"))
+        handle.signal.assert_not_awaited()
+
+    def test_pause_task_maps_a_failed_signal_to_upstream(self, workflow_gw, mock_client):
+        handle = self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+            ),
+        )
+        handle.signal.side_effect = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError, match="Pause workflow failed"):
+                asyncio.run(workflow_gw.pause_task("robot01-task-001"))
+
+    def test_resume_task_names_its_own_verb_on_a_failed_describe(
+        self, workflow_gw, mock_client
+    ):
+        # The shared describe helper reports the verb the operator asked for.
+        handle = self._workflow_handle(mock_client)
+        handle.describe.side_effect = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError, match="Resume workflow failed"):
+                asyncio.run(workflow_gw.resume_task("robot01-task-001"))
 
     # ==================== list_active_tasks ====================
 

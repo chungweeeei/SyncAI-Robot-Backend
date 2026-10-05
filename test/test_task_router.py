@@ -43,6 +43,8 @@ class _StubWorkflowGateway:
     def __init__(self):
         self.started = []
         self.cancelled = []
+        self.paused = []
+        self.resumed = []
         self.history_calls = []
         self.stats_calls = []
         self.history = (
@@ -102,6 +104,12 @@ class _StubWorkflowGateway:
 
     async def cancel_task(self, task_id):
         self.cancelled.append(task_id)
+
+    async def pause_task(self, task_id):
+        self.paused.append(task_id)
+
+    async def resume_task(self, task_id):
+        self.resumed.append(task_id)
 
     async def list_active_tasks(self):
         return self.active
@@ -231,6 +239,29 @@ class TestTaskState:
         workflow_gw.get_task_state = _raise
 
         assert client.get("/api/v1/tasks/missing").status_code == 404
+
+    def test_get_projects_a_held_run_as_paused(self, client, workflow_gw):
+        # The gateway already folded the held step into the task status; the
+        # router passes both through, which is the one place the console can
+        # see a hold (/active_tasks keeps saying IN_PROGRESS).
+        workflow_gw.state = TaskState(
+            id="robot01-task-001",
+            status="PAUSED",
+            steps=[
+                Step(id="step1", type=StepType.STANDUP, status=StepStatus.COMPLETED),
+                Step(
+                    id="step2",
+                    type=StepType.MOVE,
+                    params=MoveParams(x=1.0, y=2.0, theta=90.0),
+                    status=StepStatus.PAUSED,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-task-001").json()
+
+        assert body["status"] == "PAUSED"
+        assert [step["status"] for step in body["steps"]] == ["COMPLETED", "PAUSED"]
 
 
 class TestActiveTasks:
@@ -406,3 +437,46 @@ class TestCancelTask:
 
         assert workflow_gw.cancelled == ["robot01-task-001"]
         assert body["status"] == "CANCELING"
+
+
+class TestHoldTask:
+    def test_pause_answers_pausing_not_paused(self, client, workflow_gw):
+        # Like DELETE, a pause is a *request*: a SPEAK or posture step finishes
+        # before the run holds, so the ack must not claim PAUSED. The console
+        # discards this body and reads the hold back from GET.
+        response = client.post("/api/v1/tasks/robot01-task-001/pause")
+
+        assert response.status_code == 200
+        assert workflow_gw.paused == ["robot01-task-001"]
+        assert response.json()["status"] == "PAUSING"
+
+    def test_resume_answers_in_progress(self, client, workflow_gw):
+        response = client.post("/api/v1/tasks/robot01-task-001/resume")
+
+        assert response.status_code == 200
+        assert workflow_gw.resumed == ["robot01-task-001"]
+        assert response.json()["status"] == "IN_PROGRESS"
+
+    def test_unknown_task_is_404(self, client, workflow_gw):
+        async def _raise(task_id):
+            raise NotFoundError(f"Task {task_id} not found")
+
+        workflow_gw.pause_task = _raise
+        workflow_gw.resume_task = _raise
+
+        assert client.post("/api/v1/tasks/missing/pause").status_code == 404
+        assert client.post("/api/v1/tasks/missing/resume").status_code == 404
+
+    def test_a_closed_run_is_409_task_not_running(self, client, workflow_gw):
+        # A console whose last poll still showed the run open sends a pause a
+        # moment after it finished: a conflict with the state, with the code
+        # beside the sentence so nothing has to match on prose.
+        async def _raise(task_id):
+            raise ConflictError(f"Task {task_id} is not running", code="task_not_running")
+
+        workflow_gw.pause_task = _raise
+
+        response = client.post("/api/v1/tasks/robot01-task-001/pause")
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "task_not_running"

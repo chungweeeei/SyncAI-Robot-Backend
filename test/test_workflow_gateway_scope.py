@@ -5,10 +5,10 @@ and schedule ids are global. What is pinned here is the ownership gate that
 keeps one robot's backend from reading, cancelling, pausing or deleting another
 robot's work through nothing more than an id:
 
-* ``get_task_state`` / ``cancel_task`` verify the described execution's
-  ``task_queue`` and answer 404 for a foreign one — 404 rather than 403 so a
-  caller who addressed the wrong robot learns nothing about the id's existence
-  (the map router's ``_require_vertex`` precedent).
+* ``get_task_state`` / ``cancel_task`` / ``pause_task`` / ``resume_task`` verify
+  the described execution's ``task_queue`` and answer 404 for a foreign one —
+  404 rather than 403 so a caller who addressed the wrong robot learns nothing
+  about the id's existence (the map router's ``_require_vertex`` precedent).
 * Single-schedule verbs go through ``_require_owned_schedule``, which reads the
   ownership fact off the *describe* path's full action — no memo needed, so it
   holds for legacy schedules too.
@@ -67,6 +67,7 @@ class _StubWorkflowHandle:
         self._description = description
         self._steps = steps if steps is not None else []
         self.cancelled = False
+        self.signals = []
 
     async def describe(self):
         return self._description
@@ -76,6 +77,9 @@ class _StubWorkflowHandle:
 
     async def cancel(self):
         self.cancelled = True
+
+    async def signal(self, name):
+        self.signals.append(name)
 
 
 class _StubScheduleHandle:
@@ -199,6 +203,36 @@ def test_cancel_task_cancels_its_own_task(logger):
 
     asyncio.run(gw.cancel_task("robot01-task"))
     assert handle.cancelled is True
+
+
+def test_hold_verbs_refuse_a_foreign_task(logger):
+    # Pause and resume are signals into a running workflow — a foreign one must
+    # never receive them, and the 404 keeps the id's existence to itself.
+    handle = _StubWorkflowHandle(
+        description=SimpleNamespace(
+            status=WorkflowExecutionStatus.RUNNING, task_queue=FOREIGN_QUEUE
+        )
+    )
+    gw = _gateway(logger, _StubClient(workflow_handle=handle))
+
+    with pytest.raises(NotFoundError):
+        asyncio.run(gw.pause_task("robot02-task"))
+    with pytest.raises(NotFoundError):
+        asyncio.run(gw.resume_task("robot02-task"))
+    assert handle.signals == []
+
+
+def test_hold_verbs_signal_their_own_task(logger):
+    handle = _StubWorkflowHandle(
+        description=SimpleNamespace(
+            status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+        )
+    )
+    gw = _gateway(logger, _StubClient(workflow_handle=handle))
+
+    asyncio.run(gw.pause_task("robot01-task"))
+    asyncio.run(gw.resume_task("robot01-task"))
+    assert handle.signals == ["pause", "resume"]
 
 
 # --- Schedule ownership (describe path) ----------------------------------------
