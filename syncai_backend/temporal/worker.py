@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from typing import Optional
 
 import structlog
@@ -33,6 +34,16 @@ from syncai_backend.services.gridmap_conversion import GridmapConversionService
 # instead of a crash.
 MAX_RETRIES = 20
 RETRY_INTERVAL = 5
+
+# The longest the worker sits on an activity heartbeat before sending it. The
+# server never pushes an activity cancel to the worker: it answers the next
+# heartbeat with "cancel requested", so this interval is most of how long a
+# paused or cancelled MOVE keeps driving. Left at the SDK default (60 s cap,
+# so 0.8 x the 3 s MOVE_HEARTBEAT_TIMEOUT = 2.4 s in effect) a pause took up
+# to ~3.5 s to reach nav2. Only the sending is throttled -- the heartbeat
+# timeout the server enforces is unchanged -- and two small RPCs a second
+# from one robot are nothing to the server.
+HEARTBEAT_THROTTLE_MAX = timedelta(milliseconds=500)
 
 
 class TemporalWorkerHandle:
@@ -136,6 +147,7 @@ async def run_worker(
         # holds the second task server-side until this worker asks for it.
         activity_executor=ThreadPoolExecutor(max_workers=1),
         max_concurrent_activities=1,
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
     )
 
     logger.info(
