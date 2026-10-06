@@ -325,10 +325,13 @@ the one field that decision has been made for — the gait controller's own stat
 machine, which the console has no other way to read because
 `set_motion_key` / `set_policy_mode` are one-way UDP whose 200 only means a
 datagram went out. It is decoded to **labels only** (`PPO` / `LOCOMOTION` / …, with `UNKNOWN` for a
-code this backend cannot name). The controller's raw integers stay on the
-`robot_state` topic, so `ros2 topic echo /<robot_id>/robot_state --field
-low_level_mode` is what distinguishes MPC's unknown motion code from the
-controller's startup sentinel — over REST they are the same `"UNKNOWN"`.
+code this backend cannot name). Motion `8` is `IDLE` — the motors are not
+driven by any controller — and is labelled rather than left to the fallback
+because the console ends a commanded MPC when the motion returns to it, and
+MPC's own motion code is unknown and reads `UNKNOWN`. The controller's raw
+integers stay on the `robot_state` topic, so `ros2 topic echo
+/<robot_id>/robot_state --field low_level_mode` is what tells one unmapped code
+from another.
 
 `RobotStateSubscriber` **drops samples whose `localization_valid` is false**
 before they reach `RobotRepo`. The publisher now emits on every tick, including

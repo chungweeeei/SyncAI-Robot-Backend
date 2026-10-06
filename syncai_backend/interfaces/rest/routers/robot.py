@@ -46,7 +46,12 @@ def _mode_to_str(mode: int) -> str:
 # syncai_common/msg/RobotLowLevelMode.msg, which is where they are documented.
 _POLICY_STATE_TO_STR = {0: "PPO", 1: "HIMLOCO", 2: "CHAMP", 3: "ISSAC"}
 
-# 8 is the controller's own startup sentinel ("I have not entered a state yet").
+# 8 is IDLE: the motors are not being driven by any controller -- the state the
+# controller starts in and the one it falls back to when a gait stops. It gets
+# its own label rather than "UNKNOWN" because the console acts on it: a return to
+# IDLE ends a commanded MPC, and MPC itself reads "UNKNOWN" (below), so the two
+# have to be told apart over REST.
+#
 # Note what is NOT in here: MPC. This workspace added the `MODE M` command without
 # knowing what the controller reports for it, so an out-of-table integer is
 # expected rather than a bug. The response carries labels only, so that integer is
@@ -57,7 +62,7 @@ _MOTION_STATE_TO_STR = {
     2: "LIE_DOWN",
     3: "DAMPING",
     4: "ESTOP",
-    8: "UNKNOWN",
+    8: "IDLE",
 }
 
 
@@ -167,9 +172,9 @@ class RobotLowLevelMode(BaseModel):
         ...,
         description=(
             "The controller's motion state: STAND / LOCOMOTION / LIE_DOWN / "
-            "DAMPING / ESTOP, or UNKNOWN — which is both the controller's own "
-            "startup sentinel (8) and this backend's fallback for an unmapped "
-            "index. MPC has no known code, so it lands here."
+            "DAMPING / ESTOP / IDLE (8, motors not driven by any controller), "
+            "or UNKNOWN for an index this backend has no name for. MPC has no "
+            "known code, so it lands on UNKNOWN."
         ),
     )
 
