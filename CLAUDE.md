@@ -259,7 +259,13 @@ The MOVE wait is `workflow.wait_condition` on `handle.done() or paused`, **never
 instead of being swallowed into the activity's `ActivityError`, so a cancel is never
 mistaken for the pause's own interruption and needs no `workflow.cancellation_reason()`
 (an SDK version detail the hold should not hang on). A cancelled step reads `CANCELED` / `Task
-canceled` whatever it was doing. `WAIT` is the one step that is **not** an activity: a durable timer inside
+canceled` whatever it was doing. A pause or cancel only reaches a running activity on a
+**heartbeat** (the server answers one with "cancel requested"; it never pushes), so the
+latency is the send interval plus the poll sleep: `HEARTBEAT_THROTTLE_MAX` (worker.py)
+must stay under 0.8 x `MOVE_HEARTBEAT_TIMEOUT` — the SDK's own default throttle — and
+`NAV_POLL_INTERVAL_S` (activities.py) at or under the throttle, so a heartbeat is always
+waiting when one may go out. `test_activities.py` pins both relations; the heartbeat
+*timeout* is a separate number and is not what to tune. `WAIT` is the one step that is **not** an activity: a durable timer inside
 `RobotWorkflow._run_wait` (`wait_condition` with a timeout, remainder measured on
 `workflow.now()` so replay sees the same numbers), so it takes no slot of the one-thread
 activity executor, needs no heartbeat, and survives a worker restart with the time
@@ -314,7 +320,9 @@ syncai_tts container now and `gateways/tts` is an httpx client.
 ## Dependency pins that are not negotiable without reading `requirements.txt`
 
 `scipy>=1.8,<1.11` and `open3d>=0.18,<0.20` (both exist to stop pip dragging numpy past
-1.26, which the ROS ecosystem tolerates). `onnxruntime==1.18.1` and the `--no-deps`
+1.26, which the ROS ecosystem tolerates). `temporalio>=1.33` is a floor, not a comfort:
+`RobotWorkflow`'s hold leans on the SDK's cancellation semantics and `test_workflows.py`
+pins them on 1.34. `onnxruntime==1.18.1` and the `--no-deps`
 `kokoro-onnx` install are **gone from this repo** — they moved to SyncAI-TTS with the
 engine; do not reinstate them here. `setup.py` ships **bytecode only** on a non-symlink
 install (`InstallNoSource`); `--symlink-install` dev builds are unaffected.
