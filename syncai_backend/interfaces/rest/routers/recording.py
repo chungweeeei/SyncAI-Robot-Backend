@@ -165,8 +165,9 @@ def init_recording_router(
     recording_router = APIRouter(prefix="", tags=["Recording"])
 
     # Plain (non-async) handlers: starting a recorder blocks for the liveness
-    # probe, stopping one blocks until the child has flushed its metadata (up to
-    # ~22 s), and listing walks every bag directory. All three are threadpool
+    # probe, stopping one blocks until the child has flushed its metadata (about
+    # a minute with a full split left to compress, ~5 min at most), and listing
+    # walks every bag directory. All three are threadpool
     # work; an async handler would stall the telemetry, point-cloud and teleop
     # WebSockets for the duration.
 

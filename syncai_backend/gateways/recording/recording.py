@@ -43,9 +43,20 @@ RESERVED_NAMES = frozenset({"active"})
 # The stop ladder. SIGINT first because it is the only signal rosbag2 handles
 # as "finish and flush": a bag killed any other way has no metadata.yaml and is
 # unplayable until `ros2 bag reindex`. The rest is MdnsManager.kill_mdns's
-# terminate -> kill escalation, with a budget generous enough for the writer to
-# close a 2 GB sqlite file.
-_SIGINT_TIMEOUT = 15.0
+# terminate -> kill escalation.
+#
+# The SIGINT rung is a stall timeout, not a deadline. With file compression on,
+# rosbag2 answers SIGINT by zstd-compressing the split still open -- up to 2 GB,
+# ~50 s at the ~40 MB/s an Orin manages -- and only then finalises the earlier
+# splits' archives and writes metadata.yaml. A fixed 15 s cut that short and
+# SIGKILLed it mid-compression (dp1f_1006, 2026-10-06: both .zstd files
+# truncated, no metadata). So the recorder keeps its SIGINT for as long as the
+# bag directory keeps changing, and is escalated only after
+# _SIGINT_STALL_TIMEOUT of no writes at all -- a writer that is wedged rather
+# than slow. _SIGINT_MAX_TIMEOUT bounds the blocking POST whatever happens.
+_SIGINT_STALL_TIMEOUT = 15.0
+_SIGINT_MAX_TIMEOUT = 300.0
+_SIGINT_POLL_INTERVAL = 1.0
 _SIGTERM_TIMEOUT = 5.0
 _SIGKILL_TIMEOUT = 2.0
 
@@ -284,7 +295,9 @@ class RecordingGateway:
     def stop(self) -> Tuple[bool, str, Dict]:
         """Stop the live recorder and wait for it to flush its metadata.
 
-        Blocking, by up to ~22 s in the worst case. That is why the route is a
+        Blocking: typically a few seconds, about a minute when compression has
+        a full split left to compress, and ~5 min in the worst case (see
+        _SIGINT_MAX_TIMEOUT). That is why the route is a
         plain ``def`` handler: FastAPI runs it on a worker thread, and the
         caller genuinely wants to know whether the bag is playable, which is
         only knowable once the child is gone.
@@ -371,15 +384,14 @@ def _terminate(logger: structlog.stdlib.BoundLogger, active: _Active) -> str:
     if process.poll() is not None:
         return "already_exited"
 
-    try:
-        process.send_signal(signal.SIGINT)
-        process.wait(timeout=_SIGINT_TIMEOUT)
+    process.send_signal(signal.SIGINT)
+    if _wait_while_writing(logger, active):
         return "sigint"
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "[RecordingGateway] The recorder ignored SIGINT, sending SIGTERM",
-            recording=active.name,
-        )
+    logger.warning(
+        "[RecordingGateway] The recorder stopped flushing after SIGINT, "
+        "sending SIGTERM",
+        recording=active.name,
+    )
 
     try:
         process.terminate()
@@ -405,6 +417,65 @@ def _terminate(logger: structlog.stdlib.BoundLogger, active: _Active) -> str:
         )
         return "kill_failed"
     return "sigkill"
+
+
+def _wait_while_writing(
+    logger: structlog.stdlib.BoundLogger, active: _Active
+) -> bool:
+    """Wait for a SIGINTed recorder to exit; True if it did.
+
+    Gives up after _SIGINT_STALL_TIMEOUT with no change under the bag directory,
+    or after _SIGINT_MAX_TIMEOUT in total. "Change" is any file's size or mtime
+    moving, which covers every phase of rosbag2's shutdown: the sqlite close,
+    the .zstd growing, the uncompressed split being deleted, metadata.yaml.
+    """
+    process = active.process
+    started = time.monotonic()
+    last_progress = started
+    last_seen = _dir_progress(active.path)
+
+    while True:
+        try:
+            process.wait(timeout=_SIGINT_POLL_INTERVAL)
+            return True
+        except subprocess.TimeoutExpired:
+            pass
+
+        now = time.monotonic()
+        seen = _dir_progress(active.path)
+        if seen != last_seen:
+            last_seen = seen
+            last_progress = now
+
+        if now - last_progress >= _SIGINT_STALL_TIMEOUT:
+            return False
+        if now - started >= _SIGINT_MAX_TIMEOUT:
+            logger.warning(
+                "[RecordingGateway] The recorder was still writing at the "
+                "SIGINT budget",
+                recording=active.name,
+                budget_seconds=_SIGINT_MAX_TIMEOUT,
+            )
+            return False
+
+
+def _dir_progress(path: str) -> Tuple[Tuple[str, int, int], ...]:
+    """A fingerprint of ``path``'s files that changes whenever one is written.
+
+    Only the top level: rosbag2 writes no subdirectories.
+    """
+    entries = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    st = entry.stat()
+                except FileNotFoundError:
+                    continue
+                entries.append((entry.name, st.st_size, st.st_mtime_ns))
+    except FileNotFoundError:
+        pass
+    return tuple(sorted(entries))
 
 
 def _dir_size(path: str) -> int:
