@@ -610,7 +610,7 @@ dispatches by `StepType`:
 
 | StepType | Activity | What it does |
 |---|---|---|
-| `MOVE` | `execute_move` | Send a `NavigateToPose` goal, poll to a terminal state, heartbeat each second |
+| `MOVE` | `execute_move` | Send a `NavigateToPose` goal, poll to a terminal state, heartbeat every 0.25 s |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see the note in `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.speak()` — synthesise and play on the robot speaker, blocking for the utterance. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; list at `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the same constraints as the REST route, because both drive one gateway |
 | `WAIT` | — (workflow timer) | Do nothing for `WaitParams.seconds` (0 < s ≤ 3600) before the next step. Not an activity: a durable Temporal timer inside `RobotWorkflow._run_wait`, so it takes no slot of the one-thread activity executor, needs no heartbeat, and survives a backend restart with the time already served |
@@ -626,9 +626,9 @@ Details that matter when editing this path:
   `max_concurrent_activities=1`, so Temporal holds a second activity server-side
   rather than handing it over to queue behind the thread with its timeouts
   already ticking. On cancellation Temporal
-  *throws* `CancelledError` into the thread wherever it happens to be (often
-  inside `time.sleep`), so cleanup lives in an `except CancelledError:` block, not
-  in an `is_cancelled()` poll. `execute_move` wraps the whole of the send and
+  *throws* `CancelledError` into the thread wherever it happens to be (it
+  lands once a blocking call such as `time.sleep` returns), so cleanup lives in
+  an `except CancelledError:` block, not in an `is_cancelled()` poll. `execute_move` wraps the whole of the send and
   the poll loop in one `except CancelledError` that calls
   `cancel_active_moves()` under `activity.shield_thread_cancel_exception()`, so
   the goal is really cancelled before the activity dies. By goal *state* rather
@@ -636,6 +636,16 @@ Details that matter when editing this path:
   answered — and for the goal nav2 accepts a moment after that, the gateway
   itself disowns it: whichever of the two threads (the waiter, the rclpy
   response callback) is second sees what the first did and cancels.
+- **A cancel only reaches an activity on a heartbeat.** The server never pushes
+  it: it answers the worker's next heartbeat with "cancel requested", and the
+  worker then throws `CancelledError` into the thread. So how long a paused or
+  cancelled MOVE keeps driving is the heartbeat *send* interval plus the poll
+  sleep. The SDK throttles sending to 0.8 × `heartbeat_timeout` (2.4 s under
+  the 3 s MOVE timeout) by default; the worker caps it at
+  `HEARTBEAT_THROTTLE_MAX` (0.5 s, `temporal/worker.py`) and `_wait_for_nav_goal`
+  polls every `NAV_POLL_INTERVAL_S` (0.25 s), so nav2 hears the cancel within
+  about 0.75 s instead of ~3.5 s. The heartbeat *timeout* is untouched;
+  `test_activities.py` pins the relation between the three.
 - **MOVE heartbeats before it sends.** The heartbeat clock starts at activity
   start, and `move()` has no loop to heartbeat from, so its two waits (server
   ready, goal accepted) are bounded by `NAV_GOAL_SEND_BUDGET_S` in the gateway

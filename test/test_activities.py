@@ -116,7 +116,7 @@ class TestExecuteMove:
         beats = []
         env.on_heartbeat = lambda *details: beats.append(details)
 
-        with patch(SLEEP):  # the 1 s poll pause, not needed under test
+        with patch(SLEEP):  # the poll pause, not needed under test
             result = env.run(
                 activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0)
             )
@@ -151,6 +151,19 @@ class TestExecuteMove:
         from syncai_backend.temporal.workflows import MOVE_HEARTBEAT_TIMEOUT
 
         assert MOVE_HEARTBEAT_TIMEOUT.total_seconds() > NAV_GOAL_SEND_BUDGET_S
+
+    def test_a_cancel_reaches_the_poll_loop_quickly(self):
+        """A cancel arrives on a heartbeat reply and lands after the current
+        poll sleep. The throttle cap only shortens anything while it is below
+        the SDK's own 0.8 x heartbeat_timeout, and the poll has to produce a
+        heartbeat at least as often as one may be sent."""
+        from syncai_backend.temporal.activities import NAV_POLL_INTERVAL_S
+        from syncai_backend.temporal.worker import HEARTBEAT_THROTTLE_MAX
+        from syncai_backend.temporal.workflows import MOVE_HEARTBEAT_TIMEOUT
+
+        throttle = HEARTBEAT_THROTTLE_MAX.total_seconds()
+        assert throttle < 0.8 * MOVE_HEARTBEAT_TIMEOUT.total_seconds()
+        assert NAV_POLL_INTERVAL_S <= throttle
 
     def test_a_cancel_during_the_send_cancels_whatever_is_executing(
         self, env, activities, robot_gw

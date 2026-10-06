@@ -19,6 +19,17 @@ from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 
+# How often _wait_for_nav_goal reads the goal and heartbeats. A cancel reaches
+# this thread in two hops, and this is the second: the worker learns of it from
+# the server's reply to a heartbeat (at most every HEARTBEAT_THROTTLE_MAX, see
+# worker.py), then throws CancelledError into the thread -- which only takes
+# effect once the thread is back in Python, i.e. after the current sleep. Kept
+# at or below the throttle so a heartbeat is always waiting when the next one
+# may go out. get_move_status is an in-memory read, so polling this often is
+# free.
+NAV_POLL_INTERVAL_S = 0.25
+
+
 class ActivityResult(BaseModel):
     success: bool
     goal_id: str | None = None
@@ -55,7 +66,7 @@ class RobotActivities:
             if state in ["succeeded", "aborted", "canceled"]:
                 return state
 
-            time.sleep(1.0)
+            time.sleep(NAV_POLL_INTERVAL_S)
 
     @activity.defn
     def execute_move(
@@ -75,8 +86,10 @@ class RobotActivities:
 
         This runs in a synchronous (threaded) activity. On cancellation Temporal
         *throws* CancelledError into this thread wherever it happens to be --
-        inside time.sleep, or inside move() while nav2 is still deciding -- so
+        in the poll loop, or inside move() while nav2 is still deciding -- so
         cleanup lives in the except clause below, not in an is_cancelled() poll.
+        (A blocking C call such as time.sleep is not interrupted: the exception
+        lands when it returns, which is why NAV_POLL_INTERVAL_S is short.)
         """
         active_map = self._map_catalog_repo.active_name()
         refusal = move_refusal(
