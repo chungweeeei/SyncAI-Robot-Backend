@@ -234,11 +234,10 @@ def test_state_reports_the_low_level_mode(client, robot_repo, make_robot_state):
         # that keeps the reverse-map fallback in place.
         (2, 0, "CHAMP", "STAND"),
         (3, 4, "ISSAC", "ESTOP"),
-        # 8 is the controller's own "I have not entered a state yet" sentinel.
-        (0, 8, "PPO", "UNKNOWN"),
-        # MPC's motion code is unknown, so an out-of-table integer is expected;
-        # it degrades to the same UNKNOWN as the sentinel above, which is why the
-        # two are indistinguishable over REST.
+        # 8 is IDLE and has to stay its own label: the console ends a commanded
+        # MPC on a return to IDLE, which only works if IDLE is not the same
+        # string as the UNKNOWN that MPC's out-of-table code degrades to.
+        (0, 8, "PPO", "IDLE"),
         (0, 6, "PPO", "UNKNOWN"),
         (99, 0, "UNKNOWN", "STAND"),
     ],
