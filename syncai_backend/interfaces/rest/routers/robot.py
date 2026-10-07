@@ -14,6 +14,7 @@ from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.services.mode_restart import ModeRestartService, RestartStatus
+from syncai_backend.services.safety_lock import SafetyLockService
 
 
 # Reverse lookup: RobotMode uint8 constant -> human-readable name.
@@ -175,6 +176,16 @@ class RobotLowLevelMode(BaseModel):
             "DAMPING / ESTOP / IDLE (8, motors not driven by any controller), "
             "or UNKNOWN for an index this backend has no name for. MPC has no "
             "known code, so it lands on UNKNOWN."
+        ),
+    )
+    safety_locked: bool = Field(
+        ...,
+        description=(
+            "Whether syncai_driver_manager's software safety lock is engaged: "
+            "cmd_vel and every motion key but ESTOP are "
+            "dropped until POST /api/v1/robot/estop releases it. Every running "
+            "task is cancelled when it engages. False before the driver has "
+            "published, indistinguishable from a genuine release."
         ),
     )
 
@@ -368,6 +379,34 @@ class SetMotionKeyResponse(BaseModel):
     message: str = Field(..., description="Human-readable result of the request.")
 
 
+class EstopRequest(BaseModel):
+    locked: bool = Field(
+        ...,
+        description=(
+            "True engages the driver's safety lock (cmd_vel and every motion "
+            "key but ESTOP are dropped; every running task is cancelled), "
+            "false releases it."
+        ),
+    )
+
+
+class EstopResponse(BaseModel):
+    locked: bool = Field(..., description="The lock state that was requested.")
+    cancel_requested: bool = Field(
+        ...,
+        description=(
+            "Whether this request started cancelling every running task: true "
+            "only when it engaged a lock that was not already engaged. Started, "
+            "not finished -- the cancel runs after this response."
+        ),
+    )
+    message: str = Field(..., description="Human-readable result of the request.")
+    # No `changed` flag: the driver answers success whether or not the lock
+    # moved, and the two differ only in its prose, which this API does not
+    # match on. low_level_mode.safety_locked on GET /api/v1/robot/state is the
+    # answer to "is it locked now".
+
+
 class PolicyMode(int, Enum):
     """Gait-controller policy indices this REST surface accepts.
 
@@ -430,6 +469,7 @@ def init_robot_router(
     robot_repo: RobotRepo,
     robot_gw: RobotGateway,
     restart_svc: ModeRestartService,
+    safety_lock_svc: SafetyLockService,
 ) -> APIRouter:
     robot_router = APIRouter(prefix="", tags=["Robot"])
 
@@ -473,6 +513,10 @@ def init_robot_router(
             low_level_mode=RobotLowLevelMode(
                 policy=_policy_state_to_str(state.low_level_mode.policy_state),
                 motion=_motion_state_to_str(state.low_level_mode.motion_state),
+                # Ours, not the controller's (see RobotLowLevelMode.msg); the
+                # console's only way to know control is being dropped, and
+                # which way the estop button goes next.
+                safety_locked=state.low_level_mode.safety_state,
             ),
             # The one whitelist widening since the rule was written: without it
             # a consumer cannot tell the zeroed placeholder pose from a robot
@@ -699,12 +743,10 @@ def init_robot_router(
         # against ESTOP of all things); 202 was rejected (nothing is queued).
         #
         # Known follow-up: the driver's own asymmetry is the opposite of this
-        # one. While safe_lock_ is engaged, '4' is the ONLY key that passes and
-        # every other is rejected — and reset_safety, the release, has no
-        # gateway client at all. So once the lock is finally wired (nothing sets
-        # it today), this surface will hold the four keys that get rejected,
-        # refuse the one that passes, and offer no way to clear it. Add a
-        # reset_safety client before ESTOP is ever forwarded from here.
+        # one. While its safety lock is engaged, '4' is the ONLY key that
+        # passes and every other is rejected. The lock itself is
+        # POST /api/v1/robot/estop now, but this surface still holds the keys
+        # that get rejected and refuses the one that passes.
         if request.key is MotionKey.ESTOP:
             logger.warning(
                 "Refused to forward ESTOP motion key; no datagram sent",
@@ -747,6 +789,44 @@ def init_robot_router(
             key=request.key,
             sent=True,
             message=f"Sent motion key {request.key.value} ({request.key.name})",
+        )
+
+    @robot_router.post("/api/v1/robot/estop", response_model=EstopResponse)
+    def estop(request: EstopRequest):
+        """Engage or release the driver's safety lock (`set_safety_lock`).
+
+        Engaging cancels every running task, at once and in the background --
+        but only on the edge: a lock that was already engaged cancels nothing
+        again, and a release never cancels. The edge is SafetyLockService's,
+        shared with the robot_state samples that report a lock the driver
+        engaged itself, so one engagement is one cancel whichever side sees
+        it first.
+
+        Not the ESTOP motion key, which set_motion_key still refuses to
+        forward: that is a datagram to the gait controller, this is the
+        driver's gate in front of it. Plain ``def`` like the other command
+        endpoints: the gateway blocks on a ROS round trip.
+        """
+        success, message = robot_gw.set_safety_lock(locked=request.locked)
+        if not success:
+            # Nothing was locked, so nothing is cancelled either: a task
+            # stopped by a lock that never engaged would be a surprise.
+            logger.error(
+                "Failed to set safety lock", locked=request.locked, message=message
+            )
+            raise UpstreamError(message)
+
+        cancel_requested = request.locked and safety_lock_svc.engage_requested()
+        if request.locked:
+            message = (
+                "Safety lock engaged; cancelling every running task."
+                if cancel_requested
+                else "Safety lock was already engaged."
+            )
+        else:
+            message = "Safety lock released."
+        return EstopResponse(
+            locked=request.locked, cancel_requested=cancel_requested, message=message
         )
 
     @robot_router.post(

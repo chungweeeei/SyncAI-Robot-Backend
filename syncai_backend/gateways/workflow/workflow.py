@@ -1139,6 +1139,47 @@ class WorkflowGateway:
             )
             raise UpstreamError("Cancel workflow failed")
 
+    async def cancel_active_tasks(self) -> List[str]:
+        """Cancel every run on this robot's task queue; the ids that were asked.
+
+        The safety lock's caller (services/safety_lock.py): when the driver
+        engages it, every task is cancelled, not just the one an operator is
+        looking at. Same two reads as _require_idle and for the same reasons --
+        a fresh visibility sweep, never list_active_tasks' TTL cache (a stale
+        "nothing running" here leaves a run driving into a locked robot), plus
+        the last task this process started, which the index may not show yet.
+
+        Raises only when the sweep itself fails. One run that cannot be
+        cancelled is logged and the rest still are; one that closed in between
+        (NotFoundError) is what was wanted anyway.
+        """
+        snapshot = await self._fetch_active_tasks()
+        if snapshot.error is not None:
+            raise snapshot.error
+
+        task_ids = [task.id for task in snapshot.tasks or []]
+        if (
+            self._last_started_task_id is not None
+            and self._last_started_task_id not in task_ids
+        ):
+            task_ids.append(self._last_started_task_id)
+
+        cancelled: List[str] = []
+        for task_id in task_ids:
+            try:
+                await self.cancel_task(task_id)
+            except NotFoundError:
+                continue
+            except Exception as err:
+                self._logger.error(
+                    "[WorkflowGateway] Failed to cancel task",
+                    task_id=task_id,
+                    error=str(err),
+                )
+                continue
+            cancelled.append(task_id)
+        return cancelled
+
     async def pause_task(self, task_id: str):
         """Ask the running workflow to hold (POST /api/v1/tasks/{id}/pause)."""
         await self._signal_running_task(task_id, PAUSE_SIGNAL, "Pause workflow failed")
