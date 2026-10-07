@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import threading
 import uvicorn
 import structlog
@@ -44,6 +46,7 @@ from syncai_backend.gateways.recording.recording import RecordingGateway
 
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 from syncai_backend.services.mode_restart import ModeRestartService
+from syncai_backend.services.safety_lock import SafetyLockService
 
 from syncai_backend.temporal.worker import TemporalWorkerHandle
 
@@ -101,6 +104,7 @@ def init_rest_server(
     conversion_svc: GridmapConversionService,
     restart_svc: ModeRestartService,
     mapping_status_repo: MappingStatusRepo,
+    safety_lock_svc: SafetyLockService,
 ) -> FastAPI:
 
     description = """
@@ -108,8 +112,19 @@ def init_rest_server(
     controlling and monitoring the robot, as well as managing data and workflows.
     """
 
+    # The safety lock's cancel has to run on this loop -- WorkflowGateway
+    # belongs to it -- but is started from a ROS callback, which has no other
+    # way to reach it. See services/safety_lock.py.
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI):
+        safety_lock_svc.bind_loop(asyncio.get_running_loop())
+        yield
+
     app = FastAPI(
-        title="SyncAI Robot backend Server", description=description, version="1.0.0"
+        title="SyncAI Robot backend Server",
+        description=description,
+        version="1.0.0",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -175,6 +190,7 @@ def init_rest_server(
             robot_repo=robot_repo,
             robot_gw=robot_gw,
             restart_svc=restart_svc,
+            safety_lock_svc=safety_lock_svc,
         )
     )
     app.include_router(init_network_router(logger=logger, robot_gw=robot_gw))
@@ -283,6 +299,7 @@ def start_rest_server(
     conversion_svc: GridmapConversionService,
     restart_svc: ModeRestartService,
     mapping_status_repo: MappingStatusRepo,
+    safety_lock_svc: SafetyLockService,
 ):
 
     app = init_rest_server(
@@ -305,6 +322,7 @@ def start_rest_server(
         conversion_svc=conversion_svc,
         restart_svc=restart_svc,
         mapping_status_repo=mapping_status_repo,
+        safety_lock_svc=safety_lock_svc,
     )
 
     def _run():

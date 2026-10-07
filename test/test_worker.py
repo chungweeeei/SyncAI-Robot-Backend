@@ -182,6 +182,7 @@ def test_health_projects_worker_state():
         conversion_svc=MagicMock(),
         restart_svc=MagicMock(),
         mapping_status_repo=MagicMock(),
+        safety_lock_svc=MagicMock(),
     )
     client = TestClient(app)
 

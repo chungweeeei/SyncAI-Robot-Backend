@@ -25,6 +25,7 @@ from syncai_common.srv import (
 )
 
 from std_msgs.msg import Header
+from std_srvs.srv import SetBool
 from geometry_msgs.msg import (
     Point,
     Quaternion,
@@ -186,6 +187,14 @@ class RobotGateway:
             srv_name="set_policy_mode",
         )
 
+        # The driver's software safety lock, both ways. Same server as the two
+        # above, same relative name for the same reason. It replaced the C++
+        # driver's release-only `reset_safety` (std_srvs/Trigger).
+        safety_lock_client = self._node.create_client(
+            srv_type=SetBool,
+            srv_name="set_safety_lock",
+        )
+
         # sys_manager's operating-mode switch (which byobu session is up). On
         # this gateway rather than a new one because sys_manager is already part
         # of its surface (the wifi services above), and because switching modes
@@ -209,6 +218,7 @@ class RobotGateway:
                 "connect_wifi": connect_wifi_client,
                 "set_motion_key": set_motion_key_client,
                 "set_policy_mode": set_policy_mode_client,
+                "set_safety_lock": safety_lock_client,
                 "switch_mode": switch_mode_client,
                 "restart_mode": restart_mode_client,
             }
@@ -318,6 +328,31 @@ class RobotGateway:
         # parsing, would then surface as a spurious 502.
         if not _wait_for_future(future, timeout=10.0):
             return False, "Timeout waiting for set_policy_mode response"
+
+        response = future.result()
+        return response.success, response.message
+
+    def set_safety_lock(self, locked: bool) -> Tuple[bool, str]:
+        """Engage (True) or release (False) the driver's software safety lock.
+
+        `set_safety_lock` (std_srvs/SetBool) on driver_manager. Engaging only
+        blocks control -- motion keys other than ESTOP and cmd_vel are dropped
+        -- and sends no lie-down. The driver answers success whether or not the
+        state changed; the two cases differ only in prose, which no caller may
+        match on. Whether the lock is held is
+        RobotState.low_level_mode.safety_state.
+        """
+        safety_lock_client = self._service_clients.get("set_safety_lock")
+        if not safety_lock_client.wait_for_service(timeout_sec=5.0):
+            return False, "set_safety_lock service is not available"
+
+        self._logger.info("[RobotGateway] Setting safety lock", locked=locked)
+
+        future = safety_lock_client.call_async(SetBool.Request(data=locked))
+        # Same 10.0 as the two siblings on the driver's services worker: the
+        # callback swaps an atomic and maybe publishes, and cannot block.
+        if not _wait_for_future(future, timeout=10.0):
+            return False, "Timeout waiting for set_safety_lock response"
 
         response = future.result()
         return response.success, response.message

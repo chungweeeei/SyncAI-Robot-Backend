@@ -14,7 +14,9 @@ standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, and the
 map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`) — plus `rclpy`,
-`nav2_msgs`, `tf2_ros`. Keep those imports as they are. It is named in
+`nav2_msgs`, `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
+those imports as they are. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
+after SyncAI-Robot-Interface `b1996dd`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
 colcon workspace root materialises it into `src/` beside this package, over
 HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
@@ -115,6 +117,11 @@ Consequences:
 - Postgres is a hard dependency (20 retries × 5 s, then the process exits); Temporal is
   soft — `TemporalWorkerHandle` records `connecting`/`running`/`dead` and `/health`
   reports `degraded` instead of crashing.
+- **`WorkflowGateway` belongs to the uvicorn loop** (its Temporal client and caches are
+  touched from nowhere else). Work started from a ROS callback that needs it — today only
+  `SafetyLockService`'s cancel on the safety lock's rising edge — is handed over with
+  `run_coroutine_threadsafe` onto the loop the REST server's `lifespan` binds, never run
+  in the callback (which must not block or raise either).
 
 ### Layering (convention, not enforced)
 
@@ -123,7 +130,8 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain ex
         │
 services/                  domain work that outlives a request: gridmap_conversion (recipes,
         │                  the registry of running threads, the gridmap.recipe.json protocol),
-        │                  mode_restart (the latest restart_mode dispatch and its outcome)
+        │                  mode_restart (the latest restart_mode dispatch and its outcome),
+        │                  safety_lock (the driver lock's rising edge -> cancel every task)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording

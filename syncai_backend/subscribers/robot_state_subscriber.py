@@ -6,6 +6,7 @@ from rclpy.qos import QoSProfile
 from syncai_common.msg import RobotState as RobotStateMsg
 
 from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.services.safety_lock import SafetyLockService
 
 
 class RobotStateSubscriber:
@@ -28,11 +29,22 @@ class RobotStateSubscriber:
     console was blind because of this). The pose-honesty half of that trade is
     kept by exposing ``localization_valid`` in the payload instead, so a zeroed
     pose arrives labelled rather than not arriving.
+
+    Every sample's ``low_level_mode.safety_state`` also goes to
+    SafetyLockService, which cancels every task on the lock's rising edge.
+    Best-effort QoS is fine for that: the edge is judged against the last
+    value seen, so a dropped sample only delays it to the next one.
     """
 
-    def __init__(self, logger: structlog.stdlib.BoundLogger, robot_repo: RobotRepo):
+    def __init__(
+        self,
+        logger: structlog.stdlib.BoundLogger,
+        robot_repo: RobotRepo,
+        safety_lock_svc: SafetyLockService,
+    ):
         self._logger = logger
         self._robot_repo = robot_repo
+        self._safety_lock_svc = safety_lock_svc
 
     def register(self, node: Node):
 
@@ -50,10 +62,16 @@ class RobotStateSubscriber:
 
     def _robot_state_cb(self, msg: RobotStateMsg):
         self._robot_repo.update_robot_state(state=msg)
+        self._safety_lock_svc.observe(engaged=msg.low_level_mode.safety_state)
 
 
 def init_robot_state_subscriber(
-    logger: structlog.stdlib.BoundLogger, node: Node, robot_repo: RobotRepo
+    logger: structlog.stdlib.BoundLogger,
+    node: Node,
+    robot_repo: RobotRepo,
+    safety_lock_svc: SafetyLockService,
 ) -> RobotStateSubscriber:
-    robot_state_subscriber = RobotStateSubscriber(logger=logger, robot_repo=robot_repo)
+    robot_state_subscriber = RobotStateSubscriber(
+        logger=logger, robot_repo=robot_repo, safety_lock_svc=safety_lock_svc
+    )
     robot_state_subscriber.register(node=node)

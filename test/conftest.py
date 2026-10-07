@@ -244,6 +244,7 @@ def make_robot_state():
         motor_timestamp=1754000000,
         policy_state=1,
         motion_state=1,
+        safety_state=False,
     ):
         msg = RobotStateMsg()
         msg.robot_id = robot_id
@@ -276,6 +277,7 @@ def make_robot_state():
 
         msg.low_level_mode.policy_state = policy_state
         msg.low_level_mode.motion_state = motion_state
+        msg.low_level_mode.safety_state = safety_state
         return msg
 
     return _make

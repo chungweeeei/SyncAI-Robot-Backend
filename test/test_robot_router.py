@@ -69,6 +69,8 @@ class _StubRobotGateway:
         # The late-answer callback of the last dispatched restart: a test calls
         # it to play sys_manager answering once the rebuild is over.
         self.restart_done = None
+        self.safety_locks = []
+        self.safety_lock_result = (True, "Safety lock engaged. Remote control blocked.")
 
     def set_motion_key(self, key):
         self.motion_keys.append(key)
@@ -82,6 +84,10 @@ class _StubRobotGateway:
         self.switched_modes.append(mode)
         return self.switch_result
 
+    def set_safety_lock(self, locked):
+        self.safety_locks.append(locked)
+        return self.safety_lock_result
+
     def restart_mode(self, on_done=None):
         self.restarts += 1
         if self.restart_result[0] is None:
@@ -89,9 +95,26 @@ class _StubRobotGateway:
         return self.restart_result
 
 
+class _StubSafetyLockService:
+    """Answers engage_requested as told; counts the calls."""
+
+    def __init__(self):
+        self.engage_requests = 0
+        self.edge = True
+
+    def engage_requested(self):
+        self.engage_requests += 1
+        return self.edge
+
+
 @pytest.fixture
 def robot_gw():
     return _StubRobotGateway()
+
+
+@pytest.fixture
+def safety_lock_svc():
+    return _StubSafetyLockService()
 
 
 @pytest.fixture
@@ -105,7 +128,7 @@ def robot_repo(logger):
 
 
 @pytest.fixture
-def client(logger, robot_repo, robot_gw):
+def client(logger, robot_repo, robot_gw, safety_lock_svc):
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -114,6 +137,7 @@ def client(logger, robot_repo, robot_gw):
             robot_repo=robot_repo,
             robot_gw=robot_gw,
             restart_svc=init_mode_restart_service(logger=logger, robot_gw=robot_gw),
+            safety_lock_svc=safety_lock_svc,
         )
     )
     return TestClient(app)
@@ -222,7 +246,13 @@ def test_state_reports_the_low_level_mode(client, robot_repo, make_robot_state):
     low = _get_state(client).json()["low_level_mode"]
 
     # Labels only: the controller's raw integers stay on the ROS topic.
-    assert low == {"policy": "HIMLOCO", "motion": "LOCOMOTION"}
+    assert low == {"policy": "HIMLOCO", "motion": "LOCOMOTION", "safety_locked": False}
+
+
+def test_state_reports_an_engaged_safety_lock(client, robot_repo, make_robot_state):
+    robot_repo.update_robot_state(state=make_robot_state(safety_state=True))
+
+    assert _get_state(client).json()["low_level_mode"]["safety_locked"] is True
 
 
 @pytest.mark.parametrize(
@@ -380,6 +410,65 @@ def test_motion_key_gateway_failure_is_502_with_the_message_verbatim(client, rob
 
     assert response.status_code == 502
     assert response.json()["detail"] == "LOCKED"
+
+
+# --- POST /api/v1/robot/estop -----------------------------------------------
+
+
+def _post_estop(client, locked):
+    return client.post("/api/v1/robot/estop", json={"locked": locked})
+
+
+def test_estop_engaging_cancels_on_the_edge(client, robot_gw, safety_lock_svc):
+    response = _post_estop(client, True)
+
+    assert response.status_code == 200
+    assert robot_gw.safety_locks == [True]
+    assert safety_lock_svc.engage_requests == 1
+    assert response.json()["locked"] is True
+    assert response.json()["cancel_requested"] is True
+
+
+def test_estop_engaging_an_engaged_lock_cancels_nothing(
+    client, robot_gw, safety_lock_svc
+):
+    safety_lock_svc.edge = False
+
+    response = _post_estop(client, True)
+
+    assert response.status_code == 200
+    assert response.json()["cancel_requested"] is False
+
+
+def test_estop_release_never_cancels(client, robot_gw, safety_lock_svc):
+    robot_gw.safety_lock_result = (True, "Safety lock released. Remote control restored.")
+
+    response = _post_estop(client, False)
+
+    assert response.status_code == 200
+    assert robot_gw.safety_locks == [False]
+    assert safety_lock_svc.engage_requests == 0
+    assert response.json()["cancel_requested"] is False
+
+
+def test_estop_gateway_failure_is_502_and_cancels_nothing(
+    client, robot_gw, safety_lock_svc
+):
+    robot_gw.safety_lock_result = (False, "set_safety_lock service is not available")
+
+    response = _post_estop(client, True)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "set_safety_lock service is not available"
+    # A lock that never engaged must not stop anyone's task.
+    assert safety_lock_svc.engage_requests == 0
+
+
+def test_estop_requires_the_lock_state(client, robot_gw):
+    response = client.post("/api/v1/robot/estop", json={})
+
+    assert response.status_code == 422
+    assert robot_gw.safety_locks == []
 
 
 # --- POST /api/v1/robot/set_policy_mode -------------------------------------

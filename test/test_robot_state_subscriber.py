@@ -67,10 +67,30 @@ def node():
     return _FakeNode()
 
 
+class _RecordingSafetyLock:
+    """Stands in for SafetyLockService; records what each sample handed it."""
+
+    def __init__(self):
+        self.observed = []
+
+    def observe(self, engaged):
+        self.observed.append(engaged)
+
+
 @pytest.fixture
-def subscription(logger, node, robot_repo):
+def safety_lock_svc():
+    return _RecordingSafetyLock()
+
+
+@pytest.fixture
+def subscription(logger, node, robot_repo, safety_lock_svc):
     """The one subscription init_robot_state_subscriber registers."""
-    init_robot_state_subscriber(logger=logger, node=node, robot_repo=robot_repo)
+    init_robot_state_subscriber(
+        logger=logger,
+        node=node,
+        robot_repo=robot_repo,
+        safety_lock_svc=safety_lock_svc,
+    )
     (sub,) = node.subscriptions
     return sub
 
@@ -105,6 +125,16 @@ def test_the_whole_message_lands_in_the_repo_unfiltered(
     # router's whitelist is the only projection. A copy that trimmed fields
     # would still compare equal today and silently lose tomorrow's field.
     assert robot_repo.get_robot_state() is msg
+
+
+def test_every_sample_hands_its_safety_state_on(
+    subscription, safety_lock_svc, make_robot_state
+):
+    # Every sample, not just changes: the edge is the service's to judge.
+    for engaged in (False, True, True):
+        subscription.callback(make_robot_state(safety_state=engaged))
+
+    assert safety_lock_svc.observed == [False, True, True]
 
 
 def test_a_second_sample_replaces_the_first(subscription, robot_repo, make_robot_state):

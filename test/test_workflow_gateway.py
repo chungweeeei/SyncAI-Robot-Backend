@@ -701,6 +701,70 @@ class TestWorkflowGateway:
 
         mock_client.list_workflows.assert_called_once()
 
+    # ==================== cancel_active_tasks ====================
+
+    def _owned_running(self):
+        return SimpleNamespace(
+            status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+        )
+
+    def test_cancel_active_tasks_bypasses_the_cache(self, workflow_gw, mock_client):
+        handle = self._workflow_handle(mock_client, describe=self._owned_running())
+        self._listing(mock_client, [_execution("robot01-task-001")])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+
+            async def _poll_then_cancel():
+                await workflow_gw.list_active_tasks()
+                return await workflow_gw.cancel_active_tasks()
+
+            cancelled = asyncio.run(_poll_then_cancel())
+
+        # A console poll a moment ago must not stand in for the sweep.
+        assert mock_client.list_workflows.call_count == 2
+        assert cancelled == ["robot01-task-001"]
+        handle.cancel.assert_awaited_once()
+
+    def test_cancel_active_tasks_includes_the_last_start(self, workflow_gw, mock_client):
+        self._workflow_handle(mock_client, describe=self._owned_running())
+        self._listing(mock_client, [])
+        workflow_gw._last_started_task_id = "robot01-task-002"
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            cancelled = asyncio.run(workflow_gw.cancel_active_tasks())
+
+        # Not in the index yet, still cancelled.
+        assert cancelled == ["robot01-task-002"]
+
+    def test_cancel_active_tasks_carries_on_past_a_failure(
+        self, workflow_gw, mock_client
+    ):
+        handle = self._workflow_handle(mock_client, describe=self._owned_running())
+        handle.cancel.side_effect = [
+            RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b""),
+            _not_found(),
+            None,
+        ]
+        self._listing(
+            mock_client,
+            [_execution("a"), _execution("b"), _execution("c")],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            cancelled = asyncio.run(workflow_gw.cancel_active_tasks())
+
+        # One that failed is logged, one that closed meanwhile is fine; neither
+        # stops the rest.
+        assert cancelled == ["c"]
+        assert handle.cancel.await_count == 3
+
+    def test_cancel_active_tasks_raises_when_the_sweep_fails(
+        self, workflow_gw, mock_client
+    ):
+        mock_client.list_workflows.side_effect = RPCError(
+            "unavailable", RPCStatusCode.UNAVAILABLE, b""
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError):
+                asyncio.run(workflow_gw.cancel_active_tasks())
+
     # ==================== list_task_history ====================
 
     def _history_page(self, mock_client, executions, next_token=None, error=None):

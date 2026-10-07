@@ -32,6 +32,7 @@ from syncai_backend.services.gridmap_conversion import (
     init_gridmap_conversion_service,
 )
 from syncai_backend.services.mode_restart import init_mode_restart_service
+from syncai_backend.services.safety_lock import init_safety_lock_service
 
 from syncai_backend.subscribers.robot_state_subscriber import (
     init_robot_state_subscriber,
@@ -169,13 +170,25 @@ class SyncAIBackend(Node):
         # once the rebuild is over, long after the request has returned.
         restart_svc = init_mode_restart_service(logger=logger, robot_gw=robot_gw)
 
+        # Cancels every task when the driver's safety lock engages. Fed by the
+        # robot_state subscriber (ROS thread), run on the REST loop, which is
+        # the only one WorkflowGateway may be used from.
+        safety_lock_svc = init_safety_lock_service(
+            logger=logger, robot_gw=robot_gw, workflow_gw=workflow_gw
+        )
+
         # One /tf + /tf_static subscription for the whole process, shared by the
         # two subscribers that need transforms. Held on self because this is the
         # object that owns it; see subscribers/tf.py for why they no longer
         # build one each.
         self._tf_listener = init_tf_listener(logger=logger, node=self)
 
-        init_robot_state_subscriber(logger=logger, node=self, robot_repo=robot_repo)
+        init_robot_state_subscriber(
+            logger=logger,
+            node=self,
+            robot_repo=robot_repo,
+            safety_lock_svc=safety_lock_svc,
+        )
         init_pointcloud_subscriber(
             logger=logger,
             node=self,
@@ -226,6 +239,7 @@ class SyncAIBackend(Node):
             conversion_svc=conversion_svc,
             restart_svc=restart_svc,
             mapping_status_repo=mapping_status_repo,
+            safety_lock_svc=safety_lock_svc,
         )
 
 

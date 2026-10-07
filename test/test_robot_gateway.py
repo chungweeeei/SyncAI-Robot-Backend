@@ -454,6 +454,29 @@ class TestCommandServices:
         assert success is True
         assert client.call_async.call_args[0][0].mode == 1
 
+    @pytest.mark.parametrize("locked", [True, False])
+    def test_set_safety_lock_sends_the_bool(self, robot_gw, locked):
+        client = self._service(
+            robot_gw,
+            "set_safety_lock",
+            SimpleNamespace(success=True, message="System was not locked."),
+        )
+
+        success, message = robot_gw.set_safety_lock(locked=locked)
+
+        assert (success, message) == (True, "System was not locked.")
+        assert client.call_async.call_args[0][0].data is locked
+
+    def test_set_safety_lock_service_unavailable(self, robot_gw):
+        client = self._service(robot_gw, "set_safety_lock", None, available=False)
+        client.call_async.reset_mock()
+
+        success, message = robot_gw.set_safety_lock(locked=True)
+
+        assert success is False
+        assert "not available" in message
+        client.call_async.assert_not_called()
+
     def test_set_initial_pose_publishes_even_without_subscribers(self, robot_gw):
         # Fire-and-forget by design: no subscriber is a warning, not a failure
         # — the localizer may simply not have discovered the publisher yet.
