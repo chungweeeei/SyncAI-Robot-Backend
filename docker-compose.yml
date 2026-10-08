@@ -128,6 +128,13 @@ services:
       #    public STUN URL on a robot with no internet only makes ICE gathering
       #    wait out a timeout.
       STUN_SERVERS: ""
+      #    The camera feeder (syncai_camera_feeder, in the robot container) is
+      #    the camera's only opener, so ROS can publish it while a WHEP session
+      #    is up; it sends RTP/JPEG to 127.0.0.1:5008 (its rtp_port, the
+      #    worker's default VIDEO_RTP_IN_PORT). Left at the worker's `mjpeg`
+      #    default, every video session opens /dev/syncai/camera0 itself and
+      #    dies on "Device '/dev/syncai/camera0' is busy" / not-negotiated.
+      VIDEO_FORMAT: rtpjpeg
       #    These two are what the `runtime: nvidia` above reads to decide what
       #    to inject; `all` rather than `video` because the CSV is consumed
       #    wholesale and trimming it brings the missing elements back without
