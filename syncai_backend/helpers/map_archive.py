@@ -115,12 +115,16 @@ def _md5():
 # --- Building ---------------------------------------------------------------
 
 
-def _collect_files(map_dir: str, exclude_dirs: Sequence[str]) -> List[Tuple[str, str]]:
+def _collect_files(
+    map_dir: str, exclude_dirs: Sequence[str], exclude_files: Sequence[str] = ()
+) -> List[Tuple[str, str]]:
     """Every regular file under ``map_dir`` as ``(relpath, abspath)``, sorted.
 
     Symlinks are skipped (a link out of the map directory must not pull its
     target into the archive), as are the top-level directories in
-    ``exclude_dirs`` and a stray manifest left over from somewhere.
+    ``exclude_dirs``, the top-level files in ``exclude_files`` and a stray
+    manifest left over from somewhere. Both exclusions are top-level only: a
+    same-named entry deeper down is someone else's file and is kept.
     """
     root = os.path.realpath(map_dir)
     found: List[Tuple[str, str]] = []
@@ -140,7 +144,7 @@ def _collect_files(map_dir: str, exclude_dirs: Sequence[str]) -> List[Tuple[str,
                 continue
             rel = filename if not rel_dir else f"{rel_dir}/{filename}"
             rel = rel.replace(os.sep, "/")
-            if rel == MANIFEST_NAME:
+            if rel == MANIFEST_NAME or (rel_dir == "" and filename in exclude_files):
                 continue
             found.append((rel, full))
     return sorted(found)
@@ -196,8 +200,13 @@ def build_archive(
     fmt: ArchiveFormat,
     exported_at: str,
     exclude_dirs: Sequence[str] = (),
+    exclude_files: Sequence[str] = (),
 ) -> bytes:
     """Archive ``map_dir`` with its manifest and return the bytes.
+
+    ``exclude_dirs`` / ``exclude_files`` name top-level entries to leave out;
+    the caller decides which (the export route drops conversion intermediates
+    and the 3D map's octree).
 
     Each file is read once: hashed and written in the same pass, so the md5
     recorded is of the bytes actually stored — a hash-then-add pair of reads
@@ -211,7 +220,7 @@ def build_archive(
     writer defaults to; the import side never applies either, so none of it
     matters beyond keeping the archive free of this machine's uids.
     """
-    files = _collect_files(map_dir, exclude_dirs)
+    files = _collect_files(map_dir, exclude_dirs, exclude_files)
     hashes: Dict[str, str] = {}
     buffer = io.BytesIO()
 

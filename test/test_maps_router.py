@@ -3582,3 +3582,338 @@ def test_import_logs_its_phase_timings(client, capsys):
     line = next(line for line in out.splitlines() if "Imported map" in line)
     for field in ("inspect_ms=", "extract_ms=", "db_ms="):
         assert field in line
+
+
+# --- the robot-side 3D map ---------------------------------------------------
+#
+# syncai_mapping's build_octomap writes octomap.{bt,recipe.json} and the two
+# layer PCDs into the map directory, from the robot container, minutes after
+# the save. Nothing here starts or watches it, so every state is planted: the
+# sidecar as the build writes it, the layers as PCL writes pcl::PointXYZ.
+
+_ROAD = ((0.0, 0.0, -0.45), (0.1, 0.0, -0.45), (0.2, 0.0, -0.45), (0.3, 0.0, -0.45))
+_WALLS = ((1.0, 0.0, 0.05), (1.0, 0.0, 0.15))
+
+
+def _iso_ago(seconds):
+    from datetime import datetime, timedelta, timezone
+
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _plant_octomap(directory, make_pcl_pcd, road=_ROAD, walls=_WALLS):
+    make_pcl_pcd(directory / "octomap_road.pcd", points=road)
+    make_pcl_pcd(directory / "octomap_occupied.pcd", points=walls)
+    (directory / "octomap.bt").write_bytes(b"# Octomap OcTree binary file\n" + b"\0" * 64)
+
+
+def _plant_octomap_sidecar(directory, payload):
+    path = directory / "octomap.recipe.json"
+    path.write_text(json.dumps(payload) if not isinstance(payload, str) else payload)
+    return path
+
+
+def _octomap_entry(client, name="rawonly"):
+    return _by_name(client.get("/api/v1/maps").json())[name]
+
+
+def test_list_reports_no_3d_map_by_default(client):
+    entry = _octomap_entry(client)
+
+    assert entry["octomap_status"] == "none"
+    assert entry["octomap_error"] is None
+    assert entry["octomap_resolution"] is None
+
+
+def test_list_reports_ok_for_layers_without_a_sidecar(client, maps_dir, make_pcl_pcd):
+    """Files on disk are the evidence, as for a gridmap with no record."""
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+
+    entry = _octomap_entry(client)
+
+    assert entry["octomap_status"] == "ok"
+    assert entry["octomap_resolution"] is None
+
+
+def test_list_reports_the_recorded_resolution(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "ok", "started_at": _iso_ago(300), "params": {"resolution": 0.1},
+    })
+
+    entry = _octomap_entry(client)
+
+    assert entry["octomap_status"] == "ok"
+    assert entry["octomap_resolution"] == pytest.approx(0.1)
+
+
+def test_list_reports_a_fresh_build_as_converting(client, maps_dir):
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "converting", "started_at": _iso_ago(60), "params": {"resolution": 0.1},
+    })
+
+    entry = _octomap_entry(client)
+
+    assert entry["octomap_status"] == "converting"
+    assert entry["octomap_resolution"] is None
+    # Independent of the gridmap's own surface.
+    assert entry["grid_status"] == "none"
+
+
+def test_list_reports_a_stale_build_as_interrupted(client, maps_dir):
+    """No registry to ask in another container: a build still 'converting'
+    after the threshold was killed, and nothing will finish it."""
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "converting",
+        "started_at": _iso_ago(map_router_module.OCTOMAP_STALE_AFTER_S + 60),
+    })
+
+    assert _octomap_entry(client)["octomap_status"] == "interrupted"
+
+
+def test_list_ages_a_build_without_started_at_by_the_sidecar_mtime(client, maps_dir):
+    import time as time_module
+
+    path = _plant_octomap_sidecar(maps_dir / "rawonly", {"status": "converting"})
+    assert _octomap_entry(client)["octomap_status"] == "converting"
+
+    old = time_module.time() - map_router_module.OCTOMAP_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+
+    assert _octomap_entry(client)["octomap_status"] == "interrupted"
+
+
+def test_list_reports_a_failed_build_with_its_reason(client, maps_dir):
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "failed", "error": "cannot read patches/12.pcd",
+    })
+
+    entry = _octomap_entry(client)
+
+    assert entry["octomap_status"] == "failed"
+    assert entry["octomap_error"] == "cannot read patches/12.pcd"
+
+
+def test_list_failed_outranks_leftover_layers(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "rawonly", {"status": "failed", "error": "boom"})
+
+    assert _octomap_entry(client)["octomap_status"] == "failed"
+
+
+def test_list_ok_record_with_a_layer_missing_is_none(client, maps_dir, make_pcl_pcd):
+    """A hand-deleted layer: the route could not serve it, so do not offer it."""
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "rawonly", {"status": "ok"})
+    (maps_dir / "rawonly" / "octomap_occupied.pcd").unlink()
+
+    assert _octomap_entry(client)["octomap_status"] == "none"
+
+
+def test_list_survives_a_half_written_3d_map_sidecar(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "rawonly", '{"status": "conv')
+
+    response = client.get("/api/v1/maps")
+
+    assert response.status_code == 200
+    assert _by_name(response.json())["rawonly"]["octomap_status"] == "ok"
+
+
+def test_map_detail_carries_the_3d_map_fields(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "rawonly", {"status": "ok", "params": {"resolution": 0.05}})
+
+    body = client.get("/api/v1/maps/rawonly").json()
+
+    assert body["octomap_status"] == "ok"
+    assert body["octomap_error"] is None
+    assert body["octomap_resolution"] == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("layer, planted", [("road", _ROAD), ("occupied", _WALLS)])
+def test_octomap_layer_is_served_packed_and_unmerged(
+    client, maps_dir, make_pcl_pcd, layer, planted
+):
+    """Points 0.1 m apart survive: these are voxel centres, and the 0.3 m merge
+    /pointcloud applies would collapse a 0.1 m floor."""
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+
+    response = client.get(f"/api/v1/maps/rawonly/octomap/{layer}")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert len(response.content) == 4 + len(planted) * 12
+    count, points = _unpack_cloud(response.content)
+    assert count == len(planted)
+    assert np.allclose(points, planted)
+
+
+def test_octomap_layer_is_capped(client, maps_dir, make_pcl_pcd, monkeypatch):
+    monkeypatch.setattr(map_router_module, "OCTOMAP_MAX_POINTS", 2)
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+
+    count, _ = _unpack_cloud(client.get("/api/v1/maps/rawonly/octomap/road").content)
+
+    assert count == 2
+
+
+def test_octomap_layer_404_for_a_missing_map(client):
+    assert client.get("/api/v1/maps/nosuchmap/octomap/road").status_code == 404
+
+
+def test_octomap_layer_404_when_never_built(client):
+    response = client.get("/api/v1/maps/rawonly/octomap/road")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Map 'rawonly' has no 3D map."
+
+
+def test_octomap_layer_409_while_the_robot_builds_it(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "converting", "started_at": _iso_ago(10),
+    })
+
+    response = client.get("/api/v1/maps/rawonly/octomap/road")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_converting"
+
+
+def test_octomap_layer_404_carries_the_failure(client, maps_dir):
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "failed", "error": "road layer is empty",
+    })
+
+    response = client.get("/api/v1/maps/rawonly/octomap/road")
+
+    assert response.status_code == 404
+    assert "road layer is empty" in response.json()["detail"]
+
+
+def test_octomap_layer_404_when_interrupted(client, maps_dir):
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "converting",
+        "started_at": _iso_ago(map_router_module.OCTOMAP_STALE_AFTER_S + 60),
+    })
+
+    response = client.get("/api/v1/maps/rawonly/octomap/occupied")
+
+    assert response.status_code == 404
+    assert "not finished" in response.json()["detail"]
+
+
+def test_octomap_layer_404_when_the_pcd_is_unreadable(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    (maps_dir / "rawonly" / "octomap_road.pcd").write_text("not a pcd at all\n")
+
+    response = client.get("/api/v1/maps/rawonly/octomap/road")
+
+    assert response.status_code == 404
+    assert "octomap_road.pcd" in response.json()["detail"]
+
+
+def test_octomap_unknown_layer_is_422(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+
+    assert client.get("/api/v1/maps/rawonly/octomap/walls").status_code == 422
+
+
+def test_octomap_layer_is_recached_when_the_file_changes(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    first = client.get("/api/v1/maps/rawonly/octomap/road").content
+
+    make_pcl_pcd(maps_dir / "rawonly" / "octomap_road.pcd", points=_ROAD[:1])
+    second = client.get("/api/v1/maps/rawonly/octomap/road").content
+
+    assert struct.unpack("<I", first[:4])[0] == len(_ROAD)
+    assert struct.unpack("<I", second[:4])[0] == 1
+
+
+def test_rename_drops_the_cached_3d_map_of_the_old_name(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    assert client.get("/api/v1/maps/rawonly/octomap/road").status_code == 200
+
+    assert _rename(client, "rawonly", "hall").status_code == 200
+
+    assert client.get("/api/v1/maps/rawonly/octomap/road").status_code == 404
+    assert client.get("/api/v1/maps/hall/octomap/road").status_code == 200
+
+
+def test_delete_drops_the_cached_3d_map(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd)
+    assert client.get("/api/v1/maps/rawonly/octomap/occupied").status_code == 200
+
+    assert _delete(client, "rawonly").status_code == 200
+
+    assert client.get("/api/v1/maps/rawonly/octomap/occupied").status_code == 404
+
+
+def _building(maps_dir, name="rawonly"):
+    _plant_octomap_sidecar(maps_dir / name, {"status": "converting", "started_at": _iso_ago(5)})
+
+
+def test_rename_refuses_while_the_robot_builds_the_3d_map(client, maps_dir):
+    _building(maps_dir)
+
+    response = _rename(client, "rawonly", "hall")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_converting"
+    assert (maps_dir / "rawonly").is_dir()
+    assert not (maps_dir / "hall").exists()
+
+
+def test_delete_refuses_while_the_robot_builds_the_3d_map(client, maps_dir):
+    _building(maps_dir)
+
+    response = _delete(client, "rawonly")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_converting"
+    assert (maps_dir / "rawonly" / "map.pcd").is_file()
+
+
+def test_import_refuses_to_replace_a_map_whose_3d_map_is_building(client, maps_dir):
+    _building(maps_dir)
+
+    response = _import(client, _handmade(), name="rawonly")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_converting"
+
+
+def test_delete_goes_ahead_once_the_build_is_interrupted(client, maps_dir):
+    """Nothing is coming to write into the directory any more."""
+    _plant_octomap_sidecar(maps_dir / "rawonly", {
+        "status": "converting",
+        "started_at": _iso_ago(map_router_module.OCTOMAP_STALE_AFTER_S + 60),
+    })
+
+    assert _delete(client, "rawonly").status_code == 200
+    assert not (maps_dir / "rawonly").exists()
+
+
+def test_activate_does_not_wait_for_the_3d_map(client, map_gw, maps_dir, monkeypatch, tmp_path):
+    """Display-only: nothing in the nav stack reads it."""
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _building(maps_dir, "full")
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 200
+    assert response.json()["switched"] is True
+
+
+def test_export_leaves_the_octree_out_but_keeps_the_layers(client, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "full", make_pcl_pcd)
+    _plant_octomap_sidecar(maps_dir / "full", {"status": "ok", "params": {"resolution": 0.1}})
+
+    response = _export(client, "full", "zip")
+
+    assert response.status_code == 200
+    names = zipfile.ZipFile(io.BytesIO(response.content)).namelist()
+    assert "octomap.bt" not in names
+    assert {"octomap_road.pcd", "octomap_occupied.pcd", "octomap.recipe.json"} <= set(names)

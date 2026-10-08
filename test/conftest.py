@@ -7,6 +7,7 @@ PostgreSQL, so no database server is required.
 """
 
 import math
+import struct
 
 import pytest
 import structlog
@@ -135,6 +136,48 @@ def make_pcd():
             "DATA ascii\n"
             f"{rows}\n"
         )
+        return path
+
+    return _make
+
+
+@pytest.fixture
+def make_pcl_pcd():
+    """Factory writing a ``DATA binary`` PCD the way PCL writes ``pcl::PointXYZ``.
+
+    The robot side's 3D map layers are ``pcl::io::savePCDFileBinary`` of
+    ``pcl::PointXYZ``, whose in-memory layout is 16 bytes (xyz plus 4 bytes of
+    padding) but whose file is not: PCL's binary writer skips padding fields,
+    so the header is ``FIELDS x y z`` / ``SIZE 4 4 4`` and every row is 12
+    bytes. That exact header is the default here, so a test against it is a
+    test against what the robot writes.
+
+    ``pad_fields`` adds that many ``_`` padding fields of 4 bytes after z --
+    what a writer that *keeps* padding produces. Two or more is the case numpy
+    would refuse without ``read_pcd_xyz``'s renaming (a repeated field name).
+    """
+    def _make(path, points=((0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.2, 0.0, 0.0)),
+              pad_fields=0):
+        fields = "x y z" + " _" * pad_fields
+        sizes = "4 4 4" + " 1" * pad_fields
+        types = "F F F" + " U" * pad_fields
+        counts = "1 1 1" + " 4" * pad_fields
+        header = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            f"FIELDS {fields}\n"
+            f"SIZE {sizes}\n"
+            f"TYPE {types}\n"
+            f"COUNT {counts}\n"
+            f"WIDTH {len(points)}\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            f"POINTS {len(points)}\n"
+            "DATA binary\n"
+        ).encode("ascii")
+        row = "<fff" + "4x" * pad_fields
+        body = b"".join(struct.pack(row, x, y, z) for x, y, z in points)
+        path.write_bytes(header + body)
         return path
 
     return _make

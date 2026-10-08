@@ -5,6 +5,7 @@ import os
 import struct
 import time
 import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -42,11 +43,13 @@ from syncai_backend.helpers.map_archive import (
     inspect_archive,
 )
 from syncai_backend.repositories.map.catalog import (
+    OCTOMAP_BT,
     POINTCLOUD_PCD,
     GridInfo,
     GridRecordStatus,
     KeepoutZone,
     MapCatalogRepo,
+    OctomapLayer,
     StoredMap,
 )
 from syncai_backend.repositories.map.map import MapRepo
@@ -75,6 +78,21 @@ from syncai_backend.services.gridmap_conversion import (
 # subscriber; if one moves, move the other.
 MAP_CLOUD_VOXEL_SIZE = 0.3
 MAP_CLOUD_MAX_POINTS = 300000
+
+# The 3D map's layers are voxel centres already, so they are served without the
+# voxel merge above; this cap is only a backstop against a build run at a
+# resolution far finer than the 0.1 m the robot side defaults to (a large site
+# at 0.05 m is ~1.7 M road voxels, ~20 MB on the wire). A capped layer is
+# strided, which thins it evenly, and the route logs that it happened.
+OCTOMAP_MAX_POINTS = 1_000_000
+
+# How long a 3D-map sidecar may say ``converting`` before it is reported as
+# ``interrupted``. The build runs in the robot container, so this process has
+# no registry to ask whether it is alive -- age is the only evidence. 30 min
+# is several times the slowest build measured (minutes, at the 0.1 m default,
+# on a site of a few thousand m2) and still short enough that a build killed
+# with the container reads as interrupted within the same operator session.
+OCTOMAP_STALE_AFTER_S = 30 * 60
 
 
 # --- Schemas ----------------------------------------------------------------
@@ -200,6 +218,29 @@ class GridStatus(str, Enum):
     INTERRUPTED = "interrupted"
 
 
+class OctomapStatus(str, Enum):
+    """How this map's 3D map stands: the robot-side build's status surface.
+
+    The same five values as ``GridStatus``, and a separate type for the reason
+    that one gives about its own disk vocabulary: this is a promise to a
+    client, and the two are allowed to drift. What differs is where
+    ``interrupted`` comes from. The gridmap's is "the sidecar says converting
+    and no thread in this process is running it"; the 3D map is built in the
+    robot container, so there is no thread to ask, and ``interrupted`` is a
+    ``converting`` sidecar older than ``OCTOMAP_STALE_AFTER_S`` -- the build
+    was killed (an OOM, ``docker stop``) and nothing will finish it.
+
+    Display-only: nothing in the nav stack reads the 3D map, so none of these
+    states blocks a map switch.
+    """
+
+    NONE = "none"
+    CONVERTING = "converting"
+    OK = "ok"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
 class MapSummaryResponse(BaseModel):
     name: str = Field(..., description="Directory name under the maps root.")
     active: bool = Field(..., description="Whether this is the map the stack was launched with.")
@@ -245,6 +286,26 @@ class MapSummaryResponse(BaseModel):
             "for the curl/MCP callers written against it; new clients read "
             "`grid_status`, which also tells a failed conversion apart from a "
             "map nobody has converted yet."
+        ),
+    )
+    octomap_status: OctomapStatus = Field(
+        ...,
+        description=(
+            "How this map's 3D map stands. Built by the robot after a save, in "
+            "the background, for minutes; `ok` means both layers can be fetched "
+            "from /api/v1/maps/{name}/octomap/{road|occupied}. `interrupted` is "
+            "a build still marked running after 30 minutes."
+        ),
+    )
+    octomap_error: Optional[str] = Field(
+        None,
+        description="Why the 3D map build failed. Null for every status other than `failed`.",
+    )
+    octomap_resolution: Optional[float] = Field(
+        None,
+        description=(
+            "Voxel edge of the 3D map's layers (m), from the build's record. "
+            "Null unless `octomap_status` is `ok` and the record carries it."
         ),
     )
     size_bytes: int = Field(..., description="Total size of the map directory.")
@@ -751,6 +812,44 @@ def _grid_status(stored: StoredMap, converting: bool) -> Tuple[GridStatus, Optio
     return (GridStatus.OK if stored.grid is not None else GridStatus.NONE), None
 
 
+def _octomap_status(
+    stored: StoredMap, now: datetime
+) -> Tuple[OctomapStatus, Optional[str], Optional[float]]:
+    """Reconcile the robot-side 3D map record with the files on disk.
+
+    Returns ``(status, error, resolution)``. The order mirrors
+    ``_grid_status``: a record outranks the files, then disk decides.
+
+    - ``converting`` is reported as such until it is older than
+      ``OCTOMAP_STALE_AFTER_S``, then as ``interrupted``. Age is measured from
+      the record's ``started_at``, else from the sidecar's mtime, which the
+      build wrote when it started. ``now`` is a parameter so a test plants an
+      old timestamp instead of moving a clock.
+    - ``failed`` outranks layer files being present: reporting PCDs left by an
+      earlier build as the result of the one that failed would be wrong.
+    - Otherwise both PCDs present is ``ok`` (a record saying ``ok`` with a file
+      missing is ``none`` -- the layer route could not serve it), and no files
+      is ``none``. ``resolution`` rides along only with ``ok``.
+    """
+    record = stored.octomap_record
+    if record is not None:
+        if record.status is GridRecordStatus.CONVERTING:
+            since = record.started_at or record.recorded_at
+            if (now - since).total_seconds() > OCTOMAP_STALE_AFTER_S:
+                return OctomapStatus.INTERRUPTED, None, None
+            return OctomapStatus.CONVERTING, None, None
+        if record.status is GridRecordStatus.FAILED:
+            return OctomapStatus.FAILED, record.error, None
+    if stored.has_octomap:
+        return OctomapStatus.OK, None, (record.resolution if record is not None else None)
+    return OctomapStatus.NONE, None, None
+
+
+def _utcnow() -> datetime:
+    """Return the current time, aware and in UTC: the clock ``_octomap_status`` ages on."""
+    return datetime.now(timezone.utc)
+
+
 def _summary(
     stored: StoredMap,
     active_name: Optional[str],
@@ -778,6 +877,7 @@ def _summary(
     # must never do.
     converting = conversion_svc.is_converting(stored.name)
     status, error = _grid_status(stored, converting)
+    octomap_status, octomap_error, octomap_resolution = _octomap_status(stored, _utcnow())
 
     return MapSummaryResponse(
         name=stored.name,
@@ -788,6 +888,9 @@ def _summary(
         grid_status=status,
         grid_error=error,
         grid_converting=converting,
+        octomap_status=octomap_status,
+        octomap_error=octomap_error,
+        octomap_resolution=octomap_resolution,
         size_bytes=stored.size_bytes,
         modified_at=stored.modified_at.isoformat().replace("+00:00", "Z"),
         vertex_count=vertex_count,
@@ -878,6 +981,33 @@ def init_map_router(
     thumbnail_cache: Dict[str, Tuple[str, bytes]] = {}
     image_cache: Dict[str, Tuple[str, bytes]] = {}
     cloud_cache: Dict[str, Tuple[Tuple[int, int], bytes]] = {}
+    # The 3D map's two layers, keyed per (map, layer) on the same (size, mtime)
+    # stamp: each is a parse of a multi-MB PCD that only changes when the robot
+    # rebuilds it, which replaces the file and so moves the stamp.
+    octomap_cache: Dict[Tuple[str, OctomapLayer], Tuple[Tuple[int, int], bytes]] = {}
+
+    def _forget_renderings(name: str) -> None:
+        """Drop every cached rendering of ``name`` (import-replace, rename, delete)."""
+        for cache in (thumbnail_cache, image_cache, cloud_cache):
+            cache.pop(name, None)
+        for layer in OctomapLayer:
+            octomap_cache.pop((name, layer), None)
+
+    def _refuse_while_octomap_builds(name: str, sentence: str) -> None:
+        """409 ``octomap_converting`` while the robot is building this map's 3D map.
+
+        The build in the robot container holds the directory's path: deleting
+        or renaming it underneath makes the build's final renames fail, or --
+        worse -- recreate ``map/<old>/`` holding nothing but 3D-map files, a
+        ghost map with no ``map.pcd``. ``interrupted`` does not refuse: nothing
+        is coming to write there any more.
+        """
+        stored = map_catalog_repo.get_map(name)
+        if stored is None:
+            return
+        status, _, _ = _octomap_status(stored, _utcnow())
+        if status is OctomapStatus.CONVERTING:
+            raise ConflictError(sentence, code="octomap_converting")
 
     def _vertex_count(name: str) -> int:
         # map_vertices.map holds the bare directory name, the same spelling
@@ -963,7 +1093,7 @@ def init_map_router(
     job_lock = [Depends(_refuse_while_a_job_holds)]
 
     def _refuse_if_in_use(name: str, *, verb: str, template_consequence: str) -> None:
-        """The three 409s that guard destroying a map's contents, in order.
+        """The four 409s that guard destroying a map's contents, in order.
 
         Shared by delete and by an import that replaces an existing map, which
         destroys the same things (the directory and the vertex rows) and so has
@@ -975,6 +1105,8 @@ def init_map_router(
         - ``conversion_running``: the conversion thread closed over the
           directory path and would die writing its sidecar into a directory
           that is gone (or, worse, into the *new* one).
+        - ``octomap_converting``: the same hazard from the robot side's 3D map
+          build, which runs in another container (``_refuse_while_octomap_builds``).
         - ``template_bound``: a template holding MOVE steps names this map's
           vertices by id. Delete leaves it pointing at a map that is gone;
           replace leaves it pointing at ids the new rows do not have. Either
@@ -999,6 +1131,11 @@ def init_map_router(
                 "once the conversion has finished.",
                 code="conversion_running",
             )
+        _refuse_while_octomap_builds(
+            name,
+            f"The robot is still building the 3D map for '{name}'; try again "
+            "once it has finished.",
+        )
 
         bound = task_template_repo.list_task_templates(
             map_name=name, include_map_independent=False
@@ -1045,6 +1182,13 @@ def init_map_router(
         ``POST /api/v1/mapping/start``. The conversion below reads ``map.pcd``
         from the directory, so it does not care.
 
+        The save also starts the robot side's 3D map build (2026-10), which
+        this process neither starts nor waits for: pgo_node spawns it in the
+        robot container once the patches are on disk, and its progress shows
+        up as the catalogue's ``octomap_status``. Nothing is read here right
+        after the save -- the sidecar is another process's file, and polling
+        the catalogue is already how a client follows the gridmap conversion.
+
         A save while pgo is IDLE is refused here as 409 ``mapping_idle``
         before any directory is created: under the state machine IDLE means
         "nothing banked" by definition, and pgo's own ``NO POSES!`` as a 502
@@ -1088,7 +1232,10 @@ def init_map_router(
         What goes in: every regular file under ``map/<name>/`` relative to the
         map root — no top-level folder, since the name is an import-time
         choice — except ``traversable_debug/`` (conversion intermediates,
-        hundreds of MB, nothing reads them back), plus ``syncai_map.json``
+        hundreds of MB, nothing reads them back) and ``octomap.bt`` (the 3D
+        map's octree, tens of MB, read only by octovis on a workstation; the
+        two layer PCDs and their sidecar *do* go, since they are what the
+        target robot's console draws), plus ``syncai_map.json``
         carrying the name, the vertices (name/type/x/y/theta, **not** ids: they
         are regenerated on import) and an md5 per file. ``helpers/map_archive``
         owns the layout.
@@ -1122,6 +1269,7 @@ def init_map_router(
             format,
             exported_at=iso_now(),
             exclude_dirs=(TRAVERSABLE_DEBUG_SUBDIR_NAME,),
+            exclude_files=(OCTOMAP_BT,),
         )
 
         logger.info(
@@ -1167,9 +1315,10 @@ def init_map_router(
 
         A map of that name already on the robot is **replaced**, under the
         refusals a delete has — 409 ``map_active`` / ``conversion_running`` /
-        ``template_bound`` — because a replace destroys the same things. And
-        409 ``disk_low`` when the unpacked size exceeds the free space on the
-        maps filesystem: the body is already in memory (caps are middleware's
+        ``octomap_converting`` / ``template_bound`` — because a replace
+        destroys the same things. And 409 ``disk_low`` when the unpacked size
+        exceeds the free space on the maps filesystem: the body is already in
+        memory (caps are middleware's
         job, see ``save_map_grid``), but what lands on the robot's disk is
         bounded here, since ``map/`` filling up takes the nav stack's own
         writes down with it. The replaced map's space is not counted as free —
@@ -1292,9 +1441,7 @@ def init_map_router(
 
         # Keyed by name: whatever a map of this name looked like earlier in
         # this process's life, these renderings no longer describe it.
-        thumbnail_cache.pop(target, None)
-        image_cache.pop(target, None)
-        cloud_cache.pop(target, None)
+        _forget_renderings(target)
 
         logger.info(
             "Imported map",
@@ -1455,6 +1602,8 @@ def init_map_router(
           The conversion thread closed over the old directory path when it
           started, so a rename under it would make it die with ``OSError`` and
           leave the catalogue reporting ``converting`` for a name that is gone.
+        - 409 ``octomap_converting`` while the robot is building the 3D map,
+          for the same reason from another container.
         - 400 / 409 ``name_taken`` from ``rename_map_dir`` for a bad or
           already-used new name.
 
@@ -1484,6 +1633,11 @@ def init_map_router(
                 "once the conversion has finished.",
                 code="conversion_running",
             )
+        _refuse_while_octomap_builds(
+            name,
+            f"The robot is still building the 3D map for '{name}'; rename it "
+            "once it has finished.",
+        )
 
         new_dir = map_catalog_repo.rename_map_dir(name, request.name)
 
@@ -1531,9 +1685,7 @@ def init_map_router(
         # The renderings are keyed by name. A stale entry under the old name
         # would never be *served* (_png_response re-hashes the file before
         # consulting the cache) but it would sit there forever; drop it.
-        thumbnail_cache.pop(name, None)
-        image_cache.pop(name, None)
-        cloud_cache.pop(name, None)
+        _forget_renderings(name)
 
         logger.info(
             "Renamed map",
@@ -1587,7 +1739,10 @@ def init_map_router(
           which templates to unbind first — the one refusal that asks for work
           rather than a map switch.
 
-        All three live in ``_refuse_if_in_use``, shared with the import route
+        - 409 ``octomap_converting`` while the robot is building the 3D map:
+          the build would recreate ``map/<name>/`` with only its own files.
+
+        All of them live in ``_refuse_if_in_use``, shared with the import route
         for the case where an archive replaces an existing map.
 
         **Database first, filesystem last — the inverse of rename, on purpose.**
@@ -1643,9 +1798,7 @@ def init_map_router(
 
         # Keyed by name, and unlike rename's there is no new name to move them
         # to: drop them or they sit in the process until it restarts.
-        thumbnail_cache.pop(name, None)
-        image_cache.pop(name, None)
-        cloud_cache.pop(name, None)
+        _forget_renderings(name)
 
         logger.info("Deleted map", map=name, vertices_deleted=vertices_deleted)
         return DeleteMapResponse(
@@ -1742,7 +1895,9 @@ def init_map_router(
         rather than the cached RobotState's mode, because RobotRepo's write is
         gated on `localization_valid` and a robot that has lost localization
         therefore has no cached mode at all. That robot is precisely the one
-        whose operator is reaching for this route.
+        whose operator is reaching for this route. A 3D map still being built
+        is deliberately *not* a refusal: nothing in the nav stack reads it, and
+        holding a map switch for minutes for a picture is the wrong trade.
 
         What this deliberately does not do is guarantee the robot knows where it
         is afterwards. `[initial_pose]` is zeroed rather than carried over — a
@@ -2602,6 +2757,99 @@ def init_map_router(
             cached = (stamp, payload)
             cloud_cache[name] = cached
             logger.info("packed stored map cloud", map=name, num_points=int(points.shape[0]))
+
+        return Response(
+            content=cached[1],
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @map_router.get("/api/v1/maps/{name}/octomap/{layer}")
+    def get_map_octomap_layer(name: str, layer: OctomapLayer):
+        """One layer of the map's 3D map, packed for the viewer.
+
+        ``road`` is the floor-level free space, ``occupied`` the walls; both are
+        voxel centres the robot side exported from its OctoMap after the save
+        (see ``OctomapStatus``). Same wire format as ``/pointcloud`` and the two
+        WebSocket streams -- a little-endian uint32 count, then ``3 * count``
+        float32 xyz in the map frame -- so the console decodes it with the
+        decoder it already has. The voxel edge is not in the body; it is the
+        catalogue's ``octomap_resolution``, which a client has read before it
+        can offer the layer at all.
+
+        **Not voxel-downsampled**, unlike ``/pointcloud``: the points already
+        are one per voxel, and a 0.3 m merge would turn a 0.1 m floor into a
+        sieve. ``OCTOMAP_MAX_POINTS`` is a backstop only.
+
+        One route with the layer as a path parameter rather than two literal
+        routes or a ``?layer=``: each layer is its own resource with its own
+        cache stamp, as ``/image`` and ``/thumbnail`` are, and an unknown layer
+        is FastAPI's 422.
+
+        409 ``octomap_converting`` while the robot is building it -- "try
+        later", the ``conversion_running`` shape; 404 with a sentence for every
+        other way there is nothing to serve (never built, failed, interrupted,
+        a file gone or unreadable). Cached on (size, mtime) for the reason
+        ``/pointcloud`` gives: the robot side only ever replaces these files.
+        """
+        stored = _require(name)
+        status, error, _ = _octomap_status(stored, _utcnow())
+        if status is OctomapStatus.CONVERTING:
+            raise ConflictError(
+                f"The robot is still building the 3D map for '{name}'; try again "
+                "once it has finished.",
+                code="octomap_converting",
+            )
+        if status is OctomapStatus.FAILED:
+            raise NotFoundError(f"The 3D map for '{name}' could not be built: {error}.")
+        if status is OctomapStatus.INTERRUPTED:
+            raise NotFoundError(
+                f"The 3D map for '{name}' was not finished — the build stopped "
+                "partway through."
+            )
+        if status is not OctomapStatus.OK:
+            raise NotFoundError(f"Map '{name}' has no 3D map.")
+
+        filename = layer.filename
+        path = map_catalog_repo.octomap_layer_path(name, layer)
+        if path is None:
+            raise NotFoundError(f"Map '{name}' has no {filename}.")
+        try:
+            stats = os.stat(path)
+        except OSError as exc:
+            logger.error(
+                "Failed to stat 3D map layer", map=name, layer=layer.value, error=str(exc)
+            )
+            raise NotFoundError(f"Map '{name}' has no readable {filename}.")
+
+        key = (name, layer)
+        stamp = (stats.st_size, stats.st_mtime_ns)
+        cached = octomap_cache.get(key)
+        if cached is None or cached[0] != stamp:
+            try:
+                points = read_pcd_xyz(path)
+            except (OSError, ValueError) as exc:
+                logger.error(
+                    "Failed to read 3D map layer", map=name, layer=layer.value, error=str(exc)
+                )
+                raise NotFoundError(f"Map '{name}' has no readable {filename}.")
+
+            total = int(points.shape[0])
+            points = cap_points(points=points, max_points=OCTOMAP_MAX_POINTS)
+            if points.shape[0] < total:
+                logger.warning(
+                    "3D map layer over the point cap; serving a strided subset",
+                    map=name,
+                    layer=layer.value,
+                    num_points=total,
+                    served=int(points.shape[0]),
+                )
+            payload = struct.pack("<I", points.shape[0]) + pack_xyz_f32(points)
+            cached = (stamp, payload)
+            octomap_cache[key] = cached
+            logger.info(
+                "packed 3D map layer", map=name, layer=layer.value, num_points=int(points.shape[0])
+            )
 
         return Response(
             content=cached[1],

@@ -601,3 +601,117 @@ def test_abort_import_leaves_anything_that_is_not_staging_alone(catalog_repo, ma
 
 def test_free_bytes_is_positive(catalog_repo):
     assert catalog_repo.free_bytes() > 0
+
+
+# --- the robot-side 3D map ---------------------------------------------------
+#
+# Written by syncai_mapping's build_octomap in the robot container; this repo
+# only reads it. The status derivation (ageing a stale `converting`) is the
+# router's, tested in test_maps_router.py -- here it is what the files say.
+
+
+def _plant_octomap(directory, make_pcl_pcd, sidecar=None):
+    make_pcl_pcd(directory / "octomap_road.pcd")
+    make_pcl_pcd(directory / "octomap_occupied.pcd")
+    (directory / "octomap.bt").write_bytes(b"# Octomap OcTree binary file\n")
+    if sidecar is not None:
+        (directory / "octomap.recipe.json").write_text(
+            sidecar if isinstance(sidecar, str) else json.dumps(sidecar)
+        )
+
+
+def test_map_without_a_3d_map_reports_none_of_it(catalog_repo):
+    full = catalog_repo.get_map("full")
+
+    assert full.has_octomap is False
+    assert full.octomap_record is None
+
+
+def test_3d_map_record_is_read_off_the_sidecar(catalog_repo, maps_dir, make_pcl_pcd):
+    from datetime import datetime, timezone
+
+    _plant_octomap(maps_dir / "full", make_pcl_pcd, sidecar={
+        "status": "ok",
+        "started_at": "2026-10-08T03:12:45Z",
+        "finished_at": "2026-10-08T03:16:02Z",
+        "params": {"resolution": 0.1, "max_range": 20.0},
+        "measurements": {"road_voxels": 3},
+    })
+
+    full = catalog_repo.get_map("full")
+
+    assert full.has_octomap is True
+    record = full.octomap_record
+    assert record.status.value == "ok"
+    assert record.error is None
+    assert record.resolution == pytest.approx(0.1)
+    assert record.started_at == datetime(2026, 10, 8, 3, 12, 45, tzinfo=timezone.utc)
+    assert record.recorded_at.tzinfo is not None
+
+
+def test_3d_map_needs_both_layers(catalog_repo, maps_dir, make_pcl_pcd):
+    _plant_octomap(maps_dir / "full", make_pcl_pcd)
+    (maps_dir / "full" / "octomap_occupied.pcd").unlink()
+
+    assert catalog_repo.get_map("full").has_octomap is False
+
+
+@pytest.mark.parametrize("sidecar", [
+    '{"status": "conv',                       # torn mid-write
+    '["not", "an", "object"]',
+    '{"status": "queued"}',                   # a status this build does not know
+    '{"error": "no status at all"}',
+])
+def test_unusable_3d_map_sidecar_is_no_record(catalog_repo, maps_dir, make_pcl_pcd, sidecar):
+    """Another container rewrites this file while the catalogue polls it: an
+    unusable one must cost the card its detail, never the listing."""
+    _plant_octomap(maps_dir / "full", make_pcl_pcd, sidecar=sidecar)
+
+    full = catalog_repo.get_map("full")
+
+    assert full.octomap_record is None
+    assert full.has_octomap is True
+
+
+@pytest.mark.parametrize("params", [
+    {"resolution": "0.1"}, {"resolution": -0.1}, {"resolution": True}, "0.1", None,
+])
+def test_malformed_3d_map_params_keep_the_status(catalog_repo, maps_dir, make_pcl_pcd, params):
+    _plant_octomap(maps_dir / "full", make_pcl_pcd, sidecar={
+        "status": "failed", "error": "road layer is empty", "params": params,
+        "started_at": "not a time",
+    })
+
+    record = catalog_repo.get_map("full").octomap_record
+
+    assert record.status.value == "failed"
+    assert record.error == "road layer is empty"
+    assert record.resolution is None
+    assert record.started_at is None
+
+
+def test_octomap_layer_path(catalog_repo, maps_dir, make_pcl_pcd):
+    from syncai_backend.repositories.map.catalog import OctomapLayer
+
+    assert catalog_repo.octomap_layer_path("full", OctomapLayer.ROAD) is None
+
+    _plant_octomap(maps_dir / "full", make_pcl_pcd)
+
+    assert catalog_repo.octomap_layer_path("full", OctomapLayer.ROAD) == str(
+        maps_dir / "full" / "octomap_road.pcd"
+    )
+    assert catalog_repo.octomap_layer_path("full", OctomapLayer.OCCUPIED) == str(
+        maps_dir / "full" / "octomap_occupied.pcd"
+    )
+
+
+def test_rename_map_dir_carries_the_3d_map_along(catalog_repo, maps_dir, make_pcl_pcd):
+    """Nothing the robot side writes names the map, so a rename stays one os.rename."""
+    _plant_octomap(maps_dir / "rawonly", make_pcl_pcd, sidecar={"status": "ok"})
+
+    catalog_repo.rename_map_dir("rawonly", "hall")
+
+    hall = catalog_repo.get_map("hall")
+    assert hall.has_octomap is True
+    assert hall.octomap_record.status.value == "ok"
+    assert (maps_dir / "hall" / "octomap.bt").is_file()

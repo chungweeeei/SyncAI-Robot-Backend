@@ -241,7 +241,12 @@ the only caller that passes anything else.
   switch must reload the mask itself (`filter_mask_server/load_map`), which `activate` does.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
-  and no live process is `interrupted`. `switch_mode` kills the byobu session this
+  and no live process is `interrupted`. The 3D map's `<map>/octomap.recipe.json` is the
+  same protocol written by **another container** (the robot side's `build_octomap`,
+  started by pgo after `save_maps`): this process only reads it, and with no registry
+  to consult, a `converting` record older than `OCTOMAP_STALE_AFTER_S` (30 min) is what
+  `interrupted` means there. Its directory is held while it builds, so delete / rename /
+  import-replace refuse with 409 `octomap_converting`; activate does not wait. `switch_mode` kills the byobu session this
   process runs in, so in-memory registries die with it. The one deliberate exception is
   `ModeRestartService`'s record behind `GET /api/v1/robot/restart`: it describes a rebuild
   *this* process watched, so a backend restarted meanwhile honestly answers `idle`.

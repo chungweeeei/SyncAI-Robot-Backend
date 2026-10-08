@@ -169,6 +169,25 @@ def test_build_without_exclusions_keeps_debug_clouds(map_dir):
     assert "traversable_debug/step1.pcd" in inspect_archive(payload).manifest.files
 
 
+@pytest.mark.parametrize("fmt", list(ArchiveFormat))
+def test_build_excludes_top_level_files_only(fmt, map_dir):
+    """The export leaves the 3D map's octree out by name -- at the top level.
+    A same-named file deeper down is not the octree and must survive."""
+    (map_dir / "octomap.bt").write_bytes(b"octree")
+    (map_dir / "octomap_road.pcd").write_bytes(b"road layer")
+    (map_dir / "patches" / "octomap.bt").write_bytes(b"someone else's file")
+
+    payload = build_archive(
+        str(map_dir), "full", [], fmt, exported_at="t", exclude_files=("octomap.bt",)
+    )
+
+    files = inspect_archive(payload).manifest.files
+    assert "octomap.bt" not in files
+    assert "octomap.bt" not in _members(payload)
+    assert "octomap_road.pcd" in files
+    assert "patches/octomap.bt" in files
+
+
 def test_build_coerces_vertex_numbers_to_float(map_dir):
     payload = build_archive(
         str(map_dir), "full",

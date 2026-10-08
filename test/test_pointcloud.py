@@ -95,3 +95,32 @@ def test_read_pcd_ascii_with_a_single_point(tmp_path, make_pcd):
 
     assert xyz.shape == (1, 3)
     assert xyz.tolist() == [[1.0, 2.0, 3.0]]
+
+
+def test_read_pcd_binary_as_pcl_writes_point_xyz(tmp_path, make_pcl_pcd):
+    """The robot side's 3D map layers: ``pcl::PointXYZ`` through PCL's binary
+    writer, which drops the struct's padding -- 12-byte rows, three fields."""
+    pts = ((0.05, 0.15, -0.45), (1.25, -2.5, 0.35))
+    path = make_pcl_pcd(tmp_path / "octomap_road.pcd", points=pts)
+
+    xyz = read_pcd_xyz(str(path))
+
+    assert xyz.shape == (2, 3)
+    assert np.allclose(xyz, pts)
+
+
+def test_read_pcd_steps_over_a_padding_field(tmp_path, make_pcl_pcd):
+    """A writer that keeps PointXYZ's padding: 16-byte rows, a ``_`` column."""
+    pts = ((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))
+    path = make_pcl_pcd(tmp_path / "padded.pcd", points=pts, pad_fields=1)
+
+    assert np.allclose(read_pcd_xyz(str(path)), pts)
+
+
+def test_read_pcd_tolerates_repeated_padding_fields(tmp_path, make_pcl_pcd):
+    """numpy refuses a structured dtype with a repeated field name, and every
+    padding field is called ``_``."""
+    pts = ((1.0, 2.0, 3.0),)
+    path = make_pcl_pcd(tmp_path / "padded.pcd", points=pts, pad_fields=2)
+
+    assert np.allclose(read_pcd_xyz(str(path)), pts)

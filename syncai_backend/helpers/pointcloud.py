@@ -62,10 +62,17 @@ def read_pcd_xyz(path: str) -> np.ndarray:
         if not counts:
             counts = [1] * len(fields)
 
+        # PCL's own binary writer drops padding fields, but a PCD written by
+        # anything that keeps them names each one ``_`` -- and numpy refuses a
+        # structured dtype with a repeated field name. The columns are never
+        # read, only stepped over, so a unique name per occurrence is enough.
+        names = [
+            f"_pad{i}" if name == "_" else name for i, name in enumerate(fields)
+        ]
         dtype = np.dtype(
             [
                 (name, _PCD_TYPE_MAP[(t, s)], (c,) if c > 1 else ())
-                for name, s, t, c in zip(fields, sizes, types, counts)
+                for name, s, t, c in zip(names, sizes, types, counts)
             ]
         )
 

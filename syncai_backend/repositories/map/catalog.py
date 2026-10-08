@@ -62,6 +62,30 @@ KEEPOUT_YAML = "keepout.yaml"
 KEEPOUT_JSON = "keepout.json"
 KEEPOUT_JSON_VERSION = 1
 
+# The 3D map, since 2026-10. Written by the ROBOT side, never by this process:
+# a successful ``pgo/save_maps`` with patches makes syncai_mapping's pgo_node
+# spawn ``build_octomap`` in the robot container, which ray-casts every patch
+# from its keyframe pose into an OctoMap and exports the two layers the console
+# draws. It runs for minutes, detached from the mapping session (it survives a
+# mode switch), and reports only through ``octomap.recipe.json`` -- the same
+# converting / ok / failed vocabulary as the gridmap's sidecar, but written by
+# another process in another container, which is why this repo only reads it.
+#
+# - ``octomap.bt``: the OctoMap itself, for octovis on a workstation. Nothing
+#   here reads it, and the export leaves it out (tens of MB nobody downstream
+#   opens).
+# - ``octomap_road.pcd``: per (x, y) column, the lowest voxel observed free
+#   within a band of the local floor -- "where the lidar saw floor-level air".
+# - ``octomap_occupied.pcd``: occupied voxels from just under the local floor
+#   up to a ceiling cut, i.e. the walls.
+#
+# Both PCDs are binary ``pcl::PointXYZ`` of voxel centres, so the layer route
+# serves them as they are, without the voxel merge ``map.pcd`` needs.
+OCTOMAP_BT = "octomap.bt"
+OCTOMAP_ROAD_PCD = "octomap_road.pcd"
+OCTOMAP_OCCUPIED_PCD = "octomap_occupied.pcd"
+OCTOMAP_RECIPE_SIDECAR = "octomap.recipe.json"
+
 # Directories a map import works in, since 2026-10: an archive is unpacked and
 # verified in ``map/.import-<token>/`` and the map it replaces (if any) is
 # parked as ``map/.import-old-<token>/`` until the database has agreed. Both
@@ -122,6 +146,23 @@ class GridRecordStatus(str, Enum):
             return None
 
 
+class OctomapLayer(str, Enum):
+    """The two display layers of a map's 3D map, by the name the route takes.
+
+    On-disk vocabulary (which file is which layer), so it lives beside the
+    filenames; the REST layer uses it directly as its path-parameter type, which
+    is what turns an unknown layer into FastAPI's 422.
+    """
+
+    ROAD = "road"
+    OCCUPIED = "occupied"
+
+    @property
+    def filename(self) -> str:
+        """The file in a map directory that holds this layer."""
+        return OCTOMAP_ROAD_PCD if self is OctomapLayer.ROAD else OCTOMAP_OCCUPIED_PCD
+
+
 @dataclass(frozen=True)
 class GridInfo:
     resolution: float
@@ -162,6 +203,33 @@ class GridRecord:
 
 
 @dataclass(frozen=True)
+class OctomapRecord:
+    """How the robot-side 3D map build of this map stands, per its sidecar.
+
+    ``GridRecordStatus`` is reused for ``status`` on purpose: the robot side
+    writes the same three values the gridmap conversion does, and a second
+    enum spelling the same file vocabulary would only be two things to keep in
+    step.
+
+    ``started_at`` and ``recorded_at`` exist for the one derivation this repo
+    cannot do alone. The build runs in the robot container, so this process has
+    no registry saying whether it is still alive; a ``converting`` record is
+    aged instead (the REST layer's ``_octomap_status``). ``started_at`` is the
+    build's own ISO-8601 stamp, None when absent or unparseable; ``recorded_at``
+    is the sidecar's mtime, the fallback.
+
+    ``resolution`` is the voxel edge from ``params.resolution`` -- the console
+    sizes its points with it. None when the sidecar does not carry one.
+    """
+
+    status: GridRecordStatus
+    error: Optional[str]
+    started_at: Optional[datetime]
+    recorded_at: datetime
+    resolution: Optional[float]
+
+
+@dataclass(frozen=True)
 class StoredMap:
     name: str
     grid: Optional[GridInfo]
@@ -174,6 +242,12 @@ class StoredMap:
     # layer's _grid_status, which is where the reconciliation with the live
     # conversion registry happens.
     grid_record: Optional[GridRecord]
+    # Both octomap layer PCDs are regular files. Defaulted, like the record
+    # below, so the many StoredMap literals that predate the 3D map stay valid.
+    has_octomap: bool = False
+    # None for a map whose 3D map was never built (every map saved before
+    # 2026-10, every patch-less save) or whose sidecar says nothing usable.
+    octomap_record: Optional[OctomapRecord] = None
 
 
 class MapCatalogRepo:
@@ -212,8 +286,8 @@ class MapCatalogRepo:
     def _artifact_path(self, name: str, filename: str) -> Optional[str]:
         """Path of ``filename`` inside map ``name``, or None if it is not there.
 
-        The shared body of the three accessors below, which differ only in the
-        filename. They stay as three named methods rather than collapsing into
+        The shared body of the accessors below, which differ only in the
+        filename. They stay as named methods rather than collapsing into
         one public ``artifact_path(name, GRIDMAP_PGM)``: every caller is in the
         REST layer asking for one specific thing, and ``gridmap_yaml_path(name)``
         says what it wants where a constant passed as an argument would make the
@@ -253,6 +327,16 @@ class MapCatalogRepo:
         from ``resolve_dir`` and re-do the containment checks.
         """
         return self._artifact_path(name, POINTCLOUD_PCD)
+
+    def octomap_layer_path(self, name: str, layer: OctomapLayer) -> Optional[str]:
+        """Return the path of one 3D-map layer's PCD, or None if absent.
+
+        The robot side writes both through a temp file + rename, so a path
+        returned here always names a complete file -- what it does not promise
+        is that the build that wrote it is the current one; that is the
+        sidecar's job, and the router checks it first.
+        """
+        return self._artifact_path(name, layer.filename)
 
     def keepout_yaml_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``keepout.yaml``, or None if unloadable.
@@ -407,9 +491,12 @@ class MapCatalogRepo:
         map_server resolves it against the yaml's own directory), ``poses.txt``
         lists bare patch basenames, ``gridmap.recipe.json`` holds only
         measurements and parameters, ``keepout.yaml`` says ``image:
-        keepout.pgm`` and ``keepout.json`` holds polygons in metres. If a
-        future sidecar ever embeds the map's path, this method has to start
-        rewriting it.
+        keepout.pgm`` and ``keepout.json`` holds polygons in metres. The robot
+        side's 3D map keeps to the same rule: ``octomap.bt``,
+        ``octomap_road.pcd`` and ``octomap_occupied.pcd`` are data, and
+        ``octomap.recipe.json`` holds parameters, measurements, timestamps and
+        a path-free error sentence. If a future sidecar ever embeds the map's
+        path, this method has to start rewriting it.
 
         What this does *not* touch, and the caller must: the ``map_vertices``
         and ``task_templates`` rows that key on the bare directory name — the
@@ -834,6 +921,60 @@ class MapCatalogRepo:
             size_bytes=size_bytes,
             modified_at=datetime.fromtimestamp(newest_mtime, tz=timezone.utc),
             grid_record=self._read_grid_record(name, path),
+            has_octomap=all(
+                os.path.isfile(os.path.join(path, layer.filename)) for layer in OctomapLayer
+            ),
+            octomap_record=self._read_octomap_record(name, path),
+        )
+
+    def _read_octomap_record(self, name: str, path: str) -> Optional[OctomapRecord]:
+        """Read the robot-side 3D map build's sidecar, or None.
+
+        The tolerance rules are ``_read_grid_record``'s, for a stronger version
+        of its reason: this file is rewritten by a process in *another
+        container* while the catalogue polls it, so a torn read, an unknown
+        status or a non-object document is None -- "the files on disk are the
+        only evidence" -- and never an exception. ``started_at`` and
+        ``params.resolution`` are taken when well-formed and dropped otherwise;
+        neither may cost the record its status.
+        """
+        sidecar = os.path.join(path, OCTOMAP_RECIPE_SIDECAR)
+        try:
+            with open(sidecar, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+            recorded_at = datetime.fromtimestamp(os.stat(sidecar).st_mtime, tz=timezone.utc)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            # Debug, as for the gridmap sidecar: a mid-write read is expected
+            # while a build is running and the console polls every few seconds.
+            self.logger.debug(
+                "[MapCatalogRepo] Unreadable octomap recipe sidecar",
+                map=name,
+                error=str(exc),
+            )
+            return None
+
+        if not isinstance(document, dict):
+            return None
+        status = GridRecordStatus.parse(document.get("status"))
+        if status is None:
+            return None
+        error = document.get("error")
+        params = document.get("params")
+        resolution = params.get("resolution") if isinstance(params, dict) else None
+        if (
+            isinstance(resolution, bool)
+            or not isinstance(resolution, (int, float))
+            or not resolution > 0
+        ):
+            resolution = None
+        return OctomapRecord(
+            status=status,
+            error=error if isinstance(error, str) else None,
+            started_at=_parse_utc(document.get("started_at")),
+            recorded_at=recorded_at,
+            resolution=float(resolution) if resolution is not None else None,
         )
 
     def _read_grid_record(self, name: str, path: str) -> Optional[GridRecord]:
@@ -935,6 +1076,24 @@ def _parse_keepout_zone(entry: object) -> Optional[KeepoutZone]:
     if len(points) < 3:
         return None
     return KeepoutZone(id=zone_id, points=tuple(points))
+
+
+def _parse_utc(value: object) -> Optional[datetime]:
+    """An ISO-8601 timestamp from a sidecar, as an aware UTC datetime, or None.
+
+    The robot side writes ``2026-10-08T03:12:45Z``; Python 3.10's
+    ``fromisoformat`` does not take the ``Z``, hence the replace. A naive value
+    is read as UTC rather than local time, since every writer here is UTC.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _walk_stats(path: str) -> Tuple[int, float]:
