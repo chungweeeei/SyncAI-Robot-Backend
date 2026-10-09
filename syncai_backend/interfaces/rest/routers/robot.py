@@ -478,15 +478,17 @@ def init_robot_router(
         # This response body is a frozen third-party contract, so the fields are
         # named one by one below rather than serialised wholesale. That is the
         # ONLY thing keeping the internal parts of RobotState —
-        # motor_status.timestamp, localization_valid, and the kinematic half of
-        # each MotorState — out of a public payload.
+        # motor_status.timestamp and the kinematic half of each MotorState — out
+        # of a public payload.
         #
         # So this list is a WHITELIST, not a mirror: a field added to the message
-        # does not appear here until somebody decides it should. `low_level_mode`
-        # is the one field that decision has been made for, because the console
+        # does not appear here until somebody decides it should. Two fields have
+        # had that decision made for them: `low_level_mode`, because the console
         # has no other way to show what the gait controller is actually doing —
-        # every other view of that is a command echo. Widening it again is the
-        # same deliberate act, not a mechanical follow-on.
+        # every other view of that is a command echo — and `localization_valid`,
+        # because every sample is stored now and a zeroed pose must arrive
+        # labelled. Widening it again is the same deliberate act, not a
+        # mechanical follow-on.
         #
         # motor_status IS exposed, but flattened and re-projected: the message
         # field is a MotorStates (its `states` array plus a source `timestamp`),
