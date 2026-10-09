@@ -170,10 +170,10 @@ class MapGateway:
         """Are the AUTO-session map services discoverable right now?
 
         The precondition for a map switch, and the honest way to ask "is the nav
-        stack up". Deliberately not read off the cached RobotState's mode:
-        RobotRepo's write is gated on `localization_valid`, so a robot that has
-        lost localization has no cached state and therefore no mode -- and that
-        is exactly the robot whose operator most wants to switch maps.
+        stack up". Deliberately not read off the cached RobotState's mode: that
+        is the last frame robot_state published (the repo keeps serving it after
+        the publisher stops, e.g. through a session rebuild), and a mode names
+        the session sys_manager launched, not whether its services are up yet.
         """
         return all(
             self._service_clients[key].wait_for_service(timeout_sec=timeout_sec)
