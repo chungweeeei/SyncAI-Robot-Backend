@@ -181,6 +181,7 @@ def init_rest_server(
             workflow_gw=workflow_gw,
             map_catalog_repo=map_catalog_repo,
             conversion_svc=conversion_svc,
+            robot_gw=robot_gw,
         )
     )
     app.include_router(init_schedule_router(logger=logger, workflow_gw=workflow_gw))

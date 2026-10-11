@@ -12,8 +12,9 @@ ROS 2 `ament_python` package (`package.xml`, `setup.py`), split out of
 It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
-`SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, and the
-map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`) — plus `rclpy`,
+`SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
+map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, and the
+`NavigateToGoal` action the MOVE step sends) — plus `rclpy`,
 `nav2_msgs`, `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
 those imports as they are. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`. It is named in

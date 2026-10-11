@@ -11,9 +11,9 @@ from rclpy.publisher import Publisher
 from rclpy.client import Client
 from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
-from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 
+from syncai_common.action import NavigateToGoal
 from syncai_common.msg import WifiNetwork
 from syncai_common.srv import (
     ConnectWifiNetwork,
@@ -63,8 +63,10 @@ class MoveState(str, Enum):
     REJECTED = "rejected"
 
 
-# Tracks a NavigateToPose goal through its state machine, status polling and
-# cancel path.
+# Tracks a NavigateToGoal goal through its state machine, status polling and
+# cancel path. `feedback` is the latest NavigateToGoal.Feedback (its
+# status_msg is what the console shows beside a running MOVE step) and
+# `result` the NavigateToGoal.Result (error_code / error_msg on an abort).
 @dataclass
 class MoveGoal:
     goal_id: str
@@ -96,7 +98,7 @@ MAX_TRACKED_GOALS = 5
 # the same fast refusals.
 SWITCH_MODE_ACK_TIMEOUT = 2.0
 
-# How long move() waits for the NavigateToPose server, then for nav2 to accept
+# How long move() waits for the NavigateToGoal server, then for nav2 to accept
 # the goal. Short on purpose, and the reason is in temporal/workflows.py: the
 # MOVE activity runs under a 3 s heartbeat_timeout and has no loop to heartbeat
 # from while it is inside this call, so the whole send has to fit under that
@@ -156,8 +158,14 @@ class RobotGateway:
 
         move_client = ActionClient(
             node=self._node,
-            action_type=NavigateToPose,
-            action_name="navigate_to_pose",
+            # syncai_common's NavigateToGoal rather than nav2's NavigateToPose
+            # (2026-10): the same navigation on the same task_runner, but its
+            # result says why a MOVE failed (error_code / error_msg) and its
+            # feedback says what the robot is doing (status_msg). nav2's
+            # Humble result is std_msgs/Empty, which is why a failed MOVE used
+            # to read only "move ended in aborted".
+            action_type=NavigateToGoal,
+            action_name="navigate_to_goal",
         )
 
         self._action_clients.update({"move": move_client})
@@ -660,19 +668,22 @@ class RobotGateway:
     def move(self, x: float, y: float, yaw: float) -> Tuple[bool, str, Optional[str]]:
         self._logger.info("[RobotGateway] Sending navigation goal ", x=x, y=y, yaw=yaw)
 
-        goal_msg = NavigateToPose.Goal(pose=self._make_pose_stamped(x=x, y=y, yaw=yaw))
+        goal_msg = NavigateToGoal.Goal(pose=self._make_pose_stamped(x=x, y=y, yaw=yaw))
 
         return self._send_nav_goal("move", goal_msg)
 
-    def _move_feedback_cb(self, goal_handle):
-        goal_id = _goal_id_str(goal_handle)
+    def _move_feedback_cb(self, feedback_msg):
+        # rclpy hands the feedback callback the action's FeedbackMessage
+        # wrapper ({goal_id, feedback}), not a goal handle -- which is why
+        # _goal_id_str works on it.
+        goal_id = _goal_id_str(feedback_msg)
 
         with self._lock:
             goal = self._goals.get(goal_id)
             if not goal:
                 return
 
-            goal.feedback = goal_handle.feedback
+            goal.feedback = feedback_msg.feedback
 
     def _move_result_cb(self, goal_id: str, future):
         result = future.result()
@@ -697,10 +708,34 @@ class RobotGateway:
             if not goal:
                 return
 
-            return {
+            status: dict[str, Any] = {
                 "goal_id": goal.goal_id,
                 "state": goal.state.value,
             }
+            # The robot's reason, on an abort only: SUCCEEDED and CANCELED
+            # carry NONE by contract. NONE on an abort is meaningful too --
+            # "superseded or never started", not a navigation failure -- so it
+            # is passed on rather than dropped.
+            if goal.state is MoveState.ABORTED and goal.result is not None:
+                status["error_code"] = goal.result.error_code
+                status["error_msg"] = goal.result.error_msg
+            return status
+
+    def get_move_message(self) -> str:
+        """What the robot's navigator says it is doing, for a running MOVE.
+
+        The latest feedback's status_msg ("Following the path", "Path
+        blocked; replanning", ...) of the goal that is executing, or "" when
+        none is, or none has sent feedback yet. Not keyed by goal id: the
+        caller is the task-state read, which knows a step is running but not
+        which goal it sent, and one navigation at a time is the robot's rule
+        (task_runner's navigator mutex) as well as the task layer's.
+        """
+        with self._lock:
+            for goal in self._goals.values():
+                if goal.state is MoveState.EXECUTING and goal.feedback is not None:
+                    return goal.feedback.status_msg
+            return ""
 
     def cancel_move(self, goal_id: str) -> Tuple[bool, str]:
         with self._lock:

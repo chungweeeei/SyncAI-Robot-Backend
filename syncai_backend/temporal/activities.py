@@ -30,6 +30,30 @@ from syncai_backend.services.gridmap_conversion import GridmapConversionService
 NAV_POLL_INTERVAL_S = 0.25
 
 
+def _move_failure(status: dict) -> str:
+    """The step's error_msg for a MOVE that did not succeed.
+
+    The robot's own sentence when it gave one: NavigateToGoal's error_msg says
+    whether planning or path following failed, which is the whole reason the
+    backend moved off nav2's NavigateToPose (whose Humble result is empty). An
+    abort with error_code NONE is, by the action's contract, a goal that was
+    superseded or never started -- another navigation held the robot, or the
+    behavior tree failed to load -- not a navigation failure, and it is said
+    so rather than left as a bare "aborted".
+    """
+    state = status["state"]
+    if state != "aborted":
+        return f"move ended in {state}"
+    if status.get("error_msg"):
+        return f"move ended in aborted: {status['error_msg']}"
+    if status.get("error_code") == 0:
+        return (
+            "move ended in aborted: navigation did not start "
+            "(another navigation is running, or the behavior tree failed to load)"
+        )
+    return "move ended in aborted"
+
+
 class ActivityResult(BaseModel):
     success: bool
     goal_id: str | None = None
@@ -55,8 +79,12 @@ class RobotActivities:
         self._map_catalog_repo = map_catalog_repo
         self._conversion_svc = conversion_svc
 
-    def _wait_for_nav_goal(self, goal_id: str) -> str:
-        """Poll a navigation goal to a terminal state, heartbeating each round."""
+    def _wait_for_nav_goal(self, goal_id: str) -> dict:
+        """Poll a navigation goal to a terminal state, heartbeating each round.
+
+        Returns the gateway's last status dict: ``state``, plus the robot's
+        ``error_code`` / ``error_msg`` when the goal was aborted.
+        """
         while True:
             status = self._robot_gw.get_move_status(goal_id=goal_id)
             state = status["state"] if status else None
@@ -64,7 +92,7 @@ class RobotActivities:
             activity.heartbeat(state)
 
             if state in ["succeeded", "aborted", "canceled"]:
-                return state
+                return status
 
             time.sleep(NAV_POLL_INTERVAL_S)
 
@@ -72,7 +100,7 @@ class RobotActivities:
     def execute_move(
         self, params: MoveParams, expected_map: Optional[str] = None
     ) -> ActivityResult:
-        """Send a NavigateToPose goal and supervise it to a terminal state.
+        """Send a NavigateToGoal goal and supervise it to a terminal state.
 
         ``expected_map`` is the run's ``TaskMap``, handed over by the workflow
         when the run carries one. Before anything is sent the goal is checked
@@ -117,7 +145,8 @@ class RobotActivities:
 
             self._logger.info("[RobotActivity] Move accepted", goal_id=goal_id)
 
-            state = self._wait_for_nav_goal(goal_id=goal_id)
+            status = self._wait_for_nav_goal(goal_id=goal_id)
+            state = status["state"]
 
         except CancelledError:
             # Cancel whatever is executing rather than a remembered goal_id:
@@ -133,7 +162,7 @@ class RobotActivities:
             raise
 
         if state != "succeeded":
-            raise ApplicationError(f"move ended in {state}", non_retryable=False)
+            raise ApplicationError(_move_failure(status), non_retryable=False)
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 

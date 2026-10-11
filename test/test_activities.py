@@ -107,6 +107,39 @@ class TestExecuteMove:
         with pytest.raises(ApplicationError, match="move ended in aborted"):
             env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
 
+    def test_an_aborted_goal_carries_the_robots_reason(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {
+            "goal_id": "goal-1",
+            "state": "aborted",
+            "error_code": 100,
+            "error_msg": "Path following failed: the robot could not reach the goal",
+        }
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert str(exc_info.value) == (
+            "move ended in aborted: "
+            "Path following failed: the robot could not reach the goal"
+        )
+
+    def test_an_abort_with_no_reason_says_navigation_did_not_start(
+        self, env, activities, robot_gw
+    ):
+        # NavigateToGoal's contract: ABORTED + NONE is superseded or never
+        # started, not a navigation failure.
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {
+            "goal_id": "goal-1",
+            "state": "aborted",
+            "error_code": 0,
+            "error_msg": "",
+        }
+
+        with pytest.raises(ApplicationError, match="navigation did not start"):
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
     def test_polling_heartbeats_until_terminal(self, env, activities, robot_gw):
         robot_gw.move.return_value = (True, "", "goal-1")
         robot_gw.get_move_status.side_effect = [
