@@ -11,8 +11,8 @@ evil: the alternative is handing the map router the gateway that owns
 NavigateToGoal.
 
 The clients split by session, which is worth knowing before debugging any of
-them: ``map_server/load_map``, ``filter_mask_server/load_map``, ``relocalize``
-and ``relocalize_check`` exist only in the nav (AUTO) session,
+them: ``map_server/load_map``, ``filter_mask_server/load_map``, ``relocalize``,
+``relocalize_check`` and ``auto_localize`` exist only in the nav (AUTO) session,
 ``pgo/start_mapping``, ``pgo/save_maps`` and ``pgo/reset_mapping`` only in the
 mapping (MANUAL) one. A
 "service is not available" from one of them usually means "wrong mode", not
@@ -35,7 +35,9 @@ from rclpy.qos import QoSProfile
 from geometry_msgs.msg import Point, Pose, PoseWithCovarianceStamped, Quaternion
 from std_msgs.msg import Header
 from nav2_msgs.srv import LoadMap
-from syncai_common.srv import IsValid, Relocalize, ResetMapping, SaveMaps, StartMapping
+from syncai_common.srv import (
+    AutoLocalize, IsValid, Relocalize, ResetMapping, SaveMaps, StartMapping,
+)
 
 
 def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
@@ -154,6 +156,15 @@ class MapGateway:
             srv_name="relocalize_check",
         )
 
+        # The localizer's third service (2026-10), declared the same bare way
+        # and in the same mutually exclusive callback group as relocalize --
+        # so a second call queues behind a running search rather than
+        # overlapping it, and relocalize_check waits for it too.
+        auto_localize_client = self._node.create_client(
+            srv_type=AutoLocalize,
+            srv_name="auto_localize",
+        )
+
         self._service_clients.update(
             {
                 "load_map": load_map_client,
@@ -163,6 +174,7 @@ class MapGateway:
                 "start_mapping": start_mapping_client,
                 "relocalize": relocalize_client,
                 "relocalize_check": relocalize_check_client,
+                "auto_localize": auto_localize_client,
             }
         )
 
@@ -297,6 +309,50 @@ class MapGateway:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.25)
+
+    def auto_localize(
+        self,
+    ) -> tuple[bool, str, Optional[AutoLocalize.Response]]:
+        """Find the robot on the loaded map with no hint: kidnap recovery.
+
+        The opposite of ``swap_localizer_map``'s ``relocalize`` in the way that
+        matters: ``success`` is a *result*, not a receipt. The localizer
+        answers only once its global search has picked a pose *and* its own
+        timer has registered against a fresh scan from it, so a true here
+        means localized, with nothing left to poll. A false leaves
+        localization exactly as it was -- the candidate is withdrawn -- and
+        the response still carries the pose that did not converge, for
+        diagnosis; the router decides what to show of it.
+
+        The 30 s deadline is the localizer's two own deadlines (10 s search,
+        which includes building its KD-trees on the first call after a map
+        load, + 5 s convergence) with margin, so a slow answer is the
+        localizer's verdict rather than this side giving up first. It holds a
+        FastAPI worker thread for the duration, like every call here.
+        """
+        client = self._service_clients["auto_localize"]
+        if not client.wait_for_service(timeout_sec=5.0):
+            return False, (
+                "auto_localize is not available — finding the robot needs it "
+                "in AUTO (navigation) mode."
+            ), None
+
+        self._logger.info("[MapGateway] Auto-localizing")
+
+        future = client.call_async(AutoLocalize.Request())
+        if not _wait_for_future(future, timeout=30.0):
+            return False, "Timeout waiting for auto_localize response", None
+
+        response = future.result()
+        self._logger.info(
+            "[MapGateway] Auto-localize answered",
+            success=response.success,
+            message=response.message,
+            fitness=response.fitness,
+            inlier_ratio=response.inlier_ratio,
+            candidates=response.candidates,
+        )
+        return response.success, response.message, response
 
     def reload_map(self, yaml_path: str) -> tuple[bool, str]:
         """Make the running map_server re-read a map and re-publish it.

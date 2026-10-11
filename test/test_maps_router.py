@@ -95,6 +95,19 @@ class _StubMapGateway:
         # to reload it *after* the INI write, the commit point.
         self.keepout_calls = []
         self.keepout_result = (True, "")
+        # The kidnap recovery. `auto_localize_gate`, when set, holds the call
+        # until the test releases it -- how a second press is caught mid-search.
+        self.auto_localize_calls = 0
+        self.auto_localize_result = (
+            True,
+            "matched",
+            types.SimpleNamespace(
+                x=1.5, y=-2.0, z=0.1, yaw=1.5707963, fitness=0.02,
+                inlier_ratio=0.8, candidates=480,
+            ),
+        )
+        self.auto_localize_entered = threading.Event()
+        self.auto_localize_gate = None
 
     def reload_map(self, yaml_path):
         self.calls.append(yaml_path)
@@ -128,6 +141,13 @@ class _StubMapGateway:
 
     def localization_converged(self, timeout_s=3.0):
         return self.converged
+
+    def auto_localize(self):
+        self.auto_localize_calls += 1
+        self.auto_localize_entered.set()
+        if self.auto_localize_gate is not None:
+            self.auto_localize_gate.wait(timeout=5)
+        return self.auto_localize_result
 
 
 class _StubWorkflowGateway:
@@ -3582,3 +3602,113 @@ def test_import_logs_its_phase_timings(client, capsys):
     line = next(line for line in out.splitlines() if "Imported map" in line)
     for field in ("inspect_ms=", "extract_ms=", "db_ms="):
         assert field in line
+
+
+# --- POST /api/v1/localization/auto -----------------------------------------
+
+
+def _auto_localize(client):
+    return client.post("/api/v1/localization/auto")
+
+
+def test_auto_localize_answers_the_pose_in_degrees(client, map_gw):
+    response = _auto_localize(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["localized"] is True
+    assert body["message"] == "matched"
+    assert (body["x"], body["y"]) == pytest.approx((1.5, -2.0))
+    assert body["theta"] == pytest.approx(90.0, abs=1e-4)
+    assert body["inlier_ratio"] == pytest.approx(0.8)
+    assert body["candidates"] == 480
+    assert map_gw.auto_localize_calls == 1
+
+
+def test_auto_localize_failure_is_a_502_with_the_localizers_sentence(client, map_gw):
+    map_gw.auto_localize_result = (
+        False,
+        "search failed: ambiguous, a distinct pose scores alike",
+        types.SimpleNamespace(
+            x=0.0, y=0.0, z=0.0, yaw=0.0, fitness=0.0, inlier_ratio=0.0,
+            candidates=480,
+        ),
+    )
+
+    response = _auto_localize(client)
+
+    assert response.status_code == 502
+    assert "ambiguous" in response.json()["detail"]
+
+
+def test_auto_localize_outside_auto_mode_is_a_502(client, map_gw):
+    map_gw.auto_localize_result = (
+        False,
+        "auto_localize is not available — finding the robot needs it in AUTO "
+        "(navigation) mode.",
+        None,
+    )
+
+    response = _auto_localize(client)
+
+    assert response.status_code == 502
+    assert "AUTO" in response.json()["detail"]
+
+
+def test_auto_localize_refuses_while_a_task_is_running(client, map_gw, workflow_gw):
+    workflow_gw.tasks = [types.SimpleNamespace(id="task-7")]
+
+    response = _auto_localize(client)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "task_running"
+    assert "task-7" in response.json()["detail"]
+    assert map_gw.auto_localize_calls == 0
+
+
+def test_auto_localize_refuses_when_temporal_cannot_be_reached(
+    client, map_gw, workflow_gw
+):
+    workflow_gw.error = RuntimeError("connection refused")
+
+    response = _auto_localize(client)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "tasks_unknown"
+    assert map_gw.auto_localize_calls == 0
+
+
+def test_a_second_auto_localize_mid_search_is_a_409(client, map_gw):
+    map_gw.auto_localize_gate = threading.Event()
+    first = {}
+    worker = threading.Thread(target=lambda: first.update(r=_auto_localize(client)))
+    worker.start()
+    try:
+        assert map_gw.auto_localize_entered.wait(timeout=5)
+
+        second = _auto_localize(client)
+
+        assert second.status_code == 409
+        assert second.json()["code"] == "localize_running"
+    finally:
+        map_gw.auto_localize_gate.set()
+        worker.join(timeout=5)
+
+    assert first["r"].status_code == 200
+    assert map_gw.auto_localize_calls == 1
+    # Released after the answer: the next press goes through.
+    map_gw.auto_localize_gate = None
+    assert _auto_localize(client).status_code == 200
+
+
+def test_auto_localize_releases_the_lock_after_a_failure(client, map_gw):
+    map_gw.auto_localize_result = (False, "did not converge", None)
+    assert _auto_localize(client).status_code == 502
+
+    map_gw.auto_localize_result = (
+        True, "matched", types.SimpleNamespace(
+            x=0.0, y=0.0, z=0.0, yaw=0.0, fitness=0.0, inlier_ratio=1.0,
+            candidates=1,
+        ),
+    )
+    assert _auto_localize(client).status_code == 200
