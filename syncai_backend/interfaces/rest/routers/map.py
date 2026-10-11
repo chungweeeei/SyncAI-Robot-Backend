@@ -3,6 +3,7 @@ import hashlib
 import math
 import os
 import struct
+import threading
 import time
 import uuid
 from enum import Enum
@@ -395,6 +396,39 @@ class ImportMapResponse(BaseModel):
         ),
     )
     message: str = Field(..., description="What happened, for the operator to read.")
+
+
+class AutoLocalizeResponse(BaseModel):
+    """POST /api/v1/localization/auto — where the localizer found the robot."""
+
+    localized: bool = Field(
+        ...,
+        description=(
+            "True on any 200: the search found a pose and the localizer has "
+            "registered against a fresh scan from it, so there is nothing left "
+            "to poll. A failure is a 502 (or a 409), never a 200 with false, "
+            "and leaves localization as it was."
+        ),
+    )
+    message: str = Field(..., description="The localizer's summary of the match.")
+    x: float = Field(..., description="Map frame, metres.")
+    y: float = Field(..., description="Map frame, metres.")
+    z: float = Field(..., description="Map frame, metres.")
+    theta: float = Field(..., description="Heading in degrees, map frame.")
+    fitness: float = Field(
+        ...,
+        description="Mean squared nearest-neighbour distance of the match, m².",
+    )
+    inlier_ratio: float = Field(
+        ...,
+        description=(
+            "Fraction of the scan within the inlier distance of the map after "
+            "alignment (0-1) — the search's acceptance gate."
+        ),
+    )
+    candidates: int = Field(
+        ..., description="How many (position, heading) candidates were scored."
+    )
 
 
 class ActivateMapResponse(BaseModel):
@@ -1992,6 +2026,88 @@ def init_map_router(
             )
 
         return await asyncio.to_thread(_switch)
+
+    # --- Localization -------------------------------------------------------
+
+    # Held across one auto_localize call. The localizer serves it in a mutually
+    # exclusive callback group, so a second press would only queue behind the
+    # first and time out here -- or, worse, run a second search right after
+    # the first one succeeded. Not a queue: a press while one runs is a 409.
+    auto_localize_lock = threading.Lock()
+
+    @map_router.post(
+        "/api/v1/localization/auto", response_model=AutoLocalizeResponse
+    )
+    async def auto_localize():
+        """Find the robot on the loaded map with no hint — the localizer's
+        ``auto_localize``, the recovery for a kidnapped robot.
+
+        The operator's alternative to dragging an initial pose: carried
+        somewhere, booted away from ``[initial_pose]``, or simply lost. No
+        body, because the point is that no hint is needed. Blocks until the
+        localizer answers — up to ~15 s by its own deadlines — and a 200 is a
+        *result*: localized, nothing to poll, unlike the map switch's
+        ``relocalize``.
+
+        Refusals: 409 ``task_running`` while any job runs (this moves the
+        map frame under the robot, which mid-drive is a jump in where the
+        planner thinks it is — the same "any job" strictness as activate),
+        409 ``tasks_unknown`` when Temporal cannot say, 409
+        ``localize_running`` while a search is already in flight. Everything
+        the localizer says — not in AUTO mode, no ``poses.txt``, ambiguous
+        surroundings, did not converge — is the uniform 502 with its
+        sentence; the srv carries no code to tell them apart and prose is
+        not matched (gateways/failure.py). Writes nothing: not the INI's
+        ``[initial_pose]``, not a file.
+
+        ``async`` for the Temporal await, blocking half on a worker thread —
+        activate's split, for activate's reason.
+        """
+        active_tasks = await _running_tasks("finding the robot")
+        if active_tasks:
+            running = ", ".join(task.id for task in active_tasks)
+            raise ConflictError(
+                f"The robot is running {len(active_tasks)} "
+                f"{'task' if len(active_tasks) == 1 else 'tasks'} ({running}). "
+                "Cancel or wait for it before finding the robot.",
+                code="task_running",
+            )
+
+        if not auto_localize_lock.acquire(blocking=False):
+            raise ConflictError(
+                "The robot is already searching for where it stands; wait for "
+                "that answer.",
+                code="localize_running",
+            )
+
+        def _localize() -> AutoLocalizeResponse:
+            try:
+                ok, detail, found = map_gw.auto_localize()
+            finally:
+                auto_localize_lock.release()
+
+            if not ok:
+                logger.error("Auto-localization failed", error=detail)
+                raise UpstreamError(detail)
+
+            return AutoLocalizeResponse(
+                localized=True,
+                message=detail,
+                x=found.x,
+                y=found.y,
+                z=found.z,
+                # Radians in, degrees out: the REST vocabulary, as in
+                # set_initial_pose.
+                theta=math.degrees(found.yaw),
+                fitness=found.fitness,
+                inlier_ratio=found.inlier_ratio,
+                candidates=found.candidates,
+            )
+
+        # No await between the acquire above and this submit, so _localize
+        # always runs and always releases -- a client that drops the request
+        # meanwhile only stops waiting for the answer.
+        return await asyncio.to_thread(_localize)
 
     @map_router.post(
         "/api/v1/maps/{name}/grid/convert",

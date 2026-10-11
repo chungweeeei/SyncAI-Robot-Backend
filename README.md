@@ -348,6 +348,11 @@ status and cancel, and the latest feedback per goal for that read.
   - `relocalize` / `relocalize_check` (`syncai_localizer`, the map switch) —
     **bare** names in the robot namespace (`/<robot_id>/relocalize`, not
     `/<robot_id>/localizer/relocalize`); `gateways/map/map.py` records why.
+  - `auto_localize` (`syncai_localizer`, kidnap recovery) — the same bare name and
+    the same mutually exclusive callback group as `relocalize`. Blocks until the
+    search has a pose *and* the timer has converged on it (10 s + 5 s localizer
+    deadlines; the client waits 30 s), so its `success` is a result, not a
+    receipt. Needs a map saved with `save_patches` (`poses.txt`).
 
   The map gateway is separate on purpose: the map router has no business holding
   a handle that can make the robot move.
@@ -391,6 +396,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/robot/restart` | `restart_mode` on `syncai_sys_manager`: rebuild the byobu session of the mode already live (what `/robot/mode` refuses as a no-op). No body. Answers within the 2 s ack window with `restarting: true`; sys_manager replies only when the rebuild ends, kept for the `GET` below. **409 `restart_refused`** with sys_manager's sentence, nothing touched — in MAINTENANCE, with both sessions up, and always in MANUAL (`pgo_node` may hold an unsaved map), so in practice AUTO only. **409 `restart_running`** while one is under way; 502 if sys_manager is unreachable |
 | GET | `/api/v1/robot/restart` | How the latest restart this process dispatched went: `status` `idle` / `restarting` / `succeeded` / `failed`, `message`, `started_at` / `finished_at`. This, not `/robot/state` (which keeps serving the last frame through the rebuild), is how a console learns the outcome. Unanswered for 3 min reads `failed`; in memory, so a restarted backend says `idle` |
 | WS | `/api/v1/robot/teleop` | Inbound manual control: `{vx, vy, wz}` JSON frames at ~10 Hz, each axis clamped to [-1, 1] and published as-is (m/s / rad/s). Refused (`{"error": ...}` frame, socket stays open) while an autonomous MOVE runs. A 0.5 s stale-input watchdog and disconnect both publish zero velocity — driver_manager has no cmd_vel watchdog |
+| POST | `/api/v1/localization/auto` | Find the robot on the loaded map with **no hint** (`auto_localize`, kidnap recovery) — the alternative to `set_initial_pose`. No body; blocks up to ~15 s. 200 = localized, nothing to poll: `x` / `y` / `z`, `theta` (degrees), `fitness`, `inlier_ratio`, `candidates`. 409 `task_running` (any job — it moves the map frame), `tasks_unknown`, `localize_running` (one search at a time). Every localizer answer — not AUTO, no `poses.txt`, ambiguous, did not converge — is 502 with its sentence, localization unchanged. Writes nothing, not even `[initial_pose]` |
 | POST | `/api/v1/robot/set_initial_pose` | Seed localization with a map-frame pose (degrees in, radians out); fire-and-forget |
 | POST | `/api/v1/robot/set_motion_key` | Gait key `"0"`–`"5"`; `"4"` (ESTOP) is accepted but **not** forwarded — 200 with `sent: false` |
 | POST | `/api/v1/robot/estop` | `{"locked": bool}` → `set_safety_lock` on `syncai_driver_manager`. `true` engages the lock and, on the `false → true` edge only, starts cancelling every running task and nav goal in the background (`cancel_requested: true`; started, not finished). `false` releases it, cancelling nothing. 502 if the driver is unreachable, nothing cancelled. Not the ESTOP motion key |
