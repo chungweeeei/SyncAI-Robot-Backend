@@ -2,13 +2,13 @@
 
 Its own gateway rather than methods on ``RobotGateway``: that one is the
 driver / sys_manager / nav surface (motion keys, wifi, initialpose,
-NavigateToPose), and the map router has no business holding a handle that can
+NavigateToGoal), and the map router has no business holding a handle that can
 command the robot to move. Everything here only makes map files change hands --
 including the ``initialpose`` publisher, which re-seeds *where the robot thinks
 it is* and never asks it to go anywhere. That publisher is a second one on a
 topic ``RobotGateway`` also publishes to, which is fine in ROS and is the lesser
 evil: the alternative is handing the map router the gateway that owns
-NavigateToPose.
+NavigateToGoal.
 
 The clients split by session, which is worth knowing before debugging any of
 them: ``map_server/load_map``, ``filter_mask_server/load_map``, ``relocalize``
@@ -67,7 +67,7 @@ def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
 
     The same four lines as ``gateways/robot/robot.py``, duplicated rather than
     shared so a map gateway does not have to import the robot one (and its
-    NavigateToPose machinery) for a helper this size. If a third gateway needs
+    NavigateToGoal machinery) for a helper this size. If a third gateway needs
     it, move it to ``gateways/__init__.py`` and change all three.
 
     Deliberately not ``rclpy.spin_until_future_complete``: called from a thread

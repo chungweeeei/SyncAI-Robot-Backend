@@ -111,7 +111,7 @@ class SyncAIBackend(Node):
         # LoadMap client, so an edited gridmap can be pushed into the running
         # map_server. Its own gateway rather than a method on RobotGateway: that
         # one is the driver / sys_manager / nav surface (motion keys, wifi,
-        # initialpose, NavigateToPose), and the map router has no business
+        # initialpose, NavigateToGoal), and the map router has no business
         # holding a handle that can command the robot to move.
         map_gw = init_map_gateway(logger=logger, node=self)
         workflow_gw = init_workflow_gateway(logger=logger, robot_id=robot_id)

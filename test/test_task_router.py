@@ -147,9 +147,26 @@ def workflow_gw():
     return _StubWorkflowGateway()
 
 
+class _StubRobotGateway:
+    """The router's one robot read: the running MOVE's status sentence."""
+
+    def __init__(self):
+        self.message = ""
+        self.calls = 0
+
+    def get_move_message(self):
+        self.calls += 1
+        return self.message
+
+
 @pytest.fixture
 def catalog():
     return _StubCatalog()
+
+
+@pytest.fixture
+def robot_gw():
+    return _StubRobotGateway()
 
 
 @pytest.fixture
@@ -158,7 +175,7 @@ def conversions():
 
 
 @pytest.fixture
-def client(logger, workflow_gw, catalog, conversions):
+def client(logger, workflow_gw, catalog, conversions, robot_gw):
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -167,6 +184,7 @@ def client(logger, workflow_gw, catalog, conversions):
             workflow_gw=workflow_gw,
             map_catalog_repo=catalog,
             conversion_svc=conversions,
+            robot_gw=robot_gw,
         )
     )
     return TestClient(app)
@@ -346,10 +364,41 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-task-001").json()
 
         assert body["status"] == "IN_PROGRESS"
-        # StepState is status/error only — the definition (params) stays out.
+        # StepState is status/error/message only — the definition (params)
+        # stays out. No feedback from the robot yet reads as an empty message.
         assert body["steps"] == [
-            {"id": "step1", "status": "IN_PROGRESS", "error_msg": ""}
+            {"id": "step1", "status": "IN_PROGRESS", "error_msg": "", "message": ""}
         ]
+
+    def test_a_running_move_carries_the_robots_status(self, client, robot_gw):
+        robot_gw.message = "Path blocked; replanning"
+
+        body = client.get("/api/v1/tasks/robot01-task-001").json()
+
+        assert body["steps"][0]["message"] == "Path blocked; replanning"
+
+    def test_only_a_running_move_asks_the_robot(self, client, workflow_gw, robot_gw):
+        # A paused MOVE has cancelled its goal, and a STANDUP never had one:
+        # neither may pick up whatever navigation the gateway is tracking.
+        robot_gw.message = "Following the path"
+        workflow_gw.state = TaskState(
+            id="robot01-task-001",
+            status="PAUSED",
+            steps=[
+                Step(id="step1", type=StepType.STANDUP, status=StepStatus.IN_PROGRESS),
+                Step(
+                    id="step2",
+                    type=StepType.MOVE,
+                    params=MoveParams(x=1.0, y=2.0, theta=90.0),
+                    status=StepStatus.PAUSED,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-task-001").json()
+
+        assert [step["message"] for step in body["steps"]] == ["", ""]
+        assert robot_gw.calls == 0
 
     def test_get_unknown_task_is_404(self, client, workflow_gw):
         async def _raise(task_id):

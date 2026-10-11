@@ -1,4 +1,4 @@
-"""Tests for RobotGateway's NavigateToPose goal tracking and command services.
+"""Tests for RobotGateway's NavigateToGoal goal tracking and command services.
 
 The rclpy seams are mocked the way CoreManager's robot-gateway tests mock their
 socket/gRPC seams: ``ActionClient`` is patched at the module import site and the
@@ -26,6 +26,7 @@ from action_msgs.msg import GoalStatus  # noqa: E402
 from builtin_interfaces.msg import Time  # noqa: E402
 
 from geometry_msgs.msg import Twist  # noqa: E402
+from syncai_common.action import NavigateToGoal  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
@@ -158,6 +159,73 @@ class TestMoveGoalStateMachine:
 
     def test_unknown_goal_has_no_status(self, robot_gw):
         assert robot_gw.get_move_status(goal_id="not-a-goal") is None
+
+    def test_an_abort_carries_the_robots_reason(self, robot_gw, move_client):
+        goal_id, result_future = _send_goal(robot_gw, move_client)
+
+        result = NavigateToGoal.Result(
+            error_code=NavigateToGoal.Result.PLAN_FAILED,
+            error_msg="Planning failed: no path to the goal",
+        )
+        result_future.complete(
+            SimpleNamespace(status=GoalStatus.STATUS_ABORTED, result=result)
+        )
+
+        status = robot_gw.get_move_status(goal_id=goal_id)
+        assert status["error_code"] == NavigateToGoal.Result.PLAN_FAILED
+        assert status["error_msg"] == "Planning failed: no path to the goal"
+
+    def test_a_success_carries_no_reason(self, robot_gw, move_client):
+        goal_id, result_future = _send_goal(robot_gw, move_client)
+
+        result_future.complete(
+            SimpleNamespace(
+                status=GoalStatus.STATUS_SUCCEEDED, result=NavigateToGoal.Result()
+            )
+        )
+
+        assert "error_msg" not in robot_gw.get_move_status(goal_id=goal_id)
+
+
+def _feed(move_client, status_msg: str):
+    """Deliver one feedback message the way rclpy does: a FeedbackMessage."""
+    callback = move_client.send_goal_async.call_args[1]["feedback_callback"]
+    callback(
+        SimpleNamespace(
+            goal_id=SimpleNamespace(uuid=GOAL_UUID.bytes),
+            feedback=NavigateToGoal.Feedback(status_msg=status_msg),
+        )
+    )
+
+
+class TestMoveMessage:
+    def test_no_goal_has_no_message(self, robot_gw):
+        assert robot_gw.get_move_message() == ""
+
+    def test_no_feedback_yet_has_no_message(self, robot_gw, move_client):
+        _send_goal(robot_gw, move_client)
+
+        assert robot_gw.get_move_message() == ""
+
+    def test_the_latest_feedback_wins(self, robot_gw, move_client):
+        _send_goal(robot_gw, move_client)
+
+        _feed(move_client, "Following the path")
+        _feed(move_client, "Path blocked; replanning")
+
+        assert robot_gw.get_move_message() == "Path blocked; replanning"
+
+    def test_a_finished_goal_has_no_message(self, robot_gw, move_client):
+        _, result_future = _send_goal(robot_gw, move_client)
+        _feed(move_client, "Following the path")
+
+        result_future.complete(
+            SimpleNamespace(
+                status=GoalStatus.STATUS_SUCCEEDED, result=NavigateToGoal.Result()
+            )
+        )
+
+        assert robot_gw.get_move_message() == ""
 
 
 class TestCancelMove:

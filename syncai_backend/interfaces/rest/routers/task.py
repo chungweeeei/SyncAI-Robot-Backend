@@ -2,7 +2,7 @@ import base64
 import binascii
 import structlog
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Protocol
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from enum import Enum
@@ -155,6 +155,26 @@ class StepState(BaseModel):
         default="",
         description="Error message if the step failed",
     )
+    message: str = Field(
+        default="",
+        description=(
+            "What the robot is doing for a running MOVE step, in the robot's "
+            "own words (its navigator's status sentence); empty for every "
+            "other step and state. Free text for display only"
+        ),
+        examples=["Path blocked; replanning"],
+    )
+
+
+class MoveMessageSource(Protocol):
+    """The one thing the task-state read needs from the robot gateway.
+
+    A Protocol rather than RobotGateway itself so this router stays free of
+    rclpy: it is the router the console polls every second, and its tests run
+    without a ROS install.
+    """
+
+    def get_move_message(self) -> str: ...
 
 
 class TaskStateResponse(BaseModel):
@@ -324,6 +344,7 @@ def init_task_router(
     workflow_gw: WorkflowGateway,
     map_catalog_repo: MapCatalogRepo,
     conversion_svc: GridmapConversionService,
+    robot_gw: MoveMessageSource,
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
 
@@ -539,6 +560,17 @@ def init_task_router(
             success_rate=stats.completed / stats.total if stats.total else None,
         )
 
+    def _step_message(step: Step) -> str:
+        # Read live from the gateway, not stored on the workflow's Step: the
+        # navigator's sentence changes many times a second, and the workflow
+        # cannot see an activity's progress anyway. Only a MOVE that is
+        # running has a goal to ask about -- a PAUSED one has cancelled its
+        # goal, and between Temporal retry attempts there is none, which the
+        # gateway answers with "" and the console reads as plain "running".
+        if step.type is StepType.MOVE and step.status is StepStatus.IN_PROGRESS:
+            return robot_gw.get_move_message()
+        return ""
+
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)
     async def get_task_state(id: str):
         state = await workflow_gw.get_task_state(task_id=id)
@@ -551,6 +583,7 @@ def init_task_router(
                     id=step.id,
                     status=step.status,
                     error_msg=step.error_msg or "",
+                    message=_step_message(step),
                 )
                 for step in state.steps
             ],

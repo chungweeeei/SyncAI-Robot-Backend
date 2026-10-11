@@ -316,9 +316,16 @@ console's TTL cache. It runs on the uvicorn loop, which `WorkflowGateway` belong
 to; the REST server's lifespan hands the loop in, and an edge seen earlier runs
 once it does.
 
-**Action client:** `navigate_to_pose` (`nav2_msgs/NavigateToPose`), served by
-`syncai_task_runner`. `RobotGateway` keeps a goal-id → `MoveGoal` table so an
-activity can poll status and cancel.
+**Action client:** `navigate_to_goal` (`syncai_common/NavigateToGoal`), served by
+`syncai_task_runner`. It was `navigate_to_pose` (`nav2_msgs/NavigateToPose`)
+until 2026-10: the same navigation, but Humble's nav2 result is empty, so a
+failed MOVE could only say "move ended in aborted". `NavigateToGoal`'s result
+carries the robot's reason (`error_code` / `error_msg`, which the activity puts
+in the step's `error_msg`), and its feedback's `status_msg` says what the
+navigator is doing ("Following the path", "Path blocked; replanning", …),
+which `GET /api/v1/tasks/{id}` returns as a running MOVE step's `message`.
+`RobotGateway` keeps a goal-id → `MoveGoal` table so an activity can poll
+status and cancel, and the latest feedback per goal for that read.
 
 **Service clients.**
 
@@ -361,7 +368,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 |---|---|---|
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
 | POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE is checked against the loaded map — 409 `map_mismatch` / `conversion_running`, see *A job's map is checked twice*; stand / lie down never are. 409 `task_running` while any task runs — one task at a time |
-| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query). A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
+| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), empty otherwise. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
 | DELETE | `/api/v1/tasks/{id}` | Request cancellation; answers `CANCELING` — the final state (possibly still `COMPLETED`) comes from GET |
 | POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` is interrupted at once and re-sent on resume, a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see *Task orchestration*. 409 `task_not_running` once closed; 404 for another robot's id |
 | GET | `/api/v1/active_tasks` | What runs on this robot's queue now, *whoever* started it, with `source` / `schedule_id` / `kind` / `name` / `map_name` (the run's `TaskMap`; for a run older than the attribute, the loaded map unless it is a stand / lie down; `null` for a run that drives nowhere). A held run is still listed as `IN_PROGRESS`. Not `/tasks/active`, which would shadow `/tasks/{id}` |
@@ -576,7 +583,7 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 
 | StepType | Activity | What it does |
 |---|---|---|
-| `MOVE` | `execute_move` | Send a `NavigateToPose` goal, poll to a terminal state, heartbeat every 0.25 s |
+| `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg` |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.speak()` — synthesise and play, blocking for the utterance. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
 | `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the one-thread activity executor, no heartbeat, and it survives a backend restart with the time already served |
