@@ -136,6 +136,24 @@ registry entry is reported as `interrupted`. Before this, a failed conversion
 looked like a map nobody had converted, its reason only in
 `log/stack/<robot_id>/backend/current`.
 
+**Every conversion first waits for the robot's map cleaning.** pgo's `save_maps`
+answers as soon as the *raw* `map.pcd` is written, then spawns a detached
+`clean_map` that replaces it — seconds to minutes later, atomic rename — with a
+copy without people and one-off returns, recording its progress in
+`map_clean.recipe.json` (`converting` → `ok` / `failed`, written `converting`
+before the save answers). A grid converted straight after the save was made from
+the raw cloud: on `test` (2026-10-12) a person walking beside the robot was a
+trail of obstacles, and re-converting after the clean removed 4090 of 9932
+occupied cells. So the conversion thread polls that sidecar (2 s) before reading
+the cloud, holding the conversion slot meanwhile (`grid_status: converting`;
+rename / delete / activate get `conversion_running`), and converts once it says
+`ok`. No sidecar (no patches, cleaning off, an older map) converts at once;
+`failed`, a `converting` sidecar older than 15 min (a clean killed hard) and a
+15 min wait all convert the raw cloud, as before. Which of those it was is
+recorded as `map_clean` in `gridmap.recipe.json`. Waiting was chosen over
+"convert now, re-convert when the clean lands", which converts twice, shows a
+grid with people in it meanwhile, and collides with a hand-edit made in between.
+
 **Forbidden zones are a keepout mask beside the gridmap.** Since 2026-09 the
 planner's global costmap runs a nav2-style `KeepoutFilter` over the
 `OccupancyGrid` a second map_server, `filter_mask_server`, serves from
@@ -405,7 +423,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/network/wifi/connect` | Connect via `nmcli` (blocks up to 70 s) |
 | GET | `/api/v1/maps` | Map directories on disk with geometry, vertex counts and `grid_status` — **the conversion-status surface**; there is no job resource. `none` / `converting` / `ok` / `failed` (reason in `grid_error`) / `interrupted` (backend restarted mid-conversion). `grid_converting` is the deprecated boolean it replaces |
 | GET | `/api/v1/maps/{name}` | One map's summary |
-| POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, then z-band conversion in a background thread (`grid_pending` only means started — poll `grid_status`). On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
+| POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, then z-band conversion in a background thread, after the robot's map cleaning (`grid_pending` only means started — poll `grid_status`, which stays `converting` through the cleaning too). On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
 | POST | `/api/v1/mapping/start` | Begin a run: `pgo/start_mapping`, idle → mapping (the drive to the start point is not part of any map). No body; always resets the LIO front end (map origin = odometry origin), so the robot must be **stationary** until it returns. 409 `mapping_running` / `mapping_busy`; 502 with pgo's sentence. Touches no file |
 | GET | `/api/v1/mapping` | pgo's last-reported run state: `state` `idle` / `mapping` / `resetting` / `unknown`, `key_poses`, `loop_closures`. `unknown` is a real answer — every navigating robot, or pgo silent for 5 s. Latched, so it survives a console reload |
 | POST | `/api/v1/mapping/reset` | Discard the in-memory run and start a new map, restarting nothing: `pgo/reset_mapping` pauses intake, resets the LIO front end, rebuilds the pose graph; pgo stays mapping. No body and **no save** (saving stays a separate act — the usual case is abandoning a run gone wrong). Touches no file, hence `/mapping/`. 409 `mapping_idle` / `mapping_busy`; 502 with pgo's sentence, graph untouched. Robot must be **stationary** (static, gravity-aligning re-init) |

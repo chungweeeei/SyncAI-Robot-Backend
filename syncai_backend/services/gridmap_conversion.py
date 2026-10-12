@@ -33,6 +33,7 @@ thread body, which is load-bearing and explained at the import itself.
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, NamedTuple, Optional
 
@@ -51,6 +52,7 @@ from syncai_backend.helpers.pgm import write_text_atomic
 from syncai_backend.helpers.pointcloud import read_pcd_xyz
 from syncai_backend.repositories.map.catalog import (
     GRIDMAP_RECIPE_SIDECAR,
+    MAP_CLEAN_SIDECAR,
     GridRecordStatus,
 )
 
@@ -334,6 +336,139 @@ def write_recipe_sidecar(
         logger.warning("Could not write gridmap recipe sidecar", path=path, error=str(exc))
 
 
+# How long a conversion waits for the robot's map cleaning (MAP_CLEAN_SIDECAR)
+# before converting whatever map.pcd is on disk. The longest clean measured on
+# the robot is dp1f_1008_2_v2's 2004 keyframes: 142 s, 208 s with the octomap
+# on. Cleans are also serialised per host by a flock, so a save landing behind
+# another map's clean queues for that one first. 15 min covers both several
+# times over and is still short enough that a clean that hung does not leave a
+# fresh map without a grid for the rest of the day.
+MAP_CLEAN_TIMEOUT_S = 900.0
+# One stat + a ~700 B read per poll; a clean runs for tens of seconds at least.
+MAP_CLEAN_POLL_S = 2.0
+
+
+def _parse_iso_utc(value: object) -> Optional[datetime]:
+    """``2026-10-12T05:47:05Z`` -> an aware datetime; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def wait_for_map_clean(
+    logger: structlog.stdlib.BoundLogger,
+    directory: str,
+    *,
+    timeout_s: float = MAP_CLEAN_TIMEOUT_S,
+    poll_s: float = MAP_CLEAN_POLL_S,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    wall_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> Dict[str, object]:
+    """Block until the robot's map cleaning of ``directory`` is over; say how it ended.
+
+    Why a conversion has to wait at all: pgo_node's save_maps answers as soon as
+    the *raw* map.pcd is on disk and only then spawns ``clean_map``, a detached
+    process that replaces map.pcd seconds to minutes later with a copy without
+    people and one-off returns. POST /api/v1/maps converted straight after the
+    save answered, so every gridmap made at save time came from the raw cloud:
+    a person who walked beside the robot was a trail of obstacles on the 2D
+    map while the map.pcd next to it was already clean (map ``test``,
+    2026-10-12: the grid was finished 6 s after the save, the clean 28 s after
+    it, and re-converting removed 4090 of the grid's 9932 occupied cells).
+    Waiting was chosen over "convert now, re-convert when the clean lands":
+    that converts twice, puts a grid with people in it in front of the operator
+    for minutes, and would have to skip -- or overwrite -- a grid the operator
+    hand-edited in between.
+
+    Polls the sidecar rather than anything live because the sidecar is the only
+    surface the clean has: it is not a ROS node, and it outlives the mode
+    switch that kills the mapping session.
+
+    The returned dict goes into the gridmap sidecar as ``map_clean``, so the
+    record says which cloud the grid was made from. Its ``status``:
+
+    - ``absent``: no sidecar, nothing to wait for (a save without patches, the
+      cleaning turned off, a map imported or saved before 2026-10).
+    - ``ok``: map.pcd is the cleaned cloud.
+    - ``failed``: the clean gave up and left the raw cloud; its ``error`` is
+      copied along.
+    - ``stale``: the sidecar says ``converting`` but started longer ago than
+      ``timeout_s`` -- a clean killed hard (OOM, ``docker stop``) never writes
+      its outcome, and nothing would ever finish it.
+    - ``timed_out``: still ``converting`` after ``timeout_s`` of waiting here.
+
+    Never raises: every outcome but ``ok`` converts the raw cloud, which is
+    what this did before it waited, and a grid is what the operator needs. A
+    sidecar that cannot be read or parsed is taken as mid-write and retried
+    until the deadline rather than read as ``absent``: clean_map writes it
+    atomically, so a torn read is not expected, and converting the raw cloud
+    on a misread would bring back exactly the people this exists to remove.
+    """
+    path = os.path.join(directory, MAP_CLEAN_SIDECAR)
+    started = monotonic()
+
+    def _waited() -> float:
+        return round(monotonic() - started, 1)
+
+    logged = False
+    while True:
+        record: object = None
+        try:
+            with open(path, encoding="utf-8") as stream:
+                record = json.load(stream)
+        except FileNotFoundError:
+            return {"status": "absent"}
+        except (OSError, ValueError):
+            pass
+
+        if isinstance(record, dict):
+            status = record.get("status")
+            if status == "ok":
+                return {"status": "ok", "waited_s": _waited()}
+            if status == "failed":
+                logger.warning(
+                    "map cleaning failed; converting the raw map.pcd",
+                    error=record.get("error"),
+                )
+                return {
+                    "status": "failed",
+                    "waited_s": _waited(),
+                    "error": record.get("error"),
+                }
+            clean_started = _parse_iso_utc(record.get("started_at"))
+            if (
+                clean_started is not None
+                and (wall_now() - clean_started).total_seconds() > timeout_s
+            ):
+                logger.warning(
+                    "map cleaning never finished (killed?); converting the raw map.pcd",
+                    started_at=record.get("started_at"),
+                )
+                return {
+                    "status": "stale",
+                    "waited_s": _waited(),
+                    "started_at": record.get("started_at"),
+                }
+
+        if monotonic() - started >= timeout_s:
+            logger.warning(
+                "map cleaning still running at the deadline; converting the raw "
+                "map.pcd -- re-convert once map_clean.recipe.json says ok",
+                timeout_s=timeout_s,
+            )
+            return {"status": "timed_out", "waited_s": _waited()}
+
+        if not logged:
+            logger.info("waiting for the map cleaning before converting", sidecar=path)
+            logged = True
+        sleep(poll_s)
+
+
 class GridmapConversionService:
     """Runs pcd -> gridmap conversions and tracks the ones in flight.
 
@@ -342,6 +477,8 @@ class GridmapConversionService:
     and the per-request ``debug`` flag decides. It is a constructor argument
     rather than the module constant it used to be so that turning it on is a
     wiring decision someone can see, not an attribute somebody reassigned.
+    ``map_clean_timeout_s`` / ``map_clean_poll_s`` bound the wait for the
+    robot's map cleaning every conversion starts with (wait_for_map_clean).
     """
 
     def __init__(
@@ -349,9 +486,13 @@ class GridmapConversionService:
         logger: structlog.stdlib.BoundLogger,
         *,
         debug_subdir: Optional[str] = None,
+        map_clean_timeout_s: float = MAP_CLEAN_TIMEOUT_S,
+        map_clean_poll_s: float = MAP_CLEAN_POLL_S,
     ):
         self._logger = logger
         self._debug_subdir = debug_subdir
+        self._map_clean_timeout_s = map_clean_timeout_s
+        self._map_clean_poll_s = map_clean_poll_s
 
         # Maps with a conversion thread currently running, guarded by the lock.
         # Membership is what refuses a second concurrent conversion of the same
@@ -481,13 +622,36 @@ class GridmapConversionService:
                 }
                 if override is not None:
                     payload["recipe_override"] = override
+                if map_clean is not None:
+                    payload["map_clean"] = map_clean
                 return payload
+
+            map_clean: Optional[Dict[str, object]] = None
 
             # Before any work, so that a process that dies mid-conversion leaves a
             # record saying so. This is the write the `interrupted` state is derived
             # from; without it the only trace of an abandoned conversion is a map
             # that looks like it was never converted at all.
             write_recipe_sidecar(bound, directory, _record(GridRecordStatus.CONVERTING))
+
+            # Then wait for the robot to finish cleaning map.pcd, if it is
+            # cleaning it (wait_for_map_clean has why). Every conversion, not
+            # only the one a save starts: a re-convert requested during the
+            # clean would otherwise read the raw cloud just the same -- or the
+            # raw cloud in measure_cloud and the clean one in the pass after it,
+            # since the clean's rename can land between the two reads.
+            #
+            # The slot stays held throughout, so the map reads `converting` and
+            # rename / delete / activate keep refusing it with
+            # conversion_running. That is the right answer for those too: a
+            # rename moves the directory out from under clean_map, and a map
+            # with no grid yet cannot be activated anyway.
+            map_clean = wait_for_map_clean(
+                bound,
+                directory,
+                timeout_s=self._map_clean_timeout_s,
+                poll_s=self._map_clean_poll_s,
+            )
 
             try:
                 # Measured whichever recipe runs: z-band needs floor_z to place its

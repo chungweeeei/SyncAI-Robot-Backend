@@ -1084,6 +1084,12 @@ def init_map_router(
         "nothing banked" by definition, and pgo's own ``NO POSES!`` as a 502
         would say the robot is broken when the operator simply has not
         pressed Start. Unknown lets pgo answer, as it always did.
+
+        The conversion does not start on the cloud the save just wrote: pgo
+        cleans map.pcd of people in a detached process after answering, and
+        the conversion thread waits for that first (see
+        ``gridmap_conversion.wait_for_map_clean``), so ``grid_status`` stays
+        ``converting`` for that long too -- seconds to a few minutes.
         """
         _refuse_while_idle("save")
 
@@ -1105,7 +1111,8 @@ def init_map_router(
                 f"Saved '{request.name}'. Mapping has stopped — start it again "
                 "for another map."
                 + (
-                    " Converting to a 2D gridmap in the background."
+                    " Converting to a 2D gridmap in the background, once the "
+                    "robot has removed people from the point cloud."
                     if grid_pending
                     else (
                         " Re-run the conversion through "

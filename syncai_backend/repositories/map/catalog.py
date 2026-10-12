@@ -32,6 +32,15 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 GRIDMAP_RECIPE_SIDECAR = "gridmap.recipe.json"
 GRIDMAP_RECIPE_SIDECAR_PREV = "gridmap_prev.recipe.json"
 
+# Sidecar of the *robot's* post-save map cleaning, not of anything this process
+# runs: syncai_mapping's pgo_node writes it ``converting`` before save_maps
+# responds, and its detached ``clean_map`` turns it ``ok`` / ``failed`` --
+# replacing map.pcd (atomic rename) with a copy without people and one-off
+# returns on ``ok``. The gridmap conversion waits on it; see
+# services/gridmap_conversion.wait_for_map_clean. Absent on a save without
+# patches or with the cleaning turned off.
+MAP_CLEAN_SIDECAR = "map_clean.recipe.json"
+
 # The rest of that vocabulary, named here for the same reason and used
 # throughout this module instead of the literals it grew up with: the four
 # current files, then the generation ``archive_gridmap`` sets aside before a
