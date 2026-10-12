@@ -883,7 +883,19 @@ cp /path/to/libsyncai_worker.so lib/
 **2. Build the image.** The builder stage clones syncai_common from
 `interface.repos` (HTTPS, no credentials); nothing needs copying in. `base` is
 slow (~20 min on aarch64 the first time) and only rebuilds on a
-`requirements.txt` change.
+`requirements.txt` change (or a different `PIP_INDEX_URL`).
+
+Nearly all of that time is pip **downloading**, not building — every wheel is
+prebuilt for aarch64. From some networks `files.pythonhosted.org` crawls at
+40–70 kB/s (a 30 MB scipy wheel took 10 min), so a build that looks stuck in
+`[base 4/4]` usually is just slow. Point it at a mirror instead:
+
+```bash
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
+```
+
+pip's cache is a BuildKit cache mount, so a cancelled build does not throw away
+the wheels it already fetched; the next run picks up from there.
 
 ```bash
 docker compose build                                    # tags syncai-backend, USER_UID=${UID:-1000}
@@ -913,6 +925,7 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | `WEBRTC_LIB` | `./lib/libsyncai_worker.so` | the WebRTC worker `.so` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `postgres` / `postgres` | the infra stack's credentials |
 | `UID` / `GID` / `VIDEO_GID` | `1000` / `1000` / `44` | container user and the host's `video` group (`getent group video`) |
+| `PIP_INDEX_URL` | `https://pypi.org/simple` | build only: the PyPI index the base stage installs from (a mirror when PyPI is slow) |
 
 ```bash
 ROBOT_INSTANCE=robot02 RECORD_DIR=/mnt/ssd/record docker compose up -d

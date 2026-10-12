@@ -29,6 +29,11 @@ services:
         # Must match the owner of the mounted map/ record/ config/ directories.
         # `id -u` on the host.
         USER_UID: "${UID:-1000}"
+        # PyPI index for the base stage's pip installs (Dockerfile, base). Point
+        # it at a mirror when files.pythonhosted.org is slow from where you
+        # build; changing it rebuilds the pip layer (pip's cache mount keeps the
+        # wheels already fetched). Never a URL with credentials in it.
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
     image: syncai-backend
     container_name: syncai_backend
     restart: unless-stopped
