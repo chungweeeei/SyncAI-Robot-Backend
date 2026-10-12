@@ -1,6 +1,7 @@
 import structlog
-from typing import List
-from fastapi import APIRouter
+from datetime import datetime, timezone
+from typing import List, Optional
+from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 
 from syncai_backend.exceptions import BadRequestError, UpstreamError
@@ -30,6 +31,34 @@ class ConnectWifiNetworkRequest(BaseModel):
 
 class ConnectWifiNetworkResponse(BaseModel):
     message: str = Field(..., description="Human-readable result of the connection.")
+
+
+class WifiConnection(BaseModel):
+    uuid: str = Field(..., description="The saved network's id; the path key below.")
+    name: str = Field(..., description="The saved network's name, usually its SSID.")
+    ssid: str = Field(..., description="The SSID the robot joins with it.")
+    active: bool = Field(..., description="Whether the robot is on this network now.")
+    last_used_at: Optional[str] = Field(
+        None,
+        description="When the robot last joined it (ISO 8601, UTC), or null if never.",
+    )
+
+
+class ListWifiConnectionsResponse(BaseModel):
+    connections: List[WifiConnection] = Field(
+        ..., description="The WiFi networks saved on the robot."
+    )
+
+
+def _last_used_at(seconds: int) -> Optional[str]:
+    # NetworkManager writes 0 for a profile that has never come up.
+    if seconds <= 0:
+        return None
+    return (
+        datetime.fromtimestamp(seconds, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def init_network_router(
@@ -73,5 +102,58 @@ def init_network_router(
         return ConnectWifiNetworkResponse(
             message=f"Successfully connected to {request.ssid}"
         )
+
+    @network_router.get(
+        "/api/v1/network/wifi/connections", response_model=ListWifiConnectionsResponse
+    )
+    def list_wifi_connections():
+        success, message, connections = robot_gw.list_wifi_connections()
+        if not success:
+            logger.error("Failed to list saved WiFi networks", message=message)
+            raise UpstreamError(message)
+
+        return ListWifiConnectionsResponse(
+            connections=[
+                WifiConnection(
+                    uuid=connection.uuid,
+                    name=connection.name,
+                    ssid=connection.ssid,
+                    active=connection.active,
+                    last_used_at=_last_used_at(connection.last_used),
+                )
+                for connection in connections
+            ]
+        )
+
+    @network_router.post(
+        "/api/v1/network/wifi/connections/{uuid}/activate",
+        response_model=ConnectWifiNetworkResponse,
+    )
+    def activate_wifi_connection(uuid: str):
+        success, message, ssid = robot_gw.activate_wifi_connection(uuid=uuid)
+        if not success:
+            # 400 like a failed connect: nmcli's sentence (a changed password,
+            # a network out of range) is the operator's to act on.
+            logger.error(
+                "Failed to activate saved WiFi network", uuid=uuid, message=message
+            )
+            raise BadRequestError(message)
+
+        return ConnectWifiNetworkResponse(message=f"Successfully connected to {ssid}")
+
+    @network_router.delete(
+        "/api/v1/network/wifi/connections/{uuid}",
+        status_code=204,
+        response_class=Response,
+    )
+    def delete_wifi_connection(uuid: str):
+        success, message = robot_gw.delete_wifi_connection(uuid=uuid)
+        if not success:
+            logger.error(
+                "Failed to delete saved WiFi network", uuid=uuid, message=message
+            )
+            raise BadRequestError(message)
+
+        return Response(status_code=204)
 
     return network_router

@@ -14,9 +14,12 @@ from rclpy.action.client import ClientGoalHandle
 from action_msgs.msg import GoalStatus
 
 from syncai_common.action import NavigateToGoal
-from syncai_common.msg import WifiNetwork
+from syncai_common.msg import WifiConnection, WifiNetwork
 from syncai_common.srv import (
+    ActivateWifiConnection,
     ConnectWifiNetwork,
+    DeleteWifiConnection,
+    ListWifiConnections,
     RestartMode,
     ScanWifiNetworks,
     SetMotionKey,
@@ -182,6 +185,23 @@ class RobotGateway:
             srv_name="connect_wifi",
         )
 
+        # The saved networks (NetworkManager profiles) behind the console's
+        # Wi-Fi cards. Same server as the two above.
+        list_wifi_connections_client = self._node.create_client(
+            srv_type=ListWifiConnections,
+            srv_name="list_wifi_connections",
+        )
+
+        activate_wifi_connection_client = self._node.create_client(
+            srv_type=ActivateWifiConnection,
+            srv_name="activate_wifi_connection",
+        )
+
+        delete_wifi_connection_client = self._node.create_client(
+            srv_type=DeleteWifiConnection,
+            srv_name="delete_wifi_connection",
+        )
+
         set_motion_key_client = self._node.create_client(
             srv_type=SetMotionKey,
             srv_name="set_motion_key",
@@ -224,6 +244,9 @@ class RobotGateway:
             {
                 "scan_wifi": scan_wifi_client,
                 "connect_wifi": connect_wifi_client,
+                "list_wifi_connections": list_wifi_connections_client,
+                "activate_wifi_connection": activate_wifi_connection_client,
+                "delete_wifi_connection": delete_wifi_connection_client,
                 "set_motion_key": set_motion_key_client,
                 "set_policy_mode": set_policy_mode_client,
                 "set_safety_lock": safety_lock_client,
@@ -283,6 +306,54 @@ class RobotGateway:
         # The service itself waits up to 60s for nmcli; leave headroom on top.
         if not _wait_for_future(future, timeout=70.0):
             return False, "Timeout waiting for connect_wifi response"
+
+        response = future.result()
+        return response.success, response.message
+
+    def list_wifi_connections(self) -> Tuple[bool, str, List[WifiConnection]]:
+        list_client = self._service_clients.get("list_wifi_connections")
+        if not list_client.wait_for_service(timeout_sec=5.0):
+            return False, "list_wifi_connections service is not available", []
+
+        future = list_client.call_async(ListWifiConnections.Request())
+        # One 10 s list plus a short SSID read per profile; a handful of
+        # profiles fits well inside this.
+        if not _wait_for_future(future, timeout=15.0):
+            return False, "Timeout waiting for list_wifi_connections response", []
+
+        response = future.result()
+        if not response.success:
+            return False, response.message, []
+
+        return True, "", list(response.connections)
+
+    def activate_wifi_connection(self, uuid: str) -> Tuple[bool, str, str]:
+        """Rejoin a saved network; answers (success, message, ssid)."""
+        activate_client = self._service_clients.get("activate_wifi_connection")
+        if not activate_client.wait_for_service(timeout_sec=5.0):
+            return False, "activate_wifi_connection service is not available", ""
+
+        self._logger.info("[RobotGateway] Activating saved WiFi network", uuid=uuid)
+
+        future = activate_client.call_async(ActivateWifiConnection.Request(uuid=uuid))
+        # The service waits up to 60s for nmcli, as connect_wifi does.
+        if not _wait_for_future(future, timeout=70.0):
+            return False, "Timeout waiting for activate_wifi_connection response", ""
+
+        response = future.result()
+        return response.success, response.message, response.ssid
+
+    def delete_wifi_connection(self, uuid: str) -> Tuple[bool, str]:
+        delete_client = self._service_clients.get("delete_wifi_connection")
+        if not delete_client.wait_for_service(timeout_sec=5.0):
+            return False, "delete_wifi_connection service is not available"
+
+        self._logger.info("[RobotGateway] Deleting saved WiFi network", uuid=uuid)
+
+        future = delete_client.call_async(DeleteWifiConnection.Request(uuid=uuid))
+        # A list to find the profile, then a 15 s delete.
+        if not _wait_for_future(future, timeout=30.0):
+            return False, "Timeout waiting for delete_wifi_connection response"
 
         response = future.result()
         return response.success, response.message
