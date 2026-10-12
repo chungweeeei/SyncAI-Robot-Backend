@@ -153,10 +153,29 @@ COPY requirements.txt /tmp/requirements.txt
 # There is no kokoro-onnx step any more, and no alsa-utils above: the speech
 # engine and the speaker moved to the syncai_tts container, so this image holds
 # neither onnxruntime nor a ~310 MB model. gateways/tts is an httpx client.
-RUN python3 -m pip install --no-cache-dir --upgrade pip \
+#
+# Where the ~20 min goes is the network, not the CPU: every wheel here exists
+# prebuilt for aarch64 and nothing compiles, but files.pythonhosted.org can
+# crawl at 40-70 kB/s from some networks (measured 2026-10, while a mirror
+# served the same scipy wheel at ~17 MB/s). Two knobs for that:
+#
+#   * PIP_INDEX_URL, a build ARG — which RUN sees as an environment variable,
+#     and pip reads that variable itself, so no command below names it. Pass a
+#     mirror with `--build-arg PIP_INDEX_URL=...` (compose forwards the shell's).
+#     The default is spelled out rather than left empty so the apt pip that runs
+#     the first command never has to interpret an empty index. It is an ARG and
+#     not an ENV, so the image does not keep it — but `docker history` shows
+#     build args, so never put a credential in the URL.
+#   * a BuildKit cache mount on pip's cache dir instead of --no-cache-dir. The
+#     wheels never land in a layer (same image size as before), but a build
+#     that is cancelled half-way — or reruns after a requirements.txt edit —
+#     reuses what it already downloaded instead of starting from zero.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python3 -m pip install --upgrade pip \
     && grep -v '^open3d' /tmp/requirements.txt > /tmp/requirements.core.txt \
-    && python3 -m pip install --no-cache-dir -r /tmp/requirements.core.txt \
-    && { python3 -m pip install --no-cache-dir "$(grep '^open3d' /tmp/requirements.txt)" \
+    && python3 -m pip install -r /tmp/requirements.core.txt \
+    && { python3 -m pip install "$(grep '^open3d' /tmp/requirements.txt)" \
          || echo "WARNING: open3d unavailable for this platform — test_traversable.py will skip and the traversability recipe is disabled"; }
 
 # =============================================================================
@@ -320,7 +339,12 @@ WORKDIR /ros2_ws
 #
 # 7.x is the whole of the window where modern anyio and Humble's ROS plugins
 # both work.
-RUN python3 -m pip install --no-cache-dir "pytest>=7,<8"
+#
+# PIP_INDEX_URL and the cache mount as in base (an ARG ends with its stage, so
+# it is declared again here).
+ARG PIP_INDEX_URL=https://pypi.org/simple
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python3 -m pip install "pytest>=7,<8"
 
 # A convenience wrapper rather than something the entrypoint does on its own:
 # building takes minutes and most runs of this image do not need it, so it is
