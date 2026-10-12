@@ -52,6 +52,7 @@ from syncai_backend.gateways.workflow.schema import (
     StepParams,
     StepType,
     WorkflowTaskDefinition,
+    step_group_problem,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.interfaces.rest.routers.schedule import (
@@ -203,6 +204,7 @@ class TemplateStepResponse(BaseModel):
             "says which of those you are reading."
         ),
     )
+    group: Optional[str] = None
     vertex_status: VertexRefStatus
     resolved_params: Optional[StepParams] = Field(
         default=None,
@@ -277,6 +279,12 @@ def _check_step_ids(steps: List[TemplateStepRequest]) -> None:
         seen.add(step.id)
     if duplicates:
         raise ValueError(f"duplicate step ids: {duplicates}")
+
+
+def _check_step_groups(steps: List[TemplateStepRequest]) -> None:
+    problem = step_group_problem(steps)
+    if problem is not None:
+        raise ValueError(problem)
 
 
 def _check_map_scope(map_name: Optional[str], steps: List[TemplateStepRequest]) -> None:
@@ -395,6 +403,7 @@ def init_task_template_router(
         try:
             _check_step_ids(steps)
             _check_map_scope(map_name, steps)
+            _check_step_groups(steps)
         except ValueError as exc:
             raise BadRequestError(str(exc))
 
@@ -427,6 +436,7 @@ def init_task_template_router(
                     id=step.id,
                     type=step.type,
                     params=step.params,
+                    group=step.group,
                     vertex_id=step.vertex_id,
                     vertex_name=vertex.name if vertex else None,
                 ).model_dump(mode="json")
@@ -444,6 +454,7 @@ def init_task_template_router(
                 id=stored.id,
                 type=stored.type,
                 params=stored.params,
+                group=stored.group,
                 vertex_id=None,
                 vertex_name=None,
                 vertex_status=VertexRefStatus.NONE,
@@ -456,6 +467,7 @@ def init_task_template_router(
                 id=stored.id,
                 type=stored.type,
                 params=stored.params,
+                group=stored.group,
                 vertex_id=stored.vertex_id,
                 # The snapshot label: the only human handle for what is gone.
                 vertex_name=stored.vertex_name,
@@ -467,6 +479,7 @@ def init_task_template_router(
             id=stored.id,
             type=stored.type,
             params=stored.params,
+            group=stored.group,
             vertex_id=stored.vertex_id,
             # The vertex's *current* name, so a rename shows through.
             vertex_name=vertex.name,
@@ -692,6 +705,7 @@ def init_task_template_router(
                         id=stored.id,
                         type=stored.type,
                         params=resolved.resolved_params,
+                        group=stored.group,
                     )
                 )
             return row, steps

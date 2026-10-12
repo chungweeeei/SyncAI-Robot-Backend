@@ -264,6 +264,28 @@ def test_duplicate_step_ids_are_rejected(client):
     assert "duplicate step ids" in res.json()["detail"]
 
 
+def test_a_bad_grouping_is_rejected_with_a_sentence(client):
+    res = _create(client, steps=[dict(_move(), group="a"), dict(STANDUP, group="a")])
+    assert res.status_code == 400
+    assert "more than one" in res.json()["detail"]
+
+
+def test_a_group_is_stored_read_back_and_frozen_into_a_schedule(client, workflow_gw, dock):
+    speak = {"id": "3-speak", "type": "SPEAK", "params": {"text": "hi"}, "group": "a"}
+    task_id = _create(
+        client, steps=[dict(_move(dock.id), group="a"), speak, STANDUP]
+    ).json()["id"]
+
+    body = client.get(f"/api/v1/task_templates/{task_id}").json()
+    assert [step["group"] for step in body["steps"]] == ["a", "a", None]
+
+    res = client.post(f"/api/v1/task_templates/{task_id}/schedule",
+                      json={"id": "sched-g", "trigger": {"cron": "0 9 * * 1-5"}})
+    assert res.status_code == 200
+    frozen = workflow_gw.schedules[-1].definition.steps
+    assert [step.group for step in frozen] == ["a", "a", None]
+
+
 def test_non_uuid_path_id_is_422(client):
     assert client.get("/api/v1/task_templates/not-a-uuid").status_code == 422
 

@@ -55,9 +55,10 @@ class _StubClient:
 
 class _StubWorker:
     run_error: Exception | None = None
+    built: list = []
 
     def __init__(self, *args, **kwargs):
-        pass
+        _StubWorker.built.append(kwargs)
 
     async def run(self):
         if _StubWorker.run_error is not None:
@@ -76,6 +77,7 @@ async def _stub_ensure_search_attributes(client, logger) -> bool:
 def _stub_temporal(monkeypatch):
     _StubClient.reset(failures=0)
     _StubWorker.run_error = None
+    _StubWorker.built = []
     _registered.clear()
     monkeypatch.setattr(worker_mod, "Client", _StubClient)
     monkeypatch.setattr(worker_mod, "Worker", _StubWorker)
@@ -110,6 +112,28 @@ def test_connect_retries_then_runs():
     # The history's search attributes are registered on the connection that
     # finally succeeded, before the worker polls -- once, not per attempt.
     assert len(_registered) == 1
+
+
+def test_body_and_io_activities_poll_separate_queues():
+    """MOVE and the postures share one slot on the queue the workflow runs on;
+    SPEAK gets several on the IO queue, so a grouped SPEAK is not stuck behind
+    a MOVE's slot."""
+    activities = _activities()
+    asyncio.run(
+        run_worker(
+            logger, robot_id="robot01", activities=activities, handle=TemporalWorkerHandle()
+        )
+    )
+
+    body, io = _StubWorker.built
+    assert body["task_queue"] == "robot01.ROBOT_TASK_QUEUE"
+    assert body["workflows"]
+    assert body["max_concurrent_activities"] == 1
+    assert activities.execute_move in body["activities"]
+    assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
+    assert "workflows" not in io
+    assert io["activities"] == [activities.execute_speak]
+    assert io["max_concurrent_activities"] == worker_mod.IO_ACTIVITY_SLOTS > 1
 
 
 def test_connect_exhaustion_marks_dead_without_raising(monkeypatch):

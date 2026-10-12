@@ -40,7 +40,7 @@ starts two extra threads:
 |---|---|
 | main | `MultiThreadedExecutor.spin()` — all ROS subscriptions, TF, service/action clients |
 | uvicorn (daemon) | The FastAPI app on `0.0.0.0:3000` |
-| Temporal worker (daemon) | Polls `<robot_id>.ROBOT_TASK_QUEUE`, runs `RobotWorkflow` + activities |
+| Temporal worker (daemon) | Polls `<robot_id>.ROBOT_TASK_QUEUE` (`RobotWorkflow` + the body activities) and `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`) |
 
 - The executor is **multi-threaded on purpose**. Each point-cloud callback
   (`body_cloud`, and the multi-MB PCD reads behind `pgo/map_cloud_file`) has its
@@ -210,7 +210,7 @@ robot_id = self.get_namespace().strip("/") or "default_robot"
 |---|---|
 | ROS topics/services/actions | relative names inherit the `/<robot_id>` namespace |
 | PostgreSQL database | `<robot_id>_db` (auto-created on first connect) |
-| Temporal task queue | `<robot_id>.ROBOT_TASK_QUEUE` |
+| Temporal task queues | `<robot_id>.ROBOT_TASK_QUEUE` (workflow, body activities), `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`) |
 
 **All ROS names here are relative** (`map`, `robot_state`, `navigate_to_pose`,
 `pointlio/body_cloud`). Never hardcode `/<robot_id>/…` — that bug has been fixed
@@ -603,25 +603,57 @@ the include-order note in `server.py`).
 ## Task orchestration (Temporal)
 
 A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
-`StepType`:
+`StepType` — or a few at a time, where adjacent steps share a `group` (below):
 
 | StepType | Activity | What it does |
 |---|---|---|
 | `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg` |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.speak()` — synthesise and play, blocking for the utterance. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
-| `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the one-thread activity executor, no heartbeat, and it survives a backend restart with the time already served |
+| `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the body queue's one-thread executor, no heartbeat, and it survives a backend restart with the time already served |
 
 (`ARTIFACT` — conveyor pickup/drop via the artifact backend's REST API — was
 removed 2026-08 with `gateways/artifact/`; templates or schedules still carrying
 one must be purged before deploying.)
 
+**Groups — steps side by side.** A step may carry an optional `group` (any
+string). Adjacent steps with the same `group` start together, and the next step
+starts once all of them have finished — e.g. `MOVE(group=a)`, `SPEAK(group=a)`,
+`STANDUP` speaks while it drives, then stands. Rules, checked on
+`POST /api/v1/tasks`, schedules and templates (400 with a sentence):
+
+- a group's members must be **adjacent** — the same name again after another
+  step is refused, not read as a second group;
+- **at most one `MOVE` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
+  slot, so two would only run one after the other.
+
+**Fail-fast**: the first member to fail cancels the rest (a `MOVE` stops as on a
+task cancel) and fails the run; those siblings read `CANCELED` /
+"Canceled: step <id> failed". A task cancel reaches every member. A pause reaches
+each member on its own terms — the group's `MOVE` is interrupted and re-sent on
+resume, a `WAIT` freezes, a `SPEAK` plays on — and the run holds before the next
+step as usual. `GET /api/v1/tasks/{id}` echoes each step's `group`. `group` is an
+optional key added to the stored step (no migration): templates and schedules
+without it run exactly as before, and an ungrouped step issues the same commands
+it always did, so pre-existing histories replay.
+
 Details that matter when editing this path:
 
-- **Activities are synchronous**, in a single-worker `ThreadPoolExecutor` — one
-  thing at a time, like the robot. The worker also sets
-  `max_concurrent_activities=1`, so Temporal holds a second activity server-side
-  instead of handing it over to queue with its timeouts ticking. Cancellation is
+- **Two queues, split by what an activity occupies.** The body queue
+  (`<robot_id>.ROBOT_TASK_QUEUE`, which also carries the workflow) runs `MOVE`
+  and the posture steps in a single-worker `ThreadPoolExecutor` with
+  `max_concurrent_activities=1` — one thing at a time, like the robot — so
+  Temporal holds a second body activity server-side instead of handing it over
+  to queue with its timeouts ticking, and two runs can never drive at once. The
+  IO queue (`<robot_id>.ROBOT_IO_QUEUE`, `IO_ACTIVITY_SLOTS` = 4) runs `SPEAK`,
+  which only talks to the speech service; that is what lets a grouped `SPEAK`
+  play while its `MOVE` holds the body slot. Both workers live in the same
+  thread and share one client. `SPEAK` moved queues behind the
+  `speak-on-io-queue` patch, and the body worker still registers
+  `execute_speak` for runs that scheduled it there before the upgrade.
+  Two runs' `SPEAK`s may now overlap, as a task's `SPEAK` and a manual
+  `POST /api/v1/tts/speak` always could.
+- **Activities are synchronous**. Cancellation is
   *thrown* into the thread as `CancelledError` (landing once a blocking call like
   `time.sleep` returns), so cleanup is an `except CancelledError:`, not an
   `is_cancelled()` poll. `execute_move` wraps the send and the poll loop in one

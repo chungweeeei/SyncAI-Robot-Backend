@@ -36,6 +36,12 @@ What is pinned:
   run holds before the next one; the held step reads PAUSED while it waits;
   a pause with nothing left to hold lets the run complete; a pause and a
   cancel landing together end the run canceled rather than held.
+* Groups (``Step.group``): adjacent members run side by side and the next
+  step waits for all of them; the first failure cancels the rest (CANCELED,
+  naming the failed step) and fails the run; a run cancel reaches every
+  member; a pause interrupts the group's MOVE while its SPEAK plays on.
+  SPEAK is dispatched to the IO queue, so a stand-in registered only there
+  is what runs it.
 * WAIT is a workflow timer, not an activity: a pause freezes it and the
   resume starts a second timer for only the remainder (read off the run's
   history), and a cancel during it is CANCELED / "Task canceled".
@@ -80,6 +86,7 @@ from temporalio.worker import Worker  # noqa: E402
 
 from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     MoveParams,
+    SpeakParams,
     Step,
     StepStatus,
     StepType,
@@ -96,6 +103,7 @@ from syncai_backend.temporal.workflows import RobotWorkflow  # noqa: E402
 # Same shape the production worker derives from robot_id; the value itself is
 # arbitrary here since client and worker share it within one test.
 TASK_QUEUE = "robot01.ROBOT_TASK_QUEUE"
+IO_TASK_QUEUE = "robot01.ROBOT_IO_QUEUE"
 
 # Ten minutes: long enough that a test finishing in real time proves the
 # time-skipping server skipped it, and that a pause lands well inside it.
@@ -169,11 +177,13 @@ def _gated_move(started: asyncio.Event, release: asyncio.Event):
 
 
 @asynccontextmanager
-async def _worker(activities):
+async def _worker(activities, io_activities=None):
     """A time-skipping environment with a worker polling TASK_QUEUE.
 
     The client is built with ``pydantic_data_converter`` to mirror
     ``run_worker`` — the default converter cannot serialize WorkflowTask.
+    ``io_activities`` (SPEAK) get a second worker on IO_TASK_QUEUE, the way
+    run_worker splits them.
     """
     env = await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -185,7 +195,13 @@ async def _worker(activities):
             workflows=[RobotWorkflow],
             activities=activities,
         ):
-            yield env.client
+            if io_activities:
+                async with Worker(
+                    env.client, task_queue=IO_TASK_QUEUE, activities=io_activities
+                ):
+                    yield env.client
+            else:
+                yield env.client
     finally:
         await env.shutdown()
 
@@ -778,3 +794,220 @@ def test_cancel_during_a_wait_ends_the_run_canceled_and_the_step_canceled():
     assert steps[0].error_msg == "Task canceled"
     assert steps[1].status is StepStatus.PENDING
     assert calls == []
+
+
+# --- Groups ----------------------------------------------------------------
+
+
+def _grouped_task(task_id: str, *steps: tuple) -> WorkflowTask:
+    """``steps`` as ``(type, group)`` pairs; params as _task gives them."""
+    params = {
+        StepType.MOVE: MoveParams(x=1.5, y=-2.5, theta=90.0),
+        StepType.WAIT: WaitParams(seconds=WAIT_SECONDS),
+        StepType.SPEAK: SpeakParams(text="hello"),
+    }
+    return WorkflowTask(
+        id=task_id,
+        definition=WorkflowTaskDefinition(
+            steps=[
+                Step(id=f"step-{i}", type=step_type, params=params.get(step_type), group=group)
+                for i, (step_type, group) in enumerate(steps)
+            ]
+        ),
+    )
+
+
+def _gated_speak(started: asyncio.Event, release: asyncio.Event, calls: list):
+    """A SPEAK that parks until released. No heartbeat: the workflow gives
+    SPEAK no heartbeat_timeout, exactly as execute_speak runs."""
+
+    @activity.defn(name="execute_speak")
+    async def execute_speak(params: SpeakParams) -> ActivityResult:
+        calls.append(("execute_speak", activity.info().task_queue))
+        started.set()
+        await release.wait()
+        return ActivityResult(success=True, state="succeeded")
+
+    return execute_speak
+
+
+def test_a_lone_speak_runs_on_the_io_queue():
+    async def scenario():
+        calls: list = []
+        release = asyncio.Event()
+        release.set()
+        speak = _gated_speak(asyncio.Event(), release, calls)
+        task = _grouped_task("task-speak-io", (StepType.SPEAK, None))
+
+        # SPEAK is registered on the IO worker only: if the workflow sent it
+        # to the body queue the run would never finish.
+        async with _worker(_instant_activities([]), io_activities=[speak]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=10)
+        return calls
+
+    assert asyncio.run(scenario()) == [("execute_speak", IO_TASK_QUEUE)]
+
+
+def test_a_group_runs_its_members_side_by_side_before_the_next_step():
+    async def scenario():
+        move_started, move_release = asyncio.Event(), asyncio.Event()
+        speak_started, speak_release = asyncio.Event(), asyncio.Event()
+        calls: list = []
+        activities = [_gated_move(move_started, move_release)]
+        activities += _instant_activities(calls)[1:]
+        task = _grouped_task(
+            "task-group",
+            (StepType.MOVE, "a"),
+            (StepType.SPEAK, "a"),
+            (StepType.STANDUP, None),
+        )
+
+        async with _worker(
+            activities, io_activities=[_gated_speak(speak_started, speak_release, calls)]
+        ) as client:
+            handle = await _start(client, task)
+            # Neither is released, so both running at once is the group.
+            await asyncio.wait_for(move_started.wait(), timeout=10)
+            await asyncio.wait_for(speak_started.wait(), timeout=10)
+            together = await _statuses_until(
+                handle, lambda s: s[:2] == [StepStatus.IN_PROGRESS] * 2
+            )
+
+            # The SPEAK finishing is not enough: the next step waits for the
+            # whole group.
+            speak_release.set()
+            spoke = await _statuses_until(handle, lambda s: s[1] is StepStatus.COMPLETED)
+            await asyncio.sleep(0.3)
+            stood_early = ("execute_stand", None) in calls
+
+            move_release.set()
+            await handle.result()
+            done = await handle.query(RobotWorkflow.get_step_states)
+            return together, spoke, stood_early, done, calls
+
+    together, spoke, stood_early, done, calls = asyncio.run(scenario())
+
+    assert together == [StepStatus.IN_PROGRESS, StepStatus.IN_PROGRESS, StepStatus.PENDING]
+    assert spoke == [StepStatus.IN_PROGRESS, StepStatus.COMPLETED, StepStatus.PENDING]
+    assert not stood_early
+    assert [step.status for step in done] == [StepStatus.COMPLETED] * 3
+    assert calls[-1] == ("execute_stand", None)
+
+
+def test_a_failed_member_cancels_the_rest_and_fails_the_run():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        calls: list = []
+        activities = [_recording_move(started, release, dispatches, cancels)]
+        activities += _instant_activities(calls)[1:]
+
+        @activity.defn(name="execute_speak")
+        async def execute_speak(params: SpeakParams) -> ActivityResult:
+            await started.wait()
+            raise ApplicationError("Speak failed: no speaker", non_retryable=True)
+
+        task = _grouped_task(
+            "task-group-fail",
+            (StepType.MOVE, "a"),
+            (StepType.SPEAK, "a"),
+            (StepType.STANDUP, None),
+        )
+
+        async with _worker(activities, io_activities=[execute_speak]) as client:
+            handle = await _start(client, task)
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=15)
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return exc_info.value, steps, cancels, calls
+
+    err, steps, cancels, calls = asyncio.run(scenario())
+
+    # A failure, not a cancel: the run fails with the SPEAK's cause.
+    assert isinstance(err.cause, ActivityError)
+    assert steps[1].status is StepStatus.FAILED
+    assert "no speaker" in steps[1].error_msg
+    # The MOVE was stopped the way a cancel stops it, and says why.
+    assert cancels == [True]
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[0].error_msg == "Canceled: step step-1 failed"
+    assert steps[2].status is StepStatus.PENDING
+    assert calls == []
+
+
+def test_cancel_mid_group_cancels_every_member():
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        activities = [_recording_move(started, release, dispatches, cancels)]
+        activities += _instant_activities([])[1:]
+        task = _grouped_task(
+            "task-group-cancel",
+            (StepType.MOVE, "a"),
+            (StepType.WAIT, "a"),
+            (StepType.STANDUP, None),
+        )
+
+        async with _worker(activities) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await _statuses_until(handle, lambda s: s[1] is StepStatus.IN_PROGRESS)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+            return exc_info.value, await handle.query(RobotWorkflow.get_step_states), cancels
+
+    err, steps, cancels = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    assert cancels == [True]
+    assert [(step.status, step.error_msg) for step in steps[:2]] == [
+        (StepStatus.CANCELED, "Task canceled"),
+        (StepStatus.CANCELED, "Task canceled"),
+    ]
+    assert steps[2].status is StepStatus.PENDING
+
+
+def test_a_pause_interrupts_a_groups_move_while_its_speak_plays_on():
+    async def scenario():
+        move_started, move_release = asyncio.Event(), asyncio.Event()
+        speak_started, speak_release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        calls: list = []
+        activities = [_recording_move(move_started, move_release, dispatches, cancels)]
+        activities += _instant_activities(calls)[1:]
+        task = _grouped_task(
+            "task-group-pause", (StepType.MOVE, "a"), (StepType.SPEAK, "a")
+        )
+
+        async with _worker(
+            activities, io_activities=[_gated_speak(speak_started, speak_release, calls)]
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(move_started.wait(), timeout=10)
+            await asyncio.wait_for(speak_started.wait(), timeout=10)
+            move_started.clear()
+
+            await handle.signal(RobotWorkflow.pause)
+            held = await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            speak_release.set()
+            spoke = await _statuses_until(handle, lambda s: s[1] is StepStatus.COMPLETED)
+
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(move_started.wait(), timeout=10)
+            move_release.set()
+            await handle.result()
+            done = await handle.query(RobotWorkflow.get_step_states)
+            return held, spoke, dispatches, cancels, done
+
+    held, spoke, dispatches, cancels, done = asyncio.run(scenario())
+
+    assert held == [StepStatus.PAUSED, StepStatus.IN_PROGRESS]
+    assert spoke == [StepStatus.PAUSED, StepStatus.COMPLETED]
+    assert cancels == [True]
+    assert dispatches == [1, 1]
+    assert [step.status for step in done] == [StepStatus.COMPLETED] * 2

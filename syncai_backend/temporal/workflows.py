@@ -6,7 +6,11 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
 with workflow.unsafe.imports_passed_through():
-    from syncai_backend.gateways.workflow.config import PAUSE_SIGNAL, RESUME_SIGNAL
+    from syncai_backend.gateways.workflow.config import (
+        PAUSE_SIGNAL,
+        RESUME_SIGNAL,
+        io_task_queue_for,
+    )
     from syncai_backend.gateways.workflow.schema import (
         Step,
         StepStatus,
@@ -24,6 +28,34 @@ with workflow.unsafe.imports_passed_through():
 # NAV_GOAL_SEND_BUDGET_S, and test_activities.py checks that this stays above
 # it. Tighten either side and the other has to follow.
 MOVE_HEARTBEAT_TIMEOUT = timedelta(seconds=3)
+
+# SPEAK moved from the body queue to the IO queue when steps could run side by
+# side (Step.group). Behind a patch so a run that scheduled a SPEAK on the body
+# queue before the upgrade replays the same command after it.
+SPEAK_ON_IO_QUEUE_PATCH = "speak-on-io-queue"
+
+ACTIVITY_MAP = {
+    StepType.MOVE: RobotActivities.execute_move,
+    StepType.STANDUP: RobotActivities.execute_stand,
+    StepType.LIEDOWN: RobotActivities.execute_lie_down,
+    StepType.SPEAK: RobotActivities.execute_speak,
+}
+
+
+def _blocks(steps: list[Step]) -> list[list[Step]]:
+    """``steps`` cut into what runs together: a group's adjacent members, or
+    one ungrouped step on its own."""
+    blocks: list[list[Step]] = []
+    for step in steps:
+        if blocks and step.group is not None and blocks[-1][-1].group == step.group:
+            blocks[-1].append(step)
+        else:
+            blocks.append([step])
+    return blocks
+
+
+def _ended_badly(task: asyncio.Future) -> bool:
+    return task.done() and (task.cancelled() or task.exception() is not None)
 
 
 def _own_map() -> str | None:
@@ -86,137 +118,181 @@ class RobotWorkflow:
         self._steps = task.definition.steps
         own_map = _own_map()
 
-        activity_map = {
-            StepType.MOVE: RobotActivities.execute_move,
-            StepType.STANDUP: RobotActivities.execute_stand,
-            StepType.LIEDOWN: RobotActivities.execute_lie_down,
-            StepType.SPEAK: RobotActivities.execute_speak,
-        }
-
-        for step in self._steps:
-            # WAIT is the one step that is not an activity: it is a timer in
-            # the workflow itself (see _run_wait), so it has no entry here.
-            activity_fn = activity_map.get(step.type)
-            if activity_fn is None and step.type is not StepType.WAIT:
-                step.status = StepStatus.FAILED
-                step.error_msg = f"Unknown step type: {step.type}"
-                raise ApplicationError(
-                    f"Unknown step type: {step.type}", non_retryable=True
-                )
-
-            # The posture activities (STANDUP/LIEDOWN) take no argument, so
-            # they must be invoked with an empty arg list -- handing them a
-            # None would fail the worker's argument-count check. The schema
-            # guarantees params is None for exactly those step types.
-            args = [] if step.params is None else [step.params]
-            # The map rides as a second argument to MOVE only, and only when
-            # there is one: execute_move defaults it to None, so a run that
-            # started under an older worker (one argument in its history) and
-            # a run without the attribute look the same to it.
-            if step.type is StepType.MOVE and own_map is not None:
-                args.append(own_map)
-
-            # SPEAK cannot heartbeat: execute_speak sits in a single blocking
-            # gateway call -- one HTTP request to the speech service, held open
-            # for the whole utterance by `wait=true` -- so the
-            # MOVE_HEARTBEAT_TIMEOUT below would kill every attempt before its
-            # first heartbeat could ever arrive. Dead-worker detection for
-            # SPEAK therefore falls to start_to_close alone -- which is also
-            # why it gets a much shorter one than the heartbeating activities:
-            # a worst-case utterance (1000 chars at 0.5x speed, plus the
-            # one-time model load) is minutes, and an hour of a dead worker
-            # silently holding the step would defeat the point of the timeout.
-            if step.type is StepType.SPEAK:
-                start_to_close_timeout = timedelta(minutes=5)
-                heartbeat_timeout = None
+        # Block by block. A lone step is awaited directly -- exactly the
+        # commands the loop issued before groups existed, so those histories
+        # replay unchanged; a group's members start together (_run_group).
+        for block in _blocks(self._steps):
+            if len(block) == 1:
+                await self._run_step(block[0], own_map)
             else:
-                start_to_close_timeout = timedelta(hours=1)
-                heartbeat_timeout = MOVE_HEARTBEAT_TIMEOUT
+                await self._run_group(block, own_map)
 
-            activity_options = dict(
-                args=args,
-                # Without an explicit policy Temporal retries forever
-                # (maximum_attempts=0). The activities mark aborted and
-                # rejected moves retryable because those are sometimes
-                # transient -- but against unlimited attempts, a
-                # permanently blocked MOVE re-dispatched every backoff
-                # interval kept this run open forever: the step showed
-                # IN_PROGRESS for good, and ScheduleOverlapPolicy.SKIP
-                # silently dropped every later trigger of the schedule.
-                # Three attempts keeps the self-healing for the transient
-                # cases and turns the persistent ones into a visible
-                # FAILED step. The 5s initial interval is so a MOVE's
-                # second try isn't 1s after the first (the default) --
-                # too soon for e.g. a restarting action server to be back.
-                retry_policy=RetryPolicy(
-                    initial_interval=timedelta(seconds=5),
-                    maximum_attempts=3,
-                ),
-                # Per-attempt ceiling. This used to be minutes=3600 -- 60
-                # hours, a units slip (the intent was one hour), so it
-                # could never fire. A dead worker is caught by the 3s
-                # heartbeat regardless; this bounds the live-but-stuck
-                # case where an attempt heartbeats forever without ever
-                # reaching a terminal state. (Both values are picked per
-                # step type above -- SPEAK cannot heartbeat.)
-                start_to_close_timeout=start_to_close_timeout,
-                heartbeat_timeout=heartbeat_timeout,
-                cancellation_type=(
-                    workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
-                ),
+    async def _run_group(self, steps: list[Step], own_map: str | None) -> None:
+        """Run ``steps`` side by side and return when all have finished.
+
+        Fail-fast: the first member to fail cancels the rest -- each lands in
+        _run_step's own CancelledError branch, so a MOVE stops the robot the
+        way a task cancel does -- and once they have finished the failure is
+        raised as the run's, as a lone step's would be. The siblings read
+        CANCELED with the failed step named, not "Task canceled", because
+        nobody canceled the task.
+
+        A pause reaches each member on its own terms (a MOVE is interrupted,
+        a WAIT frozen, SPEAK and the postures finish) and the run holds before
+        the next block as usual. A cancel of the run surfaces here, from the
+        wait, and is passed on to every member before it is re-raised.
+        """
+        tasks = [asyncio.ensure_future(self._run_step(step, own_map)) for step in steps]
+        try:
+            await workflow.wait_condition(
+                lambda: all(t.done() for t in tasks) or any(_ended_badly(t) for t in tasks)
+            )
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        failed = next((i for i, t in enumerate(tasks) if _ended_badly(t)), None)
+        if failed is None:
+            return
+
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for i, step in enumerate(steps):
+            if i != failed and step.status is StepStatus.CANCELED:
+                step.error_msg = f"Canceled: step {steps[failed].id} failed"
+        raise tasks[failed].exception()
+
+    async def _run_step(self, step: Step, own_map: str | None) -> None:
+        # WAIT is the one step that is not an activity: it is a timer in
+        # the workflow itself (see _run_wait), so it has no entry here.
+        activity_fn = ACTIVITY_MAP.get(step.type)
+        if activity_fn is None and step.type is not StepType.WAIT:
+            step.status = StepStatus.FAILED
+            step.error_msg = f"Unknown step type: {step.type}"
+            raise ApplicationError(
+                f"Unknown step type: {step.type}", non_retryable=True
             )
 
-            # A pause that landed before this step (during the previous one,
-            # or between the two) holds here, before anything is dispatched.
-            # This is the whole of the hold for SPEAK and the posture steps:
-            # they are never interrupted, they finish and the run stops at
-            # the next boundary. A MOVE is cut short and a WAIT's countdown
-            # frozen, below.
-            try:
-                await self._hold(step)
-            except asyncio.CancelledError:
+        # The posture activities (STANDUP/LIEDOWN) take no argument, so
+        # they must be invoked with an empty arg list -- handing them a
+        # None would fail the worker's argument-count check. The schema
+        # guarantees params is None for exactly those step types.
+        args = [] if step.params is None else [step.params]
+        # The map rides as a second argument to MOVE only, and only when
+        # there is one: execute_move defaults it to None, so a run that
+        # started under an older worker (one argument in its history) and
+        # a run without the attribute look the same to it.
+        if step.type is StepType.MOVE and own_map is not None:
+            args.append(own_map)
+
+        # SPEAK cannot heartbeat: execute_speak sits in a single blocking
+        # gateway call -- one HTTP request to the speech service, held open
+        # for the whole utterance by `wait=true` -- so the
+        # MOVE_HEARTBEAT_TIMEOUT below would kill every attempt before its
+        # first heartbeat could ever arrive. Dead-worker detection for
+        # SPEAK therefore falls to start_to_close alone -- which is also
+        # why it gets a much shorter one than the heartbeating activities:
+        # a worst-case utterance (1000 chars at 0.5x speed, plus the
+        # one-time model load) is minutes, and an hour of a dead worker
+        # silently holding the step would defeat the point of the timeout.
+        if step.type is StepType.SPEAK:
+            start_to_close_timeout = timedelta(minutes=5)
+            heartbeat_timeout = None
+        else:
+            start_to_close_timeout = timedelta(hours=1)
+            heartbeat_timeout = MOVE_HEARTBEAT_TIMEOUT
+
+        activity_options = dict(
+            args=args,
+            # Without an explicit policy Temporal retries forever
+            # (maximum_attempts=0). The activities mark aborted and
+            # rejected moves retryable because those are sometimes
+            # transient -- but against unlimited attempts, a
+            # permanently blocked MOVE re-dispatched every backoff
+            # interval kept this run open forever: the step showed
+            # IN_PROGRESS for good, and ScheduleOverlapPolicy.SKIP
+            # silently dropped every later trigger of the schedule.
+            # Three attempts keeps the self-healing for the transient
+            # cases and turns the persistent ones into a visible
+            # FAILED step. The 5s initial interval is so a MOVE's
+            # second try isn't 1s after the first (the default) --
+            # too soon for e.g. a restarting action server to be back.
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=5),
+                maximum_attempts=3,
+            ),
+            # Per-attempt ceiling. This used to be minutes=3600 -- 60
+            # hours, a units slip (the intent was one hour), so it
+            # could never fire. A dead worker is caught by the 3s
+            # heartbeat regardless; this bounds the live-but-stuck
+            # case where an attempt heartbeats forever without ever
+            # reaching a terminal state. (Both values are picked per
+            # step type above -- SPEAK cannot heartbeat.)
+            start_to_close_timeout=start_to_close_timeout,
+            heartbeat_timeout=heartbeat_timeout,
+            cancellation_type=(
+                workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            ),
+        )
+        # SPEAK only talks to the speech service, so it goes to the IO queue,
+        # whose worker takes several at once; on the body queue a SPEAK grouped
+        # with a MOVE would wait for the MOVE's one slot. Unset, an activity
+        # goes to the run's own queue -- the body queue.
+        if step.type is StepType.SPEAK and workflow.patched(SPEAK_ON_IO_QUEUE_PATCH):
+            activity_options["task_queue"] = io_task_queue_for(workflow.info().task_queue)
+
+        # A pause that landed before this step (during the previous one,
+        # or between the two) holds here, before anything is dispatched.
+        # This is the whole of the hold for SPEAK and the posture steps:
+        # they are never interrupted, they finish and the run stops at
+        # the next boundary. A MOVE is cut short and a WAIT's countdown
+        # frozen, below.
+        try:
+            await self._hold(step)
+        except asyncio.CancelledError:
+            step.status = StepStatus.CANCELED
+            step.error_msg = "Task canceled"
+            raise
+
+        step.status = StepStatus.IN_PROGRESS
+        try:
+            if step.type is StepType.WAIT:
+                await self._run_wait(step, step.params)
+                result = None
+            elif step.type is StepType.MOVE:
+                result = await self._run_move(step, activity_fn, activity_options)
+            else:
+                result = await workflow.execute_activity(activity_fn, **activity_options)
+        except asyncio.CancelledError:
+            step.status = StepStatus.CANCELED
+            step.error_msg = "Task canceled"
+            raise
+        except ActivityError as err:
+            if isinstance(err.cause, CancelledError):
+                # A cancel of the whole run that reached us through the
+                # activity: execute_activity (SPEAK, the posture steps)
+                # answers the run's cancel by cancelling the activity and
+                # handing back its resolution, so the run's own
+                # asyncio.CancelledError never surfaces. A cancel is the
+                # only thing that resolves an activity with this cause
+                # (timeouts are TimeoutError), so it is named for what it
+                # is -- the same CANCELED a MOVE, a WAIT or a hold ends in.
                 step.status = StepStatus.CANCELED
                 step.error_msg = "Task canceled"
                 raise
+            step.status = StepStatus.FAILED
+            step.error_msg = str(err.cause or err)
+            raise
 
-            step.status = StepStatus.IN_PROGRESS
-            try:
-                if step.type is StepType.WAIT:
-                    await self._run_wait(step, step.params)
-                    result = None
-                elif step.type is StepType.MOVE:
-                    result = await self._run_move(step, activity_fn, activity_options)
-                else:
-                    result = await workflow.execute_activity(activity_fn, **activity_options)
-            except asyncio.CancelledError:
-                step.status = StepStatus.CANCELED
-                step.error_msg = "Task canceled"
-                raise
-            except ActivityError as err:
-                if isinstance(err.cause, CancelledError):
-                    # A cancel of the whole run that reached us through the
-                    # activity: execute_activity (SPEAK, the posture steps)
-                    # answers the run's cancel by cancelling the activity and
-                    # handing back its resolution, so the run's own
-                    # asyncio.CancelledError never surfaces. A cancel is the
-                    # only thing that resolves an activity with this cause
-                    # (timeouts are TimeoutError), so it is named for what it
-                    # is -- the same CANCELED a MOVE, a WAIT or a hold ends in.
-                    step.status = StepStatus.CANCELED
-                    step.error_msg = "Task canceled"
-                    raise
-                step.status = StepStatus.FAILED
-                step.error_msg = str(err.cause or err)
-                raise
+        if result is not None and not result.success:
+            step.status = StepStatus.FAILED
+            step.error_msg = "activity failed"
+            raise ApplicationError("activity failed", non_retryable=True)
 
-            if result is not None and not result.success:
-                step.status = StepStatus.FAILED
-                step.error_msg = "activity failed"
-                raise ApplicationError("activity failed", non_retryable=True)
-
-            step.status = StepStatus.COMPLETED
-
-        return
+        step.status = StepStatus.COMPLETED
 
     async def _run_move(self, step: Step, activity_fn, activity_options: dict) -> ActivityResult:
         """Run a MOVE, letting a pause interrupt it and a resume re-send it.

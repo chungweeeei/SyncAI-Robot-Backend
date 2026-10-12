@@ -14,6 +14,7 @@ from syncai_backend.gateways.workflow.config import (
     TASK_HISTORY_PAGE_SIZE_MAX,
 )
 from syncai_backend.gateways.workflow.schema import (
+    GROUP_DESCRIPTION,
     Step,
     StepType,
     StepStatus,
@@ -23,6 +24,7 @@ from syncai_backend.gateways.workflow.schema import (
     TaskSource,
     WorkflowTask,
     WorkflowTaskDefinition,
+    step_group_problem,
     validate_step_params,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
@@ -68,6 +70,7 @@ class StepRequest(BaseModel):
             "Omitted for STANDUP/LIEDOWN, required for MOVE, SPEAK and WAIT"
         ),
     )
+    group: Optional[str] = Field(default=None, description=GROUP_DESCRIPTION)
 
     # Same check as Step, repeated here so a mismatched body is rejected at the
     # request boundary (422) instead of raising a ValidationError inside the
@@ -163,6 +166,10 @@ class StepState(BaseModel):
             "other step and state. Free text for display only"
         ),
         examples=["Path blocked; replanning"],
+    )
+    group: Optional[str] = Field(
+        default=None,
+        description="The step's group, as dispatched: steps sharing one ran side by side",
     )
 
 
@@ -350,6 +357,10 @@ def init_task_router(
 
     @task_router.post("/api/v1/tasks", response_model=TaskResponse)
     async def trigger_task(req: TaskRequest):
+        # A sentence, not a 422: see step_group_problem.
+        problem = step_group_problem(req.steps)
+        if problem is not None:
+            raise BadRequestError(problem)
 
         # A job that drives is stamped with the map that is loaded now, the
         # map its positions are about to be read in -- that is the record the
@@ -376,6 +387,7 @@ def init_task_router(
                         id=step.id,
                         type=step.type,
                         params=step.params,
+                        group=step.group,
                     )
                     for step in req.steps
                 ],
@@ -584,6 +596,7 @@ def init_task_router(
                     status=step.status,
                     error_msg=step.error_msg or "",
                     message=_step_message(step),
+                    group=step.group,
                 )
                 for step in state.steps
             ],

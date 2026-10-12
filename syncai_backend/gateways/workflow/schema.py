@@ -117,6 +117,47 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
 }
 
 
+# The steps that drive the robot's body, and so run on the one-slot body queue
+# (see config.TASK_QUEUE_SUFFIX). Two of them in one group would each wait for
+# the slot the other holds, and the group would run them one after the other
+# anyway -- so a group may hold at most one.
+BODY_STEP_TYPES = frozenset({StepType.MOVE, StepType.STANDUP, StepType.LIEDOWN})
+
+
+def step_group_problem(steps) -> Optional[str]:
+    """Why ``steps``' groups cannot run, as a sentence; None when they can.
+
+    A group is a run of *adjacent* steps carrying the same ``group``, started
+    together and waited out together (RobotWorkflow._run_group). Adjacent,
+    because a group is a place in the sequence: the same name turning up again
+    after another step would be a second group the operator thinks is the
+    first. Duck-typed on ``.id`` / ``.type`` / ``.group`` so the request
+    models and Step share it.
+    """
+    closed: set[str] = set()
+    current: Optional[str] = None
+    body: list[str] = []
+    for step in steps:
+        group = step.group
+        if group != current:
+            if current is not None:
+                closed.add(current)
+            if group is not None and group in closed:
+                return (
+                    f"Steps in group '{group}' must be adjacent; step "
+                    f"'{step.id}' rejoins it after another step"
+                )
+            current, body = group, []
+        if group is not None and step.type in BODY_STEP_TYPES:
+            body.append(step.id)
+            if len(body) > 1:
+                return (
+                    f"Group '{group}' has more than one MOVE/STANDUP/LIEDOWN step "
+                    f"({', '.join(body)}); the robot can do only one at a time"
+                )
+    return None
+
+
 def validate_step_params(
     step_type: StepType, params: Optional[StepParams]
 ) -> Optional[StepParams]:
@@ -131,6 +172,15 @@ def validate_step_params(
         raise ValueError(f"{step_type.value} step requires {expected.__name__}")
 
     return params
+
+
+# Shared by Step and the REST request/response models, which all carry it.
+GROUP_DESCRIPTION = (
+    "Adjacent steps with the same group run at the same time, and the next "
+    "step starts once all of them have finished; if one fails the others are "
+    "canceled. At most one MOVE/STANDUP/LIEDOWN per group. Omitted: the step "
+    "runs on its own, after the one before it"
+)
 
 
 class Step(BaseSchema):
@@ -155,6 +205,10 @@ class Step(BaseSchema):
         description="Error message if the step failed",
         json_schema_extra={"example": ""},
     )
+    group: Optional[str] = Field(
+        default=None,
+        description=GROUP_DESCRIPTION,
+    )
 
     @model_validator(mode="after")
     def _check_params(self) -> "Step":
@@ -164,6 +218,15 @@ class Step(BaseSchema):
 
 class WorkflowTaskDefinition(BaseSchema):
     steps: List[Step] = Field(..., description="Ordered list of steps to execute")
+
+    # The routers answer a bad grouping with a 400 before building this; the
+    # check here is what keeps a run from ever starting with one.
+    @model_validator(mode="after")
+    def _check_groups(self) -> "WorkflowTaskDefinition":
+        problem = step_group_problem(self.steps)
+        if problem is not None:
+            raise ValueError(problem)
+        return self
 
 
 class WorkflowTask(BaseSchema):

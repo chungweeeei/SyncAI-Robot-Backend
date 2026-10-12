@@ -107,8 +107,9 @@ ament linters (`test_copyright`, `test_flake8`, `test_pep257`) are part of the s
 `SyncAIBackend(Node)` is constructed once; its constructor wires everything and starts
 two daemon threads. Main thread: `MultiThreadedExecutor.spin()` (all ROS callbacks, TF,
 service/action clients). uvicorn thread: FastAPI on `0.0.0.0:3000`. Temporal worker
-thread: polls `<robot_id>.ROBOT_TASK_QUEUE`, runs `RobotWorkflow` + activities in a
-single-worker `ThreadPoolExecutor`.
+thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotWorkflow`
++ the body activities (MOVE, postures) in a single-worker `ThreadPoolExecutor`,
+`max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time.
 
 Consequences:
 - **Blocking REST handlers are plain `def`, not `async def`** (ROS service calls up to
@@ -249,6 +250,19 @@ the only caller that passes anything else.
   *this* process watched, so a backend restarted meanwhile honestly answers `idle`.
 
 ### Temporal specifics
+
+**Steps run one at a time unless adjacent steps share a `group`** (`Step.group`, an
+optional key — no migration): a group's members start together, the next step waits
+for all of them, and the first failure cancels the rest and fails the run
+(`RobotWorkflow._run_group`). At most one MOVE/STANDUP/LIEDOWN per group, members
+adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
+router. That only works because activities are split by what they occupy: the body
+queue keeps its one slot (two runs never drive at once, nothing queues with its
+timeouts ticking), and SPEAK goes to the IO queue (behind the `speak-on-io-queue`
+patch; the body worker still registers `execute_speak` for runs from before it). A new
+activity that drives the robot belongs on the body queue; one that only talks to
+another service, on the IO queue. Coordination that must react at tick rate
+(stop when X) belongs in the BT (`syncai_task_runner`), not in a group.
 
 Activities are synchronous; cancellation arrives as `CancelledError` thrown into the
 thread — cleanup goes in `except CancelledError`, not an `is_cancelled()` poll. `SPEAK`
