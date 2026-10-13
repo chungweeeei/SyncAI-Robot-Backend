@@ -86,6 +86,10 @@ from temporalio.exceptions import (  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
+from syncai_backend.gateways.workflow.config import (  # noqa: E402
+    STEP_STARTED_SIGNAL,
+    reports_start,
+)
 from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     MoveParams,
     SpeakParams,
@@ -156,6 +160,21 @@ def _instant_activities(calls: list):
     return [execute_move, execute_stand, execute_lie_down]
 
 
+async def _report_started() -> None:
+    """What RobotActivities._report_started does, from an async stand-in.
+
+    A group member's run starts the next member once this arrives (or once
+    the member ends), so a stand-in that parks without it parks the group's
+    later starts too. A lone step's id carries no mark and reports nothing.
+    """
+    info = activity.info()
+    if not reports_start(info.activity_id):
+        return
+    await activity.client().get_workflow_handle(
+        info.workflow_id, run_id=info.workflow_run_id
+    ).signal(STEP_STARTED_SIGNAL, info.activity_id)
+
+
 def _gated_move(started: asyncio.Event, release: asyncio.Event):
     """A MOVE activity that parks until released, heartbeating while it waits.
 
@@ -167,6 +186,7 @@ def _gated_move(started: asyncio.Event, release: asyncio.Event):
 
     @activity.defn(name="execute_move")
     async def execute_move(params: MoveParams) -> ActivityResult:
+        await _report_started()
         started.set()
         while not release.is_set():
             activity.heartbeat()
@@ -499,6 +519,7 @@ def _recording_move(
     @activity.defn(name="execute_move")
     async def execute_move(params: MoveParams) -> ActivityResult:
         dispatches.append(activity.info().attempt)
+        await _report_started()
         started.set()
         try:
             while not release.is_set():
@@ -835,6 +856,7 @@ def _gated_speak(started: asyncio.Event, release: asyncio.Event, calls: list):
     @activity.defn(name="execute_speak")
     async def execute_speak(params: SpeakParams) -> ActivityResult:
         calls.append(("execute_speak", activity.info().task_queue))
+        await _report_started()
         started.set()
         await release.wait()
         return ActivityResult(success=True, state="succeeded")
@@ -848,6 +870,7 @@ def _cancellable_speak(started: asyncio.Event, cancels: list):
 
     @activity.defn(name="execute_speak")
     async def execute_speak(params: SpeakParams) -> ActivityResult:
+        await _report_started()
         started.set()
         try:
             while True:
@@ -1077,6 +1100,8 @@ def test_a_failed_member_stops_a_speak_mid_utterance():
 
         @activity.defn(name="execute_move")
         async def execute_move(params: MoveParams) -> ActivityResult:
+            # Accepted, then aborted once the SPEAK behind it is playing.
+            await _report_started()
             await speak_started.wait()
             raise ApplicationError("Move rejected: blocked", non_retryable=True)
 
@@ -1136,3 +1161,146 @@ def test_a_task_cancel_stops_a_speak_mid_utterance():
         (StepStatus.CANCELED, "Task canceled"),
         (StepStatus.CANCELED, "Task canceled"),
     ]
+
+
+# --- A group's start order -------------------------------------------------
+
+
+def test_a_groups_speaks_are_queued_in_list_order():
+    # Synthesis time decides when a SPEAK is queued, and the speech service
+    # plays in that order. Here the first takes longest: started together,
+    # they would be queued last-first.
+    async def scenario():
+        events: list = []
+        synthesis = {"one": 0.6, "two": 0.3, "three": 0.0}
+
+        @activity.defn(name="execute_speak")
+        async def execute_speak(params: SpeakParams) -> ActivityResult:
+            events.append(("post", params.text))
+            await asyncio.sleep(synthesis[params.text])
+            events.append(("queued", params.text))
+            await _report_started()
+            return ActivityResult(success=True, state="succeeded")
+
+        task = WorkflowTask(
+            id="task-group-speak-order",
+            definition=WorkflowTaskDefinition(
+                steps=[
+                    Step(id=f"s-{text}", type=StepType.SPEAK,
+                         params=SpeakParams(text=text), group="a")
+                    for text in synthesis
+                ]
+            ),
+        )
+        async with _worker(_instant_activities([]), io_activities=[execute_speak]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=15)
+            return events, await handle.query(RobotWorkflow.get_step_states)
+
+    events, steps = asyncio.run(scenario())
+
+    assert events == [
+        ("post", "one"), ("queued", "one"),
+        ("post", "two"), ("queued", "two"),
+        ("post", "three"), ("queued", "three"),
+    ]
+    assert [step.status for step in steps] == [StepStatus.COMPLETED] * 3
+
+
+def test_a_groups_speak_waits_for_the_standup_listed_ahead_of_it():
+    # The posture steps never report: their activity ending is their start.
+    async def scenario():
+        events: list = []
+
+        @activity.defn(name="execute_stand")
+        async def execute_stand() -> ActivityResult:
+            await asyncio.sleep(0.3)
+            events.append("stand")
+            return ActivityResult(success=True, state="succeeded")
+
+        @activity.defn(name="execute_speak")
+        async def execute_speak(params: SpeakParams) -> ActivityResult:
+            events.append("speak")
+            return ActivityResult(success=True, state="succeeded")
+
+        activities = _instant_activities([])
+        activities[1] = execute_stand
+        task = _grouped_task(
+            "task-group-stand-speak", (StepType.STANDUP, "a"), (StepType.SPEAK, "a")
+        )
+        async with _worker(activities, io_activities=[execute_speak]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=15)
+        return events
+
+    assert asyncio.run(scenario()) == ["stand", "speak"]
+
+
+def test_a_member_that_fails_before_it_starts_never_starts_the_next():
+    async def scenario():
+        calls: list = []
+
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams) -> ActivityResult:
+            raise ApplicationError("Move rejected: no path", non_retryable=True)
+
+        task = _grouped_task(
+            "task-group-fail-first", (StepType.MOVE, "a"), (StepType.SPEAK, "a")
+        )
+        async with _worker(
+            [execute_move] + _instant_activities([])[1:],
+            io_activities=[_gated_speak(asyncio.Event(), asyncio.Event(), calls)],
+        ) as client:
+            handle = await _start(client, task)
+            with pytest.raises(WorkflowFailureError):
+                await asyncio.wait_for(handle.result(), timeout=15)
+            return await handle.query(RobotWorkflow.get_step_states), calls
+
+    steps, calls = asyncio.run(scenario())
+
+    assert steps[0].status is StepStatus.FAILED
+    assert steps[1].status is StepStatus.PENDING
+    assert calls == []
+
+
+def test_a_cancel_before_the_first_member_starts_leaves_the_rest_pending():
+    async def scenario():
+        started = asyncio.Event()
+        cancels: list = []
+        calls: list = []
+
+        # Sent but never accepted: no report, so the SPEAK is never dispatched.
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams) -> ActivityResult:
+            started.set()
+            try:
+                while True:
+                    activity.heartbeat("sending")
+                    await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                cancels.append(True)
+                raise
+
+        task = _grouped_task(
+            "task-group-cancel-first", (StepType.MOVE, "a"), (StepType.SPEAK, "a")
+        )
+        async with _worker(
+            [execute_move] + _instant_activities([])[1:],
+            io_activities=[_gated_speak(asyncio.Event(), asyncio.Event(), calls)],
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await asyncio.sleep(0.3)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=15)
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return exc_info.value, steps, cancels, calls
+
+    err, steps, cancels, calls = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    assert cancels == [True]
+    assert (steps[0].status, steps[0].error_msg) == (StepStatus.CANCELED, "Task canceled")
+    assert steps[1].status is StepStatus.PENDING
+    assert calls == []

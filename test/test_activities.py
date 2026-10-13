@@ -15,8 +15,10 @@ the real thread injection and shielding need a threaded worker, which is
 integration-test territory.
 """
 
+import asyncio
 import dataclasses
-from unittest.mock import MagicMock, patch
+import threading
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -432,3 +434,130 @@ class TestExecuteSpeak:
         throttle = HEARTBEAT_THROTTLE_MAX.total_seconds()
         assert throttle < 0.8 * SPEAK_HEARTBEAT_TIMEOUT.total_seconds()
         assert SPEAK_POLL_INTERVAL_S <= throttle
+
+
+@pytest.fixture
+def worker_loop():
+    """The worker's event loop, running in a thread as run_worker's does."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+
+
+@pytest.fixture
+def client(activities, worker_loop):
+    client = MagicMock()
+    client.get_workflow_handle.return_value.signal = AsyncMock()
+    activities.bind_client(client, worker_loop)
+    return client
+
+
+def _as_group_member(env):
+    # The id shape RobotWorkflow schedules a group member under.
+    env.info = dataclasses.replace(env.info, activity_id="step-0#1")
+
+
+class TestReportStarted:
+    """A group member tells its run it has started, so the next one can go
+    (RobotWorkflow._run_group); the workflow side is in test_workflows.py."""
+
+    def test_a_moves_report_follows_the_accepted_goal(
+        self, env, activities, robot_gw, client
+    ):
+        _as_group_member(env)
+        order = []
+        robot_gw.move.side_effect = lambda **kw: order.append("move") or (True, "", "g")
+        robot_gw.get_move_status.return_value = {"goal_id": "g", "state": "succeeded"}
+        client.get_workflow_handle.return_value.signal.side_effect = (
+            lambda *args: order.append(("signal", *args))
+        )
+        env.on_heartbeat = lambda *details: order.append(("beat", *details))
+
+        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        from syncai_backend.gateways.workflow.config import STEP_STARTED_SIGNAL
+
+        assert order[:4] == [
+            ("beat", "sending"),
+            "move",
+            ("beat", "accepted"),
+            ("signal", STEP_STARTED_SIGNAL, "step-0#1"),
+        ]
+        client.get_workflow_handle.assert_called_once_with(
+            env.info.workflow_id, run_id=env.info.workflow_run_id
+        )
+
+    def test_a_lone_step_reports_nothing(self, env, activities, robot_gw, client):
+        robot_gw.move.return_value = (True, "", "g")
+        robot_gw.get_move_status.return_value = {"goal_id": "g", "state": "succeeded"}
+        beats = []
+        env.on_heartbeat = lambda *details: beats.append(details)
+
+        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        client.get_workflow_handle.assert_not_called()
+        assert ("accepted",) not in beats
+
+    def test_a_rejected_move_reports_nothing(self, env, activities, robot_gw, client):
+        _as_group_member(env)
+        robot_gw.move.return_value = (False, "server not available", None)
+
+        with pytest.raises(ApplicationError):
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        client.get_workflow_handle.assert_not_called()
+
+    def test_a_speak_reports_once_queued_and_once_per_attempt(
+        self, env, activities, tts_gw, client
+    ):
+        _as_group_member(env)
+        order = []
+        tts_gw.start_speak.side_effect = (
+            lambda **kw: order.append("post") or (True, "", _job("queued"))
+        )
+        tts_gw.await_speak.return_value = (True, "", _job("done"))
+        client.get_workflow_handle.return_value.signal.side_effect = (
+            lambda *args: order.append("signal")
+        )
+
+        env.run(activities.execute_speak, SpeakParams(text="hello", repeat=3))
+
+        assert order == ["post", "signal", "post", "post"]
+
+    def test_a_report_that_cannot_be_sent_does_not_fail_the_step(
+        self, env, activities, tts_gw, client
+    ):
+        _as_group_member(env)
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+        tts_gw.await_speak.return_value = (True, "", _job("done"))
+        client.get_workflow_handle.return_value.signal.side_effect = RuntimeError(
+            "temporal unreachable"
+        )
+
+        result = env.run(activities.execute_speak, SpeakParams(text="hello"))
+
+        assert result.success is True
+
+    def test_an_unbound_worker_reports_nothing(self, env, activities, tts_gw):
+        _as_group_member(env)
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+        tts_gw.await_speak.return_value = (True, "", _job("done"))
+
+        assert env.run(activities.execute_speak, SpeakParams(text="hello")).success
+
+    def test_the_report_fits_inside_the_moves_heartbeat_window(self):
+        """Beaten just before the report, next beaten after it and one poll."""
+        from syncai_backend.temporal.activities import (
+            NAV_POLL_INTERVAL_S,
+            STARTED_REPORT_TIMEOUT_S,
+        )
+        from syncai_backend.temporal.workflows import MOVE_HEARTBEAT_TIMEOUT
+
+        assert (
+            STARTED_REPORT_TIMEOUT_S + NAV_POLL_INTERVAL_S
+            < MOVE_HEARTBEAT_TIMEOUT.total_seconds()
+        )

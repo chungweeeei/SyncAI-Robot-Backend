@@ -253,9 +253,14 @@ the only caller that passes anything else.
 ### Temporal specifics
 
 **Steps run one at a time unless adjacent steps share a `group`** (`Step.group`, an
-optional key — no migration): a group's members start together, the next step waits
+optional key — no migration): a group's members run side by side, the next step waits
 for all of them, and the first failure cancels the rest and fails the run
-(`RobotWorkflow._run_group`). At most one MOVE/STANDUP/LIEDOWN per group, members
+(`RobotWorkflow._run_group`). They **start in list order**, each once the one before
+has *started* (MOVE: goal accepted; SPEAK: utterance queued; postures: ended; WAIT:
+timer running) — a member is scheduled under activity id `<step id>#<n>`
+(`group_activity_id`) and `MOVE`/`SPEAK` report through the `step_started` signal
+(`STEP_STARTED_SIGNAL`, sent by `RobotActivities._report_started` on the worker's
+client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/STANDUP/LIEDOWN per group, members
 adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
 router that also names the offending step (`code: invalid_step_group`, `step_id`: the
 step rejoining a closed group, or the second body step), so the console marks that row.
