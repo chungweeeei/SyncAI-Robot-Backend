@@ -617,7 +617,7 @@ removed 2026-08 with `gateways/artifact/`; templates or schedules still carrying
 one must be purged before deploying.)
 
 **Groups — steps side by side.** A step may carry an optional `group` (any
-string). Adjacent steps with the same `group` start together, and the next step
+string). Adjacent steps with the same `group` run side by side, and the next step
 starts once all of them have finished — e.g. `MOVE(group=a)`, `SPEAK(group=a)`,
 `STANDUP` speaks while it drives, then stands. Rules, checked on
 `POST /api/v1/tasks`, schedules and templates (400 with a sentence, plus
@@ -628,6 +628,31 @@ rejoining a closed group, or a group's second body step):
   step is refused, not read as a second group;
 - **at most one `MOVE` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
   slot, so two would only run one after the other.
+
+**Start order**: a group's members start **in list order**, each once the one
+before it has *started* — not finished — and from then on they overlap:
+
+| Member | Started when |
+|---|---|
+| `MOVE` | nav2 accepted the goal |
+| `SPEAK` | its first utterance is queued (the speech service plays in accepted order) |
+| `STANDUP` / `LIEDOWN` | the motion key is sent (the activity ends right there) |
+| `WAIT` | its timer runs |
+
+Scheduled all at once, as they were before, two `SPEAK`s raced through synthesis
+and played in whichever order they finished, and a `SPEAK` could be heard
+before the `STANDUP` listed ahead of it was sent. The workflow cannot see an
+activity's heartbeats, so `MOVE` and `SPEAK` report their start with a
+`step_started` workflow signal (`STEP_STARTED_SIGNAL`), sent from the activity
+thread on the worker's own client; a group member is scheduled under an
+activity id of the form `<step id>#<n>` (`group_activity_id`), which is both how
+the activity knows to report and what the report is matched against — a lone
+step keeps Temporal's id and reports nothing. A report that cannot be sent is
+logged, not fatal: the next member then waits for that one to *end*, which keeps
+the order and loses only the overlap. A member a pause holds before it starts
+holds back the starts behind it; one that never started when a failure or a
+cancel ends the group stays `PENDING`. Runs that scheduled a whole group at once
+replay under the `group-start-in-order` patch.
 
 **Fail-fast**: the first member to fail cancels the rest (a `MOVE` stops and a
 `SPEAK` goes quiet, as on a task cancel) and fails the run; those siblings read
