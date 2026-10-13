@@ -132,6 +132,10 @@ async def run_worker(
     # module; a worker without them still runs every task.
     await ensure_search_attributes(client, logger)
 
+    # For the group members' STEP_STARTED_SIGNAL (RobotActivities._report_started):
+    # the activities run in executor threads, the client lives on this loop.
+    activities.bind_client(client, asyncio.get_running_loop())
+
     worker = Worker(
         client,
         task_queue=task_queue(robot_id),

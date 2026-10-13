@@ -223,7 +223,8 @@ def validate_step_params(
 
 # Shared by Step and the REST request/response models, which all carry it.
 GROUP_DESCRIPTION = (
-    "Adjacent steps with the same group run at the same time, and the next "
+    "Adjacent steps with the same group run at the same time, started in "
+    "list order (each once the one before it has started), and the next "
     "step starts once all of them have finished; if one fails the others are "
     "canceled. At most one MOVE/STANDUP/LIEDOWN per group. Omitted: the step "
     "runs on its own, after the one before it"

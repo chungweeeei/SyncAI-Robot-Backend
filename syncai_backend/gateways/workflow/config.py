@@ -35,6 +35,30 @@ def io_task_queue_for(body_queue: str) -> str:
 PAUSE_SIGNAL = "pause"
 RESUME_SIGNAL = "resume"
 
+# The third signal, sent by an activity rather than the gateway: "the step I am
+# running has started" (a MOVE's goal accepted, a SPEAK's utterance queued). A
+# group starts its members in list order, each once the one before it has
+# started (RobotWorkflow._run_group), and this is how the workflow learns it --
+# a workflow cannot see an activity's heartbeats. Its payload is the
+# activity's own id, which the workflow minted with group_activity_id; only an
+# activity whose id has that shape reports, so a lone step adds no event to
+# its run's history.
+STEP_STARTED_SIGNAL = "step_started"
+_GROUP_ACTIVITY_ID_MARK = "#"
+
+
+def group_activity_id(step_id: str, dispatch: int) -> str:
+    """The id a group member's activity is scheduled under: its step plus a
+    per-run dispatch count, so a MOVE re-sent after a pause gets a fresh one."""
+    return f"{step_id}{_GROUP_ACTIVITY_ID_MARK}{dispatch}"
+
+
+def reports_start(activity_id: str) -> bool:
+    """Whether the activity scheduled as ``activity_id`` is a group member
+    whose run waits on its STEP_STARTED_SIGNAL. Temporal's own ids are
+    sequence numbers, so they never carry the mark."""
+    return _GROUP_ACTIVITY_ID_MARK in activity_id
+
 
 # --- "What is running right now" (GET /api/v1/active_tasks) -----------------
 #

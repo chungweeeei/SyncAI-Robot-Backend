@@ -9,6 +9,8 @@ with workflow.unsafe.imports_passed_through():
     from syncai_backend.gateways.workflow.config import (
         PAUSE_SIGNAL,
         RESUME_SIGNAL,
+        STEP_STARTED_SIGNAL,
+        group_activity_id,
         io_task_queue_for,
     )
     from syncai_backend.gateways.workflow.schema import (
@@ -41,6 +43,11 @@ SPEAK_HEARTBEAT_TIMEOUT = timedelta(seconds=75)
 # side (Step.group). Behind a patch so a run that scheduled a SPEAK on the body
 # queue before the upgrade replays the same command after it.
 SPEAK_ON_IO_QUEUE_PATCH = "speak-on-io-queue"
+
+# A group's members used to be scheduled all at once; they now start in list
+# order, each once the one before it has started (_run_group). Behind a patch
+# so a run that scheduled a whole group in one go replays the same commands.
+GROUP_START_IN_ORDER_PATCH = "group-start-in-order"
 
 ACTIVITY_MAP = {
     StepType.MOVE: RobotActivities.execute_move,
@@ -89,6 +96,12 @@ class RobotWorkflow:
         # event because both signals are idempotent: a second pause while
         # held, or a resume while running, must change nothing.
         self._pause_requested: bool = False
+        # A group's start order (_run_group): the activity id each member was
+        # last dispatched under, and the ids whose activity has reported
+        # STEP_STARTED_SIGNAL. A set, so a second report changes nothing.
+        self._dispatches: int = 0
+        self._dispatch_ids: dict[str, str] = {}
+        self._started: set[str] = set()
 
     @workflow.query
     def get_step_states(self) -> list[Step]:
@@ -104,6 +117,30 @@ class RobotWorkflow:
     @workflow.signal(name=RESUME_SIGNAL)
     def resume(self) -> None:
         self._pause_requested = False
+
+    @workflow.signal(name=STEP_STARTED_SIGNAL)
+    def step_started(self, activity_id: str) -> None:
+        self._started.add(activity_id)
+
+    def _new_dispatch_id(self, step: Step) -> str:
+        self._dispatches += 1
+        activity_id = group_activity_id(step.id, self._dispatches)
+        self._dispatch_ids[step.id] = activity_id
+        return activity_id
+
+    def _has_started(self, step: Step) -> bool:
+        """Whether a group member is far enough along for the next to go.
+
+        A WAIT has started once its timer runs; a MOVE or SPEAK once its
+        activity reports STEP_STARTED_SIGNAL (goal accepted, utterance
+        queued) under the id it was last dispatched with -- so a MOVE re-sent
+        after a pause has to report again. The posture steps never report:
+        their activity ends the moment the key is sent, and a member that has
+        ended needs no report (_run_group checks for that on its own).
+        """
+        if step.type is StepType.WAIT:
+            return step.status is StepStatus.IN_PROGRESS
+        return self._dispatch_ids.get(step.id) in self._started
 
     async def _hold(self, step: Step) -> None:
         """Park the run at ``step`` while a pause is requested.
@@ -128,7 +165,7 @@ class RobotWorkflow:
 
         # Block by block. A lone step is awaited directly -- exactly the
         # commands the loop issued before groups existed, so those histories
-        # replay unchanged; a group's members start together (_run_group).
+        # replay unchanged; a group's members run side by side (_run_group).
         for block in _blocks(self._steps):
             if len(block) == 1:
                 await self._run_step(block[0], own_map)
@@ -137,6 +174,16 @@ class RobotWorkflow:
 
     async def _run_group(self, steps: list[Step], own_map: str | None) -> None:
         """Run ``steps`` side by side and return when all have finished.
+
+        They start in list order: each member is dispatched once the one
+        before it has started (_has_started) or ended, and from then on all
+        run together. Scheduled at once instead, two SPEAKs raced through
+        synthesis into the speech service's FIFO and played in whichever
+        order they finished, and a SPEAK could be heard before the STANDUP
+        listed ahead of it was sent. A member held by a pause before it
+        starts holds back the starts behind it too. A member that never
+        started when the group ends -- a failure or a cancel came first --
+        stays PENDING, like the steps after the group.
 
         Fail-fast: the first member to fail cancels the rest -- each lands in
         _run_step's own CancelledError branch, so a MOVE stops the robot and a
@@ -151,8 +198,27 @@ class RobotWorkflow:
         the next block as usual. A cancel of the run surfaces here, from the
         wait, and is passed on to every member before it is re-raised.
         """
-        tasks = [asyncio.ensure_future(self._run_step(step, own_map)) for step in steps]
+        tasks: list[asyncio.Future] = []
         try:
+            if workflow.patched(GROUP_START_IN_ORDER_PATCH):
+                for step in steps:
+                    task = asyncio.ensure_future(
+                        self._run_step(step, own_map, report_start=True)
+                    )
+                    tasks.append(task)
+                    await workflow.wait_condition(
+                        lambda step=step, task=task: (
+                            task.done()
+                            or self._has_started(step)
+                            or any(_ended_badly(t) for t in tasks)
+                        )
+                    )
+                    if any(_ended_badly(t) for t in tasks):
+                        break
+            else:
+                tasks = [
+                    asyncio.ensure_future(self._run_step(step, own_map)) for step in steps
+                ]
             await workflow.wait_condition(
                 lambda: all(t.done() for t in tasks) or any(_ended_badly(t) for t in tasks)
             )
@@ -174,7 +240,9 @@ class RobotWorkflow:
                 step.error_msg = f"Canceled: step {steps[failed].id} failed"
         raise tasks[failed].exception()
 
-    async def _run_step(self, step: Step, own_map: str | None) -> None:
+    async def _run_step(
+        self, step: Step, own_map: str | None, report_start: bool = False
+    ) -> None:
         # WAIT is the one step that is not an activity: it is a timer in
         # the workflow itself (see _run_wait), so it has no entry here.
         activity_fn = ACTIVITY_MAP.get(step.type)
@@ -252,6 +320,12 @@ class RobotWorkflow:
         if step.type is StepType.SPEAK and workflow.patched(SPEAK_ON_IO_QUEUE_PATCH):
             activity_options["task_queue"] = io_task_queue_for(workflow.info().task_queue)
 
+        # A group member is scheduled under an id of our own, which is what
+        # tells its activity to report STEP_STARTED_SIGNAL and what that
+        # report is matched against (_has_started). Everything else keeps
+        # the id Temporal assigns, so a lone step's commands are unchanged.
+        new_activity_id = (lambda: self._new_dispatch_id(step)) if report_start else None
+
         # A pause that landed before this step (during the previous one,
         # or between the two) holds here, before anything is dispatched.
         # This is the whole of the hold for SPEAK and the posture steps:
@@ -271,8 +345,12 @@ class RobotWorkflow:
                 await self._run_wait(step, step.params)
                 result = None
             elif step.type is StepType.MOVE:
-                result = await self._run_move(step, activity_fn, activity_options)
+                result = await self._run_move(
+                    step, activity_fn, activity_options, new_activity_id
+                )
             else:
+                if new_activity_id is not None:
+                    activity_options["activity_id"] = new_activity_id()
                 result = await workflow.execute_activity(activity_fn, **activity_options)
         except asyncio.CancelledError:
             step.status = StepStatus.CANCELED
@@ -302,7 +380,9 @@ class RobotWorkflow:
 
         step.status = StepStatus.COMPLETED
 
-    async def _run_move(self, step: Step, activity_fn, activity_options: dict) -> ActivityResult:
+    async def _run_move(
+        self, step: Step, activity_fn, activity_options: dict, new_activity_id=None
+    ) -> ActivityResult:
         """Run a MOVE, letting a pause interrupt it and a resume re-send it.
 
         Never ``await handle`` directly here. Awaiting the activity task is what
@@ -320,9 +400,13 @@ class RobotWorkflow:
         the hold existed replay unchanged.
 
         On resume the step is dispatched again from scratch -- same target,
-        fresh attempts, from wherever the robot is now.
+        fresh attempts, from wherever the robot is now. In a group it is also
+        a fresh activity id (``new_activity_id``), so the members behind it
+        wait for the re-sent goal to be accepted, not the interrupted one.
         """
         while True:
+            if new_activity_id is not None:
+                activity_options["activity_id"] = new_activity_id()
             handle = workflow.start_activity(activity_fn, **activity_options)
             interrupted = False
             try:

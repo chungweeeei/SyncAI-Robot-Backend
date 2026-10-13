@@ -1,3 +1,4 @@
+import asyncio
 import math
 import time
 from typing import Optional
@@ -6,10 +7,12 @@ import structlog
 from pydantic import BaseModel
 
 from temporalio import activity
+from temporalio.client import Client
 from temporalio.exceptions import ApplicationError, CancelledError
 
 
 from syncai_backend.gateways.failure import Failure, failure_code
+from syncai_backend.gateways.workflow.config import STEP_STARTED_SIGNAL, reports_start
 from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
@@ -28,6 +31,12 @@ from syncai_backend.services.gridmap_conversion import GridmapConversionService
 # may go out. get_move_status is an in-memory read, so polling this often is
 # free.
 NAV_POLL_INTERVAL_S = 0.25
+
+# How long _report_started waits for its signal to be accepted. Temporal is
+# local and answers a signal in milliseconds; this only bounds a wedged
+# frontend, and it has to fit inside MOVE_HEARTBEAT_TIMEOUT beside the
+# heartbeat execute_move sends just before it (test_activities.py checks).
+STARTED_REPORT_TIMEOUT_S = 1.0
 
 
 def _move_failure(status: dict) -> str:
@@ -78,6 +87,50 @@ class RobotActivities:
         # conversion registry the map routes write -- one answer, not two.
         self._map_catalog_repo = map_catalog_repo
         self._conversion_svc = conversion_svc
+        # The worker's client and the loop it runs on, for _report_started.
+        # Bound by run_worker once it has connected; a sync activity cannot
+        # reach either through activity.client(), which is async-only.
+        self._client: Optional[Client] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def bind_client(self, client: Client, loop: asyncio.AbstractEventLoop) -> None:
+        self._client = client
+        self._loop = loop
+
+    def _report_started(self, beat: tuple = ()) -> None:
+        """Tell the run this group member has started (STEP_STARTED_SIGNAL).
+
+        Only a group member reports -- its run starts the next member on it
+        (RobotWorkflow._run_group) -- and it knows it is one by the id it was
+        scheduled under. The signal goes out on the worker's loop, from this
+        thread. Never fatal: a report that cannot be sent leaves the next
+        member waiting for this one to end rather than to start, which keeps
+        the order and only loses the overlap. A cancel thrown in while it is
+        out is the caller's to clean up after, so it is let through.
+
+        ``beat``, when given, is heartbeated before the signal goes out, for
+        a caller whose heartbeat window the wait could otherwise run out.
+        """
+        info = activity.info()
+        if not reports_start(info.activity_id) or self._client is None:
+            return
+        if beat:
+            activity.heartbeat(*beat)
+        handle = self._client.get_workflow_handle(
+            info.workflow_id, run_id=info.workflow_run_id
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                handle.signal(STEP_STARTED_SIGNAL, info.activity_id), self._loop
+            ).result(timeout=STARTED_REPORT_TIMEOUT_S)
+        except CancelledError:
+            raise
+        except Exception as err:
+            self._logger.warning(
+                "[RobotActivity] Could not report the step started",
+                activity_id=info.activity_id,
+                error=str(err),
+            )
 
     def _wait_for_nav_goal(self, goal_id: str) -> dict:
         """Poll a navigation goal to a terminal state, heartbeating each round.
@@ -144,6 +197,8 @@ class RobotActivities:
                 raise ApplicationError(f"Move rejected: {msg}", non_retryable=False)
 
             self._logger.info("[RobotActivity] Move accepted", goal_id=goal_id)
+            # Beat first: move() may have used most of the heartbeat window.
+            self._report_started(beat=("accepted",))
 
             status = self._wait_for_nav_goal(goal_id=goal_id)
             state = status["state"]
@@ -238,7 +293,7 @@ class RobotActivities:
         start = details[1] if len(details) > 1 and isinstance(details[1], int) else 0
         duration = 0.0
         for said in range(start, params.repeat):
-            duration += self._speak_once(params, said)
+            duration += self._speak_once(params, said, first=said == start)
             # Counted the moment it ends, not on the next utterance's first
             # poll: a retry after a failed POST would otherwise say this one
             # again.
@@ -250,8 +305,12 @@ class RobotActivities:
 
         return ActivityResult(success=True, state="succeeded")
 
-    def _speak_once(self, params: SpeakParams, said: int) -> float:
+    def _speak_once(self, params: SpeakParams, said: int, first: bool = False) -> float:
         """One utterance of ``params``, heartbeating ``said`` beside its status.
+
+        The ``first`` of an attempt reports the step started once it is
+        queued: the service plays in the order it accepts, so a SPEAK grouped
+        behind this one is queued behind it too.
 
         Returns how long it played; raises as execute_speak documents.
         """
@@ -267,6 +326,9 @@ class RobotActivities:
                 )
                 if success:
                     job_id = job.get("id")
+
+            if success and first:
+                self._report_started()
 
             if success:
                 success, message, job = self._tts_gw.await_speak(
