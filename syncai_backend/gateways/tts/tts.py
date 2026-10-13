@@ -1,34 +1,16 @@
 """Speech out, over HTTP to the syncai_tts service.
 
-This used to be the speech engine itself: a kokoro-onnx session and an ``aplay``
-subprocess living in this process. It is now a client, and the engine runs in
-its own container (the ``SyncAI-TTS`` repo). Two things moved it.
+The engine (kokoro-onnx + ``aplay``) runs in its own container (the
+``SyncAI-TTS`` repo), which owns the speaker and serialises utterances in a
+FIFO queue, so two processes cannot talk over each other.
 
-**The speaker needs exactly one owner.** "One aplay stream on the pcm node at a
-time" was enforced here by a ``threading.Lock``, which holds only while every
-caller is in this process. Moving the Temporal worker into a process of its own
-breaks that: two ``TtsGateway`` instances hold two locks and nothing stops a
-scheduled SPEAK step from talking over a manual ``POST /api/v1/tts/speak``. The
-service puts the lock back in front of the single piece of hardware.
+**There is deliberately no lock in this file**: this process holds neither the
+model nor the speaker. ``httpx.Client`` is safe to share across the uvicorn
+threadpool and the Temporal activity thread.
 
-**The pins had nothing to do with ROS.** ``onnxruntime==1.18.1`` is pinned for
-the Orin's offlined cores, and in here that pin also had to survive alongside
-the ROS ecosystem's numpy ceiling — which is why ``kokoro-onnx`` had to be
-installed ``--no-deps``. None of that is this repo's problem any more, and the
-backend process sheds a ~310 MB model from its address space.
-
-**There is deliberately no lock left in this file.** Both of the ones that were
-here guarded resources this process no longer holds: the inference session and
-the speaker. Serialisation is the service's job now, and it is a FIFO queue
-rather than a lock, so utterances also come out in the order they were accepted.
-``httpx.Client`` is safe to share across the uvicorn threadpool and the Temporal
-activity thread, and pooling connections is the point of holding one.
-
-The return shape is unchanged — ``(success, message, payload)`` with the one
-caller-fixable failure tagged via :mod:`syncai_backend.gateways.failure` — so
-``routers/tts.py`` and the SPEAK activity did not change when this was swapped.
-The service publishes the same ``code`` strings for exactly that reason; see
-``errors.py`` in the TTS repo.
+Returns ``(success, message, payload)``, with caller-fixable failures tagged
+via :mod:`syncai_backend.gateways.failure`; the service publishes matching
+``code`` strings (``errors.py`` in the TTS repo).
 """
 
 import os
@@ -41,58 +23,39 @@ import structlog
 from syncai_backend.gateways.failure import Failure, fail
 
 
-# The compose service name: the backend and the speech service share a compose
-# network on the robot, so this is what resolves there without configuration.
-# TTS_SERVICE_URL overrides it -- to 127.0.0.1:8080 when running the backend
-# on the host against a published port, for instance.
+# The compose service name; TTS_SERVICE_URL overrides it (e.g. 127.0.0.1:8080).
 _DEFAULT_BASE_URL = "http://syncai_tts:8080"
 
-# Connecting is local and should be immediate; a slow answer is the service
-# thinking, not the network.
+# Connecting is local; a slow answer is the service thinking, not the network.
 _CONNECT_TIMEOUT_S = 5.0
 
-# Generous because the service loads its ~310 MB session on the first request
-# that needs it (TTS_PRELOAD makes that a background thread at its startup, but
-# a request arriving first still waits on the same lock).
+# Generous: the first request may wait on the service loading its ~310 MB model.
 _REQUEST_TIMEOUT_S = 60.0
 
-# `speak` asks the service to hold the response until playback finishes, so this
-# has to cover an utterance plus whatever is queued ahead of it. The service
-# computes its own wait from the rendered duration; this is only the transport's
-# patience with that.
+# `speak` holds the response until playback ends, so this covers an utterance
+# plus whatever is queued ahead of it.
 _SPEAK_TIMEOUT_S = 180.0
 
-# `start_speak` does not wait for playback, only for synthesis, which the
-# service does inline -- so this is the cold-model case above, nothing more.
-# Public because the SPEAK activity cannot heartbeat while this POST is open:
-# its heartbeat_timeout has to outlast it (pinned in test_activities.py).
+# `start_speak` waits only for (inline) synthesis. Public because the SPEAK
+# activity cannot heartbeat during this POST: its heartbeat_timeout must
+# outlast it (pinned in test_activities.py).
 SPEAK_START_TIMEOUT_S = _REQUEST_TIMEOUT_S
 
-# Stopping playback is a SIGTERM to aplay and a short grace before SIGKILL on
-# the service's side; anything slower than this is the service not answering.
+# Stopping playback is quick on the service's side; slower means not answering.
 _CANCEL_TIMEOUT_S = 10.0
 
-# Backstop for the wait on a job, `speak`'s or `await_speak`'s. Under the SPEAK
-# activity's 5-minute start_to_close, so this gateway gives up with a sentence
-# before Temporal gives up on the activity.
+# Backstop for waiting on a job. Under the SPEAK activity's 5-minute
+# start_to_close, so this gives up with a sentence before Temporal does.
 _SPEAK_DEADLINE_S = 240.0
 
-# How often a job is read while it plays. The SPEAK activity heartbeats once per
-# read, and a cancel only reaches it on a heartbeat's reply, so this is kept at
-# or under the worker's HEARTBEAT_THROTTLE_MAX, as NAV_POLL_INTERVAL_S is for
-# MOVE (pinned in test_activities.py). A GET of an in-memory job is free.
+# How often a playing job is read. SPEAK heartbeats once per read and a cancel
+# arrives only on a heartbeat's reply, so keep this at or under the worker's
+# HEARTBEAT_THROTTLE_MAX (pinned in test_activities.py).
 SPEAK_POLL_INTERVAL_S = 0.25
 
-# The service's codes that this side answers differently, mapped onto ours.
-# Two namespaces that happen to agree on the first entry and need not on the
-# second, so the keys are the service's literal strings rather than our enum's
-# values: `unknown_voice` is shared on purpose and documented as such in both
-# repos, while what the service calls a full queue is a name this side is free
-# to choose for its own wire contract.
-#
-# Everything else the service can report — a missing model, a wedged device,
-# aplay not installed — is the robot's problem and stays an untagged 502,
-# exactly as it did when those failures were raised in this file.
+# The service's codes this side answers differently, keyed by the service's
+# literal strings (only `unknown_voice` is shared on purpose). Everything else
+# is the robot's problem and stays an untagged 502.
 _FAILURE_BY_CODE = {
     "unknown_voice": Failure.UNKNOWN_VOICE,
     "queue_full": Failure.TTS_QUEUE_FULL,
@@ -115,9 +78,7 @@ class TtsGateway:
             timeout=httpx.Timeout(_REQUEST_TIMEOUT_S, connect=_CONNECT_TIMEOUT_S),
         )
 
-        # Same breadcrumb rationale as the model path this replaces: the URL is
-        # an env var nobody sees in a failure message otherwise, and "could not
-        # reach the speech service" is a question about which address we tried.
+        # The URL comes from env, so log which address we will try.
         self._logger.info("[TtsGateway] Using speech service", url=self._base_url)
 
     # --- HTTP ---------------------------------------------------------------
@@ -136,8 +97,7 @@ class TtsGateway:
                 None,
             )
         except httpx.RequestError as exc:
-            # Connection refused is the common one: the container is down, or
-            # TTS_SERVICE_URL names somewhere it is not.
+            # Usually the container is down or TTS_SERVICE_URL is wrong.
             return (
                 False,
                 f"could not reach the speech service at {self._base_url}: {exc}",
@@ -152,10 +112,8 @@ class TtsGateway:
     def _error_message(self, response: httpx.Response) -> str:
         """Lift the service's ``{detail, code}`` body into our own convention.
 
-        The code is re-tagged rather than passed through as prose, because this
-        side's callers read :func:`failure_code`, not the sentence — the router
-        picks 400/409 off it and the SPEAK activity picks retryability off the
-        same one.
+        The code is re-tagged because callers read :func:`failure_code`, not
+        the sentence.
         """
         detail = ""
         code = None
@@ -196,9 +154,7 @@ class TtsGateway:
     ) -> Tuple[bool, str, bytes]:
         """Render text to a mono 16-bit WAV. Nothing reaches the speaker.
 
-        An unknown voice comes back tagged ``Failure.UNKNOWN_VOICE`` — the one
-        failure here that is the caller's to fix, so the router answers 400
-        instead of its uniform 502 and the SPEAK activity does not retry it.
+        An unknown voice comes back tagged ``Failure.UNKNOWN_VOICE``.
         """
         success, message, response = self._call(
             "POST",
@@ -216,15 +172,11 @@ class TtsGateway:
     ) -> Tuple[bool, str, Optional[float]]:
         """Speak on the robot speaker, blocking until playback finishes.
 
-        ``wait=true`` asks the service to hold the response, which keeps this
-        method's contract exactly what it was when it ran ``aplay`` itself. The
-        service answers 202 with a non-terminal job if its own wait expires
-        first (a long queue ahead of this utterance), so the poll below is the
-        rare path rather than the normal one.
+        ``wait=true`` asks the service to hold the response; it answers 202
+        with a non-terminal job if its own wait expires, hence the rare poll.
 
-        ``POST /api/v1/tts/speak`` is the caller. The SPEAK activity is not: it
-        has to heartbeat and be cancellable mid-utterance, which one blocking
-        call cannot be, so it drives the job itself (``start_speak``,
+        For ``POST /api/v1/tts/speak``. The SPEAK activity must heartbeat and
+        be cancellable, so it drives the job itself (``start_speak``,
         ``await_speak``, ``cancel_speak``).
         """
         success, message, response = self._call(
@@ -251,8 +203,8 @@ class TtsGateway:
     ) -> Tuple[bool, str, Optional[dict]]:
         """Queue an utterance and return its job without waiting for playback.
 
-        The service still synthesises inline, so an unknown voice or a missing
-        model is answered here, tagged exactly as ``speak`` tags it.
+        Synthesis is inline, so an unknown voice is answered here, as in
+        ``speak``.
         """
         success, message, response = self._call(
             "POST",
@@ -270,12 +222,9 @@ class TtsGateway:
     ) -> Tuple[bool, str, Optional[dict]]:
         """Poll ``job`` until it stops moving, or we run out of patience.
 
-        ``on_poll`` is handed the job's status before every wait; the SPEAK
-        activity passes ``activity.heartbeat``, which is what lets a cancel
-        reach it mid-utterance (it is thrown into the thread here, and the
-        activity's ``except CancelledError`` stops the job). Bounded by
-        ``_SPEAK_DEADLINE_S`` so a SPEAK activity gets a sentence from here
-        rather than being killed by its ``start_to_close``.
+        ``on_poll`` gets the status before every wait; SPEAK passes
+        ``activity.heartbeat``, which is how a cancel reaches it mid-utterance.
+        Bounded by ``_SPEAK_DEADLINE_S``.
         """
         deadline = time.monotonic() + _SPEAK_DEADLINE_S
 
@@ -312,8 +261,7 @@ class TtsGateway:
     def cancel_speak(self, job_id: str) -> Tuple[bool, str]:
         """Stop a job, queued or playing.
 
-        A job that already finished is not an error on the service's side, so
-        a cancel racing the end of the utterance needs no special case here.
+        Cancelling a finished job is not an error, so racing the end is fine.
         """
         success, message, _ = self._call(
             "DELETE", f"/api/v1/speak/{job_id}", timeout=_CANCEL_TIMEOUT_S
@@ -325,9 +273,8 @@ class TtsGateway:
         """A terminal job as ``speak``'s ``(success, message, duration)``."""
         status = job.get("status")
         if status == "done":
-            # Always a float on success. The service always sends one, but the
-            # router's SpeakResponse.duration is a required field, so a body
-            # that ever omitted it would turn a spoken utterance into a 500.
+            # Always a float: SpeakResponse.duration is required, so a missing
+            # value would turn a spoken utterance into a 500.
             duration = job.get("duration")
             return True, "", float(duration) if duration is not None else 0.0
 
@@ -352,9 +299,6 @@ class TtsGateway:
 def init_tts_gateway(
     logger: structlog.stdlib.BoundLogger, base_url: Optional[str] = None
 ) -> TtsGateway:
-    # Read here rather than at import, which is the rule the rest of this
-    # package's env reading follows: the factory runs inside
-    # SyncAIBackend.__init__, well after main.py's load_dotenv(), so a value
-    # living only in .env is actually seen.
+    # Read here, not at import, so it runs after main.py's load_dotenv().
     resolved = base_url or os.getenv("TTS_SERVICE_URL") or _DEFAULT_BASE_URL
     return TtsGateway(logger=logger, base_url=resolved)

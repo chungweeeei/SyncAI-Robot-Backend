@@ -20,29 +20,14 @@ class Base(DeclarativeBase):
 class MapPoint(Base):
     """A named point placed on a map, stored in world (map-frame) coordinates.
 
-    Coordinates mirror the navigation goal convention (``x``/``y`` in metres,
-    ``theta`` in degrees, expressed in the ``map`` frame), so a stored point can
-    be handed straight to a MOVE step without conversion.
+    ``x``/``y`` in metres, ``theta`` in degrees, map frame: a MOVE goal as-is.
     """
 
     __tablename__ = "map_vertices"
 
-    # A vertex name is how an operator addresses a place, so it has to be
-    # unambiguous within the map it names -- two vertices called "dock" on one
-    # map are indistinguishable in the UI. Scoped to ``(map, name)`` rather than
-    # ``name`` alone because the *opposite* is normal: every map is expected to
-    # have its own "dock", and a global constraint would forbid that.
-    #
-    # Both columns are NOT NULL, so this behaves the same on PostgreSQL and
-    # SQLite -- the NULLs-are-distinct problem that ruled a unique constraint out
-    # for ``TaskTemplate`` does not arise here.
-    #
-    # Enforced in the schema and not in the router because the DB is the only
-    # place that can check and insert in one step: the router would have to
-    # re-check on create *and* on rename, and still race between the two. The
-    # cost is that ``create_all`` cannot add this to a ``map_vertices`` that
-    # already exists -- any database created before this constraint keeps
-    # accepting duplicates, silently, until the table is dropped and remade.
+    # Names are unique per map (every map has its own "dock"). In the schema
+    # because only the DB can check and insert in one step. No migrations:
+    # tables created before this constraint still accept duplicates.
     __table_args__ = (UniqueConstraint("map", "name", name="uq_map_vertices_map_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -63,76 +48,40 @@ class MapPoint(Base):
 class TaskTemplate(Base):
     """An operator-authored step list, kept so it can be re-dispatched.
 
-    Temporal is not the library. Namespace ``default`` retains closed workflows
-    for one day with no archival configured, so a dispatched task's steps are
-    gone by tomorrow; the ``/tasks`` composer's output has to live somewhere that
-    survives a page reload, and this is it.
+    Temporal keeps closed workflows for one day, so saved step lists live here.
 
-    ``steps`` is a JSON array rather than a child table, for four reasons in the
-    order they matter here:
+    ``steps`` is a JSON array, not a child table, because:
 
-    1. **This package has no migrations.** The schema is whatever ``create_all``
-       produced on first boot. A typed child table would freeze the *step
-       vocabulary* into DDL nothing here can subsequently alter -- the removed
-       ``ArtifactParams`` alone was a discriminated command union of five
-       fields, and the next step type would need an ``ALTER TABLE`` on a robot
-       with no tool to run one. A JSON array grows an optional key and the old
-       rows keep validating.
-    2. **The step schema is already enforced above the storage layer.**
-       ``StepRequest`` + ``validate_step_params`` is the single authority on which
-       step types carry which params, and it runs at the request boundary. Typed
-       columns would be a second encoding of that rule, in a place that cannot
-       express "MOVE requires params, STANDUP forbids them" at all.
-    3. **A JSON array *is* the order.** A child table needs a position column,
-       and because editing a step list means reordering and inserting, every
-       update degenerates to delete-all + insert-all anyway. The child table
-       would buy typed columns for the identical whole-list rewrite, plus a
-       position column that can go wrong.
-    4. **SQLite has to work** -- ``test/conftest.py`` runs an in-memory engine,
-       and ``sqlalchemy.JSON`` is supported on both dialects.
+    1. **There are no migrations.** A typed table would freeze the step
+       vocabulary into DDL; a JSON array grows an optional key.
+    2. ``StepRequest`` + ``validate_step_params`` already enforce the schema at
+       the request boundary.
+    3. The array is the order; a child table would rewrite everything anyway.
+    4. ``sqlalchemy.JSON`` works on the SQLite test engine too.
 
-    Forward-compatibility rule that the JSON choice exists to serve, and which
-    must be honoured: only ever *add* optional keys to a stored step object.
-    Never rename, retype, or repurpose one. A blob written by a newer backend is
-    read by an older one on a rollback.
+    Only ever *add* optional keys to a stored step; never rename, retype or
+    repurpose one (an older backend reads it after a rollback).
 
-    Two traps:
+    Traps:
 
-    - **JSON columns are not mutation-tracked.** ``row.steps.append(...)`` inside
-      a session is silently not flushed. ``TaskTemplateRepo`` only ever assigns a
-      fresh list, which is why ``MutableList.as_mutable`` is not used -- but the
-      first person to try an in-place edit will lose it, hence this note.
-    - **``Base.metadata`` is shared.** The moment this class exists,
-      ``init_map_repo``'s ``MapPoint.metadata.create_all(engine)`` -- the same
-      statement spelled through a different class -- also creates
-      ``task_templates``. That is harmless, but it means adding a model to this
-      file changes what an unrelated repo factory does.
+    - **JSON columns are not mutation-tracked.** ``row.steps.append(...)`` is
+      silently not flushed; always assign a fresh list.
+    - **``Base.metadata`` is shared**, so adding a model here changes what every
+      repo factory's ``create_all`` creates.
     """
 
     __tablename__ = "task_templates"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    # A label, not an identity: two templates may share a name, and the id is
-    # what addresses one. Deliberately unlike ``MapPoint.name``, which *is*
-    # unique within its map -- the difference is ``map_name`` below being
-    # nullable. The only scope worth constraining here would be
-    # ``(map_name, name)``, since two maps may each want a "patrol"; but both
-    # PostgreSQL and SQLite treat NULLs in a unique index as distinct, so such a
-    # constraint would silently not apply to the map-independent templates --
-    # exactly the rows most likely to collide, because they are the ones
-    # offered on every map. ``map_vertices`` has no such hole: both of its
-    # constrained columns are NOT NULL.
+    # A label, not unique: a ``(map_name, name)`` constraint would not apply to
+    # NULL map_name rows (NULLs are distinct in a unique index), which are the
+    # ones most likely to collide.
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
-    # The map whose frame this task's MOVE coordinates are in, or NULL when the
-    # task has no MOVE step and is therefore runnable anywhere. Indexed for the
-    # "what can I run on the map the robot is actually on" listing.
+    # The map of the MOVE coordinates; NULL (no MOVE) runs anywhere.
     map_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
-    # Ordered saved steps; the element shape is ``_StoredStep`` in
-    # interfaces/rest/routers/task_template.py. JSONB on PostgreSQL -- indexable and
-    # comparable with ``=``, which plain ``json`` is not -- and the variant has to
-    # be chosen now, because there is no ALTER path later. Plain JSON on SQLite,
-    # which is what the test fixture runs.
+    # Element shape: ``_StoredStep`` in interfaces/rest/routers/task_template.py.
+    # JSONB on PostgreSQL (chosen now: no ALTER path later), JSON on SQLite.
     steps: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=False
     )

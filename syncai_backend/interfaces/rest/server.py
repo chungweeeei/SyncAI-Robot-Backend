@@ -73,9 +73,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ConflictError)
     async def _conflict(_: Request, exc: ConflictError) -> JSONResponse:
-        # ConflictError optionally carries a machine-readable ``code`` (see the
-        # exception's docstring); it rides next to ``detail`` so clients that
-        # only read ``detail`` keep working.
+        # ``code`` only when set, beside ``detail``.
         content: dict = {"detail": str(exc)}
         if getattr(exc, "code", None):
             content["code"] = exc.code
@@ -118,9 +116,8 @@ def init_rest_server(
     controlling and monitoring the robot, as well as managing data and workflows.
     """
 
-    # The safety lock's cancel has to run on this loop -- WorkflowGateway
-    # belongs to it -- but is started from a ROS callback, which has no other
-    # way to reach it. See services/safety_lock.py.
+    # The safety lock's cancel (started from a ROS callback) must run on this
+    # loop, which owns WorkflowGateway. See services/safety_lock.py.
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         safety_lock_svc.bind_loop(asyncio.get_running_loop())
@@ -139,13 +136,9 @@ def init_rest_server(
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
         allow_headers=["Content-Type", "Content-Length", "Authorization"],
-        # Location is not in the CORS-safelisted response header set, so
-        # without this the browser strips it from what JavaScript can see: the
-        # header is on the wire and visible in devtools, but
-        # response.headers.get("Location") returns null. A WHEP client then
-        # never learns its session URL and never sends DELETE, and the symptom
-        # is the worst kind -- video plays fine and teardown never works,
-        # leaking a camera session per page load.
+        # Location is not CORS-safelisted; without this JS cannot read it, a
+        # WHEP client never learns its session URL to DELETE, and every page
+        # load leaks a camera session while video still plays fine.
         expose_headers=["Location"],
     )
 
@@ -153,20 +146,11 @@ def init_rest_server(
 
     @app.get("/health")
     async def health() -> dict:
-        """Liveness probe, plus the task server's actual state.
+        """Liveness probe, plus the Temporal worker's state as ``task_server``.
 
-        The Temporal worker runs in a daemon thread whose death used to be
-        invisible: POST /tasks kept answering 200 (the gateway lazy-connects)
-        while nothing would ever execute the queued work. The handle makes
-        that state readable here.
-
-        Always HTTP 200 — a non-200 wired into a container healthcheck would
-        restart-loop the whole backend whenever Temporal is down for long,
-        and the rest of the process (telemetry, maps, manual control) is
-        still healthy. Degradation lives in the body. The field says
-        "task_server", not "temporal_worker": REST consumers get the
-        operator-facing vocabulary, not the implementation (the vertex /
-        MapPoint precedent).
+        Always HTTP 200: a non-200 in a container healthcheck would
+        restart-loop the whole backend while Temporal is down, though the rest
+        of the process is healthy. Degradation is reported in the body.
         """
         worker_status, worker_error = worker_handle.snapshot()
         return {
@@ -201,16 +185,10 @@ def init_rest_server(
         )
     )
     app.include_router(init_network_router(logger=logger, robot_gw=robot_gw))
-    # Serves /api/v1/maps/...: the catalogue on disk plus the vertex table. The
-    # gateway carries the save path (writing a gridmap has to tell the running
-    # map_server to re-read it) and the switch path (which also re-points the
-    # localizer). The template repo is here for the rename path only:
-    # task_templates.map_name keys on the directory name, so a map that changes
-    # its name has to carry its templates with it. workflow_gw is here for one
-    # question the map router cannot answer alone — "is a task running right
-    # now" — which is what stops a map switch landing under a moving robot.
-    # mapping_status_repo is pgo's latched run state, so /api/v1/mapping can
-    # answer after a console reload and the run routes can refuse with a code.
+    # /api/v1/maps: catalogue on disk plus the vertex table. task_template_repo
+    # is for rename (task_templates.map_name keys on the directory name);
+    # workflow_gw answers "is a task running", which gates map switches/edits;
+    # mapping_status_repo is pgo's latched run state.
     app.include_router(
         init_map_router(
             logger=logger,
@@ -223,15 +201,10 @@ def init_rest_server(
             mapping_status_repo=mapping_status_repo,
         )
     )
-    # Serves /api/v1/task_templates: the operator's library of re-dispatchable
-    # step lists. It needs map_repo to resolve a stored MOVE step's vertex
-    # reference against that vertex's *current* pose, map_catalog_repo to answer
-    # "is this template's map the one the robot is on", and workflow_gw for the
-    # one route that freezes a template into a Temporal schedule.
-    #
-    # Included after the task router, though nothing depends on the order: the
-    # /api/v1/task_templates prefix cannot collide with /api/v1/tasks/{id}, which
-    # is precisely why that prefix was chosen over /api/v1/tasks/templates.
+    # /api/v1/task_templates: map_repo resolves a MOVE step's vertex to its
+    # current pose; workflow_gw is for freezing a template into a schedule. The
+    # prefix (not /api/v1/tasks/templates) avoids colliding with
+    # /api/v1/tasks/{id}, so include order does not matter.
     app.include_router(
         init_task_template_router(
             logger=logger,
@@ -253,28 +226,16 @@ def init_rest_server(
     app.include_router(
         init_telemetry_router(logger=logger, telemetry_repo=telemetry_repo)
     )
-    # The inbound WS counterpart of the streams above: the console's manual
-    # control sends normalized velocity frames here. Takes robot_gw, not a
-    # repo — it is a command surface, same as the robot router.
+    # Inbound WS: the console's manual-control velocity frames.
     app.include_router(init_teleop_router(logger=logger, robot_gw=robot_gw))
-    # Speech out. A gateway like robot/map, but its downstream is the
-    # syncai_tts container over HTTP rather than a ROS service -- and that
-    # container, not this process, is what owns the speaker.
+    # Speech out, via the syncai_tts container over HTTP (it owns the speaker).
     app.include_router(init_tts_router(logger=logger, tts_gw=tts_gw))
-    # Video out, as WHEP. The backend owns the signalling only -- SDP
-    # exchange, the Location header, CORS; the media path lives inside a Go
-    # c-shared library this process dlopens on the first request. That is the
-    # first FFI in this workspace and it is not free; see gateways/webrtc.
+    # Video out, as WHEP. The backend owns signalling only; media runs in a Go
+    # c-shared library dlopened on first request. See gateways/webrtc.
     app.include_router(init_webrtc_router(logger=logger, webrtc_gw=webrtc_gw))
-    # Bag recording. A gateway and a catalogue repo rather than one or the
-    # other, because the two halves of a recording's state live in different
-    # places and neither can answer alone: the gateway owns the `ros2 bag
-    # record` child (which recording is live, and the only handle that can stop
-    # it), while the repo owns record/ on disk (which bags exist, and what their
-    # metadata.yaml says). "A directory with no metadata and no process behind
-    # it was interrupted" is a sentence only the router can say, and it says it
-    # by holding both -- the same split as the map router's conversion registry
-    # against its sidecar.
+    # Bag recording needs both halves: the gateway owns the live `ros2 bag
+    # record` child, the repo owns record/ on disk. Only holding both can say
+    # "no metadata and no process behind it" means interrupted.
     app.include_router(
         init_recording_router(
             logger=logger,

@@ -71,11 +71,9 @@ from syncai_backend.gateways.workflow.config import (
 )
 
 
-# Temporal's execution statuses, folded to the task statuses the REST layer
-# answers. One task status has no Temporal counterpart: PAUSED. A held run is
-# still RUNNING to the server, so get_task_state derives PAUSED from the step
-# list the workflow query returns (the held step carries StepStatus.PAUSED) --
-# which also keeps the console's poll at one query per read.
+# Temporal's execution statuses, folded to the REST task statuses. PAUSED has no
+# Temporal counterpart: a held run is RUNNING, so get_task_state derives PAUSED from
+# the held step in the workflow query.
 _WORKFLOW_STATUS_MAP = {
     WorkflowExecutionStatus.RUNNING: "IN_PROGRESS",
     WorkflowExecutionStatus.CONTINUED_AS_NEW: "IN_PROGRESS",
@@ -87,38 +85,20 @@ _WORKFLOW_STATUS_MAP = {
 }
 
 
-# The schedule that started a run, as Temporal itself records it.
-#
-# This is a *predefined* search attribute, written by the schedule machinery on
-# every triggered execution, with or without anything this backend stamps. It
-# is the only way *that* provenance is recoverable at all: a scheduled run's
-# workflow id is `<schedule_id>-<nominal ISO time>`, a string the backend never
-# forms, never stores and cannot reconstruct (it would have to guess the exact
-# nominal instant). Nothing in the memo helps either — the memo belongs to the
-# *schedule*, not to the run it starts.
-#
-# The two custom attributes this backend does write (TaskKind / TaskName, in
-# search_attributes.py) are the other half of a run's provenance — what kind
-# of job it was and which template it came from — and exist because the
-# history has to filter and count on them. This key stays the authority for
-# "a schedule started it": a schedule registered before those attributes
-# existed keeps firing without them.
+# The schedule that started a run: a predefined attribute Temporal's schedule machinery
+# writes on every triggered run. The only way to recover that provenance (a scheduled
+# run's id embeds a nominal time the backend cannot reconstruct, and the memo is the
+# schedule's), and the authority for "a schedule started it", since schedules
+# registered before TaskKind/TaskName fire without them.
 _SCHEDULED_BY_KEY = SearchAttributeKey.for_keyword("TemporalScheduledById")
 
 
 def _active_query(task_queue: str) -> str:
     """The visibility List Filter behind GET /api/v1/active_tasks.
 
-    `TaskQueue` is the per-robot scope, so no custom attribute is needed: every
-    execution for this robot is enqueued on `<robot_id>.ROBOT_TASK_QUEUE` by
-    WorkflowGateway, whoever started it. `WorkflowType` keeps a future second
-    workflow type on the same queue out of the answer.
-
-    Requires SQL advanced visibility, i.e. Temporal server >= 1.20 on Postgres
-    or MySQL — the compose stack pins temporalio/auto-setup:1.29.7 on Postgres,
-    so this is satisfied. A deployment on standard visibility would reject the
-    query with INVALID_ARGUMENT; see the handler in _fetch_active_tasks for what
-    to do about it.
+    `TaskQueue` is the per-robot scope; `WorkflowType` keeps a future second
+    workflow type out. Needs SQL advanced visibility (server >= 1.20 on Postgres,
+    as compose pins); see _fetch_active_tasks for the INVALID_ARGUMENT otherwise.
     """
     return (
         f"WorkflowType = '{WORKFLOW_TYPE_NAME}' "
@@ -127,21 +107,16 @@ def _active_query(task_queue: str) -> str:
     )
 
 
-# The inverse of _WORKFLOW_STATUS_MAP over the *closed* statuses, as the
-# visibility List Filter spells them. It is the filter vocabulary of
-# GET /api/v1/task_history: one REST status may fold several Temporal ones
-# (TimedOut reads as FAILED, Terminated as CANCELED), and the query must ask for
-# every one the response would report under that name. ContinuedAsNew is left
-# out: it maps to IN_PROGRESS, which a history of finished runs never shows.
+# REST status -> the closed Temporal statuses it folds, as the List Filter spells
+# them (GET /api/v1/task_history's filter). ContinuedAsNew maps to IN_PROGRESS, so it
+# is left out.
 _CLOSED_STATUS_FILTER = {
     "COMPLETED": ("Completed",),
     "FAILED": ("Failed", "TimedOut"),
     "CANCELED": ("Canceled", "Terminated"),
 }
 
-# The inverse again, for reading a `GROUP BY ExecutionStatus` count back into
-# the REST vocabulary: a TimedOut group is added to FAILED, Terminated to
-# CANCELED, exactly as the list reports those runs.
+# And back, for reading a `GROUP BY ExecutionStatus` count into REST statuses.
 _REST_STATUS_OF = {
     temporal: rest
     for rest, temporals in _CLOSED_STATUS_FILTER.items()
@@ -152,10 +127,8 @@ _REST_STATUS_OF = {
 def _quote(value: str) -> str:
     r"""A List Filter string literal.
 
-    The filter parser accepts ``\'`` (and ``''``) inside a quoted value, and
-    rejects anything that is not ``column op literal`` outright -- so this is
-    for a template name that legitimately carries an apostrophe, not the only
-    thing standing between a query string and the index.
+    For a template name with an apostrophe; the parser rejects anything but
+    ``column op literal`` anyway, so this is not the only injection guard.
     """
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -163,10 +136,8 @@ def _quote(value: str) -> str:
 def _kind_predicate(kind: TaskKind) -> str:
     """The List Filter clause for one kind.
 
-    SCHEDULE keys on the attribute Temporal itself stamps, not on the TaskKind
-    this backend also writes: schedules registered before the custom
-    attributes existed keep firing without them, and their runs must still
-    count as scheduled. The other kinds exist only as TaskKind.
+    SCHEDULE keys on TemporalScheduledById, not TaskKind, so runs of schedules
+    that predate the custom attributes still count.
     """
     if kind is TaskKind.SCHEDULE:
         return "TemporalScheduledById IS NOT NULL"
@@ -183,12 +154,8 @@ def _history_query(
 ) -> str:
     """The visibility List Filter behind GET /api/v1/task_history and /stats.
 
-    The same WorkflowType / TaskQueue scope as _active_query — the task queue is
-    what keeps another robot's runs on the shared namespace out of the answer.
-
-    No ORDER BY: SQL visibility rejects a custom one (that is an Elasticsearch
-    feature), and its default order is already the one a history wants — closed
-    executions newest CloseTime first.
+    Same scope as _active_query. No ORDER BY: SQL visibility rejects a custom one,
+    and its default (newest CloseTime first) is what a history wants.
     """
     if status is None:
         statuses = tuple(s for group in _CLOSED_STATUS_FILTER.values() for s in group)
@@ -220,9 +187,7 @@ def _schedule_id_of(execution) -> Optional[str]:
     try:
         return execution.typed_search_attributes.get(_SCHEDULED_BY_KEY)
     except Exception:
-        # Never fatal, same policy as _read_steps / _read_memo: provenance is
-        # decoration, presence is the safety fact. A run whose attributes cannot
-        # be decoded must still be reported as running.
+        # Never fatal: provenance is decoration, presence is the safety fact.
         return None
 
 
@@ -231,11 +196,8 @@ def _provenance_of(
 ) -> Tuple[Optional[TaskKind], Optional[str]]:
     """The run's kind and template name off its search attributes.
 
-    Same never-fatal policy as _schedule_id_of. A scheduled run registered
-    before the attributes existed carries neither, so its kind falls back to
-    SCHEDULE off TemporalScheduledById and its name to None; a direct run
-    dispatched without saying stays (None, None). An unknown kind value -- a
-    newer backend's -- reads as None rather than failing the row.
+    Never fatal. A scheduled run without the attributes falls back to SCHEDULE
+    (off TemporalScheduledById); an unknown kind (a newer backend's) reads None.
     """
     try:
         attributes = execution.typed_search_attributes
@@ -253,11 +215,10 @@ def _provenance_of(
 
 
 def _map_of(execution) -> Optional[str]:
-    """The run's ``TaskMap``, or None. Same never-fatal policy as the two above.
+    """The run's ``TaskMap``, or None. Never fatal.
 
-    None is ambiguous on purpose -- no MOVE step, or a run older than the
-    attribute -- and ActiveTask.map_in_use is the one place that tells them
-    apart, because only the reader knows which map is loaded now.
+    None is ambiguous on purpose (no MOVE, or older than the attribute);
+    ActiveTask.map_in_use tells them apart, as only it knows the loaded map.
     """
     try:
         return execution.typed_search_attributes.get(TASK_MAP_KEY) or None
@@ -280,12 +241,9 @@ def _direct_search_attributes(provenance: TaskProvenance) -> TypedSearchAttribut
 def _schedule_search_attributes(schedule: ScheduleTask) -> TypedSearchAttributes:
     """What every run a schedule starts inherits from its action.
 
-    Always SCHEDULE -- the one kind a direct dispatch may not claim -- plus the
-    template's name when the schedule was made from one, and the map its
-    frozen coordinates are in. The same name and map _schedule_to_memo writes,
-    carried a second time because the memo is the schedule's and only the
-    action's attributes reach the runs. The map is what lets a run that fires
-    after the robot moved to another map refuse to drive (execute_move).
+    SCHEDULE, plus the template name and map _schedule_to_memo also writes:
+    repeated here because only the action's attributes reach the runs. The map
+    lets a run firing after a map switch refuse to drive (execute_move).
     """
     pairs = [SearchAttributePair(TASK_KIND_KEY, TaskKind.SCHEDULE.value)]
     if schedule.task_template_name:
@@ -297,11 +255,9 @@ def _schedule_search_attributes(schedule: ScheduleTask) -> TypedSearchAttributes
 
 @dataclass
 class _ActiveSnapshot:
-    """One cached answer — success or failure — and when it was taken.
+    """One cached answer (success or failure) and when it was taken.
 
-    `fetched_at` is a monotonic reading (TTL arithmetic must not be affected by
-    a wall-clock step), while `as_of` is the wall clock the client renders
-    elapsed times against.
+    `fetched_at` is monotonic for the TTL; `as_of` is wall clock for the client.
     """
 
     fetched_at: float
@@ -313,20 +269,14 @@ class _ActiveSnapshot:
 def _build_schedule_spec(trigger: ScheduleTrigger) -> ScheduleSpec:
     """Map a ScheduleTrigger (cron or interval) to a Temporal ScheduleSpec.
 
-    A cron goes out as ``"<cron> # <cron>"``. Temporal compiles a cron string
-    into a StructuredCalendarSpec and forgets the string, but it copies whatever
-    follows ``#`` into that calendar's ``comment`` -- and the comment is echoed
-    back verbatim by both describe() and list_schedules(), and survives a
-    schedule *update*. That is what lets ``_read_trigger`` report the cron as
-    typed without keeping a copy in the memo, which the server does not let an
-    update rewrite (verified against 1.29.7: UpdateSchedule ignores ``memo``).
+    A cron goes out as ``"<cron> # <cron>"``: Temporal forgets the cron string but
+    keeps the text after ``#`` as the calendar's ``comment``, echoed by describe,
+    list and update. That is how ``_read_trigger`` reports the cron, since an
+    update cannot rewrite the memo (server 1.29.7 ignores ``memo``).
 
-    Three cron spellings are refused up front because they would break that
-    echo: a ``#`` of the caller's own (it would become the comment), a
-    ``CRON_TZ=`` / ``TZ=`` prefix (Temporal moves it into the timezone, and
-    rejects it outright when a timezone is also given -- the REST body has a
-    ``timezone`` field for this), and ``@every`` (Temporal compiles it into an
-    IntervalSpec, which has no comment; ``intervalSeconds`` is that trigger).
+    Refused because they break that echo: a ``#`` of the caller's, a
+    ``CRON_TZ=`` / ``TZ=`` prefix (use ``timezone``), and ``@every`` (compiled to
+    an IntervalSpec with no comment; use ``intervalSeconds``).
     """
     if trigger.cron:
         cron = trigger.cron.strip()
@@ -357,13 +307,10 @@ def _build_schedule_spec(trigger: ScheduleTrigger) -> ScheduleSpec:
 def _spec_to_trigger(spec: ScheduleSpec) -> ScheduleTrigger:
     """Reconstruct a ScheduleTrigger from a Temporal ScheduleSpec.
 
-    The cron comes from the first calendar's ``comment`` -- the channel
-    ``_build_schedule_spec`` writes it into -- or, for a spec this process built
-    and has not sent yet (tests, mostly), from ``cron_expressions`` with that
-    same ``# comment`` stripped. A calendar without a comment is a cron
-    registered before the comment existed, or a schedule created outside this
-    API: neither can be turned back into a string, so the trigger comes back
-    empty and ``_read_trigger`` falls through to the memo.
+    The cron is the first calendar's ``comment``, or, for a spec not yet sent
+    (tests), ``cron_expressions`` with the comment stripped. A calendar without a
+    comment (older or foreign schedule) yields an empty trigger and
+    ``_read_trigger`` falls through to the memo.
     """
     if spec.calendars:
         comment = spec.calendars[0].comment
@@ -387,27 +334,14 @@ def _spec_to_trigger(spec: ScheduleSpec) -> ScheduleTrigger:
 def _schedule_to_memo(schedule: ScheduleTask, robot_id: str) -> dict:
     """Serialise a schedule's provenance into memo fields.
 
-    The memo is readable from ``list_schedules()`` while the start-workflow args
-    are not, so this is the only channel by which the collection endpoint can
-    say which map a schedule belongs to.
+    The memo is readable from ``list_schedules()``, the start-workflow args are
+    not. ``robot_id`` is always written because the namespace is shared and the
+    list element's action carries no task queue; it answers "mine?" without a
+    describe per row (older schedules fall back to describe, in list_schedules).
 
-    ``robot_id`` is written unconditionally, and for the same list-path reason:
-    the namespace is shared by every robot on the Temporal server, and the list
-    element's action (a ScheduleListActionStartWorkflow) does not carry the
-    task queue, so the memo is the only thing that lets ``list_schedules``
-    answer "mine or another robot's?" without a describe per row. The describe
-    path does not need it — the full action carries ``task_queue`` there — which
-    is exactly what the legacy fallback in ``list_schedules`` leans on for
-    schedules written before this key existed.
-
-    The trigger is deliberately NOT here any more. It used to be (``cron`` /
-    ``interval_seconds`` / ``timezone`` keys), because Temporal forgets the cron
-    string it compiled; but a schedule memo is immutable on the server -- the
-    UpdateSchedule RPC carries a ``memo`` field and 1.29.7 ignores it -- so a
-    copy here would go stale the first time ``update_schedule_trigger`` ran.
-    The spec itself carries the string now (see ``_build_schedule_spec``);
-    ``_read_trigger`` still reads the old keys off schedules registered before
-    this change.
+    The trigger is deliberately NOT here: the server ignores memo on update, so
+    a copy would go stale (see ``_build_schedule_spec``). ``_read_trigger``
+    still reads the old keys off schedules from before.
     """
     memo: dict = {"robot_id": robot_id}
     if schedule.map_name:
@@ -420,13 +354,7 @@ def _schedule_to_memo(schedule: ScheduleTask, robot_id: str) -> dict:
 
 
 async def _read_memo(described) -> dict:
-    """One memo read per description, tolerating a schedule that has none.
-
-    Split out from the interpretation below so each call site awaits the decode
-    exactly once and then pulls both the trigger and the provenance out of the
-    result -- the previous shape awaited it inside the trigger helper, which
-    would have meant a second decode per row once provenance was added.
-    """
+    """One memo read per description (decode once per row), tolerating none."""
     try:
         return await described.memo() or {}
     except Exception:
@@ -436,14 +364,10 @@ async def _read_memo(described) -> dict:
 def _read_trigger(memo: dict, spec: ScheduleSpec) -> ScheduleTrigger:
     """The schedule's *current* trigger: the spec first, the memo as legacy.
 
-    The spec is authoritative because it is the only thing an update rewrites:
-    an interval round-trips as-is, and a cron comes back through the calendar
-    comment ``_build_schedule_spec`` planted. The memo's ``cron`` /
-    ``interval_seconds`` / ``timezone`` keys are what schedules registered
-    before that comment existed carry, and for those the compiled calendar
-    cannot be read back, so they are still honoured -- but only when the spec
-    has nothing to say. Once such a schedule's trigger is edited the spec
-    speaks and the stale memo copy is ignored, which is the whole point.
+    The spec is what an update rewrites. The memo's ``cron`` /
+    ``interval_seconds`` / ``timezone`` keys are honoured only when the spec has
+    nothing to say (schedules from before the comment), so an edited trigger wins
+    over the stale copy.
     """
     trigger = _spec_to_trigger(spec)
     if trigger.cron or trigger.interval_seconds:
@@ -464,25 +388,14 @@ def _read_trigger(memo: dict, spec: ScheduleSpec) -> ScheduleTrigger:
 def _schedule_task_queue(desc) -> Optional[str]:
     """The task queue a described schedule dispatches onto, or None.
 
-    This is the ownership fact for a schedule: every schedule this backend
-    creates starts its workflow on ``<robot_id>.ROBOT_TASK_QUEUE``, so the
-    action's task queue says which robot the schedule belongs to — the same
-    predicate ``_active_query`` uses for running executions.
+    The ownership fact (the same predicate as ``_active_query``). Only the describe
+    path has it; the list path's action carries no task queue, hence the memo's
+    ``robot_id``.
 
-    Only the *describe* path can answer: a ScheduleListDescription's action is a
-    ScheduleListActionStartWorkflow, one field (the workflow type name), with no
-    task queue at any price. Hence the memo carries ``robot_id`` for the list
-    path and this reads the action for the describe path.
-
-    None for anything that is not a start-workflow action. Callers treat that as
-    "not owned" — the opposite default from ``_read_steps``' never-fatal policy,
-    and deliberately so: steps are decoration on a schedule already known to be
-    ours, while ownership is the fact that decides whether another robot's
-    schedule can be paused or deleted from here. Decoration degrades open;
-    a safety predicate degrades closed.
-
-    Module-level and free of ``self`` for the same reason as ``_read_steps``:
-    unit tests hand it a hand-built description.
+    None for a non-start-workflow action, which callers treat as "not owned":
+    unlike ``_read_steps``' never-fatal decoration, ownership decides whether
+    another robot's schedule can be paused or deleted here, so it degrades closed.
+    Module-level so tests can hand it a built description.
     """
     action = getattr(desc.schedule, "action", None)
     if not isinstance(action, ScheduleActionStartWorkflow):
@@ -493,17 +406,11 @@ def _schedule_task_queue(desc) -> Optional[str]:
 async def _read_steps(logger: structlog.stdlib.BoundLogger, desc) -> List[Step]:
     """Decode the frozen step list out of a *described* schedule's action.
 
-    ``ScheduleActionStartWorkflow._from_proto`` leaves ``args`` as the raw
-    ``temporalio.api.common.v1.Payload`` protos, and the ScheduleDescription
-    carries the data_converter that turns them back into a WorkflowTask.
+    ``args`` are raw Payload protos, decoded with the description's
+    data_converter. Module-level, taking the logger, for unit tests.
 
-    Module-level, and taking the logger rather than reading ``self._logger``, so
-    it can be unit-tested against a hand-built description -- the same reason
-    ``_spec_to_trigger`` is not a method.
-
-    Never fatal. A schedule created outside this API, or one whose payload this
-    converter cannot map, must still report its trigger and next run times --
-    the same policy ``get_task_state``'s step query and the memo read above use.
+    Never fatal: a foreign or undecodable schedule still reports its trigger and
+    next run times.
     """
     action = getattr(desc.schedule, "action", None)
     if not isinstance(action, ScheduleActionStartWorkflow) or not action.args:
@@ -511,9 +418,8 @@ async def _read_steps(logger: structlog.stdlib.BoundLogger, desc) -> List[Step]:
 
     try:
         args = list(action.args)
-        # Guarded rather than assumed: args are Payloads only on the describe
-        # path. A ScheduleTask this process just built still holds the python
-        # objects, and so does a test's stub.
+        # Payloads only on the describe path; a just-built ScheduleTask or a test
+        # stub holds python objects.
         if isinstance(args[0], Payload):
             args = await desc.data_converter.decode(args, [WorkflowTask])
         task = args[0]
@@ -530,46 +436,28 @@ async def _read_steps(logger: structlog.stdlib.BoundLogger, desc) -> List[Step]:
 class WorkflowGateway:
     def __init__(self, logger: structlog.stdlib.BoundLogger, robot_id: str):
         self._logger = logger
-        # Tasks are enqueued on this robot's own task queue (must match the
-        # worker's queue name in temporal/worker.py) so its own Temporal
-        # worker — not another robot's — executes them.
+        # This robot's own queue (matches temporal/worker.py), so only its worker
+        # executes them.
         self._robot_id = robot_id
         self._task_queue = task_queue(robot_id)
         self._client: Client | None = None
 
-        # Ownership verdicts for schedules whose memo predates the robot_id
-        # key, so the describe-per-legacy-row fallback in list_schedules is
-        # paid once per schedule rather than once per poll. Never invalidated,
-        # and that is sound rather than lazy: the cache is consulted only for
-        # rows with no robot_id in the memo, and every schedule this codebase
-        # creates writes one — so a delete-and-recreate under the same id
-        # arrives with a memo and never reads its stale entry. The one writer
-        # that could still mint memo-less schedules is a backend running the
-        # previous version of this file.
-        #
-        # Same single-loop threading argument as _active_snapshot above: only
-        # the uvicorn event loop touches this, so no lock.
+        # Ownership verdicts for schedules whose memo predates robot_id, so
+        # list_schedules' describe fallback is paid once per schedule, not per poll.
+        # Never invalidated, soundly: only memo-less rows consult it, and every
+        # schedule created now writes robot_id. Uvicorn loop only, so no lock.
         self._schedule_owner_cache: dict[str, bool] = {}
 
-        # The active-task cache. Both fields are touched ONLY from the uvicorn
-        # event loop (start_rest_server runs uvicorn on its own daemon thread);
-        # the Temporal worker in temporal/worker.py runs asyncio.run on a
-        # different thread with its own Client and must never reach this.
-        #
-        # The lock is created lazily rather than here because this gateway is
-        # constructed on the main thread, before that loop exists.
+        # The active-task cache, touched ONLY from the uvicorn loop (the worker
+        # thread has its own Client). The lock is made lazily: this is constructed
+        # on the main thread, before that loop exists.
         self._active_snapshot: Optional[_ActiveSnapshot] = None
         self._active_lock: Optional[asyncio.Lock] = None
 
-        # The last task start_task successfully started, for _require_idle's
-        # first check. The visibility index the second check reads is
-        # eventually consistent — a workflow started moments ago may not be in
-        # it yet — while describe-by-id is strongly consistent, so remembering
-        # our own last start is what closes the back-to-back-dispatch window.
-        # In-memory only: lost on restart, at which point the visibility sweep
-        # is still there and anything older than a restart is in the index.
-        # Same single-loop argument as the fields above — only the uvicorn
-        # event loop calls start_task.
+        # The last task start_task started, for _require_idle's first check:
+        # visibility is eventually consistent, describe-by-id is not, so this
+        # closes the back-to-back-dispatch window. Lost on restart, when the
+        # visibility sweep covers it. Uvicorn loop only.
         self._last_started_task_id: Optional[str] = None
 
     async def _get_client(self) -> Client:
@@ -589,35 +477,22 @@ class WorkflowGateway:
     async def _require_idle(self, client: Client) -> None:
         """Refuse to dispatch while anything is already running on this robot.
 
-        "One robot does one task at a time" used to hold by accident, not by
-        rule: ScheduleOverlapPolicy.SKIP only constrains a schedule against
-        itself, and a direct POST /api/v1/tasks checked nothing at all. Two
-        concurrent workflows do not collide on the robot — the worker's
-        max_workers=1 serialises activities — but that mutex has the wrong
-        granularity: the *steps* of the two tasks interleave, so the robot
-        walks one task's route with the other task's stops spliced into it.
-        This is the entrance every direct
-        dispatch goes through, so the rule is enforced here; scheduled runs
-        cannot be gated (Temporal starts them itself), which is why an
-        operator dispatch is refused *during* a scheduled run but not the
-        other way around.
+        SKIP only constrains a schedule against itself, and the one-slot worker
+        serialises activities, not tasks: two runs' steps would interleave. Every
+        direct dispatch comes through here; scheduled runs cannot be gated
+        (Temporal starts them), so a dispatch is refused during a scheduled run
+        but not the reverse.
 
         Two reads, cheapest-and-strongest first:
 
-        1. Describe the task this process last started. Describe-by-id is
-           strongly consistent, so this closes the window where a start from
-           a moment ago has not reached the visibility index yet — and this
-           backend is the only writer of direct dispatches for its robot.
-        2. A fresh visibility sweep of the task queue (the _active_query
-           predicate), which sees everything else: scheduled runs, and starts
-           that predate a backend restart. Fresh rather than through
-           list_active_tasks' TTL cache — a console-poll-stale answer is fine
-           for display but not for a dispatch decision.
+        1. Describe the task this process last started (strongly consistent;
+           covers a start not yet in the visibility index).
+        2. A fresh visibility sweep of the queue (scheduled runs, starts before a
+           restart). Not the TTL cache: stale is fine to display, not to dispatch.
 
-        Check-then-start is not atomic; two requests in the same instant can
-        both pass. With this robot's writers being one console and the MCP
-        server, that residual window is accepted — the alternative (a mutex
-        workflow per robot) is a task-model rework.
+        Check-then-start is not atomic; with one console and the MCP server as
+        writers that window is accepted (the alternative is a per-robot mutex
+        workflow).
         """
         if self._last_started_task_id is not None:
             handle = client.get_workflow_handle(self._last_started_task_id)
@@ -628,8 +503,7 @@ class WorkflowGateway:
                     # Retention already dropped it; certainly not running.
                     description = None
                 else:
-                    # Don't fail the dispatch on this read: the visibility
-                    # sweep below still runs and fails closed on error.
+                    # Not fatal: the sweep below still runs and fails closed.
                     self._logger.warn(
                         "[WorkflowGateway] Failed to describe last started task",
                         task_id=self._last_started_task_id,
@@ -647,12 +521,10 @@ class WorkflowGateway:
             self._last_started_task_id = None
 
         snapshot = await self._fetch_active_tasks()
-        # A dispatch decision is as good a snapshot as a console poll; storing
-        # it keeps the active_tasks cache warm (same loop, same slot).
+        # Store it: keeps the active_tasks cache warm.
         self._active_snapshot = snapshot
         if snapshot.error is not None:
-            # Fail closed: "could not tell whether the robot is busy" must not
-            # become "assume it is idle" on a machine that moves.
+            # Fail closed: "could not tell" must not become "assume idle".
             raise snapshot.error
         if snapshot.tasks:
             raise ConflictError(
@@ -662,11 +534,9 @@ class WorkflowGateway:
     async def start_task(
         self, request: WorkflowTask, provenance: TaskProvenance = TaskProvenance()
     ):
-        """Dispatch a run. `provenance` is stamped on it as search attributes
-        (see _direct_search_attributes) rather than carried in the workflow
-        argument: the history filters on them, and the one field the workflow
-        does read -- the map -- has to reach scheduled runs too, which only
-        attributes do. The workflow reads it back off its own info."""
+        """Dispatch a run. `provenance` is stamped as search attributes, not passed
+        as the argument: history filters on them, and the map must also reach
+        scheduled runs, which only attributes do."""
         try:
             client = await self._get_client()
         except Exception as err:
@@ -686,13 +556,8 @@ class WorkflowGateway:
                 search_attributes=_direct_search_attributes(provenance),
             )
         except WorkflowAlreadyStartedError:
-            # Workflow ids are namespace-global while task queues are
-            # per-robot, so this fires for a re-post of this robot's own task
-            # AND for a collision with another robot's — Temporal rejects both
-            # identically and does not say which. A 400 naming the id beats the
-            # generic 502 below either way: the request was well formed, the id
-            # is just taken. Same precedent as create_schedule's
-            # ScheduleAlreadyRunningError.
+            # Ids are namespace-global, so this is a re-post or another robot's id;
+            # Temporal does not say which. A 400 naming the id beats the generic 502.
             raise BadRequestError(f"Task {request.id} already exists")
         except Exception as err:
             self._logger.error(
@@ -705,19 +570,13 @@ class WorkflowGateway:
     async def _describe_owned_task(self, task_id: str, failure_message: str):
         """Connect, describe ``task_id`` and refuse it unless it is this robot's.
 
-        Every single-task verb (read, cancel, pause, resume) starts here.
-        Workflow ids are namespace-global; the task queue is what scopes an
-        execution to this robot (the predicate _active_query already uses).
-        Without this check a console pointed at robot01 could read — and
-        cancel — robot02's runs through nothing more than an id. 404 rather
-        than 403, the same reasoning as the map router's _require_vertex: from
-        this robot's URL space the task genuinely is not there, and "belongs to
-        another robot" would confirm the id exists to a caller who addressed
-        the wrong robot.
+        Every single-task verb starts here. Ids are namespace-global; the task
+        queue scopes an execution to this robot, so robot01's console cannot read
+        or cancel robot02's runs. 404, not 403 (as the map router's
+        _require_vertex): confirming the id exists elsewhere would leak it.
 
-        ``failure_message`` names the verb in the UpstreamError a failed
-        describe raises, so the operator reads "Cancel workflow failed" rather
-        than a describe they never asked for.
+        ``failure_message`` names the verb in the UpstreamError a failed describe
+        raises.
         """
         try:
             client = await self._get_client()
@@ -758,10 +617,8 @@ class WorkflowGateway:
             )
             raise UpstreamError("Unknown workflow status")
 
-        # Per-step state lives in the workflow and is exposed via a query. This
-        # can fail in the brief window before the workflow's first task executes
-        # or when no worker is polling -- degrade to an empty step list rather
-        # than erroring the whole request.
+        # Per-step state is a workflow query. It can fail before the first workflow
+        # task runs or with no worker polling; degrade to no steps.
         try:
             steps = await handle.query("get_step_states", result_type=List[Step])
         except Exception as err:
@@ -772,10 +629,8 @@ class WorkflowGateway:
             )
             steps = []
 
-        # A held run is still RUNNING to Temporal; the workflow marks the step
-        # it is holding at PAUSED (see RobotWorkflow._hold), and that is the
-        # whole of what "the task is paused" means. When the query failed
-        # above the hold cannot be seen, and IN_PROGRESS is the honest answer.
+        # A held run is RUNNING to Temporal; the held step reads PAUSED
+        # (RobotWorkflow._hold). If the query failed, IN_PROGRESS is the honest answer.
         if status == "IN_PROGRESS" and any(
             step.status is StepStatus.PAUSED for step in steps
         ):
@@ -786,21 +641,12 @@ class WorkflowGateway:
     async def list_active_tasks(self) -> Tuple[List[ActiveTask], datetime]:
         """What is running on this robot right now, and when that was read.
 
-        This is the only thing in the system that can answer the question. The
-        REST surface has no task collection, the database stores no runs, and a
-        schedule-triggered execution's workflow id is never recorded anywhere —
-        but every one of them is an execution on this robot's task queue, so
-        Temporal's visibility index knows about all of them equally: runs from
-        this browser, from another tab, from the MCP server, from a schedule
-        that fired while nobody was looking, and runs that started before the
-        page asking was ever loaded.
+        The only source for it: Temporal visibility sees every execution on this
+        robot's queue, whoever started it (console, MCP, a schedule).
 
-        Cached in one slot for ACTIVE_TASK_CACHE_TTL_S. The console polls this
-        from every open tab, and without the cache each of them would spend a
-        Temporal RPC on an answer that is identical.
+        Cached in one slot for ACTIVE_TASK_CACHE_TTL_S, since every open tab polls.
         """
-        # Lazily built on first use, on the loop that will own it. Racing to
-        # create it is not possible: everything here runs on that single loop.
+        # Lazily, on the owning loop; no race, as everything here is on that loop.
         if self._active_lock is None:
             self._active_lock = asyncio.Lock()
 
@@ -809,11 +655,8 @@ class WorkflowGateway:
             return cached
 
         async with self._active_lock:
-            # Re-check inside the lock. This is not belt and braces: without it,
-            # N callers arriving in the same tick all miss, all queue on the
-            # lock, and each then makes its own RPC — N *serialised* round trips,
-            # which is worse than no lock at all. With it, one fetches and the
-            # rest replay what it stored.
+            # Re-check: otherwise N callers arriving together each make their own
+            # serialised RPC, worse than no lock.
             cached = self._read_active_cache()
             if cached is not None:
                 return cached
@@ -828,13 +671,9 @@ class WorkflowGateway:
     def _read_active_cache(self) -> Optional[Tuple[List[ActiveTask], datetime]]:
         """Replay the snapshot while it is fresh, re-raising a cached failure.
 
-        Failures are cached in the same slot as successes, and that matters more
-        than the success path: a gRPC connect to a dead Temporal can block for
-        seconds, and the lock above serialises those attempts, so an uncached
-        failure with four tabs polling would pile waiters onto the event loop.
-        The cost is that the first success after a recovery is up to one TTL
-        late, which is the right trade for a state that changes a few times an
-        hour.
+        Failures are cached too: a connect to a dead Temporal can block for
+        seconds, and the lock serialises those, so uncached failures would pile
+        waiters on the loop. The cost: a recovery shows up to one TTL late.
         """
         snapshot = self._active_snapshot
         if snapshot is None:
@@ -863,9 +702,8 @@ class WorkflowGateway:
 
         tasks: List[ActiveTask] = []
         try:
-            # No `await` on list_workflows: it returns the iterator directly.
-            # This is the call the warning in list_schedules was written for —
-            # the two APIs differ, and awaiting this one is a TypeError.
+            # No `await` on list_workflows: it returns the iterator (unlike
+            # list_schedules); awaiting it is a TypeError.
             async for execution in client.list_workflows(
                 _active_query(self._task_queue),
                 limit=ACTIVE_TASK_LIST_LIMIT,
@@ -874,9 +712,7 @@ class WorkflowGateway:
             ):
                 status = _WORKFLOW_STATUS_MAP.get(execution.status)
                 if status is None:
-                    # Skipped rather than raised: one unmapped status must not
-                    # cost the operator the whole answer, and the query already
-                    # filtered on Running so this is a Temporal-side surprise.
+                    # Skipped, not raised: one surprise must not cost the whole answer.
                     self._logger.warn(
                         "[WorkflowGateway] Unmapped status in active tasks",
                         task_id=execution.id,
@@ -903,13 +739,9 @@ class WorkflowGateway:
                 )
         except RPCError as err:
             if err.status == RPCStatusCode.INVALID_ARGUMENT:
-                # Almost certainly a deployment on *standard* visibility, where
-                # a List Filter this shape is rejected. The fix is to drop the
-                # TaskQueue / WorkflowType predicates from _active_query and
-                # filter the results in Python; it is not pre-built because the
-                # pinned server (auto-setup 1.29.7 on Postgres) has advanced
-                # visibility and one code path is worth more than a fallback
-                # nothing exercises.
+                # Almost certainly *standard* visibility. The fix would be to drop
+                # the TaskQueue / WorkflowType predicates and filter in Python; not
+                # pre-built, since the pinned server has advanced visibility.
                 self._logger.error(
                     "[WorkflowGateway] Visibility rejected the active-task query; "
                     "is this server on standard visibility?",
@@ -927,9 +759,7 @@ class WorkflowGateway:
             )
             return failed(UpstreamError("List active tasks failed"))
 
-        # Debug rather than info: this is the cache-miss line, i.e. the one that
-        # says how often Temporal is actually being asked. It is the only way to
-        # tell coalescing from a cache that is quietly doing nothing.
+        # Debug: the cache-miss line, the only way to see how often Temporal is asked.
         self._logger.debug(
             "[WorkflowGateway] Active task snapshot refreshed", count=len(tasks)
         )
@@ -947,15 +777,11 @@ class WorkflowGateway:
     ) -> Tuple[List[TaskHistoryEntry], Optional[bytes]]:
         """One page of this robot's finished executions, newest first.
 
-        Answers the rows and the token for the page after them (None on the
-        last page). The token is Temporal's own and is only valid for the same
-        query, i.e. the same `status` / `since` / `until` / `kind` / `name`.
-
-        How far back this reaches is the namespace retention and nothing else:
-        the backend stores no runs, so a run Temporal has deleted is gone.
+        Answers the rows and the next page's token (None on the last), which is
+        valid only for the same filters. Reach is the namespace retention: the
+        backend stores no runs.
         """
-        # `status` arrives from a REST enum, so an unknown one is a caller bug
-        # in this process, not something to answer 400 for.
+        # `status` comes from a REST enum: an unknown one is a bug here, not a 400.
         if status is not None and status not in _CLOSED_STATUS_FILTER:
             raise ValueError(f"Not a closed task status: {status}")
 
@@ -975,8 +801,7 @@ class WorkflowGateway:
             kind=kind,
             name=name,
         )
-        # One page and only one: iterating with `async for` would follow the
-        # token to the end of the retention window inside a single request.
+        # One page only: `async for` would follow the token to the end of retention.
         pages = client.list_workflows(
             query,
             page_size=page_size,
@@ -988,8 +813,7 @@ class WorkflowGateway:
         except RPCError as err:
             if err.status == RPCStatusCode.INVALID_ARGUMENT:
                 if next_page_token is not None:
-                    # A token from another query (the caller changed a filter
-                    # but kept paging) or one it made up.
+                    # A token from another query, or a made-up one.
                     raise BadRequestError("Invalid page token")
                 self._logger.error(
                     "[WorkflowGateway] Visibility rejected the task-history query; "
@@ -1014,7 +838,7 @@ class WorkflowGateway:
         for execution in pages.current_page or []:
             mapped = _WORKFLOW_STATUS_MAP.get(execution.status)
             if mapped is None:
-                # Skipped, not raised — same policy as _fetch_active_tasks.
+                # Skipped, not raised, as in _fetch_active_tasks.
                 self._logger.warn(
                     "[WorkflowGateway] Unmapped status in task history",
                     task_id=execution.id,
@@ -1055,9 +879,8 @@ class WorkflowGateway:
     ) -> TaskHistoryStats:
         """How this robot's finished executions under a filter ended, counted.
 
-        The same filter as list_task_history, answered by one `count_workflows`
-        with `GROUP BY ExecutionStatus` -- the one GROUP BY the server allows,
-        and the one this needs. See TASK_STATS_RPC_TIMEOUT_S for the cost.
+        list_task_history's filter, answered by one `count_workflows ... GROUP BY
+        ExecutionStatus` (see TASK_STATS_RPC_TIMEOUT_S).
         """
         if status is not None and status not in _CLOSED_STATUS_FILTER:
             raise ValueError(f"Not a closed task status: {status}")
@@ -1105,9 +928,7 @@ class WorkflowGateway:
 
         counts = {rest: 0 for rest in _CLOSED_STATUS_FILTER}
         for group in result.groups:
-            # A group's value is the Temporal spelling; one not in the table
-            # (a Running group, were the query ever to admit one) is simply
-            # not a finished run.
+            # A value not in the table (e.g. Running) is not a finished run.
             rest = _REST_STATUS_OF.get(str(group.group_values[0]))
             if rest is not None:
                 counts[rest] += group.count
@@ -1121,13 +942,9 @@ class WorkflowGateway:
         )
 
     async def cancel_task(self, task_id: str):
-        # Describe before cancelling, purely for the ownership check: cancel is
-        # the request that made the missing scope dangerous (an id is all it
-        # took to stop another robot mid-run), so it must not act until the
-        # execution is known to sit on this robot's task queue. Costs one RPC
-        # on a rare, operator-initiated call. The describe→cancel race is
-        # benign — a workflow that closes in between makes cancel a no-op, and
-        # one that is deleted answers NOT_FOUND, handled below either way.
+        # Describe first, for the ownership check: an id alone must not stop another
+        # robot mid-run. The describe->cancel race is benign (a closed run makes
+        # cancel a no-op; a deleted one answers NOT_FOUND).
         handle, _ = await self._describe_owned_task(task_id, "Cancel workflow failed")
 
         try:
@@ -1143,16 +960,12 @@ class WorkflowGateway:
     async def cancel_active_tasks(self) -> List[str]:
         """Cancel every run on this robot's task queue; the ids that were asked.
 
-        The safety lock's caller (services/safety_lock.py): when the driver
-        engages it, every task is cancelled, not just the one an operator is
-        looking at. Same two reads as _require_idle and for the same reasons --
-        a fresh visibility sweep, never list_active_tasks' TTL cache (a stale
-        "nothing running" here leaves a run driving into a locked robot), plus
-        the last task this process started, which the index may not show yet.
+        For services/safety_lock.py. Same two reads as _require_idle: a fresh sweep
+        (a stale "nothing running" leaves a run driving into a locked robot) plus
+        the last task this process started.
 
-        Raises only when the sweep itself fails. One run that cannot be
-        cancelled is logged and the rest still are; one that closed in between
-        (NotFoundError) is what was wanted anyway.
+        Raises only when the sweep fails. A run that cannot be cancelled is logged
+        and the rest still are; one already closed (NotFoundError) is fine.
         """
         snapshot = await self._fetch_active_tasks()
         if snapshot.error is not None:
@@ -1192,18 +1005,13 @@ class WorkflowGateway:
     async def _signal_running_task(self, task_id: str, signal: str, failure_message: str):
         """Deliver ``signal`` to ``task_id`` if it is this robot's and still open.
 
-        The signal is addressed by *name*, as the step-state query is, so this
-        module does not import the workflow class. Both signals are fire-and-
-        forget on the Temporal side and idempotent in the workflow, which is
-        why the REST ack is only a claim about the request — the hold itself is
-        read back from GET /api/v1/tasks/{id}.
+        Addressed by name, so this module does not import the workflow. Signals are
+        fire-and-forget and idempotent, so the REST ack only covers the request; the
+        hold is read back from GET /api/v1/tasks/{id}.
 
-        A closed run answers 409 ``task_not_running`` rather than letting the
-        server's own "already completed" error surface as a 502: a console
-        whose last poll still showed the run open will send a pause a moment
-        after it finished, and that is a conflict with the state, not a
-        failure of the orchestrator. The describe→signal race is the same
-        benign one cancel_task has.
+        A closed run answers 409 ``task_not_running``, not the server's 502: a
+        console's stale poll sends a pause just after the run finished. The
+        describe->signal race is as benign as cancel_task's.
         """
         handle, description = await self._describe_owned_task(task_id, failure_message)
 
@@ -1235,14 +1043,11 @@ class WorkflowGateway:
 
         spec = _build_schedule_spec(schedule.trigger)
 
-        # Each scheduled trigger starts a RobotWorkflow. Temporal appends the
-        # nominal trigger time to this id, so every run is a distinct execution
-        # that can be queried via GET /api/v1/tasks/{id}.
+        # Temporal appends the nominal trigger time to this id, so each run is a
+        # distinct execution, readable via GET /api/v1/tasks/{id}.
         workflow_task = WorkflowTask(id=schedule.id, definition=schedule.definition)
 
-        # Provenance + this robot's identity into the memo, so get/list can
-        # echo the first back and list can scope on the second. The trigger
-        # rides in the spec itself -- see _build_schedule_spec / _schedule_to_memo.
+        # Provenance + robot_id into the memo; the trigger rides in the spec.
         memo = _schedule_to_memo(schedule, self._robot_id)
 
         try:
@@ -1254,16 +1059,14 @@ class WorkflowGateway:
                         args=[workflow_task],
                         id=schedule.id,
                         task_queue=self._task_queue,
-                        # Inherited by every run this schedule starts, on top
-                        # of the TemporalScheduledById the server stamps; the
-                        # history reads kind and name off the run from here.
+                        # Inherited by every run, beside the server's
+                        # TemporalScheduledById.
                         typed_search_attributes=_schedule_search_attributes(
                             schedule
                         ),
                     ),
                     spec=spec,
-                    # A single robot can only do one thing at a time: never let a
-                    # new run start while the previous one is still executing.
+                    # Never start a run while the previous one is still executing.
                     policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
                 ),
                 # Never empty: robot_id is always present, so no `or None`.
@@ -1282,18 +1085,10 @@ class WorkflowGateway:
     ) -> ScheduleDescription:
         """Describe a schedule, insisting it dispatches onto this robot's queue.
 
-        Schedule ids are namespace-global while task queues are per-robot, so
-        without this gate the four single-schedule verbs (get / pause / resume /
-        delete) would operate on any robot's schedule through nothing more than
-        an id. The action's task queue is the same ownership fact _active_query
-        keys running executions on; it is read here rather than from the memo
-        because the describe path carries the full action — which also makes
-        the check hold for legacy schedules whose memo predates the robot_id
-        key.
-
-        404 rather than 403 on a foreign schedule, the same reasoning as
-        get_task_state (and the map router's _require_vertex before it): from
-        this robot's URL space the schedule genuinely is not there.
+        Schedule ids are namespace-global, so without this the single-schedule verbs
+        would act on any robot's schedule. Reads the action's task queue (which
+        covers memo-less legacy schedules too). 404 on a foreign one, as
+        _describe_owned_task.
         """
         handle = client.get_schedule_handle(schedule_id)
 
@@ -1334,14 +1129,12 @@ class WorkflowGateway:
                 t.astimezone(timezone.utc) for t in desc.info.next_action_times
             ],
             map_name=memo.get("map_name"),
-            # Schedules registered before the TaskTemplate rename carry the old
-            # memo keys; a memo is immutable on the server (see
-            # _schedule_to_memo), so read both forever.
+            # Pre-TaskTemplate-rename memo keys; memos are immutable, so read both.
             task_template_id=memo.get("task_template_id", memo.get("saved_task_id")),
             task_template_name=memo.get(
                 "task_template_name", memo.get("saved_task_name")
             ),
-            # Only the describe path can reach the frozen steps; see _read_steps.
+            # Only the describe path reaches the frozen steps.
             steps=await _read_steps(self._logger, desc),
         )
 
@@ -1350,22 +1143,12 @@ class WorkflowGateway:
     ) -> bool:
         """Whether a schedule met on the *list* path belongs to this robot.
 
-        The cheap answer is the memo's robot_id, written by create_schedule
-        since the namespace became visibly shared; the list element's action
-        cannot carry the task queue (see _schedule_task_queue), so the memo is
-        the only per-row fact available without another RPC.
+        The memo's robot_id when present (the only per-row fact without an RPC).
+        A legacy memo-less schedule falls back to one describe, cached in
+        ``_schedule_owner_cache``.
 
-        A memo with no robot_id is a legacy schedule, from before the key
-        existed. For those — and only those — fall back to one describe(),
-        whose full action does carry the task queue, and cache the verdict so
-        the cost is one RPC per legacy schedule ever, not per poll. See the
-        cache's note in __init__ for why it never needs invalidating.
-
-        A describe that fails answers False (row hidden this round) without
-        caching, so a transient RPC error neither drops the whole listing nor
-        sticks to the schedule — the same one-bad-row-must-not-cost-the-answer
-        policy as _fetch_active_tasks' unmapped-status skip. Hiding rather than
-        showing on error is the ownership default: see _schedule_task_queue.
+        A failed describe answers False (hidden this round) without caching: one
+        bad row must not cost the listing, and ownership degrades closed.
         """
         owner = memo.get("robot_id")
         if owner is not None:
@@ -1403,12 +1186,10 @@ class WorkflowGateway:
         schedules: List[ScheduleView] = []
         try:
             # `list_schedules` is a coroutine returning the iterator, hence the
-            # await inside the async-for. (`list_workflows`, by contrast, returns
-            # the iterator directly — do not copy this shape onto that one.)
+            # await (`list_workflows` is not; do not copy this shape there).
             async for item in await client.list_schedules():
                 memo = await _read_memo(item)
-                # The namespace is shared by every robot on this Temporal
-                # server; only this robot's schedules belong in its answer.
+                # The namespace is shared; keep only this robot's schedules.
                 if not await self._owns_listed_schedule(client, item.id, memo):
                     continue
                 schedules.append(
@@ -1421,22 +1202,16 @@ class WorkflowGateway:
                             for t in item.info.next_action_times
                         ],
                         map_name=memo.get("map_name"),
-                        # Old memo keys: same pre-rename fallback as the
-                        # describe path above.
+                        # Pre-rename memo keys, as in get_schedule.
                         task_template_id=memo.get(
                             "task_template_id", memo.get("saved_task_id")
                         ),
                         task_template_name=memo.get(
                             "task_template_name", memo.get("saved_task_name")
                         ),
-                        # `steps` deliberately left empty. A schedule *list*
-                        # element is a ScheduleListDescription whose action is a
-                        # ScheduleListActionStartWorkflow -- one field, the
-                        # workflow type name. The frozen args are unreachable
-                        # here at any price, and faking it with a describe() per
-                        # row would turn one paged RPC into 1+N on first paint
-                        # for data most rows never show. GET /{id} is the path
-                        # that carries steps.
+                        # `steps` deliberately empty: the list element's action
+                        # carries only the workflow type name, and a describe per
+                        # row would make one RPC 1+N. GET /{id} carries steps.
                     )
                 )
         except Exception as err:
@@ -1457,9 +1232,7 @@ class WorkflowGateway:
             )
             raise UpstreamError("Failed to connect to Temporal server")
 
-        # Ownership gate (one extra RPC on a rare, operator-initiated call);
-        # the verify→act race is benign — a schedule deleted in between just
-        # answers the NOT_FOUND handled below.
+        # Ownership gate; the verify->act race is benign (NOT_FOUND below).
         await self._require_owned_schedule(client, schedule_id)
 
         handle = client.get_schedule_handle(schedule_id)
@@ -1527,22 +1300,14 @@ class WorkflowGateway:
     async def update_schedule_trigger(self, schedule_id: str, trigger: ScheduleTrigger):
         """Replace a schedule's firing rule in place, touching nothing else.
 
-        ``ScheduleHandle.update`` is describe-then-UpdateSchedule: the callback
-        gets the current description and hands back the Schedule to store. Only
-        ``spec`` is swapped; the action (the frozen WorkflowTask payload, still
-        raw), the SKIP policy and the state (paused, note) go back exactly as
-        the server described them. Because the schedule is updated rather than
-        recreated, the server keeps its record of the run a previous trigger
-        may still have going, so SKIP still holds across the edit.
+        ``ScheduleHandle.update`` is describe-then-UpdateSchedule; only ``spec`` is
+        swapped, action, policy and state go back as described. Updating rather
+        than recreating keeps the server's record of a running run, so SKIP holds
+        across the edit.
 
-        The ownership gate lives inside the callback rather than in a separate
-        ``_require_owned_schedule``: the SDK's update already performs the
-        describe, so checking there costs no extra RPC, and raising out of the
-        callback aborts the update before anything is sent. 404 for a foreign
-        schedule, same as every other single-schedule verb.
-
-        The memo is left alone on purpose. It no longer carries the trigger
-        (see ``_schedule_to_memo``), and the server would ignore a new one anyway.
+        The ownership check runs inside the callback (the SDK already describes,
+        so no extra RPC; raising aborts the update). 404 for a foreign schedule.
+        The memo is left alone: it carries no trigger, and the server ignores it.
         """
         try:
             client = await self._get_client()
@@ -1552,8 +1317,7 @@ class WorkflowGateway:
             )
             raise UpstreamError("Failed to connect to Temporal server")
 
-        # Validate before any RPC: a malformed trigger is the caller's 400, not
-        # a reason to have described anything.
+        # Validate before any RPC: a malformed trigger is the caller's 400.
         spec = _build_schedule_spec(trigger)
 
         def _retrigger(inp: ScheduleUpdateInput) -> ScheduleUpdate:

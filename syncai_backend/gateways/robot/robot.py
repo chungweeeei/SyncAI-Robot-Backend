@@ -44,10 +44,9 @@ from syncai_backend.gateways.failure import Failure, fail
 class MotionKey(str, Enum):
     """Keys accepted by the driver manager's `set_motion_key` service.
 
-    The driver maps each one to a gait-controller MODE character (see
-    DriverManagerNode::setMotionKeyCallback) -- except ESTOP, which bypasses
-    the MODE keymap and goes out as its own datagram. Kept as strings because
-    the service field is a string that is forwarded verbatim.
+    Each maps to a gait-controller MODE character (see
+    DriverManagerNode::setMotionKeyCallback), except ESTOP, which goes out as
+    its own datagram. Strings because the srv field is forwarded verbatim.
     """
 
     STAND = "0"  # MODE Z
@@ -66,10 +65,8 @@ class MoveState(str, Enum):
     REJECTED = "rejected"
 
 
-# Tracks a NavigateToGoal goal through its state machine, status polling and
-# cancel path. `feedback` is the latest NavigateToGoal.Feedback (its
-# status_msg is what the console shows beside a running MOVE step) and
-# `result` the NavigateToGoal.Result (error_code / error_msg on an abort).
+# One NavigateToGoal goal. `feedback` is the latest Feedback (status_msg shows
+# beside a running MOVE step); `result` the Result (error_code / error_msg).
 @dataclass
 class MoveGoal:
     goal_id: str
@@ -79,39 +76,22 @@ class MoveGoal:
     result: Optional[Any] = None
 
 
-# How many finished MOVE goals _goals keeps around. The dict used to grow
-# without bound — every goal carried its ClientGoalHandle and result forever,
-# so a robot on a patrol schedule leaked a few dozen entries a day. Five is
-# enough for every real reader: the MOVE activity polls only its own (newest)
-# goal and returns on the terminal state, so by the time a goal is old enough
-# to evict, nothing will ask about it again. Eviction happens on insert, and
-# never touches an EXECUTING goal — get_move_status / cancel_move on a live
-# goal must keep working no matter how the book fills up.
+# How many finished MOVE goals _goals keeps (otherwise it grows without bound).
+# The MOVE activity polls only its own newest goal, so five is plenty. Eviction
+# happens on insert and never touches an EXECUTING goal.
 MAX_TRACKED_GOALS = 5
 
-# How long switch_mode() waits for sys_manager's answer before reporting the
-# switch as merely dispatched. This is NOT sized to how long a switch takes
-# (tens of seconds of byobu commands and sleep offsets) and must not be: on a
-# real switch sys_manager kills the byobu session THIS PROCESS runs in before
-# it would ever respond, so no timeout is long enough to see that answer. The
-# window only exists to catch the responses that do come back fast — the no-op
-# ("Already in AUTO; nothing to do") and a refusal — where reporting the real
-# outcome beats a blind "dispatched". Module-level so tests can shrink it.
-# restart_mode() shares it: the same server, the same session teardown, and
-# the same fast refusals.
+# How long switch_mode() / restart_mode() wait for sys_manager before reporting
+# "dispatched". NOT sized to a switch: a real switch kills the byobu session
+# this process runs in before any answer. It only catches the fast no-op and
+# refusals. Module-level so tests can shrink it.
 SWITCH_MODE_ACK_TIMEOUT = 2.0
 
-# How long move() waits for the NavigateToGoal server, then for nav2 to accept
-# the goal. Short on purpose, and the reason is in temporal/workflows.py: the
-# MOVE activity runs under a 3 s heartbeat_timeout and has no loop to heartbeat
-# from while it is inside this call, so the whole send has to fit under that
-# window or Temporal kills the attempt from the outside. That is worse than a
-# quick refusal here, because a goal nav2 accepts just after the kill has no
-# supervisor. A nav2 that is not answering within a second on a robot in AUTO
-# mode is a real fault; the workflow's retry policy (3 attempts, 5 s apart) is
-# what gives a server that is merely slow to come up its chance. The old values
-# were 30 s and 10 s, which the heartbeat made unreachable in practice.
-# test_activities.py checks the workflow's timeout against the budget.
+# How long move() waits for the NavigateToGoal server, then for acceptance.
+# The whole send must fit under the MOVE activity's 3 s heartbeat_timeout
+# (temporal/workflows.py), since it cannot heartbeat inside this call; a kill
+# mid-send can leave an accepted goal unsupervised. A slow server gets its
+# chance from the workflow's retry policy. test_activities.py pins the budget.
 NAV_SERVER_WAIT_S = 1.0
 NAV_ACCEPT_WAIT_S = 1.5
 NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
@@ -128,11 +108,7 @@ def _goal_id_str(goal_handle: ClientGoalHandle) -> str:
 
 
 def _clamp_normalized(value: float) -> float:
-    """[-1, 1] with NaN/inf collapsed to 0 — the last gate before the wire.
-
-    The frontend clamps too, but this is the boundary a malformed or hostile
-    client actually reaches, so the guarantee lives here.
-    """
+    """[-1, 1] with NaN/inf collapsed to 0 — the last gate before the wire."""
     if not math.isfinite(value):
         return 0.0
     return max(-1.0, min(1.0, value))
@@ -161,12 +137,9 @@ class RobotGateway:
 
         move_client = ActionClient(
             node=self._node,
-            # syncai_common's NavigateToGoal rather than nav2's NavigateToPose
-            # (2026-10): the same navigation on the same task_runner, but its
-            # result says why a MOVE failed (error_code / error_msg) and its
-            # feedback says what the robot is doing (status_msg). nav2's
-            # Humble result is std_msgs/Empty, which is why a failed MOVE used
-            # to read only "move ended in aborted".
+            # NavigateToGoal, not nav2's NavigateToPose: its result says why a
+            # MOVE failed and its feedback what the robot is doing (Humble's
+            # NavigateToPose result is Empty).
             action_type=NavigateToGoal,
             action_name="navigate_to_goal",
         )
@@ -185,8 +158,7 @@ class RobotGateway:
             srv_name="connect_wifi",
         )
 
-        # The saved networks (NetworkManager profiles) behind the console's
-        # Wi-Fi cards. Same server as the two above.
+        # Saved networks (NetworkManager profiles). Same server as the above.
         list_wifi_connections_client = self._node.create_client(
             srv_type=ListWifiConnections,
             srv_name="list_wifi_connections",
@@ -207,34 +179,27 @@ class RobotGateway:
             srv_name="set_motion_key",
         )
 
-        # Relative, like every other client here, so it resolves under this
-        # node's robot_id namespace and reaches this robot's driver_manager only.
-        # An absolute, fleet-wide name has been a bug in this backend before.
+        # Relative, like every client here, so it reaches this robot's
+        # driver_manager only; an absolute name has been a bug before.
         set_policy_mode_client = self._node.create_client(
             srv_type=SetPolicyMode,
             srv_name="set_policy_mode",
         )
 
-        # The driver's software safety lock, both ways. Same server as the two
-        # above, same relative name for the same reason. It replaced the C++
-        # driver's release-only `reset_safety` (std_srvs/Trigger).
+        # The driver's software safety lock, both ways. Same server as above.
         safety_lock_client = self._node.create_client(
             srv_type=SetBool,
             srv_name="set_safety_lock",
         )
 
-        # sys_manager's operating-mode switch (which byobu session is up). On
-        # this gateway rather than a new one because sys_manager is already part
-        # of its surface (the wifi services above), and because switching modes
-        # is very much "a handle that can command the robot" — the reason
-        # MapGateway exists is to keep such handles away from the map router.
+        # sys_manager's operating-mode switch (which byobu session is up). Here,
+        # not in MapGateway: it is a handle that can command the robot.
         switch_mode_client = self._node.create_client(
             srv_type=SwitchMode,
             srv_name="switch_mode",
         )
 
-        # Its sibling: rebuild the session of the mode already live, which
-        # switch_mode deliberately refuses to do. Same server, same reasons.
+        # Rebuild the live mode's session, which switch_mode refuses to do.
         restart_mode_client = self._node.create_client(
             srv_type=RestartMode,
             srv_name="restart_mode",
@@ -316,8 +281,7 @@ class RobotGateway:
             return False, "list_wifi_connections service is not available", []
 
         future = list_client.call_async(ListWifiConnections.Request())
-        # One 10 s list plus a short SSID read per profile; a handful of
-        # profiles fits well inside this.
+        # One 10 s list plus a short SSID read per profile.
         if not _wait_for_future(future, timeout=15.0):
             return False, "Timeout waiting for list_wifi_connections response", []
 
@@ -365,8 +329,8 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Setting motion key", key=key.value)
 
-        # .value, not the enum member: the srv field is a plain string and
-        # rosidl stores whatever it is handed.
+        # .value: the srv field is a plain string and rosidl stores whatever
+        # it is handed.
         future = motion_key_client.call_async(SetMotionKey.Request(key=key.value))
         if not _wait_for_future(future, timeout=10.0):
             return False, "Timeout waiting for set_motion_key response"
@@ -377,18 +341,13 @@ class RobotGateway:
     def set_policy_mode(self, mode: int) -> Tuple[bool, str]:
         """Switch the gait controller's policy (`MODE <uint>` over UDP).
 
-        Takes a plain int rather than an enum: `SetPolicyMode.mode` is a bare
-        uint8 whose legal set is the gait controller's policy index -- a
-        namespace this workspace does not own (see syncai_common/README.md). The
-        REST layer narrows it to the indices we are willing to expose, and
-        keeping this signature an int means a caller that needs an unexposed one
-        does not have to widen an enum that lives in the REST layer.
+        A plain int: the legal set is the gait controller's policy index, which
+        this workspace does not own (see syncai_common/README.md); REST narrows
+        it to the exposed indices.
 
-        Same fire-and-forget caveat as set_motion_key, and worse: the driver's
-        callback formats one string and hands it to sendto(), whose return it
-        ignores, and unlike set_motion_key it validates nothing and is not gated
-        by the safety lock. A True here means the datagram was written -- not
-        that the controller switched policy.
+        Fire-and-forget: the driver ignores sendto()'s return, validates
+        nothing and is not gated by the safety lock. True means the datagram
+        was written, not that the controller switched policy.
         """
         policy_mode_client = self._service_clients.get("set_policy_mode")
         if not policy_mode_client.wait_for_service(timeout_sec=5.0):
@@ -397,14 +356,8 @@ class RobotGateway:
         self._logger.info("[RobotGateway] Setting policy mode", mode=mode)
 
         future = policy_mode_client.call_async(SetPolicyMode.Request(mode=mode))
-        # The same 10.0 as set_motion_key, deliberately rather than a third
-        # number: the driver's callback is one snprintf plus one sendto on a
-        # datagram socket and cannot block, so the only latency is the DDS round
-        # trip plus its turn on the driver's shared services callback group. The
-        # 45.0 / 70.0 above are large because those service *implementations*
-        # sleep (a rescan, nmcli); nothing here does. Not shrunk to ~1 s either:
-        # a discovery hiccup, or an executor thread briefly starved by telemetry
-        # parsing, would then surface as a spurious 502.
+        # Same 10.0 as set_motion_key: the callback cannot block, but ~1 s would
+        # turn a discovery hiccup or a starved executor into a spurious 502.
         if not _wait_for_future(future, timeout=10.0):
             return False, "Timeout waiting for set_policy_mode response"
 
@@ -414,11 +367,9 @@ class RobotGateway:
     def set_safety_lock(self, locked: bool) -> Tuple[bool, str]:
         """Engage (True) or release (False) the driver's software safety lock.
 
-        `set_safety_lock` (std_srvs/SetBool) on driver_manager. Engaging only
-        blocks control -- motion keys other than ESTOP and cmd_vel are dropped
-        -- and sends no lie-down. The driver answers success whether or not the
-        state changed; the two cases differ only in prose, which no caller may
-        match on. Whether the lock is held is
+        Engaging only drops motion keys other than ESTOP and cmd_vel; it sends
+        no lie-down. The driver answers success whether or not the state
+        changed (never match its prose); the held state is
         RobotState.low_level_mode.safety_state.
         """
         safety_lock_client = self._service_clients.get("set_safety_lock")
@@ -428,8 +379,7 @@ class RobotGateway:
         self._logger.info("[RobotGateway] Setting safety lock", locked=locked)
 
         future = safety_lock_client.call_async(SetBool.Request(data=locked))
-        # Same 10.0 as the two siblings on the driver's services worker: the
-        # callback swaps an atomic and maybe publishes, and cannot block.
+        # Same 10.0 as its siblings: the callback cannot block.
         if not _wait_for_future(future, timeout=10.0):
             return False, "Timeout waiting for set_safety_lock response"
 
@@ -439,24 +389,14 @@ class RobotGateway:
     def switch_mode(self, mode: int) -> Tuple[Optional[bool], str]:
         """Ask sys_manager to switch the operating mode. Three-valued on purpose.
 
-        Returns ``(True, msg)`` / ``(False, msg)`` when sys_manager answered
-        inside ``SWITCH_MODE_ACK_TIMEOUT``, and ``(None, msg)`` when it did not
-        — and on a real switch, ``None`` is the EXPECTED outcome, not a fault.
-        ``switch_mode`` kills every known byobu session before building the
-        target one, and this backend is a pane of whichever session is live, so
-        the service response to a genuine switch is addressed to a process that
-        is already dying. The caller cannot usually deliver its own HTTP
-        response either; the console treats the dropped connection as the
-        signal and polls robot_state until the new session's backend answers.
+        ``(True|False, msg)`` when sys_manager answered inside
+        ``SWITCH_MODE_ACK_TIMEOUT``; ``(None, msg)`` otherwise, which is the
+        EXPECTED outcome of a real switch: sys_manager kills the byobu session
+        this backend runs in first. The console treats the dropped connection
+        as the signal and polls robot_state. The short wait catches the fast
+        answers ("Already in X; nothing to do", refusals).
 
-        The quick answers are worth the short wait, though: "Already in X;
-        nothing to do" (sys_manager refuses to rebuild the live mode — in
-        MANUAL a rebuild would drop an unsaved map, since pgo keeps its
-        keyframes in RAM) and refusals both come back in well under a second,
-        and reporting them beats a blind "dispatched".
-
-        Takes the RobotMode uint8 (MANUAL=1 / AUTO=2), not a REST enum — same
-        int-at-the-boundary contract as set_policy_mode.
+        Takes the RobotMode uint8 (MANUAL=1 / AUTO=2), not a REST enum.
         """
         switch_mode_client = self._service_clients.get("switch_mode")
         if not switch_mode_client.wait_for_service(timeout_sec=5.0):
@@ -476,32 +416,16 @@ class RobotGateway:
     ) -> Tuple[Optional[bool], str]:
         """Ask sys_manager to rebuild the live mode's session. Three-valued.
 
-        sys_manager answers only once the rebuild is over (tens of seconds of
-        byobu commands), so ``(None, msg)`` — no answer inside
-        ``SWITCH_MODE_ACK_TIMEOUT`` — is the EXPECTED outcome of one that goes
-        ahead. The window exists for the answers that come back fast.
+        sys_manager answers only once the rebuild is over, so ``(None, msg)``
+        is the EXPECTED outcome of one that goes ahead. Fast answers are
+        refusals with nothing touched (MAINTENANCE, both sessions up, MANUAL
+        with a possibly unsaved map — so in practice AUTO only), tagged
+        ``Failure.RESTART_REFUSED``. An unreachable service stays untagged.
 
-        Those are refusals, and sys_manager refuses with nothing touched in
-        exactly three states: nothing running (MAINTENANCE), both sessions up
-        (ambiguous), and MANUAL — always, since pgo_node may hold an unsaved
-        map in RAM. So in practice this restarts AUTO only. They are tagged
-        ``Failure.RESTART_REFUSED``: they are the robot's state, not a fault,
-        and the caller's next step is a different request (switch_mode), not
-        a retry. An unreachable service stays untagged.
-
-        ``on_done`` is how the real outcome of a dispatched restart is not
-        lost. Run as its own container this process survives the teardown,
-        so sys_manager's eventual answer — "Restarted AUTO", or "ended up in
-        MAINTENANCE" — does arrive, and it is the only statement anywhere that
-        the rebuild worked. It is called once, from the executor thread, with
-        ``(success, message)`` — only when this returned ``None``; an answer
-        inside the window is the return value instead. A late failure is left
-        untagged: nothing is refused after the rebuild has begun, so it is a
-        rebuild that went wrong, not the robot's state. As a byobu pane the
-        process dies first and the callback never runs, which is the caller's
-        to account for.
-
-        No argument to the srv: the mode is whatever get_mode would report.
+        ``on_done(success, message)`` gets the late outcome, once, on the
+        executor thread, only when this returned ``None``. A late failure is
+        untagged (a rebuild that went wrong, not a refusal). As a byobu pane
+        the process dies first and it never runs.
         """
         restart_mode_client = self._service_clients.get("restart_mode")
         if not restart_mode_client.wait_for_service(timeout_sec=5.0):
@@ -548,13 +472,9 @@ class RobotGateway:
     def set_initial_pose(self, x: float, y: float, yaw: float) -> Tuple[bool, str]:
         """Seed localization with an operator-supplied map-frame pose.
 
-        Fire-and-forget: `initialpose` is a plain topic, so there is no ack and
-        no way to learn here whether the guess converged — the localizer applies
-        it as an ICP initial guess on its next cycle. Only the consumers that
-        are already discovered will see this sample (the topic is volatile, not
-        latched), which is why a missing subscriber is worth a log line: an
-        initialpose that nobody receives is indistinguishable from one that was
-        received and ignored, and that has cost debugging time before.
+        Fire-and-forget on a volatile topic: no ack, and only already-discovered
+        subscribers see it. Hence the warning when nobody is subscribed — an
+        unreceived initialpose looks the same as an ignored one.
         """
         initial_pose_pub = self._publishers.get("initial_pose")
 
@@ -567,9 +487,8 @@ class RobotGateway:
         self._logger.info("[RobotGateway] Publishing initial pose", x=x, y=y, yaw=yaw)
 
         pose_stamped = self._make_pose_stamped(x=x, y=y, yaw=yaw)
-        # Covariance is left at zero: the localizer reads x/y/yaw only (it
-        # refills roll/pitch/z from the current estimate, see applyPlanarGuess)
-        # and a REST caller has no meaningful uncertainty to report.
+        # Covariance stays zero: the localizer reads x/y/yaw only (see
+        # applyPlanarGuess).
         msg = PoseWithCovarianceStamped(header=pose_stamped.header)
         msg.pose.pose = pose_stamped.pose
         initial_pose_pub.publish(msg)
@@ -579,21 +498,12 @@ class RobotGateway:
     def teleop_cmd_vel(self, vx: float, vy: float, wz: float) -> Tuple[bool, str]:
         """Publish one teleop velocity command, clamped to [-1, 1] per axis.
 
-        The clamped value goes on the wire as-is (m/s and rad/s): there used
-        to be scale-to-ceiling constants here (0.5 m/s / 0.65 rad/s) but the
-        artificial cap was dropped on request — full stick now means
-        1.0 m/s / 1.0 rad/s. The [-1, 1] clamp is kept as the one hard bound:
-        a broken or hostile client can command fast, but never 10 m/s. If a
-        ceiling below 1.0 is ever wanted again, this is where it goes.
+        The clamped value goes on the wire as m/s and rad/s; a lower ceiling,
+        if ever wanted, goes here.
 
-        Refused outright while a MOVE goal is EXECUTING: the controller owns
-        cmd_vel during FollowPath (20 Hz), there is no mux in the stack, and
-        the driver is last-message-wins per datagram — interleaving teleop
-        would make the robot judder between two command sources. The operator
-        cancels the task first, then drives.
-
-        No per-call info log and no subscriber-count warning (the
-        set_initial_pose template's two lines): this runs at ~10 Hz.
+        Refused while a MOVE goal is EXECUTING: the controller owns cmd_vel and
+        there is no mux, so teleop would make the robot judder. No per-call
+        logging: this runs at ~10 Hz.
         """
         if self._autonomous_move_active():
             return False, "autonomous move in progress"
@@ -610,14 +520,9 @@ class RobotGateway:
     def teleop_stop(self) -> None:
         """Publish a zero-velocity Twist — the teleop watchdog/disconnect stop.
 
-        This exists because the driver manager has NO cmd_vel watchdog: when a
-        publisher goes quiet it just stops sending AXES, it never sends a stop.
-        So the backend owns stop-on-disconnect and stop-on-stale-input, and
-        this is the primitive both use.
-
-        Gated like teleop_cmd_vel: while an autonomous MOVE is executing the
-        teleop path contributed no motion, and injecting zeros would fight the
-        controller on its own topic.
+        The driver manager has NO cmd_vel watchdog, so the backend owns
+        stop-on-disconnect / stale input. Gated like teleop_cmd_vel, so zeros
+        never fight the controller during a MOVE.
         """
         if self._autonomous_move_active():
             return
@@ -637,14 +542,10 @@ class RobotGateway:
         if not client.wait_for_server(timeout_sec=NAV_SERVER_WAIT_S):
             return False, "Action server is not available", None
 
-        # The goal is registered by the response callback, on the executor
-        # thread, rather than by this thread once its wait returns. The
-        # difference matters exactly when this thread stops waiting -- the
-        # acceptance times out, or a Temporal cancel is thrown into the
-        # activity thread mid-wait -- and nav2 accepts the goal anyway.
-        # Registered, it can be cancelled; unregistered, it is a robot driving
-        # to a pose nobody is watching. `pending` is the handshake between the
-        # two threads: whichever side is second learns what the first did.
+        # The response callback (executor thread) registers the goal, so a goal
+        # nav2 accepts after this thread stopped waiting (timeout, or a Temporal
+        # cancel) is still known and can be cancelled. `pending` is the
+        # handshake: whichever side is second learns what the first did.
         pending: dict = {"abandoned": False, "goal_id": None}
         future = client.send_goal_async(
             goal=goal_msg, feedback_callback=self._move_feedback_cb
@@ -654,9 +555,7 @@ class RobotGateway:
         try:
             answered = _wait_for_future(future, timeout=NAV_ACCEPT_WAIT_S)
         except BaseException:
-            # Whatever interrupted the wait -- the expected one is Temporal's
-            # CancelledError thrown into the activity thread -- the goal is no
-            # longer ours to leave running.
+            # Typically Temporal's CancelledError: the goal must not keep running.
             self._disown_pending(pending)
             raise
         if not answered:
@@ -692,10 +591,8 @@ class RobotGateway:
         )
 
         if abandoned:
-            # The sender gave up (timed out, or was cancelled) before nav2
-            # answered. Nobody will poll this goal, so nobody may leave it
-            # driving. Fire-and-forget: the result callback records CANCELED
-            # when nav2 confirms, and there is no caller left to report to.
+            # The sender gave up before nav2 answered; nobody will poll this
+            # goal. Fire-and-forget: the result callback records CANCELED.
             self._logger.warning(
                 "[RobotGateway] Goal accepted after its sender gave up; cancelling",
                 goal_id=goal_id,
@@ -719,10 +616,8 @@ class RobotGateway:
     def _evict_finished_goals(self) -> None:
         """Trim _goals to MAX_TRACKED_GOALS, oldest finished first.
 
-        Caller holds self._lock. Relies on dict insertion order for "oldest";
-        EXECUTING goals are skipped, so with more live goals than the cap the
-        dict simply stays over it until they finish — correctness over the
-        bound, and in practice the task-level mutex keeps live goals at one.
+        Caller holds self._lock. Insertion order is age; EXECUTING goals are
+        never evicted, even if that leaves the dict over the cap.
         """
         excess = len(self._goals) - MAX_TRACKED_GOALS
         if excess <= 0:
@@ -744,9 +639,7 @@ class RobotGateway:
         return self._send_nav_goal("move", goal_msg)
 
     def _move_feedback_cb(self, feedback_msg):
-        # rclpy hands the feedback callback the action's FeedbackMessage
-        # wrapper ({goal_id, feedback}), not a goal handle -- which is why
-        # _goal_id_str works on it.
+        # rclpy passes the FeedbackMessage wrapper ({goal_id, feedback}).
         goal_id = _goal_id_str(feedback_msg)
 
         with self._lock:
@@ -783,10 +676,8 @@ class RobotGateway:
                 "goal_id": goal.goal_id,
                 "state": goal.state.value,
             }
-            # The robot's reason, on an abort only: SUCCEEDED and CANCELED
-            # carry NONE by contract. NONE on an abort is meaningful too --
-            # "superseded or never started", not a navigation failure -- so it
-            # is passed on rather than dropped.
+            # The reason, on an abort only. NONE on an abort ("superseded or
+            # never started") is meaningful, so it is passed on.
             if goal.state is MoveState.ABORTED and goal.result is not None:
                 status["error_code"] = goal.result.error_code
                 status["error_msg"] = goal.result.error_msg
@@ -795,12 +686,9 @@ class RobotGateway:
     def get_move_message(self) -> str:
         """What the robot's navigator says it is doing, for a running MOVE.
 
-        The latest feedback's status_msg ("Following the path", "Path
-        blocked; replanning", ...) of the goal that is executing, or "" when
-        none is, or none has sent feedback yet. Not keyed by goal id: the
-        caller is the task-state read, which knows a step is running but not
-        which goal it sent, and one navigation at a time is the robot's rule
-        (task_runner's navigator mutex) as well as the task layer's.
+        The executing goal's latest feedback status_msg, or "". Not keyed by
+        goal id: the task-state read does not know it, and only one navigation
+        runs at a time.
         """
         with self._lock:
             for goal in self._goals.values():
@@ -832,11 +720,9 @@ class RobotGateway:
     def cancel_active_moves(self) -> Tuple[bool, str]:
         """Cancel every goal still executing -- the cancelled-MOVE cleanup path.
 
-        By goal state rather than by id, because the activity may not have one:
-        a Temporal cancel can land while nav2 is still deciding, before move()
-        has returned anything. The task-level mutex keeps live goals at one, so
-        "everything executing" is at most one goal and it is, by construction,
-        ours. Anything accepted after this ran is handled by _disown_pending.
+        By state, not id: a Temporal cancel can land before move() returned an
+        id. Only one goal runs at a time, so this is ours. A goal accepted
+        after this ran is handled by _disown_pending.
         """
         with self._lock:
             active = [

@@ -76,111 +76,64 @@ class SyncAIBackend(Node):
         robot_repo = init_robot_repo(logger=logger)
         map_repo = init_map_repo(logger=logger, engine=engine)
 
-        # The operator's library of re-dispatchable step lists. Its own repo
-        # rather than a method on MapRepo: that one is the vertex table, this is a
-        # different table, and the only thing they share is the engine.
+        # The operator's library of re-dispatchable step lists.
         task_template_repo = init_task_template_repo(logger=logger, engine=engine)
-        # The maps on disk, as opposed to the one that is loaded. Reads the
-        # filesystem only; no engine, no ROS.
+        # The maps on disk, as opposed to the one that is loaded. Filesystem only.
         map_catalog_repo = init_map_catalog_repo(logger=logger)
         # Single-slot cache for the live body_cloud, drained by the WS stream.
-        # The static map cloud used to have a second one; it is read from the
-        # saved .pcd on request now, so there is nothing to cache between calls.
         pointcloud_repo = init_pointcloud_repo(logger=logger)
-        # Second slot of the same shape for pgo's merged "map so far" cloud
-        # (mapping mode only). Content-agnostic seq+bytes, so no new repo class
-        # — and no reset hook needed, because this process restarts with every
-        # mapping session.
+        # Same slot shape for pgo's merged "map so far" cloud (mapping mode only).
         map_cloud_repo = init_pointcloud_repo(logger=logger)
-        # The third pgo surface, and the one REST reads back: its latched run
-        # state (idle / mapping / resetting), so GET /api/v1/mapping can answer
-        # after a console reload and the run routes can refuse with a code
-        # instead of relaying pgo's refusal as a 502. Unlike the two slots
-        # above it ages its sample out, because this container outlives the
-        # mapping session that published it.
+        # pgo's latched run state, so GET /api/v1/mapping survives a console
+        # reload and run routes can refuse with a code. Ages its sample out,
+        # because this container outlives the mapping session.
         mapping_status_repo = init_mapping_status_repo(logger=logger)
-        # Single-slot pose/joints cache feeding the internal telemetry WS
-        # (the high-rate channel the 3D viewer uses instead of the frozen,
-        # whole-second-resolution GET /api/v1/robot/state contract).
+        # Pose/joints cache feeding the internal telemetry WS (the 3D viewer's
+        # high-rate channel).
         telemetry_repo = init_telemetry_repo(logger=logger)
-        # The bags on disk, as opposed to the one being written. Filesystem
-        # only; no engine, no ROS — the map catalogue's shape.
+        # The bags on disk, as opposed to the one being written. Filesystem only.
         recording_catalog_repo = init_recording_catalog_repo(logger=logger)
 
         robot_gw = init_robot_gateway(logger=logger, node=self)
-        # LoadMap client, so an edited gridmap can be pushed into the running
-        # map_server. Its own gateway rather than a method on RobotGateway: that
-        # one is the driver / sys_manager / nav surface (motion keys, wifi,
-        # initialpose, NavigateToGoal), and the map router has no business
-        # holding a handle that can command the robot to move.
+        # LoadMap client. Its own gateway so the map router holds no handle that
+        # can command the robot to move.
         map_gw = init_map_gateway(logger=logger, node=self)
         workflow_gw = init_workflow_gateway(logger=logger, robot_id=robot_id)
-        # Speech out, over HTTP to the syncai_tts container. No node handle:
-        # nothing about it is ROS.
-        #
-        # It used to hold the kokoro session and the aplay subprocess, and one
-        # instance was load-bearing — its internal lock was the only thing
-        # keeping a scheduled SPEAK step and a manual POST /api/v1/tts/speak off
-        # the speaker at the same time. That guarantee now lives in the service,
-        # in front of the one piece of hardware, which is what lets the Temporal
-        # worker move to a process of its own without two locks in two processes
-        # failing to see each other. One instance here is now merely tidy: it is
-        # a pooled httpx.Client, not a resource owner.
+        # Speech out, over HTTP to the syncai_tts container. The speaker lock
+        # lives in that service now, so this is just a pooled httpx.Client.
         tts_gw = init_tts_gateway(logger=logger)
-        # WHEP signalling for the camera stream. No node handle, same as the
-        # TTS gateway: nothing about it is ROS. One instance because two things
-        # need a single owner -- the worker's sync.Once InitWorker, and the
-        # single-viewer slot that lets a new WHEP request preempt a browser tab
-        # that died without sending DELETE.
-        #
-        # Construction loads nothing. The dlopen -- and with it the Go runtime
-        # and its signal handlers, into this rclpy process, with no dlclose to
-        # undo it -- happens on the first WHEP request, so a boot that never
-        # streams never pays for any of it.
+        # WHEP signalling for the camera stream. One instance: the worker's
+        # sync.Once InitWorker and the single-viewer slot need a single owner.
+        # The dlopen (Go runtime + signal handlers, never unloaded) happens on
+        # the first WHEP request, not here.
         webrtc_gw = init_webrtc_gateway(logger=logger)
-        # `ros2 bag record` as a supervised child. No node handle, for the same
-        # reason as the two gateways above: nothing in it is ROS from this
-        # process's side — the recorder runs its own node, out of process, so a
-        # bag of the 20 Hz lidar cloud never shares this executor with the
-        # telemetry and TF callbacks.
-        #
-        # robot_id rather than the node, though, and it is load-bearing: it is
-        # what expands a relative topic in the request (`livox/lidar`) into the
-        # namespaced one the recorder must subscribe to. The records_dir is
-        # taken off the repo so the two halves of the feature cannot end up
-        # pointed at different directories.
+        # `ros2 bag record` as a supervised child, out of process, so a bag of the
+        # lidar cloud never shares this executor. robot_id expands a relative
+        # topic (`livox/lidar`) into the namespaced one; records_dir comes off the
+        # repo so both halves point at the same directory.
         recording_gw = init_recording_gateway(
             logger=logger,
             robot_id=robot_id,
             records_dir=recording_catalog_repo.records_dir,
         )
 
-        # The pcd -> gridmap conversion: the recipes, the registry of threads
-        # running right now, and the on-disk record each one leaves. Built here
-        # rather than reached for as module state inside the map router, which
-        # is what it used to be -- one process, one registry, and now a
-        # collaborator the router is handed like every other. It holds no node
-        # and no engine: a conversion is numpy/scipy/open3d over files in the
-        # map directory, and the only thing it shares with the rest of the
-        # process is the directory the catalogue repo also reads.
+        # The pcd -> gridmap conversion: recipes, running threads, on-disk record.
+        # Built here, not module state in the map router, so the router is handed
+        # it like any other collaborator.
         conversion_svc = init_gridmap_conversion_service(logger=logger)
 
-        # The latest restart of the live mode and how it ended. Its own object
-        # because the answer outlives the POST that asked: sys_manager replies
-        # once the rebuild is over, long after the request has returned.
+        # The latest restart of the live mode and how it ended; outlives the POST
+        # because sys_manager replies only once the rebuild is over.
         restart_svc = init_mode_restart_service(logger=logger, robot_gw=robot_gw)
 
-        # Cancels every task when the driver's safety lock engages. Fed by the
-        # robot_state subscriber (ROS thread), run on the REST loop, which is
-        # the only one WorkflowGateway may be used from.
+        # Cancels every task when the driver's safety lock engages. Fed from the
+        # ROS thread, run on the REST loop (the only one WorkflowGateway may use).
         safety_lock_svc = init_safety_lock_service(
             logger=logger, robot_gw=robot_gw, workflow_gw=workflow_gw
         )
 
-        # One /tf + /tf_static subscription for the whole process, shared by the
-        # two subscribers that need transforms. Held on self because this is the
-        # object that owns it; see subscribers/tf.py for why they no longer
-        # build one each.
+        # One /tf + /tf_static subscription for the whole process (see
+        # subscribers/tf.py).
         self._tf_listener = init_tf_listener(logger=logger, node=self)
 
         init_robot_state_subscriber(
@@ -195,8 +148,7 @@ class SyncAIBackend(Node):
             pointcloud_repo=pointcloud_repo,
             tf_buffer=self._tf_listener.buffer,
         )
-        # pgo's merged map cloud arrives already in the map frame, so unlike
-        # the live cloud above this needs no tf_buffer.
+        # pgo's merged cloud is already in the map frame: no tf_buffer.
         init_map_cloud_subscriber(logger=logger, node=self, map_cloud_repo=map_cloud_repo)
         init_mapping_status_subscriber(
             logger=logger, node=self, mapping_status_repo=mapping_status_repo
@@ -207,8 +159,7 @@ class SyncAIBackend(Node):
             telemetry_repo=telemetry_repo,
             tf_buffer=self._tf_listener.buffer,
         )
-        # The planner's route, onto the same telemetry socket. No tf_buffer: the
-        # plan is published in the map frame already.
+        # The planner's route, onto the telemetry socket; already in the map frame.
         init_path_subscriber(logger=logger, node=self, telemetry_repo=telemetry_repo)
 
         worker_handle = start_temporal_worker(
@@ -248,9 +199,8 @@ def main():
 
     try:
         backend_node = SyncAIBackend(logger=logger)
-        # MultiThreadedExecutor lets the point-cloud callback group run on a
-        # separate thread from the robot_state/map/TF callbacks, so a busy scan
-        # frame can't starve them.
+        # Lets the point-cloud callback groups run beside robot_state/TF, so a
+        # busy scan frame can't starve them.
         executor = MultiThreadedExecutor()
         executor.add_node(backend_node)
         executor.spin()

@@ -24,43 +24,29 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
-# Mirrors database/postgres.py: same bounded-retry shape for the same reason —
-# on a robot boot the shared docker-compose services (postgres, temporal) may
-# come up after the backend does. The difference is what happens when the
-# budget runs out: postgres raises and takes the process down (a backend
-# without its DB is useless), while the worker only marks itself dead. The
-# backend runs in a byobu pane with no supervisor to restart it, and with
-# Temporal gone the rest of the process (telemetry, maps, manual control) is
-# still worth keeping alive — so the failure is surfaced through /health
-# instead of a crash.
+# Same bounded retry as database/postgres.py (compose services may come up after the
+# backend), but running out only marks the worker dead: there is no supervisor, and
+# the rest of the process is worth keeping, so /health reports it instead.
 MAX_RETRIES = 20
 RETRY_INTERVAL = 5
 
-# The longest the worker sits on an activity heartbeat before sending it. The
-# server never pushes an activity cancel to the worker: it answers the next
-# heartbeat with "cancel requested", so this interval is most of how long a
-# paused or cancelled MOVE keeps driving. Left at the SDK default (60 s cap,
-# so 0.8 x the 3 s MOVE_HEARTBEAT_TIMEOUT = 2.4 s in effect) a pause took up
-# to ~3.5 s to reach nav2. Only the sending is throttled -- the heartbeat
-# timeout the server enforces is unchanged -- and two small RPCs a second
-# from one robot are nothing to the server.
+# The longest the worker holds a heartbeat before sending it. The server never pushes
+# a cancel; it answers the next heartbeat, so this is most of how long a paused or
+# cancelled MOVE keeps driving (the SDK default made it ~3.5 s). Only sending is
+# throttled; the heartbeat timeout is unchanged. Must stay under 0.8 x
+# MOVE_HEARTBEAT_TIMEOUT (pinned in test_activities.py).
 HEARTBEAT_THROTTLE_MAX = timedelta(milliseconds=500)
 
-# How many IO activities (SPEAK) run at once. More than one so a SPEAK from a
-# second run, or a group with two of them, is not left ticking its
-# start_to_close behind the first; a handful because each is one held-open
-# HTTP request and the speaker plays one utterance at a time anyway.
+# Concurrent IO activities (SPEAK): more than one so a second run's SPEAK does not tick
+# its start_to_close behind the first; few, as each holds an HTTP request open.
 IO_ACTIVITY_SLOTS = 4
 
 
 class TemporalWorkerHandle:
     """Cross-thread view of the worker's lifecycle for /health.
 
-    The worker lives in a daemon thread; before this handle existed, a failed
-    ``Client.connect`` killed that thread silently and the only symptom was
-    tasks that queued forever. Every exit path of the thread now lands in one
-    of these states, so "is the task server actually polling?" is answerable
-    from the REST side.
+    Every exit path of the worker thread lands in one of these states, so a failed
+    connect is visible instead of tasks silently queueing forever.
     """
 
     STATUS_CONNECTING = "connecting"
@@ -95,11 +81,9 @@ async def run_worker(
     handle: TemporalWorkerHandle,
     ready: Optional[threading.Event] = None,
 ) -> None:
-    """Connect to Temporal (with bounded retries), register the
-    workflow/activities, and run forever.
+    """Connect to Temporal (bounded retries), register workflow/activities, run forever.
 
-    `ready` is set right before the worker starts polling, so a caller running
-    this in a background thread can block until the worker is up.
+    `ready` is set right before polling starts.
     """
     server = temporal_server_url()
     client = None
@@ -126,14 +110,11 @@ async def run_worker(
                 return
             await asyncio.sleep(RETRY_INTERVAL)
 
-    # Here rather than in the gateway's lazy connect: this is the one place
-    # that already waits for Temporal to be up, and the attributes have to
-    # exist before the first run is stamped with them. Non-fatal -- see the
-    # module; a worker without them still runs every task.
+    # Here, not in the gateway: this already waits for Temporal, and the attributes
+    # must exist before the first run is stamped. Non-fatal.
     await ensure_search_attributes(client, logger)
 
-    # For the group members' STEP_STARTED_SIGNAL (RobotActivities._report_started):
-    # the activities run in executor threads, the client lives on this loop.
+    # For STEP_STARTED_SIGNAL: activities run in executor threads, the client on this loop.
     activities.bind_client(client, asyncio.get_running_loop())
 
     worker = Worker(
@@ -144,29 +125,20 @@ async def run_worker(
             activities.execute_move,
             activities.execute_stand,
             activities.execute_lie_down,
-            # Still here for runs started before SPEAK moved to the IO queue:
-            # their histories keep it on this one (SPEAK_ON_IO_QUEUE_PATCH).
+            # For runs from before SPEAK_ON_IO_QUEUE_PATCH.
             activities.execute_speak,
         ],
-        # One body activity at a time, stated twice because the two settings
-        # mean different things. The executor is the thread that runs
-        # activities; max_concurrent_activities is how many the worker
-        # *accepts* from the server. Left at its default (100) the worker
-        # would take a second activity while the first held the only thread,
-        # and that activity's heartbeat_timeout and start_to_close would tick
-        # while it queued behind the thread -- so the one realistic overlap, a
-        # schedule firing during a direct task (see _require_idle's
-        # docstring), failed its MOVE by heartbeat timeout instead of waiting.
-        # Capped to 1, Temporal holds the second task server-side until this
-        # worker asks for it. It is also what keeps two runs from driving the
-        # robot at once.
+        # One body activity at a time, set twice: the executor is the thread that runs
+        # activities, max_concurrent_activities is how many the worker accepts. With
+        # the default (100) a second activity (e.g. a schedule firing during a direct
+        # task) ticked its heartbeat/start_to_close timeouts queued behind the thread;
+        # capped, Temporal holds it server-side. Also keeps two runs from driving.
         activity_executor=ThreadPoolExecutor(max_workers=1),
         max_concurrent_activities=1,
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
     )
-    # The activities that only talk to another service (SPEAK), on their own
-    # queue so a run can speak while its MOVE holds the body slot (Step.group).
-    # Executor and cap kept equal for the same reason as above.
+    # SPEAK on its own queue so a run can speak while its MOVE holds the body slot.
+    # Executor and cap equal for the same reason as above.
     io_worker = Worker(
         client,
         task_queue=io_task_queue(robot_id),
@@ -203,9 +175,8 @@ def start_temporal_worker(
     handle = TemporalWorkerHandle()
 
     def _thread_target() -> None:
-        # Anything that escapes run_worker — including worker.run() dying
-        # mid-flight — must land in the handle, or we are back to the silent
-        # dead thread this exists to prevent.
+        # Anything escaping run_worker, including worker.run() dying, must land in
+        # the handle.
         try:
             activities = RobotActivities(
                 logger=logger,
@@ -230,8 +201,7 @@ def start_temporal_worker(
     thread = threading.Thread(target=_thread_target, daemon=True)
     thread.start()
     handle.thread = thread
-    # Not becoming ready in 10s is expected when Temporal is still booting —
-    # the retry budget above runs ~100s — so this is a heads-up, not a failure.
+    # Expected while Temporal boots (the retry budget is ~100 s): a heads-up only.
     if not ready.wait(timeout=10.0):
         logger.warning(
             "Temporal worker not ready yet; still connecting in the background",

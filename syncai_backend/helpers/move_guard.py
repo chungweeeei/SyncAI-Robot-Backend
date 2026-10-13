@@ -1,26 +1,19 @@
 """Whether a job may drive on the map that is loaded right now.
 
-Two consumers ask the same question at two moments, and they must not
-disagree about the answer: ``POST /api/v1/tasks`` asks it before a run is
-started (and answers 409), and ``RobotActivities.execute_move`` asks it again
-before every goal it sends (and fails the run). The second exists because a
-schedule fires without passing through the first, and because a map can start
-rebuilding between a dispatch and its third MOVE step. Both read the codes and
-sentences from here, which is also why the sentences are operator prose: the
-router hands them to the console verbatim, and a failed step's message is what
-the history row shows.
-
-Pure on purpose -- the active map and whether it is converting are handed in --
-so the rule is tested once, here, without a catalogue or a worker.
+``POST /api/v1/tasks`` asks before a run starts (409), and
+``RobotActivities.execute_move`` asks again before every goal (fails the run),
+because a schedule skips the first check and a map can start rebuilding
+mid-run. Both share these codes and sentences, which are operator prose: the
+console and the history row show them verbatim. Pure, so the rule is tested
+here without a catalogue or a worker.
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
 
-# The wire codes, beside ConflictError's detail. ``conversion_running`` is the
-# code the map routes already answer for "this map's floor plan is being
-# rebuilt"; the console reads one word for one condition, whichever route said it.
+# Wire codes beside ConflictError's detail. ``conversion_running`` matches the
+# code the map routes use for the same condition.
 MAP_MISMATCH = "map_mismatch"
 CONVERSION_RUNNING = "conversion_running"
 
@@ -38,14 +31,10 @@ def move_refusal(
 ) -> Optional[MoveRefusal]:
     """Why a job with MOVE steps must not drive now, or None if it may.
 
-    ``expected_map`` is the map the job's coordinates are in, when anyone said:
-    a caller's expectation at dispatch, a run's ``TaskMap`` in the activity.
-    None means unknown, and an unknown map is not refused -- the MCP server and
-    curl dispatch without one, and a schedule older than the attribute has none.
-
-    The mismatch is checked first. A job planned on another map is wrong
-    however the loaded one is doing, and the fix the sentence names (switch
-    maps) is the one that applies.
+    ``expected_map`` is the map the job's coordinates are in (the dispatch's
+    expectation, or a run's ``TaskMap``). None means unknown and is not
+    refused: the MCP server, curl and old schedules carry none. A mismatch is
+    checked first, since switching maps is then the fix that applies.
     """
     if expected_map and expected_map != active_map:
         loaded = (

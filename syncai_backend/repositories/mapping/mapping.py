@@ -1,24 +1,11 @@
 """Single-slot cache of pgo's run state (``pgo/mapping_status``).
 
-The third of pgo's surfaces this process mirrors, next to the live merge
-(``map_cloud_repo``) and the services the map gateway calls, and the one REST
-reads back: ``GET /api/v1/mapping`` answers from it, and the start / save /
-reset routes pre-empt the refusal pgo would give from it (a 409 with a code
-rather than a 502 with pgo's sentence). pgo comes up IDLE in a mapping session
-since 2026-10 and banks nothing until ``start_mapping``; a successful
-``save_maps`` returns it to IDLE. The console needs that answer after a page
-reload, which is why the topic is latched and why this slot exists.
+``GET /api/v1/mapping`` answers from it, and the start / save / reset routes
+use it to pre-empt pgo's refusal (409 with a code, not 502 with pgo's sentence).
 
-``get`` ages the sample out. The other single-slot caches here never do
-(``main.py`` notes the process used to restart with every mapping session), but
-this backend runs as its own container now and outlives a MANUAL -> AUTO
-switch, and a latched MAPPING sample from a pgo that no longer exists would
-otherwise be reported forever -- there is no pgo in a nav session to say
-otherwise. pgo republishes at 1 Hz; five periods is enough slack for a busy
-executor and short enough that a dead pgo reads as ``unknown`` before an
-operator acts on it. Read-time expiry rather than a timer, the same way
-``ModeRestartService`` applies its deadline: nothing to schedule, nothing to
-cancel, and the injected clock makes it testable.
+Unlike the other caches, ``get`` ages the sample out: this process outlives a
+switch to a nav session, where no pgo would ever replace a latched MAPPING.
+Expiry is applied on read, like ``ModeRestartService``'s deadline.
 """
 
 import threading
@@ -30,8 +17,7 @@ from typing import Callable, Optional
 import structlog
 
 
-# How long a latched sample is believed. pgo publishes on every transition and
-# at 1 Hz; past this the likelier story is that the mapping session is gone.
+# How long a latched sample is believed. pgo republishes at 1 Hz.
 MAPPING_STATUS_TTL_S = 5.0
 
 
@@ -50,9 +36,7 @@ class MappingStatus:
     state: MappingState
     key_poses: int
     loop_closures: int
-    # pgo's clock when it published, seconds. For display and log correlation
-    # only -- the TTL is measured on this process's monotonic clock, because
-    # the two clocks need not agree.
+    # pgo's clock, for display only; the TTL uses this process's monotonic clock.
     stamp: float
     received_at: float
 
@@ -81,9 +65,7 @@ class MappingStatusRepo:
     def get(self) -> Optional[MappingStatus]:
         """The latest sample, or None when there is none or it has expired.
 
-        None is the one representation of "unknown": no pgo has published since
-        this process started (the normal state of a navigating robot), or the
-        last one to publish has been silent for longer than the TTL.
+        None means "unknown": no pgo has published, or it went silent.
         """
         with self._lock:
             status = self._status

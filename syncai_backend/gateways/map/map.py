@@ -1,26 +1,16 @@
 """The map router's ROS surface: map_server reloads, localizer swaps, pgo saves.
 
-Its own gateway rather than methods on ``RobotGateway``: that one is the
-driver / sys_manager / nav surface (motion keys, wifi, initialpose,
-NavigateToGoal), and the map router has no business holding a handle that can
-command the robot to move. Everything here only makes map files change hands --
-including the ``initialpose`` publisher, which re-seeds *where the robot thinks
-it is* and never asks it to go anywhere. That publisher is a second one on a
-topic ``RobotGateway`` also publishes to, which is fine in ROS and is the lesser
-evil: the alternative is handing the map router the gateway that owns
-NavigateToGoal.
+Separate from ``RobotGateway`` so the map router holds no handle that can
+command the robot to move. Its ``initialpose`` publisher only re-seeds where
+the robot thinks it is; a second publisher on RobotGateway's topic is fine.
 
-The clients split by session, which is worth knowing before debugging any of
-them: ``map_server/load_map``, ``filter_mask_server/load_map``, ``relocalize``,
-``relocalize_check`` and ``auto_localize`` exist only in the nav (AUTO) session,
-``pgo/start_mapping``, ``pgo/save_maps`` and ``pgo/reset_mapping`` only in the
-mapping (MANUAL) one. A
-"service is not available" from one of them usually means "wrong mode", not
-"broken stack" -- which is exactly what ``POST /api/v1/maps/{name}/activate``
-turns into its ``stack_not_ready`` refusal. ``filter_mask_server`` is the
-keepout pane of that session; since the workspace's 2026-09-30 change its
-launch writes a blank mask for a map that has none, so it is up on every map
-the session boots into, not only the ones with zones drawn.
+The clients split by session: ``map_server/load_map``,
+``filter_mask_server/load_map``, ``relocalize``, ``relocalize_check`` and
+``auto_localize`` exist only in the nav (AUTO) session; ``pgo/start_mapping``,
+``pgo/save_maps`` and ``pgo/reset_mapping`` only in the mapping (MANUAL) one.
+"Service is not available" usually means "wrong mode", which activate turns
+into ``stack_not_ready``. The nav launch writes a blank keepout mask for a map
+without one, so ``filter_mask_server`` is up on every map.
 """
 
 import math
@@ -43,17 +33,10 @@ from syncai_common.srv import (
 def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
     """The operator's sentence for a failed ``LoadMap`` call.
 
-    LoadMap.srv carries no `message` field -- only `uint8 result` and the grid --
-    so every string an operator gets for a failed reload is written here. It is
-    parameterised on the server and the file names because two map_server
-    instances answer it: ``map_server`` for ``gridmap.*`` and
-    ``filter_mask_server`` for ``keepout.*``, and "map_server rejected
-    gridmap.yaml" would send the operator to the wrong file for the latter.
-
-    RESULT_UNDEFINED_FAILURE is unreachable against syncai_map_server (its
-    loadMapResponseFromYaml switches over exactly the four LOAD_MAP_STATUS
-    values), but the srv defines it and a stock nav2 map_server on the same DDS
-    graph would send it, so it is kept rather than left to the fallback.
+    LoadMap.srv has no `message` field, so the prose is written here,
+    parameterised because two servers answer it (``map_server`` for
+    ``gridmap.*``, ``filter_mask_server`` for ``keepout.*``).
+    RESULT_UNDEFINED_FAILURE is kept for a stock nav2 map_server.
     """
     messages = {
         LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST: f"{server} could not find the map yaml",
@@ -67,14 +50,9 @@ def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
 def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
     """Bridge a ROS future to the FastAPI worker thread that is waiting on it.
 
-    The same four lines as ``gateways/robot/robot.py``, duplicated rather than
-    shared so a map gateway does not have to import the robot one (and its
-    NavigateToGoal machinery) for a helper this size. If a third gateway needs
-    it, move it to ``gateways/__init__.py`` and change all three.
-
-    Deliberately not ``rclpy.spin_until_future_complete``: called from a thread
-    that is not the executor's, that deadlocks. Here the response is delivered on
-    a MultiThreadedExecutor thread while this thread parks on the Event.
+    Duplicated from ``gateways/robot/robot.py`` to avoid importing it; a third
+    user should move it to ``gateways/__init__.py``. Not
+    ``spin_until_future_complete``: off the executor thread, that deadlocks.
     """
     event = threading.Event()
     future.add_done_callback(lambda _: event.set())
@@ -89,8 +67,7 @@ class MapGateway:
         self._service_clients: dict[str, Client] = {}
         self.register_service_clients()
 
-        # Same topic and QoS as RobotGateway's: volatile, depth 5. See the
-        # module docstring for why this gateway has its own.
+        # Same topic and QoS as RobotGateway's: volatile, depth 5.
         self._initial_pose_pub = self._node.create_publisher(
             PoseWithCovarianceStamped, "initialpose", QoSProfile(depth=5)
         )
@@ -102,10 +79,8 @@ class MapGateway:
             srv_name="map_server/load_map",
         )
 
-        # The keepout mask's map_server: the same executable run under the name
-        # filter_mask_server by costmap_filter_info.launch.py, so its service is
-        # built the same way (`service_prefix + "load_map"`) and carries the
-        # node name just as load_map's does.
+        # The keepout mask's map_server (costmap_filter_info.launch.py); its
+        # service carries the node name, like load_map's.
         load_keepout_client = self._node.create_client(
             srv_type=LoadMap,
             srv_name="filter_mask_server/load_map",
@@ -116,36 +91,23 @@ class MapGateway:
             srv_name="pgo/save_maps",
         )
 
-        # pgo_node declares this one with the node name in the path for the same
-        # reason save_maps carries it: both are `create_service("...")` inside
-        # the /<robot_id>/pgo namespace, so the prefix is the namespace, not the
-        # node. Whatever is true of save_maps is true of this -- they are two
-        # lines apart in pgo_node's constructor.
+        # Like save_maps, under the /<robot_id>/pgo namespace.
         reset_mapping_client = self._node.create_client(
             srv_type=ResetMapping,
             srv_name="pgo/reset_mapping",
         )
 
-        # The third pgo service, declared the same way (2026-10): what moves
-        # pgo from IDLE to MAPPING, since a mapping session comes up banking
-        # nothing.
+        # Moves pgo from IDLE to MAPPING; a mapping session starts idle.
         start_mapping_client = self._node.create_client(
             srv_type=StartMapping,
             srv_name="pgo/start_mapping",
         )
 
-        # Bare names, unlike load_map's. The localizer declares these with
-        # plain `create_service("relocalize", ...)` (syncai_localizer's
-        # src/localizer_node.cpp:51-59),
-        # so they resolve against its *namespace* and land at
-        # /<robot_id>/relocalize -- while map_server builds its own
-        # `service_prefix + "load_map"`, which is why that one carries the node
-        # name and these do not. Writing `localizer/relocalize` here, on the
-        # reasonable-looking assumption that it matched the node, cost a
-        # stack_not_ready refusal against a perfectly healthy stack: a stale
-        # entry under that name can even linger in `ros2 service list` after a
-        # participant dies, so the list is not the check -- `ros2 node info
-        # /<robot_id>/localizer_node` is.
+        # Bare names, unlike load_map's: the localizer's plain
+        # `create_service("relocalize", ...)` lands at /<robot_id>/relocalize.
+        # Do not write `localizer/relocalize`; it caused false stack_not_ready.
+        # Check with `ros2 node info /<robot_id>/localizer_node`, not
+        # `ros2 service list`, which can show stale entries.
         relocalize_client = self._node.create_client(
             srv_type=Relocalize,
             srv_name="relocalize",
@@ -156,10 +118,8 @@ class MapGateway:
             srv_name="relocalize_check",
         )
 
-        # The localizer's third service (2026-10), declared the same bare way
-        # and in the same mutually exclusive callback group as relocalize --
-        # so a second call queues behind a running search rather than
-        # overlapping it, and relocalize_check waits for it too.
+        # Bare like relocalize and in its mutually exclusive callback group, so
+        # calls queue behind a running search.
         auto_localize_client = self._node.create_client(
             srv_type=AutoLocalize,
             srv_name="auto_localize",
@@ -181,11 +141,9 @@ class MapGateway:
     def nav_services_ready(self, timeout_sec: float = 2.0) -> bool:
         """Are the AUTO-session map services discoverable right now?
 
-        The precondition for a map switch, and the honest way to ask "is the nav
-        stack up". Deliberately not read off the cached RobotState's mode: that
-        is the last frame robot_state published (the repo keeps serving it after
-        the publisher stops, e.g. through a session rebuild), and a mode names
-        the session sys_manager launched, not whether its services are up yet.
+        The precondition for a map switch. Not read off the cached RobotState
+        mode, which can be stale and names the session, not whether its
+        services are up.
         """
         return all(
             self._service_clients[key].wait_for_service(timeout_sec=timeout_sec)
@@ -199,26 +157,14 @@ class MapGateway:
 
         Two calls, and the second is not optional.
 
-        `relocalize` swaps the map: `relocCB` checks the path exists, hands it to
-        `ICPLocalizer::loadMap` -- which builds into local buffers and swaps only
-        as its last statement, so a failed load leaves the old map serving rather
-        than leaving the localizer with nothing -- then stores an initial guess
-        and republishes the latched map cloud. Note what its `success` does *not*
-        mean: registration has not run. It happens on the node's 5 Hz timer
-        afterwards, with no deadline and no give-up, and the only surface that
-        ever reports it is `relocalize_check`.
+        `relocalize` swaps the map (a failed load keeps the old one serving).
+        Its `success` does not mean registered: that runs later on a 5 Hz timer
+        and only `relocalize_check` reports it.
 
-        The guess handed to `relocalize` here is deliberately transient. `relocCB`
-        takes the request's raw 6-DOF, bypassing `applyPlanarGuess` -- the path
-        `initialpose` goes through, which re-fills roll/pitch/z from the current
-        estimate. That matters because the lidar is mounted tilted: map_T_body
-        always carries ~15 degrees of pitch, and a flat roll=pitch=0 guess never
-        passes `rough_max_corr_dist`, so the localizer freezes retrying it
-        forever (the failure `applyPlanarGuess` was written to prevent). So the
-        zeros below only satisfy `relocCB`'s demand for *a* guess; the
-        `initialpose` publish immediately overwrites it with a tilt-correct one,
-        which the timer picks up on its next 200 ms cycle. Dropping the second
-        call reintroduces the freeze.
+        `relocalize` takes the raw 6-DOF guess, bypassing `applyPlanarGuess`.
+        The lidar is tilted (~15 degrees of pitch), so the flat zeros below would
+        freeze the localizer; the `initialpose` publish overwrites them with a
+        tilt-correct guess. Dropping it reintroduces the freeze.
         """
         relocalize_client = self._service_clients.get("relocalize")
         if not relocalize_client.wait_for_service(timeout_sec=5.0):
@@ -234,9 +180,8 @@ class MapGateway:
                 yaw=float(yaw), pitch=0.0, roll=0.0,
             )
         )
-        # The handler reads a ~100-200 MB PCD off disk and voxel-downsamples it
-        # twice before returning. 60s is generous for the conference-hall clouds
-        # while still bounded, since this holds a FastAPI worker thread.
+        # Reads and downsamples a ~100-200 MB PCD; bounded since this holds a
+        # FastAPI worker thread.
         if not _wait_for_future(future, timeout=60.0):
             return False, "Timeout waiting for relocalize response"
 
@@ -250,10 +195,8 @@ class MapGateway:
     def _seed_initial_pose(self, x: float, y: float, yaw: float) -> None:
         """Publish `initialpose` so the guess goes through `applyPlanarGuess`.
 
-        Covariance stays zero: the localizer reads x/y/yaw only, and a map switch
-        has no meaningful uncertainty to report. A missing subscriber is logged
-        for the same reason RobotGateway logs it -- an initialpose nobody
-        receives looks exactly like one that was received and ignored.
+        Covariance stays zero (the localizer reads x/y/yaw only). A missing
+        subscriber is logged, as in RobotGateway.
         """
         if self._initial_pose_pub.get_subscription_count() == 0:
             self._logger.warning(
@@ -279,20 +222,12 @@ class MapGateway:
     def localization_converged(self, timeout_s: float = 3.0) -> Optional[bool]:
         """Has the localizer's ICP actually converged? None if it cannot be asked.
 
-        Polls `relocalize_check` (`code=0`, the branch that reports the real
-        `localize_success` rather than the unconditional true). This is the only
-        surface in the entire stack that answers the question: the localizer
-        publishes no status topic, and `RobotState.localization_valid` is
-        TF-presence only -- the localizer broadcasts map->odom unconditionally,
-        with an identity offset, from the first odom sample, so a localizer that
-        has never converged still reports `localization_valid: true` all the way
-        to the console.
+        Polls `relocalize_check` (`code=0`, the real `localize_success`). The
+        only surface that answers this: `RobotState.localization_valid` is
+        TF-presence only and reads true before any convergence.
 
-        Best effort by construction. A false here means "not yet", not "never":
-        registration retries at 5 Hz indefinitely, so a caller that waits longer
-        would sometimes get a true. The short budget exists because this runs
-        inside a REST handler, and the operator's recourse -- setting an initial
-        pose from the dashboard -- is the same either way.
+        Best effort: false means "not yet" (registration retries forever). The
+        budget is short because this runs inside a REST handler.
         """
         check_client = self._service_clients.get("relocalize_check")
         if not check_client.wait_for_service(timeout_sec=1.0):
@@ -315,20 +250,12 @@ class MapGateway:
     ) -> tuple[bool, str, Optional[AutoLocalize.Response]]:
         """Find the robot on the loaded map with no hint: kidnap recovery.
 
-        The opposite of ``swap_localizer_map``'s ``relocalize`` in the way that
-        matters: ``success`` is a *result*, not a receipt. The localizer
-        answers only once its global search has picked a pose *and* its own
-        timer has registered against a fresh scan from it, so a true here
-        means localized, with nothing left to poll. A false leaves
-        localization exactly as it was -- the candidate is withdrawn -- and
-        the response still carries the pose that did not converge, for
-        diagnosis; the router decides what to show of it.
+        Unlike ``relocalize``, ``success`` is a result: true means localized.
+        False leaves localization as it was; the response still carries the
+        pose that did not converge, for diagnosis.
 
-        The 30 s deadline is the localizer's two own deadlines (10 s search,
-        which includes building its KD-trees on the first call after a map
-        load, + 5 s convergence) with margin, so a slow answer is the
-        localizer's verdict rather than this side giving up first. It holds a
-        FastAPI worker thread for the duration, like every call here.
+        The 30 s deadline outlasts the localizer's own (10 s search + 5 s
+        convergence), so a slow answer is its verdict, not ours.
         """
         client = self._service_clients["auto_localize"]
         if not client.wait_for_service(timeout_sec=5.0):
@@ -357,26 +284,13 @@ class MapGateway:
     def reload_map(self, yaml_path: str) -> tuple[bool, str]:
         """Make the running map_server re-read a map and re-publish it.
 
-        ``loadMapCallback`` reads both the yaml and the .pgm off disk on every
-        call -- there is no caching -- then stamps a fresh header and publishes
-        onto the same transient_local publisher, which also replaces the retained
-        sample so late joiners get the edit too. On failure it returns before
-        publishing and leaves the previously loaded grid in place, so a rejected
-        reload cannot leave the stack without a map.
+        Re-reads yaml + pgm (no caching) and republishes on the transient_local
+        topic, so late joiners get the edit. A failed reload keeps the old grid.
 
-        map_server holds exactly one grid -- the one `[map] map` named at launch
-        -- so this call *is* the running map, for the localizer, both costmaps and
-        every stored vertex. That is why it was for a long time only ever called
-        for the active map: handing it another map's yaml on its own swaps the
-        grid out from under a localizer still registering against the old cloud.
-
-        `POST /api/v1/maps/{name}/activate` is the one caller that legitimately
-        passes a different map, because it does not do it on its own -- it pairs
-        this with `swap_localizer_map` and the INI write, so the grid, the point
-        cloud and `active_name()` move together. The pairing is the precondition,
-        not the map's identity: any future caller that reaches for this with a
-        non-active name and no matching localizer swap is the bug this paragraph
-        used to forbid outright.
+        map_server holds one grid: this call *is* the running map. Passing a
+        non-active map is only valid paired with `swap_localizer_map` and the
+        INI write, as activate does; alone it swaps the grid out from under the
+        localizer.
         """
         load_map_client = self._service_clients.get("load_map")
         if not load_map_client.wait_for_service(timeout_sec=5.0):
@@ -387,11 +301,8 @@ class MapGateway:
         self._logger.info("[MapGateway] Reloading map", map_url=map_url)
 
         future = load_map_client.call_async(LoadMap.Request(map_url=map_url))
-        # The handler is synchronous: yaml parse, a GraphicsMagick decode of a
-        # ~2.4 MB P5, a full pass building the OccupancyGrid, then a publish --
-        # comfortably under a second for the real maps at startup. 20s is ~20x
-        # headroom while still short enough that a wedged map_server does not
-        # hold a FastAPI worker thread for a minute.
+        # Under a second in practice; 20 s is headroom yet short enough that a
+        # wedged map_server does not hold a worker thread for long.
         if not _wait_for_future(future, timeout=20.0):
             return False, "Timeout waiting for map_server/load_map response"
 
@@ -406,30 +317,16 @@ class MapGateway:
     def reload_keepout(self, yaml_path: str) -> tuple[bool, str]:
         """Make ``filter_mask_server`` re-read a keepout mask and re-publish it.
 
-        The same ``LoadMap`` call as ``reload_map``, against the second
-        map_server instance the nav session runs for the planner's
-        KeepoutFilter. The mask topic is transient_local, so the re-published
-        grid both reaches the running filter -- which rebuilds its mask costmap
-        on arrival, no restart -- and replaces the retained sample for a
-        planner that comes up later.
+        The same ``LoadMap`` call as ``reload_map``, against the KeepoutFilter's
+        map_server. The transient_local topic reaches the running filter and
+        any later one.
 
-        Two things ``reload_map``'s docstring does not have to say:
+        - **A map switch does not move the mask along**: the old map's zones
+          stay in force, so activate calls this too.
+        - **Clearing zones is a reload, not a delete**: the caller writes an
+          all-unknown mask and reloads it.
 
-        - **A map switch does not move the mask along.** ``filter_mask_server``
-          holds whichever mask it was last handed, and the launch derives the
-          keepout path once at boot; ``map_server/load_map`` onto another map
-          leaves the *old* map's zones in force, in the old map's world
-          coordinates. ``POST /api/v1/maps/{name}/activate`` therefore calls
-          this too, with the new map's ``keepout.yaml``.
-        - **Clearing zones is a reload, not a delete.** Removing the files
-          changes nothing here; the caller writes an all-unknown mask and
-          reloads it.
-
-        "Not available" means the nav session is not up (mapping mode), or its
-        keepout pane is down -- since the workspace's 2026-09-30 change the
-        launch generates a blank mask for a map without one, so it is no longer
-        the normal state of a map that simply has no zones yet. The sentence
-        says where the zones will apply instead of pretending they are lost.
+        "Not available" means mapping mode or a down keepout pane.
         """
         client = self._service_clients.get("load_keepout")
         if not client.wait_for_service(timeout_sec=5.0):
@@ -444,7 +341,7 @@ class MapGateway:
         self._logger.info("[MapGateway] Reloading keepout mask", map_url=map_url)
 
         future = client.call_async(LoadMap.Request(map_url=map_url))
-        # Same handler, same file sizes as reload_map: 20 s is ample.
+        # Same as reload_map.
         if not _wait_for_future(future, timeout=20.0):
             return False, "Timeout waiting for filter_mask_server/load_map response"
 
@@ -460,9 +357,7 @@ class MapGateway:
 
         save_maps_client = self._service_clients.get("save_maps")
         if not save_maps_client.wait_for_service(timeout_sec=5.0):
-            # Name the mode: pgo runs only in the mapping (MANUAL) session, and
-            # a bare "service is not available" reads as a broken stack rather
-            # than the wrong one.
+            # Name the mode: pgo runs only in the MANUAL session.
             return False, (
                 "pgo/save_maps is not available — saving a map needs the robot "
                 "in MANUAL (mapping) mode."
@@ -484,35 +379,19 @@ class MapGateway:
     def reset_mapping(self, reset_lio: bool = True) -> tuple[bool, str]:
         """Discard the map built so far and start a new one, restarting nothing.
 
-        The counterpart to ``save_map``, and the other half of a mapping run's
-        lifecycle: pgo holds its keyframes in RAM, so this throws away whatever
-        has not been saved and there is no way back short of replaying a bag.
-        Saving first is the caller's decision, kept deliberately separate --
-        the common use is abandoning a run that went wrong in its first thirty
-        seconds, where an automatic save would only litter the catalogue.
+        Irreversible: pgo's unsaved keyframes are discarded. Saving first is
+        the caller's decision, kept separate on purpose.
 
-        ``reset_lio`` is True for every operator-facing call. False resets the
-        pose graph alone and leaves pointlio's odometry running, which is a
-        bag-replay affordance rather than something the console offers: the new
-        map's origin follows the odometry origin, so a graph-only reset starts
-        the map wherever the old run had drifted to.
+        ``reset_lio`` is True for every operator call; False (graph only) is
+        for bag replay, since the map's origin follows the odometry origin.
 
-        pgo owns the ordering -- pause, reset the front end, rebuild the graph,
-        then gate on the boundary timestamp it got back -- so this is one call
-        with one verdict and nothing here to sequence. A failure means the
-        pose graph was left exactly as it was; there is no partial reset.
-
-        The 30 s deadline, like the 20 s and 180 s ones above, is a budget
-        rather than a guess: up to ~1 s joining an in-flight map merge, pgo's
-        own 5 s cap on the pointlio round trip, and then freeing the keyframe
-        clouds -- hundreds of MB after a long run. Generous, still bounded, and
-        it holds a FastAPI worker thread for the duration.
+        pgo owns the sequencing; a failure leaves the pose graph untouched.
+        30 s covers an in-flight merge, pgo's 5 s pointlio cap and freeing
+        the keyframe clouds.
         """
         reset_client = self._service_clients.get("reset_mapping")
         if not reset_client.wait_for_service(timeout_sec=5.0):
-            # Named the same way save_maps names it, and for the same reason:
-            # both live only in the mapping session, so "missing" means the
-            # wrong mode far more often than a broken stack.
+            # Name the mode, as save_map does.
             return False, (
                 "pgo/reset_mapping is not available — starting a new map needs "
                 "the robot in MANUAL (mapping) mode."
@@ -527,9 +406,7 @@ class MapGateway:
 
         response = future.result()
         if response.success:
-            # The receipt that something was actually discarded. Zero means the
-            # run had banked no keyframes yet, which is a materially different
-            # outcome from resetting a twenty-minute drive.
+            # Zero means the run had banked no keyframes yet.
             self._logger.info(
                 "[MapGateway] Mapping run reset",
                 dropped_key_poses=response.dropped_key_poses,
@@ -540,26 +417,13 @@ class MapGateway:
     def start_mapping(self, reset_lio: bool = True) -> tuple[bool, str]:
         """Begin a mapping run: pgo from IDLE to MAPPING.
 
-        The opening bracket of a run, where ``save_map`` is the closing one
-        (2026-10): a mapping session comes up with pgo idle and banking
-        nothing, so until this is called the drive to the starting point is
-        not part of any map, and a successful save returns pgo to idle for the
-        next one. pgo runs the same sequence as a reset from the other
-        precondition -- pause, reset the LIO front end, fresh pose graph, gate
-        on the boundary timestamp -- and refuses while already mapping, so a
-        stale console tab cannot discard a run with the wrong button.
+        The opening bracket of a run; a successful ``save_map`` closes it.
+        pgo refuses while already mapping, so a stale tab cannot discard a run.
 
-        ``reset_lio`` is True for every operator-facing call, as for a reset
-        and for the same reason: the graph's origin is the odometry origin,
-        so only a LIO reset starts the map where the robot stands. The robot
-        must be stationary through pointlio's re-initialisation; pgo's
-        ``message`` says so and is rendered verbatim.
-
-        The deadline is the reset's: pgo's own 5 s cap on the pointlio round
-        trip plus margin, and nothing to free since an idle pgo holds no
-        keyframes. No ``Failure`` code: the srv carries none, prose is not
-        matched (gateways/failure.py), and the router pre-empts the one
-        discriminable refusal -- already mapping -- from the latched status.
+        ``reset_lio`` as for reset_mapping: only a LIO reset starts the map
+        where the robot stands, which must be stationary meanwhile (pgo's
+        ``message`` says so). No ``Failure`` code: the router pre-empts
+        "already mapping" from the latched status.
         """
         start_client = self._service_clients.get("start_mapping")
         if not start_client.wait_for_service(timeout_sec=5.0):

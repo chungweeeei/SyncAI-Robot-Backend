@@ -103,10 +103,7 @@ class ScheduleStateResponse(BaseModel):
     task_template_name: Optional[str] = Field(
         default=None, description="That template's name at registration time."
     )
-    # The element is StepRequest rather than a new response model: it is already
-    # exactly {id, type, params}, it is already imported here, and a second
-    # identical model is a copy that can drift. (StepState is the wrong shape --
-    # that one is status/error, not a definition.)
+    # StepRequest reused as the element: a second identical model could drift.
     steps: List[StepRequest] = Field(
         default_factory=list,
         description=(
@@ -181,11 +178,8 @@ def init_schedule_router(
     @schedule_router.get(
         "/api/v1/schedules/{id}",
         response_model=ScheduleStateResponse,
-        # The only route here that serialises Step objects outward, and FastAPI
-        # defaults this flag to True: everything under BaseSchema inherits the
-        # to_camel generator, so the default would answer `error_msg` as
-        # `errorMsg` while the request side accepts both spellings — a silent
-        # asymmetry at a boundary the frontend documents as snake_case-only.
+        # Load-bearing: BaseSchema's to_camel aliases would otherwise answer
+        # multi-word Step fields in camelCase; the frontend is snake_case-only.
         response_model_by_alias=False,
     )
     async def get_schedule(id: str):
@@ -215,11 +209,8 @@ def init_schedule_router(
     async def update_schedule(id: str, req: ScheduleUpdateRequest):
         """Change when an existing schedule fires, in place.
 
-        PATCH rather than PUT because the body names one facet of the resource
-        (the same partial-update shape as ``PATCH /api/v1/maps/{name}``); the
-        schedule keeps its id, its frozen steps, its provenance and its paused
-        state. The schedule id is a Temporal identity and cannot be renamed --
-        that is a delete and a create.
+        Id, frozen steps, provenance and paused state are kept; the id cannot
+        be renamed (that is a delete and a create).
         """
         await workflow_gw.update_schedule_trigger(
             schedule_id=id,

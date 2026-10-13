@@ -34,26 +34,17 @@ class ListVoicesResponse(BaseModel):
 def init_tts_router(logger: structlog.stdlib.BoundLogger, tts_gw: TtsGateway) -> APIRouter:
     tts_router = APIRouter(prefix="", tags=["TTS"])
 
-    # Plain (non-async) handlers, still: the work moved out of this process but
-    # the blocking did not. Every one of these is a synchronous HTTP call to the
-    # speech service — synthesis takes as long as it takes there (including the
-    # one-time model load on its first request) and /speak additionally waits
-    # out the utterance. Threadpool work, not event-loop work.
+    # Plain `def`: each is a blocking HTTP call to the speech service, and
+    # /speak also waits out the utterance.
 
     def _raise_for(message: str) -> None:
-        # Two caller-fixable failures; everything else (the speech service
-        # unreachable, its weights missing, a wedged speaker) is ours and
-        # answers 502. Keyed on the code the gateway tags the message with, not
-        # on the sentence: the SPEAK activity applies the same rule to decide
-        # retryability, and matching prose in two places is how the two drift
-        # apart on a reword.
+        # Two caller-fixable failures, keyed on the Failure code (shared with
+        # the SPEAK activity's retry rule), never the sentence; the rest 502.
         code = failure_code(message)
         if code is Failure.UNKNOWN_VOICE:
             raise BadRequestError(message)
         if code is Failure.TTS_QUEUE_FULL:
-            # 409 rather than 502: the robot is fine, there is just already a
-            # backlog of speech. The console's next step is to wait or to stop
-            # queueing, which is not the next step for a 502.
+            # 409, not 502: the robot is fine, there is a speech backlog.
             raise ConflictError(message, code=Failure.TTS_QUEUE_FULL.value)
         raise UpstreamError(message)
 
@@ -65,8 +56,7 @@ def init_tts_router(logger: structlog.stdlib.BoundLogger, tts_gw: TtsGateway) ->
             raise UpstreamError(message)
         return ListVoicesResponse(voices=voices)
 
-    # No response_model — the body is the WAV itself, so the OpenAPI schema is
-    # declared through `responses` instead.
+    # No response_model: the body is the WAV, declared via `responses`.
     @tts_router.post(
         "/api/v1/tts/synthesize",
         responses={200: {"content": {"audio/wav": {}}, "description": "The rendered WAV."}},

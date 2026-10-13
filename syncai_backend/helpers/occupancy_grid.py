@@ -1,9 +1,7 @@
 """Convert a nav_msgs/OccupancyGrid into a base64-encoded PNG.
 
-The numpy + OpenCV pipeline here is deliberately chosen over a lighter image
-library: the same numpy image can later be drawn on (cv2.circle / polylines /
-addWeighted) to composite laser / pose / path overlays server-side without
-swapping tooling.
+numpy + OpenCV rather than a lighter image library so overlays (laser, pose,
+path) can later be drawn on the same image server-side.
 """
 
 import base64
@@ -20,10 +18,8 @@ _UNKNOWN_GREY = 205
 def occupancy_grid_to_png(grid: OccupancyGrid) -> np.ndarray:
     """Render the grid as an upright single-channel greyscale image.
 
-    OccupancyGrid values map to greyscale as: free (0) -> 255, occupied (100)
-    -> 0, unknown (-1) -> 205, intermediate occupancy probabilities linearly in
-    between. The grid is stored row-major from the bottom-left origin, so the
-    image is flipped vertically to match the top-left origin of a .pgm / PNG.
+    Free (0) -> 255, occupied (100) -> 0, unknown (-1) -> 205, linear in
+    between; flipped vertically so row 0 is the top, as in a .pgm / PNG.
     """
     height = grid.info.height
     width = grid.info.width
@@ -34,7 +30,6 @@ def occupancy_grid_to_png(grid: OccupancyGrid) -> np.ndarray:
     known = data >= 0
     img[known] = np.round((100 - data[known]) * 255.0 / 100.0).astype(np.uint8)
 
-    # ROS row 0 is the bottom of the map; PNG row 0 is the top.
     return cv2.flip(img, 0)
 
 

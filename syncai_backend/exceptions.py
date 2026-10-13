@@ -9,11 +9,9 @@ class UnauthorizedError(Exception):
 class BadRequestError(Exception):
     """A request that cannot be carried out as written (HTTP 400).
 
-    ``code`` and ``step_id`` are optional and ride next to ``detail``, as
-    ConflictError's ``code`` does. ``step_id`` names the step of a task body
-    the refusal is about, so the console can mark that row instead of leaving
-    the operator to find it from the sentence -- including for a rule the
-    console does not mirror.
+    Optional ``code`` and ``step_id`` ride next to ``detail``. ``step_id``
+    names the task-body step the refusal is about, so the console can mark
+    that row.
     """
 
     def __init__(
@@ -30,12 +28,9 @@ class BadRequestError(Exception):
 class ConflictError(Exception):
     """A request that contradicts current state (HTTP 409).
 
-    ``code`` is an optional stable, machine-readable discriminator for callers
-    that must tell two 409s on the same route apart — the re-convert endpoint
-    raises both "a conversion is already running" and "this grid holds hand
-    edits", and the frontend confirms-and-retries only the latter. Matching on
-    the human-readable detail instead would couple the UI to prose that exists
-    to be reworded. Optional so every pre-existing raise stays valid.
+    ``code`` is an optional machine-readable discriminator for callers that
+    must tell two 409s on one route apart (e.g. re-convert: "conversion
+    running" vs "grid holds hand edits"), so the UI never matches on prose.
     """
 
     def __init__(self, message: str, code: "str | None" = None):
@@ -43,8 +38,6 @@ class ConflictError(Exception):
         self.code = code
 
 
-# Maps to 502 Bad Gateway. Named for what it means — a downstream dependency
-# (Temporal, a ROS service) failed us — not for the status family; the old
-# name, InternalServerError, read as "this maps to 500" and it never did.
+# 502: a downstream dependency (Temporal, a ROS service) failed.
 class UpstreamError(Exception):
     pass

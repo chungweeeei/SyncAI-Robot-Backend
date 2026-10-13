@@ -9,24 +9,16 @@ from nav_msgs.msg import Path
 from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 
 
-# Frame the planner's global costmap works in. Deliberately un-namespaced:
-# `global_frame` is the one frame parameter the nav launch files never rewrite
-# per robot (see syncai_planner/launch/planner_server.launch.py), because a
-# single shared map frame is the point of it.
+# The global costmap's frame. Deliberately un-namespaced (see
+# syncai_planner/launch/planner_server.launch.py).
 _MAP_FRAME = "map"
 
-# Upper bound on the points forwarded to the viewport. NavFn emits a pose per
-# costmap cell (0.05 m), so a 40 m route is ~800 poses and a warehouse crossing
-# more; at 512 the band the frontend draws is already smoother than the screen
-# can show, and the JSON stays around 8 kB.
+# Upper bound on points forwarded to the viewport (NavFn emits one per 0.05 m
+# cell); 512 already looks smooth and keeps the JSON ~8 kB.
 _MAX_PATH_POINTS = 512
 
-# Consecutive poses closer together than this (metres) are treated as the same
-# point. Zero-length segments are what the frontend's ribbon builder cannot
-# survive — it derives a surface normal from the tangent between neighbours, and
-# a duplicated point makes that normal NaN, which silently blanks the whole mesh.
-# Filtering here rather than there keeps the wire format free of samples no
-# consumer could use.
+# Consecutive poses closer than this (metres) are one point: a zero-length
+# segment makes the frontend ribbon's normal NaN and blanks the whole mesh.
 _MIN_POINT_SPACING_M = 1e-3
 
 
@@ -34,47 +26,26 @@ class PathSubscriber:
     """Feeds TelemetryRepo's path slot, and therefore the telemetry WebSocket,
     from the planner's ``plan`` topic.
 
-    Kept apart from TelemetrySubscriber even though it writes the same repo: that
-    one exists to carry pose and joints at the rate a gait actually moves at,
-    composing them through TF, whereas a global route arrives about once every
-    3 s, needs no transform (it is published in the map frame already) and wants
-    the opposite QoS. The only thing the two share is the socket they end up on.
+    Apart from TelemetrySubscriber: a route arrives ~every 3 s in the map frame
+    (no TF) and wants different QoS. Not the controller's
+    ``received_global_plan``, which is a pruned slice in base_link.
 
-    Not ``received_global_plan`` from the controller: that is the pruned slice of
-    the route left in front of the robot, transformed into ``<robot_id>/base_link``
-    and truncated to the local costmap. The viewport wants the whole remaining
-    route in map coordinates, which is exactly what ``plan`` is.
-
-    Two properties of the publisher shape what this can promise
-    (syncai_planner/src/planner_server.cpp):
-
-    1. ``publishPlan`` skips the publish entirely when nothing is subscribed, and
-       the QoS is VOLATILE, so there is no last-value replay. After a backend
-       restart mid-run the viewport has no route until the BT replans — up to
-       ~3 s of blank, which is why nothing here tries to synthesise one.
-    2. It publishes only on success. Arrival, cancellation and abort are all
-       indistinguishable silence, which is why clearing the route is TTL-based in
-       the repo rather than event-based here.
+    The publisher (syncai_planner/src/planner_server.cpp) is VOLATILE and
+    publishes only on success, so a restarted backend shows no route until the
+    next replan, and clearing the route is TTL-based in the repo.
     """
 
     def __init__(self, logger: structlog.stdlib.BoundLogger, telemetry_repo: TelemetryRepo):
         self._logger = logger
         self._repo = telemetry_repo
 
-        # Edge-triggered logging for the frame check below, same tri-state
-        # pattern as TelemetrySubscriber._tf_available: log once when paths start
-        # being dropped and once when they recover, not once per plan.
+        # Edge-triggered logging for the frame check (tri-state, as in
+        # TelemetrySubscriber._tf_available).
         self._frame_ok = None
 
     def register(self, node: Node):
-        # BEST_EFFORT, like every other subscriber here, even though the
-        # publisher is a RELIABLE rclcpp::QoS(1) -- a BEST_EFFORT request still
-        # matches a RELIABLE offer, so the topic connects and only the
-        # retransmission is given up. The cost is higher here than elsewhere:
-        # the other subscribers read 20 Hz feeds where the next sample is 50 ms
-        # away, while a plan arrives every ~3 s, so a dropped one leaves the
-        # operator looking at a route the robot has already left until the next
-        # BT replan.
+        # BEST_EFFORT still matches the RELIABLE publisher. Costlier here than on
+        # 20 Hz feeds: a dropped plan shows a stale route until the next replan.
         node.create_subscription(
             msg_type=Path,
             topic="plan",  # relative, so it inherits the robot_id namespace
@@ -90,11 +61,7 @@ class PathSubscriber:
     def _plan_cb(self, msg: Path):
         frame = msg.header.frame_id
         if frame != _MAP_FRAME:
-            # Dropped, not reprojected. Everything downstream — the wire format,
-            # the frontend's ground band, the map raster it is drawn on — treats
-            # these numbers as map metres, so plotting another frame's
-            # coordinates would draw a confidently wrong route rather than a
-            # slightly-off one.
+            # Dropped, not reprojected: everything downstream assumes map metres.
             if self._frame_ok is not False:
                 self._logger.warning(
                     "planned path dropping: unexpected frame (expected the "
@@ -111,10 +78,7 @@ class PathSubscriber:
 
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        # Defensive: the planner only publishes on success, so an empty plan is
-        # not something it produces today. Forwarding it as the clear sample
-        # costs nothing and means a future producer that does publish one gets
-        # the behaviour it would expect.
+        # Defensive (the planner never sends one today): an empty plan clears.
         if not msg.poses:
             self._repo.update_path(points=(), stamp=stamp)
             return
@@ -123,26 +87,19 @@ class PathSubscriber:
 
     def _thin(self, msg: Path) -> tuple:
         """Reduce a plan to at most _MAX_PATH_POINTS deduplicated (x, y) pairs."""
-        # Stride sampling rather than a distance- or curvature-aware simplifier:
-        # NavFn's output is already uniformly spaced along the route, so keeping
-        # every nth pose loses nothing a 0.12 m wide band on the floor could
-        # show, and it costs one pass.
+        # Stride sampling suffices: NavFn's output is uniformly spaced.
         stride = max(1, -(-len(msg.poses) // _MAX_PATH_POINTS))  # ceil division
 
         points = []
         for i in range(0, len(msg.poses), stride):
             p = msg.poses[i].pose.position
-            # Rounded to millimetres purely to keep the JSON small — three
-            # decimals is far finer than the costmap resolution the poses came
-            # from, so nothing is lost.
+            # Millimetres keep the JSON small; far finer than the costmap.
             xy = (round(p.x, 3), round(p.y, 3))
             if points and self._too_close(points[-1], xy):
                 continue
             points.append(xy)
 
-        # The goal end of the route is the one point whose exact position the
-        # operator is reading, and a stride that does not divide the length
-        # evenly is exactly what would drop it.
+        # Always keep the goal, which an uneven stride would drop.
         last = msg.poses[-1].pose.position
         goal = (round(last.x, 3), round(last.y, 3))
         if not points or not self._too_close(points[-1], goal):

@@ -1,18 +1,12 @@
 """pgo's run state (``pgo/mapping_status``) -> ``MappingStatusRepo``.
 
-A ~20 B typed message, RELIABLE + TRANSIENT_LOCAL depth 1, for the same
-reason the map-cloud notice is latched: a backend that (re)starts mid-session
-must learn whether a Start is needed without waiting for the next transition.
-The durability has to match pgo's publisher exactly -- a VOLATILE reader
-connects and gets nothing replayed. Relative topic, so the node's namespace
-(robot_id) scopes it. No dedicated callback group: it is as cheap as
-``robot_state``.
+RELIABLE + TRANSIENT_LOCAL depth 1, so a (re)started backend learns the state
+at once; durability must match pgo's publisher exactly (a VOLATILE reader gets
+nothing replayed). Cheap, so no dedicated callback group.
 
-The callback translates the message's ``uint8`` constants into the repo's
-enum so nothing above the subscriber imports a ROS type, and it never raises:
-an exception out of a callback would end the executor and the process, and an
-unknown state code (a pgo newer than this backend) is a warning that leaves
-the slot as it was.
+The callback maps the ``uint8`` codes to the repo's enum (no ROS types above
+here) and never raises, since that would end the executor and the process; an
+unknown code is a warning that leaves the slot as it was.
 """
 
 import structlog

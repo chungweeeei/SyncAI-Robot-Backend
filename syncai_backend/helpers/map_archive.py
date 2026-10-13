@@ -1,26 +1,19 @@
 """Checksummed ``.zip`` / ``.tar.gz`` archives of a map directory.
 
-The transport format for ``GET /api/v1/maps/{name}/export`` and
-``POST /api/v1/maps/import``: the files under ``map/<name>/`` stored relative to
-the map root, plus one manifest, ``syncai_map.json``, carrying an md5 for every
-file, the map's name and its vertices. The manifest is archive metadata — it is
-never written into the map directory and never lists itself — so a round trip
-leaves the directory byte-identical and a re-export has nothing to exclude.
+Used by ``GET /api/v1/maps/{name}/export`` and ``POST /api/v1/maps/import``:
+the files under ``map/<name>/`` relative to the map root, plus a manifest
+``syncai_map.json`` (an md5 per file, the map's name, its vertices). The
+manifest is never written into the map directory and never lists itself, so a
+round trip leaves the directory byte-identical.
 
-This module knows nothing about maps, ROS, repositories or FastAPI. It is "a
-directory archive with a manifest", and every refusal is a ``MapArchiveError``
-whose message is the sentence the operator reads; the router decides the status
-code, the same contract ``helpers/pgm.py`` has with its ``ValueError``.
+Map-, ROS- and FastAPI-agnostic. Every refusal is a ``MapArchiveError`` whose
+message is the operator's sentence; the router picks the status code.
 
-**Inspect, then extract.** ``inspect_archive`` validates every member's name and
-type and parses and cross-checks the manifest *without writing anything*, so an
-archive that was not produced by this API — or was altered since — is refused
-before a byte reaches the maps directory. ``extract_archive`` then streams only
-the files the manifest lists, hashing as it writes, and refuses on the first
-mismatch. Neither ever calls ``extractall``/``extract``: on Python 3.10 those
-honour absolute names, create links and apply modes and owners from the archive
-(``tarfile.data_filter`` only arrived in 3.12). ``ZipFile.open`` and
-``TarFile.extractfile`` hand back bytes and nothing else.
+**Inspect, then extract.** ``inspect_archive`` validates members and the
+manifest without writing anything; ``extract_archive`` streams only the listed
+files, hashing as it writes. Never use ``extractall``/``extract``: on Python
+3.10 they honour absolute names, links, modes and owners (``data_filter`` is
+3.12+).
 """
 
 import hashlib
@@ -42,11 +35,9 @@ MANIFEST_NAME = "syncai_map.json"
 MANIFEST_FORMAT = "syncai-map"
 MANIFEST_VERSION = 1
 
-# A zip of a million empty entries is a few kilobytes on the wire and a million
-# name checks here; a map directory has a few hundred patches at most.
+# A tiny zip can hold millions of empty entries; a map has a few hundred files.
 MAX_MEMBERS = 50_000
-# The manifest carries a few hundred vertices at most; anything larger is not
-# ours.
+# A real manifest is far smaller; anything larger is not ours.
 MAX_MANIFEST_BYTES = 16 << 20
 
 _CHUNK = 1 << 20
@@ -55,10 +46,7 @@ _VERTEX_NUMBERS = ("x", "y", "theta")
 
 
 class ArchiveFormat(str, Enum):
-    """The two containers an export comes in. ``str`` mixin, not ``StrEnum``:
-    the runtime is 3.10, and FastAPI needs the mixin to accept the value as a
-    query parameter.
-    """
+    """The two export containers. ``str`` mixin, not ``StrEnum`` (Python 3.10)."""
 
     ZIP = "zip"
     TAR_GZ = "tar.gz"
@@ -80,11 +68,9 @@ class MapArchiveError(ValueError):
 class ArchiveManifest:
     """What ``syncai_map.json`` says, after shape-checking.
 
-    ``files`` maps a posix relpath from the map root to the lowercase hex md5 of
-    that file's bytes. ``vertices`` are plain dicts of ``name``/``type``/``x``/
-    ``y``/``theta`` with the numbers already coerced to float; ``type`` is
-    passed through as a string because which types exist is the caller's
-    vocabulary, not this module's.
+    ``files`` maps posix relpath -> lowercase hex md5. ``vertices`` are dicts of
+    ``name``/``type``/``x``/``y``/``theta`` (numbers as float); ``type`` is an
+    unchecked string, the caller's vocabulary.
     """
 
     name: str
@@ -99,16 +85,13 @@ class InspectedArchive:
 
     format: ArchiveFormat
     manifest: ArchiveManifest
-    # Sum of the declared, uncompressed sizes of the files the manifest lists.
-    # Authoritative for both containers (a tar member's size delimits the
-    # stream; a ZipExtFile stops at file_size), so a caller can compare it with
-    # free disk before anything is written.
+    # Declared uncompressed size of the listed files; authoritative for both
+    # containers, so a caller can check free disk before writing.
     total_bytes: int
 
 
 def _md5():
-    # An integrity tag, not a signature: ``usedforsecurity=False`` is what keeps
-    # md5 constructible on a FIPS-mode kernel.
+    # Integrity tag, not a signature; ``usedforsecurity=False`` keeps it FIPS-safe.
     return hashlib.md5(usedforsecurity=False)
 
 
@@ -118,9 +101,8 @@ def _md5():
 def _collect_files(map_dir: str, exclude_dirs: Sequence[str]) -> List[Tuple[str, str]]:
     """Every regular file under ``map_dir`` as ``(relpath, abspath)``, sorted.
 
-    Symlinks are skipped (a link out of the map directory must not pull its
-    target into the archive), as are the top-level directories in
-    ``exclude_dirs`` and a stray manifest left over from somewhere.
+    Skips symlinks (so nothing outside the map is pulled in), top-level
+    ``exclude_dirs`` and a stray manifest.
     """
     root = os.path.realpath(map_dir)
     found: List[Tuple[str, str]] = []
@@ -175,8 +157,7 @@ def _manifest_bytes(
 class _HashingReader:
     """A ``read(n)`` wrapper that feeds a hash with everything it hands out.
 
-    ``TarFile.addfile`` pulls the member's bytes through ``read``, so wrapping
-    the source is how one pass over the file both hashes it and stores it.
+    Lets ``TarFile.addfile`` hash and store a file in one pass.
     """
 
     def __init__(self, source, digest):
@@ -199,17 +180,10 @@ def build_archive(
 ) -> bytes:
     """Archive ``map_dir`` with its manifest and return the bytes.
 
-    Each file is read once: hashed and written in the same pass, so the md5
-    recorded is of the bytes actually stored — a hash-then-add pair of reads
-    could record one generation of ``gridmap.pgm`` and store the next.
-
-    No top-level ``<name>/`` folder: the name is an import-time choice (the
-    import route takes ``?name=``), so a folder would carry a label the import
-    may override. The manifest carries it, and goes in **last**.
-
-    Members carry no owner and a fixed ``0o644`` (tar) or whatever the zip
-    writer defaults to; the import side never applies either, so none of it
-    matters beyond keeping the archive free of this machine's uids.
+    Each file is hashed and stored in one read, so the md5 matches the stored
+    bytes even if the file is rewritten meanwhile. No top-level ``<name>/``
+    folder (import may rename via ``?name=``); the manifest goes in last. Tar
+    members carry no owner, so the archive holds none of this machine's uids.
     """
     files = _collect_files(map_dir, exclude_dirs)
     hashes: Dict[str, str] = {}
@@ -254,8 +228,7 @@ def build_archive(
 def sniff_format(payload: bytes) -> ArchiveFormat:
     """Which container ``payload`` is, from its magic bytes.
 
-    A plain, uncompressed ``.tar`` is deliberately not accepted: nothing here
-    produces one, and the export's two formats are the import's two formats.
+    A plain ``.tar`` is refused: export never produces one.
     """
     if payload[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
         return ArchiveFormat.ZIP
@@ -311,13 +284,11 @@ class _Reader:
         if info.is_dir():
             kind = "dir"
         elif info.flag_bits & 0x1:
-            # Encrypted entries cannot be read without a password, and nothing
-            # here writes one.
+            # Encrypted entry.
             kind = "other"
         else:
-            # The high 16 bits of external_attr are the Unix mode when the
-            # archive was made on Unix; an MS-DOS/Windows writer leaves them 0,
-            # which has no file-type bits and means "an ordinary file" here.
+            # High 16 bits are the Unix mode; a Windows writer leaves them 0,
+            # which counts as an ordinary file.
             mode = info.external_attr >> 16
             kind = "file" if stat.S_IFMT(mode) == 0 or stat.S_ISREG(mode) else "other"
         return _Member(info.filename, kind, info.file_size, info)
@@ -345,14 +316,9 @@ class _Reader:
 def _check_member_name(raw: str) -> str:
     r"""The member's path relative to the map root, or raise.
 
-    Rejects everything that could land a write outside the destination or
-    hide one: empty names, NULs, backslashes (the zip spec mandates ``/``, and a
-    backslash would be a literal filename character on Linux that hides
-    ``..\\``), absolute paths, any ``.``/``..``/empty component, and names that
-    ``normpath`` would rewrite (``./a``, ``a//b``). Any depth of *relative*
-    subdirectory is fine — ``patches/`` today, whatever a later sidecar needs
-    tomorrow; an allowlist of directory names would make every addition to the
-    map directory an archive-format change.
+    Rejects empty names, NULs, backslashes (they could hide ``..\\``), absolute
+    paths, ``.``/``..``/empty components and non-normalised names. Any relative
+    depth is allowed, so new map sidecars need no archive-format change.
     """
     name = raw[:-1] if raw.endswith("/") else raw
     if not name or "\x00" in name or "\\" in name:
@@ -464,11 +430,9 @@ def _parse_manifest(raw: bytes) -> ArchiveManifest:
 def inspect_archive(payload: bytes) -> InspectedArchive:
     """Validate ``payload`` without writing anything; raise or describe it.
 
-    In order: the container is one we produce and opens; it has a sane number
-    of members; every member — directories included — has a safe relative
-    name; no member is a link, device or encrypted entry; exactly one manifest
-    sits at the root and parses; and the set of files in the archive is
-    *exactly* the set the manifest lists. Only the manifest's bytes are read.
+    Checks the container, member count, every member name, that all members
+    are plain files or dirs, one root manifest that parses, and that the
+    archive's files are exactly the manifest's. Reads only the manifest.
     """
     fmt = sniff_format(payload)
     with _Reader(payload, fmt) as reader:
@@ -526,11 +490,9 @@ def inspect_archive(payload: bytes) -> InspectedArchive:
 def extract_archive(payload: bytes, inspected: InspectedArchive, dest_dir: str) -> int:
     """Write the manifest's files under ``dest_dir``; return the bytes written.
 
-    ``dest_dir`` is expected to be a fresh, empty directory the caller owns (a
-    staging directory it will rename or remove). Every file is hashed as it is
-    written and compared with the manifest; the first mismatch raises, leaving
-    whatever landed for the caller to remove. Modes, mtimes and owners from the
-    archive are never applied — the files are created with the process umask.
+    ``dest_dir`` is a fresh staging directory the caller owns and cleans up.
+    The first md5 mismatch raises. Archive modes, mtimes and owners are never
+    applied.
     """
     root = os.path.realpath(dest_dir)
     written = 0
@@ -546,8 +508,7 @@ def extract_archive(payload: bytes, inspected: InspectedArchive, dest_dir: str) 
                 raise MapArchiveError(f"{rel!r} is listed in the manifest but not in the archive.")
 
             target = os.path.realpath(os.path.join(root, rel))
-            # Belt and braces over _check_member_name: a write must land
-            # strictly inside the destination.
+            # Belt and braces over _check_member_name.
             if os.path.commonpath([root, target]) != root or target == root:
                 raise MapArchiveError(f"Archive member {rel!r} escapes the destination.")
             os.makedirs(os.path.dirname(target), exist_ok=True)

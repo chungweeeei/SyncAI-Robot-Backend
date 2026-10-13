@@ -19,9 +19,8 @@ from syncai_backend.repositories.recording.catalog import (
 )
 
 
-# What a caller may ask for at once. Not a resource limit -- rosbag2 handles far
-# more -- but a boundary guard, so a malformed body cannot turn into a several-
-# thousand-element argv.
+# A boundary guard, not a resource limit: a malformed body must not become a
+# huge argv.
 _MAX_TOPICS = 64
 
 
@@ -29,15 +28,9 @@ class RecordingStatus(str, Enum):
     """How a recording on disk ended.
 
     ``recording`` is the live one, ``ok`` a bag with a metadata.yaml, and
-    ``interrupted`` a directory with neither -- which means the recorder died
-    without flushing: the backend pane was killed, a `switch_mode` tore down the
-    byobu session, or the process crashed. Such a bag still holds its messages
-    and `ros2 bag reindex <dir>` rebuilds the metadata.
-
-    Only two of the three are stored: ``interrupted`` is derived from a
-    directory with no metadata and no process behind it, the same way the map
-    catalogue derives its own ``interrupted`` from a sidecar with no conversion
-    thread behind it.
+    ``interrupted`` (derived, not stored) a directory with neither: the recorder
+    died without flushing. Its messages survive; `ros2 bag reindex <dir>`
+    rebuilds the metadata.
     """
 
     RECORDING = "recording"
@@ -132,10 +125,7 @@ class ListRecordingsResponse(BaseModel):
 def _summary(stored: StoredRecording, active_name: Optional[str]) -> RecordingSummary:
     """Project one directory, reconciling disk state with the live slot.
 
-    The reconciliation is the whole point, and it is the same split as the map
-    catalogue's: the bag metadata is what survives this process, the gateway's
-    slot is what is true only while it is up, and neither alone can tell a
-    recording in progress from one whose process is gone.
+    Neither alone tells a recording in progress from one whose process is gone.
     """
     if stored.name == active_name:
         status = RecordingStatus.RECORDING
@@ -164,12 +154,8 @@ def init_recording_router(
 ) -> APIRouter:
     recording_router = APIRouter(prefix="", tags=["Recording"])
 
-    # Plain (non-async) handlers: starting a recorder blocks for the liveness
-    # probe, stopping one blocks until the child has flushed its metadata (about
-    # a minute with a full split left to compress, ~5 min at most), and listing
-    # walks every bag directory. All three are threadpool
-    # work; an async handler would stall the telemetry, point-cloud and teleop
-    # WebSockets for the duration.
+    # Plain `def`: start blocks for the liveness probe, stop until the child
+    # flushes (up to ~5 min), and listing walks every bag directory.
 
     @recording_router.post(
         "/api/v1/recordings", status_code=201, response_model=ActiveRecordingResponse
@@ -177,15 +163,10 @@ def init_recording_router(
     def start_recording(request: StartRecordingRequest):
         """Start recording ROS topics into record/<name>/.
 
-        Answers with the recording as it stands one heartbeat in, not with a
-        promise: the response is written after the child has survived its
-        liveness probe, so a 201 here means a recorder is running.
-
-        Every refusal happens before anything is spawned. Two of them are 409s a
-        client must tell apart by ``code``: ``recording_running`` means stop the
-        current one first (its name is in the message), ``name_taken`` means
-        pick another name — rosbag2 will not write into an existing directory,
-        and silently appending to somebody else's bag would be worse if it did.
+        A 201 means the child survived its liveness probe. Every refusal comes
+        before anything is spawned: 409 ``recording_running`` (stop the current
+        one first) or ``name_taken`` (rosbag2 will not write into an existing
+        directory).
         """
         name = (request.name or "").strip() or _default_name()
         if name in RESERVED_NAMES:
@@ -205,13 +186,8 @@ def init_recording_router(
         if len(topics) > _MAX_TOPICS:
             raise BadRequestError(f"Too many topics (> {_MAX_TOPICS}).")
 
-        # Asked before the name collision, and only so the operator reads the
-        # more actionable of two simultaneously-true refusals: while something
-        # is recording, nothing can start whatever it is called, so "stop the
-        # current one" beats "pick another name". This is not the check that
-        # enforces one-at-a-time -- that one is the slot claimed under the
-        # gateway's lock below, and it stays authoritative; losing the race here
-        # costs a less helpful sentence, nothing more.
+        # Before the name check only for the more actionable sentence; the
+        # authoritative one-at-a-time check is the gateway's slot under its lock.
         live = recording_gw.active_name()
         if live is not None:
             raise ConflictError(
@@ -220,8 +196,7 @@ def init_recording_router(
                 code="recording_running",
             )
 
-        # resolve_dir is what validates the name against the filesystem-safety
-        # pattern; calling it through exists() does both in one step.
+        # exists() also validates the name (via resolve_dir).
         if recording_catalog_repo.exists(name):
             raise ConflictError(
                 f"A recording named '{name}' already exists.", code="name_taken"
@@ -243,16 +218,9 @@ def init_recording_router(
     def active_recording():
         """What is being recorded right now, or `null`.
 
-        A route of its own rather than "find the entry with status `recording`
-        in the catalogue", which is a mild departure from the map router's rule
-        that the catalogue is the only status surface. The reason is cost: a
-        console polling this once a second would otherwise walk every bag
-        directory on the robot to learn the size of one of them. Nothing is
-        *only* knowable here — the listing reports the live recording too.
-
-        Also where a recorder that died on its own is noticed: the slot is
-        reaped on every read, so a crashed recording stops reading as active
-        without anyone having to call stop.
+        Its own route so a per-second poll does not walk every bag directory.
+        The slot is reaped on every read, so a crashed recorder stops reading
+        as active without a stop.
         """
         status = recording_gw.status()
         return ActiveRecordingResponse(**status) if status is not None else None
@@ -263,10 +231,8 @@ def init_recording_router(
     def stop_recording():
         """Stop the live recorder and wait for the bag to be closed.
 
-        Blocks until the child is gone, because the one thing the caller wants
-        to know — is this bag playable — is not knowable before that. The answer
-        is in ``complete``: false means the recorder had to be killed and the
-        bag needs `ros2 bag reindex`, not that the data is lost.
+        ``complete`` false means the recorder was killed and the bag needs
+        `ros2 bag reindex`, not that data is lost. 409 ``not_recording``.
         """
         success, message, payload = recording_gw.stop()
         if not success:
@@ -286,9 +252,7 @@ def init_recording_router(
     def list_recordings():
         """Every bag under record/, newest first.
 
-        The live slot is sampled **once**, before the projection, so the listing
-        cannot report two states of the same recording either side of a stop
-        that lands mid-scan.
+        The live slot is sampled once, so a stop mid-scan cannot show two states.
         """
         active_name = recording_gw.active_name()
         return ListRecordingsResponse(
@@ -304,9 +268,8 @@ def init_recording_router(
     def delete_recording(name: str):
         """Delete record/<name>/ and everything under it. There is no undo.
 
-        Refused for the recording being written — an rmtree under a live sqlite
-        writer leaves the recorder happily writing into an unlinked file, so the
-        operator stops it first and then decides.
+        409 ``recording_active`` for the live one: the recorder would keep
+        writing into an unlinked file.
         """
         if recording_gw.active_name() == name:
             raise ConflictError(
@@ -323,27 +286,15 @@ def init_recording_router(
 
 
 def _default_name() -> str:
-    """A UTC timestamp, in the shape of the bags already on these robots.
-
-    UTC rather than local time, because it is what every other timestamp this
-    backend emits uses and a name that sorts is worth more here than one that
-    matches the operator's wall clock.
-    """
+    """A UTC timestamp, like every other timestamp this backend emits."""
     return datetime.now(timezone.utc).strftime("rec_%Y%m%d_%H%M%S")
 
 
 def _raise_for_start(message: str, payload: dict) -> None:
     """Map the gateway's failure onto a status code.
 
-    Keyed on the code the gateway tags the message with, the tts and webrtc
-    routers' pattern: the contract is a (success, message, payload) tuple and
-    the set of failures the caller can act on differently is two. Everything
-    else — no `ros2` on PATH, a spawn that failed, a recorder that exited on its
-    own arguments — is this robot's fault and answers 502 with the gateway's own
+    The two tagged failures are 409s; everything else is 502 with the gateway's
     sentence.
-
-    The wire values are unchanged; Failure's members carry the same strings this
-    published as `code` before they had a name.
     """
     code = failure_code(message)
     if code is Failure.RECORDING_RUNNING:

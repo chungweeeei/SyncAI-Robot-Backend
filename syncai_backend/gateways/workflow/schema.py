@@ -18,23 +18,17 @@ class BaseSchema(BaseModel):
 class StepStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
-    # The run is holding at this step (POST /api/v1/tasks/{id}/pause): either
-    # the step was interrupted (a MOVE, whose goal is cancelled and re-sent on
-    # resume) or it has not started yet because the hold landed before it. At
-    # most one step carries it at a time, and the gateway reads the task-level
-    # PAUSED off it, so the console's poll stays one query.
+    # Holding here (POST /api/v1/tasks/{id}/pause): interrupted (a MOVE, re-sent on
+    # resume) or not yet started. At most one step at a time; the gateway derives the
+    # task-level PAUSED from it.
     PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
 
 
-# ARTIFACT (conveyor pickup/drop via the artifact backend's REST API) was a
-# member here until 2026-08: the whole integration — gateways/artifact,
-# execute_artifact, ArtifactParams and its command union — was removed when the
-# conveyor work was shelved, deliberately rather than left to rot. Old saved
-# tasks / frozen schedules that still carry an ARTIFACT step fail Step
-# validation now; purge them before deploying a build without it.
+# ARTIFACT was removed 2026-08; stored tasks / frozen schedules still carrying one
+# fail validation, so purge them before deploying.
 class StepType(str, Enum):
     MOVE = "MOVE"
     STANDUP = "STANDUP"
@@ -59,12 +53,8 @@ class MoveParams(BaseSchema):
     )
 
 
-# Field constraints mirror the REST router's SynthesizeRequest
-# (routers/tts.py): a SPEAK step and a manual POST /api/v1/tts/speak drive the
-# same TtsGateway, so what one accepts the other must too. All single-word
-# field names, so BaseSchema's camelCase aliasing is a no-op here — same
-# property MoveParams relies on (see the task_template router's serialisation
-# note).
+# Constraints mirror routers/tts.py's SynthesizeRequest: both drive the same
+# TtsGateway. Single-word field names, so camelCase aliasing is a no-op here.
 SPEAK_REPEAT_MAX = 10
 
 
@@ -83,9 +73,8 @@ class SpeakParams(BaseSchema):
     speed: float = Field(
         1.0, ge=0.5, le=2.0, description="Playback rate multiplier (0.5–2.0)."
     )
-    # Bounded so a slip (100 for 10) cannot keep the robot talking for an
-    # hour. The workflow scales SPEAK's start_to_close by it, so the bound is
-    # also what keeps that timeout finite.
+    # Bounded against a slip; the workflow scales SPEAK's start_to_close by it, so it
+    # also keeps that timeout finite.
     repeat: int = Field(
         1,
         ge=1,
@@ -97,10 +86,8 @@ class SpeakParams(BaseSchema):
     )
 
 
-# A WAIT step is a durable Temporal timer in the workflow, not an activity
-# (see RobotWorkflow._run_wait), so the bound is not an activity timeout: it is
-# there so a typo in the console (3600 typed as minutes) cannot park the robot
-# for days while /tasks answers 409 task_running to everything else.
+# WAIT is a workflow timer (RobotWorkflow._run_wait); the bound only stops a typo
+# from parking the robot for days while /tasks answers 409 task_running.
 class WaitParams(BaseSchema):
     seconds: float = Field(
         ...,
@@ -111,20 +98,13 @@ class WaitParams(BaseSchema):
     )
 
 
-# Re-widened when SPEAK arrived (it was a single-member alias after the
-# ARTIFACT removal), and again for WAIT. Pydantic's smart union tells the
-# members apart by their required fields — MoveParams needs x/y/theta,
-# SpeakParams needs text, WaitParams needs seconds, with no overlap — so no
-# discriminator field is necessary.
+# Pydantic's smart union tells the members apart by their disjoint required fields,
+# so no discriminator is needed.
 StepParams = MoveParams | SpeakParams | WaitParams
 
 
-# Which params model each step type expects; None means the step takes no
-# params at all (STANDUP/LIEDOWN are a single motion key, there is nothing to
-# parameterise). The table survives StepParams collapsing to one model:
-# without it a MOVE step with no body at all -- params is optional -- would
-# validate fine here and only blow up inside the activity, long after the REST
-# call was answered with 200.
+# Which params model each step type expects (None: takes none). Without it a MOVE
+# with no params would validate and only fail inside the activity, after a 200.
 STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.MOVE: MoveParams,
     StepType.STANDUP: None,
@@ -134,24 +114,20 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
 }
 
 
-# The steps that drive the robot's body, and so run on the one-slot body queue
-# (see config.TASK_QUEUE_SUFFIX). Two of them in one group would each wait for
-# the slot the other holds, and the group would run them one after the other
-# anyway -- so a group may hold at most one.
+# Steps on the one-slot body queue (config.TASK_QUEUE_SUFFIX). Two in one group would
+# just run one after the other, so a group may hold at most one.
 BODY_STEP_TYPES = frozenset({StepType.MOVE, StepType.STANDUP, StepType.LIEDOWN})
 
 
-# The ``code`` of every refusal step_group_problem makes. One code for both
-# rules: what a client does with it is mark ``step_id``, and that is the same
-# whichever rule the step broke.
+# The one ``code`` for both step_group_problem rules: a client just marks ``step_id``.
 INVALID_STEP_GROUP = "invalid_step_group"
 
 
 class StepGroupProblem(str):
     """step_group_problem's sentence, carrying the step it is about.
 
-    A ``str`` so every caller that raises it as a message keeps working; the
-    routers also read ``step_id`` into the 400 (see BadRequestError).
+    A ``str`` so callers raising it as a message keep working; routers also read
+    ``step_id`` into the 400. Raise it with ``refusal()``.
     """
 
     code = INVALID_STEP_GROUP
@@ -169,15 +145,11 @@ class StepGroupProblem(str):
 def step_group_problem(steps) -> Optional[StepGroupProblem]:
     """Why ``steps``' groups cannot run, as a sentence; None when they can.
 
-    The sentence names the step that breaks the rule as ``step_id``: the one
-    that rejoins a closed group, or the second MOVE/STANDUP/LIEDOWN of one.
-
-    A group is a run of *adjacent* steps carrying the same ``group``, started
-    together and waited out together (RobotWorkflow._run_group). Adjacent,
-    because a group is a place in the sequence: the same name turning up again
-    after another step would be a second group the operator thinks is the
-    first. Duck-typed on ``.id`` / ``.type`` / ``.group`` so the request
-    models and Step share it.
+    ``step_id`` names the step that rejoins a closed group, or the second
+    MOVE/STANDUP/LIEDOWN of one. A group must be *adjacent* steps (RobotWorkflow.
+    _run_group): the same name after another step would be a second group the
+    operator takes for the first. Duck-typed on ``.id`` / ``.type`` / ``.group``
+    so the request models and Step share it.
     """
     closed: set[str] = set()
     current: Optional[str] = None
@@ -267,8 +239,7 @@ class Step(BaseSchema):
 class WorkflowTaskDefinition(BaseSchema):
     steps: List[Step] = Field(..., description="Ordered list of steps to execute")
 
-    # The routers answer a bad grouping with a 400 before building this; the
-    # check here is what keeps a run from ever starting with one.
+    # The routers answer 400 first; this keeps a run from ever starting with one.
     @model_validator(mode="after")
     def _check_groups(self) -> "WorkflowTaskDefinition":
         problem = step_group_problem(self.steps)
@@ -293,12 +264,8 @@ class TaskState(BaseSchema):
 class TaskSource(str, Enum):
     """Who started a running task.
 
-    DIRECT, not OPERATOR: `POST /api/v1/tasks` is a plain REST route and the
-    console is not its only caller (curl and any external bridge dispatch the
-    same way), so "an operator did this" would be a claim the backend cannot
-    make. All it can tell apart is "someone called the endpoint" from "a
-    Temporal schedule fired", and the latter only because the schedule
-    machinery stamps its own search attribute on the run.
+    DIRECT, not OPERATOR: `POST /api/v1/tasks` has callers besides the console, so
+    the backend can only tell "the endpoint was called" from "a schedule fired".
     """
 
     DIRECT = "DIRECT"
@@ -308,11 +275,8 @@ class TaskSource(str, Enum):
 class TaskKind(str, Enum):
     """How a run was started, as the console mints it into the task id.
 
-    Lowercase on purpose, unlike every other enum here: these are literally
-    the second segment of ``<robot_id>-<kind>-<ts>-<seq>``, and the words the
-    history dashboard filters and counts by. SCHEDULE is the backend's own: it
-    is stamped on every run a schedule starts, and a direct POST may not claim
-    it (``TaskRequest`` refuses it at the boundary).
+    Lowercase: these are literally the ``<kind>`` in ``<robot_id>-<kind>-<ts>-<seq>``.
+    SCHEDULE is stamped by the backend; ``TaskRequest`` refuses it from a direct POST.
     """
 
     GOAL = "goal"
@@ -325,36 +289,28 @@ class TaskKind(str, Enum):
 class TaskProvenance(BaseSchema):
     """What a run carries about its origin beyond the id Temporal keeps.
 
-    Written to the run as custom search attributes (``TaskKind`` /
-    ``TaskName``, see gateways/workflow/search_attributes.py) rather than
-    the memo, because the history has to *filter and count* on them, and a
-    memo cannot be queried. Both optional: the MCP server and curl keep
-    dispatching with neither, and such a run is simply unlabelled.
+    Stamped as search attributes (search_attributes.py) so history can filter and
+    count on them. Both optional: a run dispatched with neither is unlabelled.
     """
 
     kind: Optional[TaskKind] = Field(default=None)
     # TaskTemplate.name is String(255); the bound keeps the attribute in step.
     name: Optional[str] = Field(default=None, max_length=255)
-    # The map the run's MOVE coordinates are in, stamped as ``TaskMap``. Set
-    # by the task router from the map that is loaded at dispatch -- never
-    # taken from the caller, whose own idea of the map is only checked
-    # against it -- and None for a run with no MOVE step, which needs no map.
+    # Stamped as ``TaskMap``: the map loaded at dispatch, set by the task router,
+    # never taken from the caller. None for a run with no MOVE.
     map_name: Optional[str] = Field(default=None)
 
 
-# The kinds that never drive anywhere, so never hold a map. Used only to read
-# a run that predates ``TaskMap``: see ActiveTask.map_in_use.
+# Kinds that never drive, so hold no map; only for runs predating ``TaskMap``.
 POSTURE_KINDS = frozenset({TaskKind.STANDUP, TaskKind.LIEDOWN})
 
 
 class ActiveTask(BaseSchema):
-    """One execution that is running on this robot's task queue right now.
+    """One execution running on this robot's task queue right now.
 
-    Deliberately identity and provenance only -- no step list. The point of this
-    shape is that it comes from a single visibility query with no per-task
-    follow-up, which is what makes it cheap enough for the whole console to poll
-    (see ACTIVE_TASK_CACHE_TTL_S). Per-step detail already has an endpoint:
-    GET /api/v1/tasks/{id}, and `id` here is exactly the id it takes.
+    Identity and provenance only, no steps: it comes from one visibility query, cheap
+    enough for the console to poll (ACTIVE_TASK_CACHE_TTL_S). Steps are at
+    GET /api/v1/tasks/{id}.
     """
 
     id: str = Field(..., description="Workflow id, i.e. the task id")
@@ -390,14 +346,10 @@ class ActiveTask(BaseSchema):
     def map_in_use(self, active_map: Optional[str]) -> Optional[str]:
         """The map this run holds while it runs, or None if it holds none.
 
-        The attribute when the run carries one. A run without it either drives
-        nowhere -- a posture dispatch -- or predates ``TaskMap`` (a schedule
-        registered before it, or a run started by an older backend), and the
-        second kind is answered with the map loaded *now*. That is not a guess:
-        a run can only drive on the loaded map, and activate refuses to switch
-        while anything runs, so the map it started on is still the loaded one.
-        It over-claims for a map-less job of another kind (a SPEAK-only task),
-        which costs an edit that waits for the job, never an edit under one.
+        The attribute when present. Otherwise a posture run holds none, and any other
+        run predates ``TaskMap`` and holds the map loaded *now*: activate refuses to
+        switch while anything runs, so that is the one it started on. Over-claims for
+        a map-less job (SPEAK-only), which only makes an edit wait.
         """
         if self.map_name:
             return self.map_name
@@ -407,11 +359,10 @@ class ActiveTask(BaseSchema):
 
 
 class TaskHistoryEntry(BaseSchema):
-    """One execution on this robot's task queue that has finished.
+    """One finished execution on this robot's task queue.
 
-    The same single-visibility-query shape as ActiveTask, plus when it closed.
-    No step list for the same reason: GET /api/v1/tasks/{id} answers that for a
-    closed run too, as long as retention still has it.
+    ActiveTask's shape plus close time; steps via GET /api/v1/tasks/{id} while
+    retention has it.
     """
 
     id: str = Field(..., description="Workflow id, i.e. the task id")
@@ -440,11 +391,8 @@ class TaskHistoryEntry(BaseSchema):
 
 
 class TaskHistoryStats(BaseSchema):
-    """The finished runs matching a history filter, counted rather than listed.
-
-    Counted by Temporal (``count_workflows``), so the numbers are exact for
-    the whole retention window however many pages the list would take.
-    """
+    """Finished runs matching a history filter, counted by ``count_workflows``:
+    exact for the whole retention window."""
 
     as_of: datetime = Field(..., description="When the counts were taken (UTC)")
     total: int
@@ -481,12 +429,8 @@ class ScheduleTask(BaseSchema):
         ..., description="Task definition executed on each trigger"
     )
 
-    # Provenance, stashed in the schedule memo rather than anywhere Temporal
-    # interprets (see _schedule_to_memo). Unlike the start-workflow args the
-    # memo IS readable on the *list* path -- which is what lets the collection
-    # endpoint flag a schedule whose map is no longer the active one without an
-    # extra describe per row. The trigger is NOT memo material: a schedule memo
-    # cannot be rewritten by an update, and the trigger can.
+    # Provenance, in the schedule memo (_schedule_to_memo), which the list path can
+    # read. The trigger is not memo material: an update cannot rewrite a memo.
     map_name: Optional[str] = Field(
         default=None,
         description="Map whose frame this schedule's MOVE coordinates are in.",

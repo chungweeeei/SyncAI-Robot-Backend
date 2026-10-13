@@ -1,21 +1,11 @@
 """Read and write the per-robot system INI.
 
-``config/system.ini`` is the workspace's identity file: every launch file reads
-``[system] robot_id`` from it, and docker-compose bind-mounts
-``config/instances/robotNN.ini`` over it inside the container. ``[map]`` in that
-same file is what decides which map the stack loads.
+``config/system.ini`` carries ``[system] robot_id`` (read by every launch file)
+and ``[map]`` (which map the stack loads); docker-compose bind-mounts
+``config/instances/robotNN.ini`` over it.
 
-``gateways/artifact/artifact.py`` used to carry its own copy of the path
-constant and its own ``configparser`` read; it went away with the artifact
-integration (2026-08), leaving this module the only INI reader. If a second
-reader ever appears, consolidate it here rather than pasting again.
-
-This module was read-only by design until the maps library grew a Switch-map
-control: `set_active_map` is the writer that pairs with it, and it is
-deliberately the *only* one. Both halves of "which map is the robot on" now live
-here -- read by `active_map_name`, moved by `set_active_map` -- because they have
-to agree about the interpolation in ``[map]``, and a second writer elsewhere
-would be free not to.
+This is the only INI reader and `set_active_map` the only writer; keep it that
+way, since reader and writer must agree about the interpolation in ``[map]``.
 """
 
 import configparser
@@ -26,23 +16,15 @@ from typing import Optional
 
 import structlog
 
-# Absolute path so the INI resolves no matter what cwd the process is started
-# from. ~/robot_ws is the workspace inside the robot container.
+# Absolute: entrypoints do not reliably run from the workspace root.
 DEFAULT_SYSTEM_INI = os.path.expanduser("~/robot_ws/config/system.ini")
 
 SYSTEM_INI_ENV = "SYNCAI_SYSTEM_INI"
 
-# Serialises every read and write of the INI within this process. The reason is
-# the in-place rewrite in `set_active_map` (see there for why it cannot be a
-# temp-file-and-rename): for the width of that rewrite the file is truncated
-# or half-written, and `active_map_name` reading it in that window answers
-# None -- which the map router's rename and delete routes take as "this map is
-# not active", and let a destructive operation through on the very map
-# map_server has open. Two operators and a few milliseconds, but rmtree is
-# what is on the other side of that guard. An RLock rather than a Lock so a
-# writer that re-reads to verify (which set_active_map does) does not deadlock
-# on itself. Process-local: a second process rewriting this file would need
-# its own coordination.
+# Serialises INI reads and writes in this process. `set_active_map` rewrites in
+# place, and a read of the half-written file answers None, which the rename and
+# delete routes take as "not active" -- letting rmtree through on the loaded
+# map. RLock so the writer's verifying re-read does not deadlock. Process-local.
 _INI_LOCK = threading.RLock()
 
 
@@ -53,18 +35,11 @@ def system_ini_path() -> str:
 def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
     """Return the bare name of the map the stack was launched with, or None.
 
-    Read from the INI rather than from the cached ``RobotState``, even though
-    ``RobotState.map`` carries the same value: ``RobotStateSubscriber`` only
-    caches samples whose localization is valid, so that field is unavailable
-    until relocalization has run, and a freshly booted robot would then report
-    none of its maps as active.
-
-    ``[map] name`` is the canonical key. Older instance files only set the
-    derived paths, so fall back to the parent directory of ``[map] map``
-    (``map/dp2f/gridmap.yaml`` -> ``dp2f``).
-
-    Never raises. A robot with no INI, or one whose INI has no ``[map]``, must
-    still be able to list the maps sitting on its disk.
+    From the INI, not ``RobotState.map``: the cached state is only kept once
+    localization is valid, so a freshly booted robot would report no active map.
+    Falls back to the parent directory of ``[map] map``
+    (``map/dp2f/gridmap.yaml`` -> ``dp2f``) for older files without ``name``.
+    Never raises, so a robot without a usable INI can still list its maps.
     """
     path = system_ini_path()
     config = configparser.ConfigParser()
@@ -92,14 +67,9 @@ def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
     return None
 
 
-# The keys `set_active_map` rewrites, by section. `[map] name` is the switch
-# itself; the `[initial_pose]` reset is what stops a pose measured in the old
-# map's frame from being applied as a seed in the new one.
-#
-# syncai_localizer's localizer.launch.py: its read_initial_pose() reads x/y/yaw
-# with fallback=0.0 per key, so a key this does not find is already the value
-# being written. z is here because the section carries it even though the
-# launch ignores it.
+# The keys `set_active_map` rewrites. `[initial_pose]` is zeroed so a pose from
+# the old map's frame is not seeded into the new one; localizer.launch.py reads
+# each key with fallback=0.0, so a missing key needs no write. z is unused by it.
 _MAP_SECTION = "map"
 _MAP_NAME_KEY = "name"
 _INITIAL_POSE_SECTION = "initial_pose"
@@ -107,8 +77,7 @@ _INITIAL_POSE_RESET = {"x": "0.0", "y": "0.0", "z": "0.0", "yaw": "0.0"}
 
 _SECTION_RE = re.compile(r"^\s*\[(?P<name>[^]]+)\]\s*$")
 
-# Splits `  name: dp2f  ` into indent / key / separator / value / trailing, so a
-# rewrite can replace the value and put every other byte of the line back.
+# indent / key / separator / value / trailing, so only the value changes.
 _KEY_RE = re.compile(
     r"^(?P<indent>\s*)(?P<key>[^\s:=#;][^:=]*?)(?P<sep>\s*[:=]\s*)"
     r"(?P<value>.*?)(?P<trail>\s*)$"
@@ -118,39 +87,18 @@ _KEY_RE = re.compile(
 def set_active_map(name: str, logger: structlog.stdlib.BoundLogger) -> str:
     """Point the INI at ``name`` and zero ``[initial_pose]``. Returns the path.
 
-    The counterpart to `active_map_name`, and the only thing in the backend that
-    writes this file. It exists because `POST /api/v1/maps/{name}/activate` swaps
-    the running localizer and map_server in place: without the INI write the swap
-    would not survive a stack restart, and `active_map_name` would go on naming
-    the old map to every caller that asks which one is active.
+    Makes ``POST /api/v1/maps/{name}/activate`` survive a stack restart.
 
-    Two things here look like mistakes and are not.
+    **Rewritten in place, never temp file + rename.** The INI is a single-file
+    bind mount; a rename gives it a new inode the container never sees. A torn
+    write is caught by the verifying re-read.
 
-    **The file is rewritten in place, never through a temp file and a rename.**
-    docker-compose bind-mounts ``config/instances/robotNN.ini`` onto
-    ``config/system.ini`` as a *single file*. `os.rename` gives the new content a
-    new inode; the bind mount goes on resolving the old one, so the container
-    would keep reading the pre-edit file forever while the host file sat
-    orphaned. The usual atomic-write idiom is exactly wrong for this path. The
-    cost is a torn file if the process dies mid-write, which the re-read below
-    turns into a loud failure rather than a silent one.
+    **Edited line by line, not via ConfigParser.write().** ``[map]`` uses
+    interpolation (``pcd: map/%(name)s/map.pcd``); a write-back would bake in
+    the old name. Line edits also keep comments, key order and delimiters.
 
-    **Lines are edited individually rather than round-tripped through
-    ConfigParser.write().** ``[map]`` is written with interpolation
-    (``pcd: map/%(name)s/map.pcd``), so a plain read expands it and a write-back
-    would bake the resolved name in permanently -- destroying the property that
-    makes this file editable by hand, and silently pinning pcd/map at the *old*
-    map while `name` moved on. Rewriting one line at a time also keeps comments,
-    key order and the file's ``:`` delimiters, which a git-tracked per-robot
-    identity file deserves.
-
-    Raises OSError if the file cannot be read or written, and ValueError if it
-    has no ``[map] name`` to rewrite (the caller turns both into a 5xx; the
-    router checks W_OK up front so the common case never reaches here).
-
-    Held under ``_INI_LOCK`` from the first read to the verifying re-read, so a
-    concurrent ``active_map_name`` waits for a whole file rather than reading
-    the truncated one.
+    Raises OSError on I/O failure, ValueError if there is no ``[map] name``.
+    Holds ``_INI_LOCK`` from the first read to the re-read.
     """
     with _INI_LOCK:
         return _set_active_map_locked(name, logger)
@@ -213,10 +161,8 @@ def _set_active_map_locked(name: str, logger: structlog.stdlib.BoundLogger) -> s
     with open(path, "w", encoding="utf-8") as handle:
         handle.writelines(out)
 
-    # Read it back before telling the caller the switch is recorded. interpolation
-    # is off on purpose: this asserts the raw `%(name)s` survived, which a parser
-    # that expands it could not tell us, and it is the one property that makes the
-    # next hand edit a one-line change.
+    # Verify before reporting success; interpolation off so the raw `%(name)s`
+    # values are read as written.
     check = configparser.ConfigParser(interpolation=None)
     try:
         if not check.read(path):

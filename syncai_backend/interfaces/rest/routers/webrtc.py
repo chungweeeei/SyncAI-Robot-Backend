@@ -8,8 +8,7 @@ from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 
 
-# An SDP offer from a browser is a few kilobytes. The cap is a boundary guard,
-# not a tuning knob: without it a stray upload reaches a cgo call.
+# A boundary guard (an offer is a few KB): a stray upload must not reach cgo.
 _MAX_SDP_BYTES = 64 * 1024
 
 
@@ -49,23 +48,14 @@ def init_webrtc_router(
 ) -> APIRouter:
     webrtc_router = APIRouter(prefix="", tags=["WebRTC"])
 
-    # Plain (non-async) handlers: creating a session blocks in the worker until
-    # ICE gathering completes (0.1-5 s, in a cgo call that releases the GIL) --
-    # threadpool work, not event-loop work. An async handler here would stall
-    # the telemetry, point-cloud and teleop WebSockets for the duration.
-    #
-    # Which is also why the offer arrives as a `bytes` body parameter rather
-    # than through Request.body(): that one is a coroutine, and awaiting it
-    # would force the handler async. FastAPI reads the body during dependency
-    # resolution and only then dispatches the sync handler to the threadpool,
-    # which puts the blocking call exactly where it belongs.
+    # Plain `def`: creating a session blocks in the worker until ICE gathering
+    # completes (0.1-5 s), which would stall the WebSockets on the event loop.
+    # Hence a `bytes` body parameter, not the coroutine Request.body().
 
     def _decode_offer(raw: bytes) -> str:
         """Turn the request body into an SDP string, or refuse it as a 400.
 
-        Four checks and no more. Python does not parse SDP here: the offer's
-        semantics are pion's to judge, and a pre-check that guesses wrong is a
-        route that breaks the next time a browser changes its offer shape.
+        Only sanity checks: the offer's semantics are pion's to judge.
         """
         if not raw:
             raise BadRequestError(
@@ -84,24 +74,14 @@ def init_webrtc_router(
         return text
 
     def _raise_for(message: str) -> None:
-        # Keyed on the code the gateway tags the message with, the tts router's
-        # `unknown voice` pattern: the set of failures a caller answers
-        # differently is one, and it is one the gateway already knows it is
-        # returning.
-        #
-        # Everything else -- a missing library, a failed InitWorker, an offer
-        # pion rejected, a GStreamer pipeline that would not start because the
-        # camera is held by scripts/publish_camera_crop.sh -- answers 502 with
-        # the worker's own sentence. Camera-busy deliberately gets no code: it
-        # is indistinguishable from any other pipeline failure in the Go error
-        # string, and a code that guesses is worse than prose that does not.
+        # Only a pending session gets a code (409); everything else is 502 with
+        # the worker's sentence. Camera-busy gets no code: the Go error cannot
+        # tell it from any other pipeline failure.
         if failure_code(message) is Failure.WHEP_SESSION_PENDING:
             raise ConflictError(message, code=Failure.WHEP_SESSION_PENDING.value)
         raise UpstreamError(message)
 
-    # No response_model -- the body is the answer SDP itself, so the OpenAPI
-    # schema is declared through `responses` instead (the tts /synthesize
-    # precedent).
+    # No response_model: the body is the answer SDP, declared via `responses`.
     @webrtc_router.post(
         "/api/v1/webrtc/whep",
         status_code=201,
@@ -113,17 +93,13 @@ def init_webrtc_router(
         },
         response_class=Response,
     )
-    # Defaulted to empty rather than required: with Body(...) an empty body is
-    # rejected by FastAPI's own validation as a 422 carrying a pydantic blob
-    # ("Field required", loc ["body"]), which tells a WHEP client nothing. The
-    # default lets _decode_offer answer the 400 with a sentence instead.
+    # Defaulted to empty so _decode_offer answers a 400 sentence, not a 422.
     def whep_create(offer: bytes = Body(b"", media_type="application/sdp")):
         offer_sdp = _decode_offer(offer)
 
-        # The worker offers two sendonly tracks (H264 + Opus), so it expects
-        # two recvonly m-lines. Logged rather than refused: that is the
-        # worker's constraint, and enforcing it here would pin it in two
-        # places that then have to be changed together.
+        # The worker expects one video and one audio m-line. Logged, not
+        # refused, here and in the other routes: the constraint is the
+        # worker's, and enforcing it twice means changing it twice.
         if offer_sdp.count("m=video") != 1 or offer_sdp.count("m=audio") != 1:
             logger.warning(
                 "WHEP offer is not the expected two-m-line shape",
@@ -139,14 +115,10 @@ def init_webrtc_router(
         session_id = payload["session_id"]
         logger.info("WHEP session created", session_id=session_id)
 
-        # Location is relative on purpose. An absolute URL would have to be
-        # built from the request, which arrives at 0.0.0.0:3000 behind whatever
-        # host the console was pointed at; baking that in yields a teardown URL
-        # that works from one network and not another. WHEP permits a relative
-        # URI and browsers resolve it against the response URL.
+        # Location is relative on purpose: an absolute one built from the
+        # request works from one network and not another.
         #
-        # status_code is set here as well as on the decorator: the decorator
-        # is what OpenAPI reads, this is what goes on the wire.
+        # status_code here too: the decorator's is only what OpenAPI reads.
         return Response(
             status_code=201,
             content=payload["answer_sdp"],
@@ -160,10 +132,8 @@ def init_webrtc_router(
     def whep_delete(session_id: str):
         """Tear a WHEP session down.
 
-        Idempotent, matching the worker: a 204 even for an id it has never
-        seen. WHEP clients fire this on page unload, and the worker cannot tell
-        "already gone" (video sessions self-close on connection failure) from
-        "never existed" anyway, so a 404 here would be noise that means nothing.
+        Idempotent like the worker: 204 even for an unknown id (sessions
+        self-close on connection failure).
         """
         success, message, _ = webrtc_gw.delete_video_session(session_id=session_id)
         if not success:
@@ -188,23 +158,12 @@ def init_webrtc_router(
     def whip_create(offer: bytes = Body(b"", media_type="application/sdp")):
         """Talk to the robot: the browser's microphone out of its speaker.
 
-        The mirror image of the WHEP route and deliberately identical in shape
-        -- same body type, same Location contract, same blocking-in-a-worker-
-        thread reasoning. Only the direction differs, and only the worker cares
-        about that.
-
-        One talker at a time, and that is a property of the hardware rather
-        than a policy: the speaker is one ALSA device, so a second session
-        would be fighting the first for it. A new POST preempts the old
-        session, matching WHEP.
+        The mirror image of the WHEP route. One talker at a time (the speaker
+        is one ALSA device); a new POST preempts the old session.
         """
         offer_sdp = _decode_offer(offer)
 
-        # The worker receives exactly one audio track and offers none back, so
-        # a browser that sends video here is sending something nothing will
-        # consume. Logged rather than refused, for the same reason as the WHEP
-        # side: the constraint is the worker's, and enforcing it in two places
-        # means changing it in two places.
+        # The worker receives exactly one audio track; logged, as for WHEP.
         if offer_sdp.count("m=audio") != 1:
             logger.warning(
                 "WHIP offer is not the expected single-audio shape",
@@ -233,17 +192,12 @@ def init_webrtc_router(
     def whip_delete(session_id: str):
         """Tear a WHIP session down.
 
-        Answers 204 even for an id the worker rejects as unknown. The audio
-        export is not idempotent the way the video one is -- it reports
-        not-found -- but that difference is the worker's bookkeeping, not
-        something a client firing this on page unload can act on, and this
-        route's job is to release the speaker. The gateway has already dropped
-        the slot by the time the worker is asked.
+        204 even for an id the worker reports unknown: the gateway has already
+        dropped the slot, and a page-unload client cannot act on it.
         """
         success, message, _ = webrtc_gw.delete_audio_session(session_id=session_id)
         if not success:
-            # Logged, not raised: see the docstring. A 502 here would make a
-            # page unload look like a robot fault.
+            # Logged, not raised: a 502 would make a page unload look like a fault.
             logger.info(
                 "WHIP session teardown reported no such session",
                 session_id=session_id,
@@ -266,31 +220,15 @@ def init_webrtc_router(
     def duplex_create(offer: bytes = Body(b"", media_type="application/sdp")):
         """Both directions over one peer connection: camera out, microphone in.
 
-        Deliberately **not** called WHEP or WHIP, and not served under either
-        path. Both of those specify one direction, and a client that finds a
-        WHEP endpoint is entitled to assume it can send an offer with no
-        sendonly m-line and get video. This is a third thing with its own
-        contract, so it gets its own name rather than a flag on a route that
-        already means something.
-
-        What it buys over holding a WHEP and a WHIP session at once: one
-        ICE/DTLS handshake instead of two, one gathering wait instead of two,
-        one port pair, and a failure mode where both directions live or die
-        together instead of one connecting while the other silently does not.
-
-        What it costs: it holds the camera *and* the speaker, so it preempts
-        any live WHEP or WHIP session, and either of those preempts it back.
-        The gateway arbitrates that by device rather than by kind.
+        **Not** WHEP or WHIP, which each specify one direction. One handshake
+        and one port pair, and both directions live or die together. It holds
+        the camera and the speaker, so it and WHEP/WHIP preempt each other
+        (the gateway arbitrates by device).
         """
         offer_sdp = _decode_offer(offer)
 
-        # The shape the worker answers: one video m-line it sends on, one audio
-        # m-line it both sends and receives on. Logged rather than refused, for
-        # the same reason as the other two routes -- the constraint belongs to
-        # the worker, and enforcing it here means changing it in two places.
-        # A browser that offers two separate audio m-lines instead gets the
-        # second one rejected by pion, which shows up as no microphone rather
-        # than as an error.
+        # One video m-line, one sendrecv audio m-line; logged, as for WHEP. A
+        # second audio m-line is rejected by pion and shows up as no microphone.
         if offer_sdp.count("m=video") != 1 or offer_sdp.count("m=audio") != 1:
             logger.warning(
                 "Duplex offer is not the expected one-video-one-audio shape",
@@ -319,10 +257,7 @@ def init_webrtc_router(
     def duplex_delete(session_id: str):
         """Tear a duplex session down, releasing both devices.
 
-        Idempotent like the WHEP teardown: the worker's export answers success
-        for an id it has never seen, because a duplex session self-closes on
-        connection failure and "already gone" is the normal case for a browser
-        that dropped off the network.
+        Idempotent like the WHEP teardown.
         """
         success, message, _ = webrtc_gw.delete_duplex_session(session_id=session_id)
         if not success:
@@ -337,14 +272,9 @@ def init_webrtc_router(
     def webrtc_status():
         """What this backend believes about the camera and speaker streams.
 
-        Earns its own route because the media path is fire-and-forget: the
-        worker sends RTP into a socket and exports no session statistics, so
-        without this there is no way to tell "nobody is watching" from
-        "somebody is watching, do not steal their stream".
-
-        Not folded into /health: that route is the task server's liveness
-        contract, and its docstring argues explicitly against letting a
-        subsystem's degradation reach a container healthcheck.
+        The worker exports no session statistics, so this is the only way to
+        tell whether someone is watching. Kept out of /health, which is the
+        liveness contract.
         """
         return WebRtcStatusResponse(**webrtc_gw.status())
 

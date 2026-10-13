@@ -1,30 +1,21 @@
 """The custom search attributes this backend stamps on every run it starts.
 
-Three Keyword attributes: ``TaskKind`` (how the run was started -- see
-``TaskKind`` in schema.py) and ``TaskName`` (the template it came from) exist
-for ``GET /api/v1/task_history`` and its ``/stats`` sibling, which filter and
-count on them -- the memo cannot be queried, and the workflow id only carries
-the kind for runs the console itself minted.
+``TaskKind`` (see schema.py) and ``TaskName`` (the template) exist for
+``GET /api/v1/task_history`` and ``/stats``, which filter and count on them; the
+memo cannot be queried.
 
-``TaskMap`` is the map a run's MOVE coordinates are in. It is an attribute
-rather than memo for a different reason: a *scheduled* run inherits its
-schedule action's search attributes and nothing of the schedule's memo, so
-this is the only place both kinds of run can carry it. Two readers: the
-active-task list (which map a running job holds, so the map routes can refuse
-to edit it) and the workflow itself (which checks it against the loaded map
-before driving -- see RobotActivities.execute_move).
+``TaskMap`` is the map a run's MOVE coordinates are in. An attribute rather than memo
+because a scheduled run inherits only its action's search attributes. Read by the
+active-task list (which map a job holds, for the map routes' refusal) and by
+RobotActivities.execute_move (checked against the loaded map).
 
-Keyword rather than Text: the filters are exact matches, and SQL visibility
-only allows ``=`` / ``IN`` / ``STARTS_WITH`` on Keyword columns (Text is
-full-text, no equality). On the pinned server (auto-setup 1.29.7 on Postgres)
-Keyword attributes map onto the pre-allocated ``Keyword01..10`` columns; the
-auto-setup image's own test set takes one of them, these take three more.
+Keyword, not Text: SQL visibility allows ``=`` / ``IN`` / ``STARTS_WITH`` only on
+Keyword. On the pinned server (auto-setup 1.29.7, Postgres) these take three of the
+``Keyword01..10`` columns.
 
-Registration is a namespace-level operation the backend has to do itself:
-``temporalio/auto-setup`` registers custom attributes only on a fresh
-install, from a list that has no environment knob for extra names. So the
-worker registers them at connect, idempotently, and the README gives the CLI
-equivalent for a stack where the backend has no operator rights.
+auto-setup registers custom attributes only on a fresh install, with no knob for
+extra names, so the worker registers them at connect, idempotently; the README gives
+the CLI equivalent.
 """
 
 from typing import Dict
@@ -55,12 +46,9 @@ async def ensure_search_attributes(
 ) -> bool:
     """Register the attributes on the client's namespace if they are missing.
 
-    Idempotent: lists first and adds only what is absent, because
-    AddSearchAttributes answers ALREADY_EXISTS for a known name. Never raises.
-    A backend that cannot register them (no operator rights, an old server)
-    still serves everything else; the kind/name filters and the stats endpoint
-    then answer 502, and the gateway logs the INVALID_ARGUMENT that says why.
-    Answers True when the attributes are known to be registered.
+    Lists first and adds only what is absent (AddSearchAttributes answers
+    ALREADY_EXISTS). Never raises: without them everything else still works, and
+    the kind/name filters and /stats answer 502. True when known to be registered.
     """
     try:
         listed = await client.operator_service.list_search_attributes(

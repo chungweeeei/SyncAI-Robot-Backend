@@ -1,28 +1,17 @@
 """Stop every task when the driver's safety lock engages.
 
-While syncai_driver_manager's `SafetyLock` is engaged it drops cmd_vel and
-every motion key but ESTOP. A run that keeps going through that would send nav
-goals to a robot that cannot move, so the backend cancels everything on this
-robot's task queue the moment the lock engages.
+While syncai_driver_manager's `SafetyLock` is engaged the robot cannot move,
+so every task on this robot's queue is cancelled the moment it engages.
 
-Two ways in, one edge between them. The operator engages the lock through
-POST /api/v1/robot/estop (`engage_requested`), which cancels at once. The
-driver may also engage it itself (`SafetyLock::trigger`: low battery,
-overheat), which this process only learns from
-RobotState.low_level_mode.safety_state on `robot_state` at 1 Hz (`observe`).
-Both feed the same last-seen state, so what is acted on is an EDGE:
-false -> true cancels, a repeated true does not, and true -> false (the same
-endpoint with `locked: false`, or anything else that releases it) does
-nothing. The first sample counts as an edge when it is already true -- runs
-outlive a backend restart, and a lock that engaged while this process was
-down still has to stop them.
+Two inputs feed one last-seen state: the operator's POST /api/v1/robot/estop
+(`engage_requested`, cancels at once) and the driver's own trigger (low
+battery, overheat), seen only via RobotState.low_level_mode.safety_state at
+1 Hz (`observe`). Only the false -> true edge cancels. A first sample that is
+already true counts as an edge: runs outlive a backend restart.
 
-Two threads meet here. `observe` runs on the ROS executor, where nothing may
-block or raise (an exception out of a callback ends spin() and the process).
-The cancel itself has to run on the uvicorn loop: WorkflowGateway's client and
-caches belong to that loop alone. `bind_loop` is how that loop is handed in,
-from the REST server's startup; an edge seen before then is held and run on
-bind.
+`observe` runs on the ROS executor and must never block or raise (that ends
+spin()). The cancel runs on the uvicorn loop, which owns WorkflowGateway;
+`bind_loop` hands that loop in at REST startup, and an earlier edge waits for it.
 """
 
 import asyncio
@@ -50,16 +39,14 @@ class SafetyLockService:
         self._pending = False
 
     def observe(self, engaged: bool) -> None:
-        """Feed one sample of safety_state. Never blocks, never raises."""
+        """Feed one safety_state sample. Never blocks, never raises."""
         self._transition(engaged)
 
     def engage_requested(self) -> bool:
         """The operator engaged the lock (POST /api/v1/robot/estop).
 
-        Cancels now rather than a robot_state tick later, and records the
-        lock as engaged so the sample that then reports it is not a second
-        edge. Returns whether a cancel was started -- False when the lock was
-        already engaged, which is the true -> true the rule leaves alone.
+        Cancels now and records the lock as engaged, so the next sample is not
+        a second edge. Returns False when it was already engaged.
         """
         return self._transition(True)
 
@@ -99,8 +86,7 @@ class SafetyLockService:
 
     async def _stop_all(self) -> None:
         # Nav first and directly: a Temporal cancel only reaches a MOVE on its
-        # next heartbeat, and the robot should stop driving now. Off the loop,
-        # because cancel_active_moves blocks on a ROS round trip.
+        # next heartbeat. In the executor, since it blocks on a ROS round trip.
         loop = asyncio.get_running_loop()
         try:
             ok, message = await loop.run_in_executor(
