@@ -276,7 +276,7 @@ def test_speak_polls_when_the_services_own_wait_expires(monkeypatch, recorder):
     The rare path, but the one that decides whether `speak()` is honest about
     having blocked until the utterance finished.
     """
-    monkeypatch.setattr(tts_module, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(tts_module, "SPEAK_POLL_INTERVAL_S", 0.0)
     statuses = iter(["playing", "playing", "done"])
 
     def handler(request):
@@ -296,7 +296,7 @@ def test_speak_polls_when_the_services_own_wait_expires(monkeypatch, recorder):
 def test_speak_gives_up_before_the_activity_does(monkeypatch):
     """Bounded so a SPEAK step gets a sentence from here rather than being
     killed by its own start_to_close."""
-    monkeypatch.setattr(tts_module, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(tts_module, "SPEAK_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(tts_module, "_SPEAK_DEADLINE_S", 0.0)
 
     def handler(request):
@@ -310,7 +310,7 @@ def test_speak_gives_up_before_the_activity_does(monkeypatch):
 
 
 def test_the_service_going_away_mid_utterance_is_reported(monkeypatch):
-    monkeypatch.setattr(tts_module, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(tts_module, "SPEAK_POLL_INTERVAL_S", 0.0)
 
     def handler(request):
         if request.method == "POST":
@@ -318,6 +318,95 @@ def test_the_service_going_away_mid_utterance_is_reported(monkeypatch):
         raise httpx.ConnectError("Connection refused", request=request)
 
     success, message, duration = make_gateway(handler).speak(text="hi")
+
+    assert not success
+    assert _BASE_URL in message
+
+
+# --- The job API the SPEAK activity drives ----------------------------------
+
+
+def test_start_speak_queues_without_waiting_for_playback(recorder):
+    """The activity has to get the id back at once: it is what a cancel stops."""
+
+    def handler(request):
+        recorder.append(request)
+        return json_response(202, job("queued"))
+
+    success, message, started = make_gateway(handler).start_speak(text="hello")
+
+    assert success, message
+    assert started["id"] == "job-1"
+    body = json.loads(recorder[0].content)
+    assert body["wait"] is False
+    assert recorder[0].url.path == "/api/v1/speak"
+
+
+def test_start_speak_tags_an_unknown_voice_as_speak_does():
+    def handler(request):
+        return json_response(
+            400, {"detail": "Unknown voice 'xx'.", "code": "unknown_voice"}
+        )
+
+    success, message, started = make_gateway(handler).start_speak(text="hi", voice="xx")
+
+    assert not success
+    assert failure_code(message) is Failure.UNKNOWN_VOICE
+    assert started is None
+
+
+def test_await_speak_reports_every_poll(monkeypatch):
+    """``on_poll`` is the activity's heartbeat: once per read, before the wait."""
+    monkeypatch.setattr(tts_module, "SPEAK_POLL_INTERVAL_S", 0.0)
+    statuses = iter(["playing", "done"])
+
+    def handler(request):
+        return json_response(200, job(next(statuses)))
+
+    polls = []
+    success, message, finished = make_gateway(handler).await_speak(
+        job("queued"), on_poll=polls.append
+    )
+
+    assert success, message
+    assert finished["status"] == "done"
+    assert polls == ["queued", "playing"]
+
+
+def test_a_cancel_inside_await_speak_is_not_swallowed(monkeypatch):
+    """Temporal throws the cancel into the thread, here through the heartbeat;
+    the gateway's own error handling must let it through to the activity."""
+    monkeypatch.setattr(tts_module, "SPEAK_POLL_INTERVAL_S", 0.0)
+
+    class Cancelled(Exception):
+        pass
+
+    def on_poll(_status):
+        raise Cancelled()
+
+    gateway = make_gateway(lambda request: json_response(200, job("playing")))
+
+    with pytest.raises(Cancelled):
+        gateway.await_speak(job("playing"), on_poll=on_poll)
+
+
+def test_cancel_speak_deletes_the_job(recorder):
+    def handler(request):
+        recorder.append(request)
+        return json_response(200, job("cancelled", error="cancelled during playback"))
+
+    success, message = make_gateway(handler).cancel_speak("job-1")
+
+    assert success, message
+    assert recorder[0].method == "DELETE"
+    assert recorder[0].url.path == "/api/v1/speak/job-1"
+
+
+def test_a_cancel_the_service_cannot_take_is_reported():
+    def handler(request):
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    success, message = make_gateway(handler).cancel_speak("job-1")
 
     assert not success
     assert _BASE_URL in message

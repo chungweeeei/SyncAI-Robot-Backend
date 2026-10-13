@@ -609,7 +609,7 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 |---|---|---|
 | `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg` |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
-| `SPEAK` | `execute_speak` | `TtsGateway.speak()` — synthesise and play, blocking for the utterance. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
+| `SPEAK` | `execute_speak` | `TtsGateway.start_speak()` then `await_speak()` — queue the utterance on the speech service, then poll its job and heartbeat until it has played; a cancel `DELETE`s the job mid-sentence. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
 | `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the body queue's one-thread executor, no heartbeat, and it survives a backend restart with the time already served |
 
 (`ARTIFACT` — conveyor pickup/drop via the artifact backend's REST API — was
@@ -627,8 +627,8 @@ starts once all of them have finished — e.g. `MOVE(group=a)`, `SPEAK(group=a)`
 - **at most one `MOVE` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
   slot, so two would only run one after the other.
 
-**Fail-fast**: the first member to fail cancels the rest (a `MOVE` stops as on a
-task cancel) and fails the run; those siblings read `CANCELED` /
+**Fail-fast**: the first member to fail cancels the rest (a `MOVE` stops and a
+`SPEAK` goes quiet, as on a task cancel) and fails the run; those siblings read `CANCELED` /
 "Canceled: step <id> failed". A task cancel reaches every member. A pause reaches
 each member on its own terms — the group's `MOVE` is interrupted and re-sent on
 resume, a `WAIT` freezes, a `SPEAK` plays on — and the run holds before the next
@@ -678,18 +678,26 @@ Details that matter when editing this path:
   and `MOVE_HEARTBEAT_TIMEOUT` must stay above it (pinned in
   `test_activities.py`). The old 30 s / 10 s waits were unreachable under a 3 s
   heartbeat anyway; a slow nav2 gets its chance from the retry policy.
-- **`SPEAK` does not heartbeat.** `execute_speak` is one blocking HTTP request,
-  held open for the utterance by `wait=true`, so the 3 s `heartbeat_timeout`
-  would kill every attempt. It runs on a **5-minute `start_to_close`** alone —
-  far shorter than the heartbeating activities' hour, so a dead worker holding a
-  SPEAK is noticed. Without heartbeats it is effectively not cancellable
-  mid-utterance: a cancelled task finishes its sentence (a *pause* never tries —
-  it waits the step out). This is now a **choice, not a constraint**: the speech
-  service's playback is a job (POST returns an id, GET reports state, DELETE
-  stops it), so enqueue-and-poll would make the heartbeat real and let `except
-  CancelledError` cut the utterance, as `_wait_for_nav_goal` does for MOVE. It
-  stayed blocking so moving speech out of this process changed nothing in the
-  task path.
+- **`SPEAK` heartbeats while it plays, and a cancel stops it mid-sentence.**
+  The speech service's playback is a job (POST queues it and returns an id, GET
+  reports its state, DELETE stops it), so `execute_speak` queues with
+  `wait=false` and polls the job every `SPEAK_POLL_INTERVAL_S` (0.25 s,
+  `gateways/tts/tts.py`), heartbeating on each read — the shape
+  `_wait_for_nav_goal` has for MOVE. A cancel (a task cancel, or a sibling in
+  its group failing) lands in `except CancelledError`, which `DELETE`s the job;
+  the service SIGTERMs `aplay`. A *pause* never cancels a SPEAK — it finishes
+  and the run holds after it. The POST is the one stretch with no heartbeat (the
+  service synthesises inline, and a cold one loads its model first), so
+  `SPEAK_HEARTBEAT_TIMEOUT` (75 s, `temporal/workflows.py`) outlasts
+  `SPEAK_START_TIMEOUT_S`; the POST is shielded, so a cancel arriving during it
+  still finds the job id to stop. A long window does not slow a cancel: that
+  rides the next heartbeat's reply, paced by `HEARTBEAT_THROTTLE_MAX`, which
+  is why the worker *must* keep the throttle capped — at the SDK default
+  (0.8 × 75 s) a cancel would wait a minute. `test_activities.py` pins both
+  relations. The **5-minute `start_to_close`** stays, far shorter than the
+  others' hour; the gateway gives up on a backed-up speech queue at 240 s with
+  a sentence before it fires. `POST /api/v1/tts/speak` still uses the blocking
+  `speak()` (`wait=true`).
 - **Per-step state is a workflow query** (`get_step_states`), not a table.
   `GET /api/v1/tasks/{id}` degrades to an empty step list if the query fails (no
   worker polling yet) instead of failing the request.

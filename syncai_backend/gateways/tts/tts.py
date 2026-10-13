@@ -33,7 +33,7 @@ The service publishes the same ``code`` strings for exactly that reason; see
 
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
 import structlog
@@ -62,11 +62,26 @@ _REQUEST_TIMEOUT_S = 60.0
 # patience with that.
 _SPEAK_TIMEOUT_S = 180.0
 
-# Backstop for the whole of `speak`, polling included. Under the SPEAK
+# `start_speak` does not wait for playback, only for synthesis, which the
+# service does inline -- so this is the cold-model case above, nothing more.
+# Public because the SPEAK activity cannot heartbeat while this POST is open:
+# its heartbeat_timeout has to outlast it (pinned in test_activities.py).
+SPEAK_START_TIMEOUT_S = _REQUEST_TIMEOUT_S
+
+# Stopping playback is a SIGTERM to aplay and a short grace before SIGKILL on
+# the service's side; anything slower than this is the service not answering.
+_CANCEL_TIMEOUT_S = 10.0
+
+# Backstop for the wait on a job, `speak`'s or `await_speak`'s. Under the SPEAK
 # activity's 5-minute start_to_close, so this gateway gives up with a sentence
 # before Temporal gives up on the activity.
 _SPEAK_DEADLINE_S = 240.0
-_POLL_INTERVAL_S = 0.5
+
+# How often a job is read while it plays. The SPEAK activity heartbeats once per
+# read, and a cancel only reaches it on a heartbeat's reply, so this is kept at
+# or under the worker's HEARTBEAT_THROTTLE_MAX, as NAV_POLL_INTERVAL_S is for
+# MOVE (pinned in test_activities.py). A GET of an in-memory job is free.
+SPEAK_POLL_INTERVAL_S = 0.25
 
 # The service's codes that this side answers differently, mapped onto ours.
 # Two namespaces that happen to agree on the first entry and need not on the
@@ -207,9 +222,10 @@ class TtsGateway:
         first (a long queue ahead of this utterance), so the poll below is the
         rare path rather than the normal one.
 
-        The service's job API is also pollable and cancellable, which is what a
-        future ``execute_speak`` should use directly: it would let the activity
-        heartbeat, which it cannot do while it sits in this one blocking call.
+        ``POST /api/v1/tts/speak`` is the caller. The SPEAK activity is not: it
+        has to heartbeat and be cancellable mid-utterance, which one blocking
+        call cannot be, so it drives the job itself (``start_speak``,
+        ``await_speak``, ``cancel_speak``).
         """
         success, message, response = self._call(
             "POST",
@@ -220,15 +236,93 @@ class TtsGateway:
         if not success:
             return False, message, None
 
-        try:
-            job = response.json()
-        except ValueError as exc:
-            return False, f"the speech service returned an unreadable job: {exc}", None
-
-        success, message, job = self._await_terminal(job)
+        success, message, job = self._job_of(response)
         if not success:
             return False, message, None
 
+        success, message, job = self.await_speak(job)
+        if not success:
+            return False, message, None
+
+        return self.speak_outcome(job)
+
+    def start_speak(
+        self, text: str, voice: str = "af_heart", speed: float = 1.0
+    ) -> Tuple[bool, str, Optional[dict]]:
+        """Queue an utterance and return its job without waiting for playback.
+
+        The service still synthesises inline, so an unknown voice or a missing
+        model is answered here, tagged exactly as ``speak`` tags it.
+        """
+        success, message, response = self._call(
+            "POST",
+            "/api/v1/speak",
+            timeout=SPEAK_START_TIMEOUT_S,
+            json={**self._payload(text=text, voice=voice, speed=speed), "wait": False},
+        )
+        if not success:
+            return False, message, None
+
+        return self._job_of(response)
+
+    def await_speak(
+        self, job: dict, on_poll: Optional[Callable[[str], None]] = None
+    ) -> Tuple[bool, str, Optional[dict]]:
+        """Poll ``job`` until it stops moving, or we run out of patience.
+
+        ``on_poll`` is handed the job's status before every wait; the SPEAK
+        activity passes ``activity.heartbeat``, which is what lets a cancel
+        reach it mid-utterance (it is thrown into the thread here, and the
+        activity's ``except CancelledError`` stops the job). Bounded by
+        ``_SPEAK_DEADLINE_S`` so a SPEAK activity gets a sentence from here
+        rather than being killed by its ``start_to_close``.
+        """
+        deadline = time.monotonic() + _SPEAK_DEADLINE_S
+
+        while job.get("status") not in _TERMINAL_STATUSES:
+            if time.monotonic() >= deadline:
+                self._logger.warning(
+                    "[TtsGateway] Gave up waiting for an utterance",
+                    job_id=job.get("id"),
+                    status=job.get("status"),
+                )
+                return (
+                    False,
+                    f"the utterance was still {job.get('status')!r} after "
+                    f"{_SPEAK_DEADLINE_S:.0f}s; the speech queue is backed up",
+                    None,
+                )
+
+            if on_poll is not None:
+                on_poll(job.get("status"))
+
+            time.sleep(SPEAK_POLL_INTERVAL_S)
+
+            success, message, response = self._call(
+                "GET", f"/api/v1/speak/{job.get('id')}", timeout=_REQUEST_TIMEOUT_S
+            )
+            if not success:
+                return False, message, None
+            success, message, job = self._job_of(response)
+            if not success:
+                return False, message, None
+
+        return True, "", job
+
+    def cancel_speak(self, job_id: str) -> Tuple[bool, str]:
+        """Stop a job, queued or playing.
+
+        A job that already finished is not an error on the service's side, so
+        a cancel racing the end of the utterance needs no special case here.
+        """
+        success, message, _ = self._call(
+            "DELETE", f"/api/v1/speak/{job_id}", timeout=_CANCEL_TIMEOUT_S
+        )
+        return success, message
+
+    @staticmethod
+    def speak_outcome(job: dict) -> Tuple[bool, str, Optional[float]]:
+        """A terminal job as ``speak``'s ``(success, message, duration)``."""
         status = job.get("status")
         if status == "done":
             # Always a float on success. The service always sends one, but the
@@ -247,45 +341,12 @@ class TtsGateway:
     def _payload(text: str, voice: str, speed: float) -> Dict[str, object]:
         return {"text": text, "voice": voice, "speed": speed}
 
-    def _await_terminal(
-        self, job: dict
-    ) -> Tuple[bool, str, Optional[dict]]:
-        """Poll the job until it stops moving, or we run out of patience.
-
-        Only reached when the service's own wait expired, which means something
-        is queued ahead of this utterance. Bounded by ``_SPEAK_DEADLINE_S`` so a
-        SPEAK activity gets a sentence from here rather than being killed by its
-        ``start_to_close``.
-        """
-        deadline = time.monotonic() + _SPEAK_DEADLINE_S
-
-        while job.get("status") not in _TERMINAL_STATUSES:
-            if time.monotonic() >= deadline:
-                self._logger.warning(
-                    "[TtsGateway] Gave up waiting for an utterance",
-                    job_id=job.get("id"),
-                    status=job.get("status"),
-                )
-                return (
-                    False,
-                    f"the utterance was still {job.get('status')!r} after "
-                    f"{_SPEAK_DEADLINE_S:.0f}s; the speech queue is backed up",
-                    None,
-                )
-
-            time.sleep(_POLL_INTERVAL_S)
-
-            success, message, response = self._call(
-                "GET", f"/api/v1/speak/{job.get('id')}", timeout=_REQUEST_TIMEOUT_S
-            )
-            if not success:
-                return False, message, None
-            try:
-                job = response.json()
-            except ValueError as exc:
-                return False, f"the speech service returned an unreadable job: {exc}", None
-
-        return True, "", job
+    @staticmethod
+    def _job_of(response: httpx.Response) -> Tuple[bool, str, Optional[dict]]:
+        try:
+            return True, "", response.json()
+        except ValueError as exc:
+            return False, f"the speech service returned an unreadable job: {exc}", None
 
 
 def init_tts_gateway(

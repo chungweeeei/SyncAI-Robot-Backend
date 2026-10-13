@@ -25,7 +25,8 @@ from temporalio.exceptions import ApplicationError, CancelledError  # noqa: E402
 from temporalio.testing import ActivityEnvironment  # noqa: E402
 
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
-from syncai_backend.gateways.workflow.schema import MoveParams  # noqa: E402
+from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
+from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams  # noqa: E402
 from syncai_backend.temporal.activities import RobotActivities  # noqa: E402
 
 
@@ -291,3 +292,107 @@ class TestPostureActivities:
             env.run(activities.execute_lie_down)
 
         assert exc_info.value.non_retryable is True
+
+
+def _job(status: str, **overrides) -> dict:
+    return {"id": "job-1", "status": status, "duration": 1.25, "error": None,
+            "code": None, **overrides}
+
+
+class TestExecuteSpeak:
+    """The speech job is driven from here so a cancel can stop it mid-sentence.
+
+    ``speak_outcome`` is a staticmethod the activity calls on the class, so the
+    real translation runs even though the gateway instance is a MagicMock.
+    """
+
+    def test_queues_then_polls_with_a_heartbeat_per_read(self, env, activities, tts_gw):
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+
+        def _await(job, on_poll):
+            on_poll("queued")
+            on_poll("playing")
+            return True, "", _job("done")
+
+        tts_gw.await_speak.side_effect = _await
+        beats = []
+        env.on_heartbeat = lambda *details: beats.append(details)
+
+        result = env.run(activities.execute_speak, SpeakParams(text="hello"))
+
+        assert result.success is True
+        assert tts_gw.start_speak.call_args[1]["text"] == "hello"
+        assert beats == [("queued",), ("playing",)]
+        tts_gw.cancel_speak.assert_not_called()
+
+    def test_a_cancel_while_playing_stops_the_utterance(self, env, activities, tts_gw):
+        tts_gw.start_speak.return_value = (True, "", _job("playing"))
+        tts_gw.await_speak.side_effect = CancelledError()
+        tts_gw.cancel_speak.return_value = (True, "")
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_speak, SpeakParams(text="hello"))
+
+        tts_gw.cancel_speak.assert_called_once_with("job-1")
+
+    def test_a_failed_stop_is_logged_and_the_cancel_still_lands(
+        self, env, activities, tts_gw
+    ):
+        tts_gw.start_speak.return_value = (True, "", _job("playing"))
+        tts_gw.await_speak.side_effect = CancelledError()
+        tts_gw.cancel_speak.return_value = (False, "could not reach the speech service")
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_speak, SpeakParams(text="hello"))
+
+    def test_a_cancel_before_the_job_exists_has_nothing_to_stop(
+        self, env, activities, tts_gw
+    ):
+        tts_gw.start_speak.side_effect = CancelledError()
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_speak, SpeakParams(text="hello"))
+
+        tts_gw.await_speak.assert_not_called()
+        tts_gw.cancel_speak.assert_not_called()
+
+    def test_an_unknown_voice_is_non_retryable(self, env, activities, tts_gw):
+        tts_gw.start_speak.return_value = (
+            False, fail(Failure.UNKNOWN_VOICE, "unknown voice: 'xx'"), None
+        )
+
+        with pytest.raises(ApplicationError, match="Speak failed") as exc_info:
+            env.run(activities.execute_speak, SpeakParams(text="hello", voice="xx"))
+
+        assert exc_info.value.non_retryable is True
+        tts_gw.await_speak.assert_not_called()
+
+    def test_a_failed_job_is_retryable_with_the_services_reason(
+        self, env, activities, tts_gw
+    ):
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+        tts_gw.await_speak.return_value = (
+            True, "", _job("failed", error="aplay failed: audio open error")
+        )
+
+        with pytest.raises(ApplicationError, match="audio open error") as exc_info:
+            env.run(activities.execute_speak, SpeakParams(text="hello"))
+
+        assert exc_info.value.non_retryable is False
+
+    def test_the_heartbeat_window_covers_the_post(self):
+        """The POST that queues the job is the one stretch with no heartbeat."""
+        from syncai_backend.gateways.tts.tts import SPEAK_START_TIMEOUT_S
+        from syncai_backend.temporal.workflows import SPEAK_HEARTBEAT_TIMEOUT
+
+        assert SPEAK_HEARTBEAT_TIMEOUT.total_seconds() > SPEAK_START_TIMEOUT_S
+
+    def test_a_cancel_reaches_the_poll_loop_quickly(self):
+        """Same relation as MOVE's: a heartbeat waiting whenever one may go out."""
+        from syncai_backend.gateways.tts.tts import SPEAK_POLL_INTERVAL_S
+        from syncai_backend.temporal.worker import HEARTBEAT_THROTTLE_MAX
+        from syncai_backend.temporal.workflows import SPEAK_HEARTBEAT_TIMEOUT
+
+        throttle = HEARTBEAT_THROTTLE_MAX.total_seconds()
+        assert throttle < 0.8 * SPEAK_HEARTBEAT_TIMEOUT.total_seconds()
+        assert SPEAK_POLL_INTERVAL_S <= throttle

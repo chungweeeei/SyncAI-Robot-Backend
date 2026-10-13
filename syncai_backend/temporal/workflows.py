@@ -29,6 +29,14 @@ with workflow.unsafe.imports_passed_through():
 # it. Tighten either side and the other has to follow.
 MOVE_HEARTBEAT_TIMEOUT = timedelta(seconds=3)
 
+# Heartbeat window for SPEAK. execute_speak heartbeats once per read of the
+# speech job, but not while the POST that queues it is out -- the service
+# synthesises inline, and a cold one loads its model first -- so this has to
+# outlast the gateway's SPEAK_START_TIMEOUT_S (test_activities.py checks it).
+# A cancel is not slowed by a long window: it rides the next heartbeat's
+# reply, and the worker's HEARTBEAT_THROTTLE_MAX is what paces those.
+SPEAK_HEARTBEAT_TIMEOUT = timedelta(seconds=75)
+
 # SPEAK moved from the body queue to the IO queue when steps could run side by
 # side (Step.group). Behind a patch so a run that scheduled a SPEAK on the body
 # queue before the upgrade replays the same command after it.
@@ -131,9 +139,10 @@ class RobotWorkflow:
         """Run ``steps`` side by side and return when all have finished.
 
         Fail-fast: the first member to fail cancels the rest -- each lands in
-        _run_step's own CancelledError branch, so a MOVE stops the robot the
-        way a task cancel does -- and once they have finished the failure is
-        raised as the run's, as a lone step's would be. The siblings read
+        _run_step's own CancelledError branch, so a MOVE stops the robot and a
+        SPEAK stops talking the way a task cancel does -- and once they have
+        finished the failure is raised as the run's, as a lone step's would
+        be. The siblings read
         CANCELED with the failed step named, not "Task canceled", because
         nobody canceled the task.
 
@@ -188,19 +197,15 @@ class RobotWorkflow:
         if step.type is StepType.MOVE and own_map is not None:
             args.append(own_map)
 
-        # SPEAK cannot heartbeat: execute_speak sits in a single blocking
-        # gateway call -- one HTTP request to the speech service, held open
-        # for the whole utterance by `wait=true` -- so the
-        # MOVE_HEARTBEAT_TIMEOUT below would kill every attempt before its
-        # first heartbeat could ever arrive. Dead-worker detection for
-        # SPEAK therefore falls to start_to_close alone -- which is also
-        # why it gets a much shorter one than the heartbeating activities:
-        # a worst-case utterance (1000 chars at 0.5x speed, plus the
-        # one-time model load) is minutes, and an hour of a dead worker
-        # silently holding the step would defeat the point of the timeout.
+        # SPEAK's heartbeat window is wider than MOVE's (see
+        # SPEAK_HEARTBEAT_TIMEOUT: the POST that queues it cannot beat), and
+        # its start_to_close much shorter than the hour the others get: a
+        # worst-case utterance (1000 chars at 0.5x speed, plus the one-time
+        # model load) is minutes, and the gateway gives up on a backed-up
+        # speech queue at 240 s with a sentence -- before this fires.
         if step.type is StepType.SPEAK:
             start_to_close_timeout = timedelta(minutes=5)
-            heartbeat_timeout = None
+            heartbeat_timeout = SPEAK_HEARTBEAT_TIMEOUT
         else:
             start_to_close_timeout = timedelta(hours=1)
             heartbeat_timeout = MOVE_HEARTBEAT_TIMEOUT
@@ -226,11 +231,11 @@ class RobotWorkflow:
             ),
             # Per-attempt ceiling. This used to be minutes=3600 -- 60
             # hours, a units slip (the intent was one hour), so it
-            # could never fire. A dead worker is caught by the 3s
+            # could never fire. A dead worker is caught by the
             # heartbeat regardless; this bounds the live-but-stuck
             # case where an attempt heartbeats forever without ever
             # reaching a terminal state. (Both values are picked per
-            # step type above -- SPEAK cannot heartbeat.)
+            # step type above.)
             start_to_close_timeout=start_to_close_timeout,
             heartbeat_timeout=heartbeat_timeout,
             cancellation_type=(

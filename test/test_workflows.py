@@ -39,7 +39,8 @@ What is pinned:
 * Groups (``Step.group``): adjacent members run side by side and the next
   step waits for all of them; the first failure cancels the rest (CANCELED,
   naming the failed step) and fails the run; a run cancel reaches every
-  member; a pause interrupts the group's MOVE while its SPEAK plays on.
+  member, a SPEAK included (it heartbeats, so it is stopped mid-utterance);
+  a pause interrupts the group's MOVE while its SPEAK plays on.
   SPEAK is dispatched to the IO queue, so a stand-in registered only there
   is what runs it.
 * WAIT is a workflow timer, not an activity: a pause freezes it and the
@@ -98,6 +99,7 @@ from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
     TASK_MAP_KEY,
 )
 from syncai_backend.temporal.activities import ActivityResult  # noqa: E402
+from syncai_backend.temporal.worker import HEARTBEAT_THROTTLE_MAX  # noqa: E402
 from syncai_backend.temporal.workflows import RobotWorkflow  # noqa: E402
 
 # Same shape the production worker derives from robot_id; the value itself is
@@ -183,7 +185,9 @@ async def _worker(activities, io_activities=None):
     The client is built with ``pydantic_data_converter`` to mirror
     ``run_worker`` — the default converter cannot serialize WorkflowTask.
     ``io_activities`` (SPEAK) get a second worker on IO_TASK_QUEUE, the way
-    run_worker splits them.
+    run_worker splits them. Both cap the heartbeat throttle as run_worker
+    does: a cancel rides a heartbeat's reply, and left at the SDK default
+    (0.8 x heartbeat_timeout) SPEAK's 75 s window would hold one for a minute.
     """
     env = await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -194,10 +198,14 @@ async def _worker(activities, io_activities=None):
             task_queue=TASK_QUEUE,
             workflows=[RobotWorkflow],
             activities=activities,
+            max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
         ):
             if io_activities:
                 async with Worker(
-                    env.client, task_queue=IO_TASK_QUEUE, activities=io_activities
+                    env.client,
+                    task_queue=IO_TASK_QUEUE,
+                    activities=io_activities,
+                    max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
                 ):
                     yield env.client
             else:
@@ -818,8 +826,10 @@ def _grouped_task(task_id: str, *steps: tuple) -> WorkflowTask:
 
 
 def _gated_speak(started: asyncio.Event, release: asyncio.Event, calls: list):
-    """A SPEAK that parks until released. No heartbeat: the workflow gives
-    SPEAK no heartbeat_timeout, exactly as execute_speak runs."""
+    """A SPEAK that parks until released. It does not heartbeat, so a cancel
+    never reaches it -- the uninterruptible kind, for the tests where nothing
+    should cancel it; SPEAK's heartbeat window outlasts every hold here.
+    ``_cancellable_speak`` is the one that heartbeats."""
 
     @activity.defn(name="execute_speak")
     async def execute_speak(params: SpeakParams) -> ActivityResult:
@@ -827,6 +837,24 @@ def _gated_speak(started: asyncio.Event, release: asyncio.Event, calls: list):
         started.set()
         await release.wait()
         return ActivityResult(success=True, state="succeeded")
+
+    return execute_speak
+
+
+def _cancellable_speak(started: asyncio.Event, cancels: list):
+    """A SPEAK that plays until cancelled, heartbeating as execute_speak does
+    -- which is the only way a cancel reaches a running activity."""
+
+    @activity.defn(name="execute_speak")
+    async def execute_speak(params: SpeakParams) -> ActivityResult:
+        started.set()
+        try:
+            while True:
+                activity.heartbeat("playing")
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            cancels.append(True)
+            raise
 
     return execute_speak
 
@@ -1011,3 +1039,71 @@ def test_a_pause_interrupts_a_groups_move_while_its_speak_plays_on():
     assert cancels == [True]
     assert dispatches == [1, 1]
     assert [step.status for step in done] == [StepStatus.COMPLETED] * 2
+
+
+def test_a_failed_member_stops_a_speak_mid_utterance():
+    async def scenario():
+        speak_started = asyncio.Event()
+        speak_cancels: list = []
+
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams) -> ActivityResult:
+            await speak_started.wait()
+            raise ApplicationError("Move rejected: blocked", non_retryable=True)
+
+        task = _grouped_task(
+            "task-group-fail-speak", (StepType.MOVE, "a"), (StepType.SPEAK, "a")
+        )
+
+        async with _worker(
+            [execute_move] + _instant_activities([])[1:],
+            io_activities=[_cancellable_speak(speak_started, speak_cancels)],
+        ) as client:
+            handle = await _start(client, task)
+            with pytest.raises(WorkflowFailureError):
+                await asyncio.wait_for(handle.result(), timeout=15)
+            return await handle.query(RobotWorkflow.get_step_states), speak_cancels
+
+    steps, speak_cancels = asyncio.run(scenario())
+
+    assert steps[0].status is StepStatus.FAILED
+    # The SPEAK was cancelled while it played, not left to finish its sentence.
+    assert speak_cancels == [True]
+    assert steps[1].status is StepStatus.CANCELED
+    assert steps[1].error_msg == "Canceled: step step-0 failed"
+
+
+def test_a_task_cancel_stops_a_speak_mid_utterance():
+    async def scenario():
+        move_started, move_release = asyncio.Event(), asyncio.Event()
+        speak_started = asyncio.Event()
+        dispatches: list = []
+        move_cancels: list = []
+        speak_cancels: list = []
+        activities = [_recording_move(move_started, move_release, dispatches, move_cancels)]
+        activities += _instant_activities([])[1:]
+        task = _grouped_task(
+            "task-group-cancel-speak", (StepType.MOVE, "a"), (StepType.SPEAK, "a")
+        )
+
+        async with _worker(
+            activities, io_activities=[_cancellable_speak(speak_started, speak_cancels)]
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(move_started.wait(), timeout=10)
+            await asyncio.wait_for(speak_started.wait(), timeout=10)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=15)
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return exc_info.value, steps, move_cancels, speak_cancels
+
+    err, steps, move_cancels, speak_cancels = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    assert move_cancels == [True]
+    assert speak_cancels == [True]
+    assert [(step.status, step.error_msg) for step in steps] == [
+        (StepStatus.CANCELED, "Task canceled"),
+        (StepStatus.CANCELED, "Task canceled"),
+    ]

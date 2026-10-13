@@ -266,9 +266,11 @@ another service, on the IO queue. Coordination that must react at tick rate
 
 Activities are synchronous; cancellation arrives as `CancelledError` thrown into the
 thread — cleanup goes in `except CancelledError`, not an `is_cancelled()` poll. `SPEAK`
-does not heartbeat (one blocking HTTP call to the speech service, held open for the
-utterance) so it runs on `start_to_close` alone; that service's playback is a pollable,
-cancellable job, so this is now a choice rather than a constraint. Per-step state
+drives the speech service's playback as a job (queue, poll + heartbeat, `DELETE` on
+cancel), so a task cancel or a failed group sibling stops it mid-sentence; a pause lets
+it finish. Its POST cannot heartbeat (synthesis is inline), so `SPEAK_HEARTBEAT_TIMEOUT`
+must outlast the gateway's `SPEAK_START_TIMEOUT_S`, and a cancel only arrives promptly
+because the worker caps the heartbeat throttle. Per-step state
 is a workflow **query**, not a table — and the task-level `PAUSED` is derived from it,
 because **Temporal has no paused status**: `pause`/`resume` are two idempotent workflow
 **signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `gateways/workflow/config.py`, shared by
