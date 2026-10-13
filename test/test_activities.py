@@ -15,6 +15,7 @@ the real thread injection and shielding need a threaded worker, which is
 integration-test territory.
 """
 
+import dataclasses
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -322,8 +323,43 @@ class TestExecuteSpeak:
 
         assert result.success is True
         assert tts_gw.start_speak.call_args[1]["text"] == "hello"
-        assert beats == [("queued",), ("playing",)]
+        # The count said so far rides beside the status (see the retry test).
+        assert beats == [("queued", 0), ("playing", 0), ("done", 1)]
         tts_gw.cancel_speak.assert_not_called()
+
+    def test_says_the_text_as_many_times_as_asked(self, env, activities, tts_gw):
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+        tts_gw.await_speak.return_value = (True, "", _job("done"))
+        beats = []
+        env.on_heartbeat = lambda *details: beats.append(details)
+
+        result = env.run(activities.execute_speak, SpeakParams(text="hello", repeat=3))
+
+        assert result.success is True
+        assert tts_gw.start_speak.call_count == 3
+        assert [said for _, said in beats] == [1, 2, 3]
+
+    def test_a_retry_says_only_what_is_left(self, env, activities, tts_gw):
+        # The third of five failed on the last attempt, after two were said:
+        # the heartbeat that attempt left is what this one starts from.
+        env.info = dataclasses.replace(env.info, heartbeat_details=["playing", 2])
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+        tts_gw.await_speak.return_value = (True, "", _job("done"))
+
+        env.run(activities.execute_speak, SpeakParams(text="hello", repeat=5))
+
+        assert tts_gw.start_speak.call_count == 3
+
+    def test_a_heartbeat_from_before_repeat_reads_as_none_said(
+        self, env, activities, tts_gw
+    ):
+        env.info = dataclasses.replace(env.info, heartbeat_details=["playing"])
+        tts_gw.start_speak.return_value = (True, "", _job("queued"))
+        tts_gw.await_speak.return_value = (True, "", _job("done"))
+
+        env.run(activities.execute_speak, SpeakParams(text="hello", repeat=2))
+
+        assert tts_gw.start_speak.call_count == 2
 
     def test_a_cancel_while_playing_stops_the_utterance(self, env, activities, tts_gw):
         tts_gw.start_speak.return_value = (True, "", _job("playing"))

@@ -204,7 +204,10 @@ class RobotWorkflow:
         # model load) is minutes, and the gateway gives up on a backed-up
         # speech queue at 240 s with a sentence -- before this fires.
         if step.type is StepType.SPEAK:
-            start_to_close_timeout = timedelta(minutes=5)
+            # Per utterance: a SPEAK says its text `repeat` times in one
+            # attempt. Older histories carry no repeat and read 1, so they
+            # schedule the same five minutes they always did.
+            start_to_close_timeout = timedelta(minutes=5) * step.params.repeat
             heartbeat_timeout = SPEAK_HEARTBEAT_TIMEOUT
         else:
             start_to_close_timeout = timedelta(hours=1)
