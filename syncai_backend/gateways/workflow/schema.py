@@ -65,6 +65,9 @@ class MoveParams(BaseSchema):
 # field names, so BaseSchema's camelCase aliasing is a no-op here — same
 # property MoveParams relies on (see the task_template router's serialisation
 # note).
+SPEAK_REPEAT_MAX = 10
+
+
 class SpeakParams(BaseSchema):
     text: str = Field(
         ...,
@@ -79,6 +82,18 @@ class SpeakParams(BaseSchema):
     )
     speed: float = Field(
         1.0, ge=0.5, le=2.0, description="Playback rate multiplier (0.5–2.0)."
+    )
+    # Bounded so a slip (100 for 10) cannot keep the robot talking for an
+    # hour. The workflow scales SPEAK's start_to_close by it, so the bound is
+    # also what keeps that timeout finite.
+    repeat: int = Field(
+        1,
+        ge=1,
+        le=SPEAK_REPEAT_MAX,
+        description=(
+            "How many times to say the text, back to back (1–10). Omitted: once, "
+            "so a step stored before this field speaks as it always did."
+        ),
     )
 
 

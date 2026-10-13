@@ -61,6 +61,7 @@ is cheaper than sharing one event loop across tests would be worth.
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import pytest
 
@@ -875,6 +876,34 @@ def test_a_lone_speak_runs_on_the_io_queue():
         return calls
 
     assert asyncio.run(scenario()) == [("execute_speak", IO_TASK_QUEUE)]
+
+
+def test_a_repeated_speak_gets_five_minutes_per_utterance():
+    # One attempt says the text `repeat` times, so a timeout sized for one
+    # utterance would cut a long repeat off partway.
+    async def scenario():
+        seen: list = []
+
+        @activity.defn(name="execute_speak")
+        async def execute_speak(params: SpeakParams) -> ActivityResult:
+            seen.append(activity.info().start_to_close_timeout)
+            return ActivityResult(success=True, state="succeeded")
+
+        task = WorkflowTask(
+            id="task-speak-repeat",
+            definition=WorkflowTaskDefinition(
+                steps=[
+                    Step(id="s", type=StepType.SPEAK,
+                         params=SpeakParams(text="hello", repeat=3)),
+                ]
+            ),
+        )
+        async with _worker(_instant_activities([]), io_activities=[execute_speak]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=10)
+        return seen
+
+    assert asyncio.run(scenario()) == [timedelta(minutes=15)]
 
 
 def test_a_group_runs_its_members_side_by_side_before_the_next_step():

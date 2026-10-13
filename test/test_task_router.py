@@ -256,6 +256,29 @@ class TestTriggerTask:
         assert client.post("/api/v1/tasks", json=task).status_code == 422
         assert workflow_gw.started == []
 
+    @pytest.mark.parametrize("repeat, expected", [(None, 1), (3, 3), (10, 10)])
+    def test_a_speak_step_carries_its_repeat_through(
+        self, client, workflow_gw, repeat, expected
+    ):
+        # Omitted is once, so every SPEAK stored before the field speaks as it did.
+        params = {"text": "hi"} if repeat is None else {"text": "hi", "repeat": repeat}
+        task = _move_task()
+        task["steps"] = [{"id": "s1", "type": "SPEAK", "params": params}]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        started, _ = workflow_gw.started[0]
+        assert started.definition.steps[0].params.repeat == expected
+
+    @pytest.mark.parametrize("repeat", [0, 11])
+    def test_a_speak_repeat_out_of_range_is_a_422(self, client, workflow_gw, repeat):
+        task = _move_task()
+        task["steps"] = [
+            {"id": "s1", "type": "SPEAK", "params": {"text": "hi", "repeat": repeat}}
+        ]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
     def test_a_wait_step_carries_its_seconds_through(self, client, workflow_gw):
         task = _move_task()
         task["steps"] = [{"id": "s1", "type": "WAIT", "params": {"seconds": 12.5}}]

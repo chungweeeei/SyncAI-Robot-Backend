@@ -221,12 +221,39 @@ class RobotActivities:
         heartbeat_timeout outlasts the gateway's timeout on that request
         (SPEAK_HEARTBEAT_TIMEOUT, pinned in test_activities.py).
 
+        ``params.repeat`` utterances are said back to back in one attempt. The
+        count already said rides in the heartbeat beside the job's status, so
+        a retry after the third of five fails says the remaining two rather
+        than starting over; a heartbeat from before the field carries no count
+        and reads as none said.
+
         Only Failure.UNKNOWN_VOICE is the request's fault and non-retryable;
         everything else (the service unreachable, its model missing, device
         trouble) is treated as possibly transient, same philosophy as the move
         rejections — the workflow's maximum_attempts=3 bounds the ones that are
         not. Note that a full speech queue is retryable on purpose: three
         attempts five seconds apart is exactly the right response to a backlog.
+        """
+        details = activity.info().heartbeat_details
+        start = details[1] if len(details) > 1 and isinstance(details[1], int) else 0
+        duration = 0.0
+        for said in range(start, params.repeat):
+            duration += self._speak_once(params, said)
+            # Counted the moment it ends, not on the next utterance's first
+            # poll: a retry after a failed POST would otherwise say this one
+            # again.
+            activity.heartbeat("done", said + 1)
+
+        self._logger.info(
+            "[RobotActivity] Speak finished", duration=duration, repeat=params.repeat
+        )
+
+        return ActivityResult(success=True, state="succeeded")
+
+    def _speak_once(self, params: SpeakParams, said: int) -> float:
+        """One utterance of ``params``, heartbeating ``said`` beside its status.
+
+        Returns how long it played; raises as execute_speak documents.
         """
         job_id = None
         try:
@@ -243,7 +270,7 @@ class RobotActivities:
 
             if success:
                 success, message, job = self._tts_gw.await_speak(
-                    job, on_poll=activity.heartbeat
+                    job, on_poll=lambda status: activity.heartbeat(status, said)
                 )
 
         except CancelledError:
@@ -274,6 +301,4 @@ class RobotActivities:
                 non_retryable=failure_code(message) is Failure.UNKNOWN_VOICE,
             )
 
-        self._logger.info("[RobotActivity] Speak finished", duration=duration)
-
-        return ActivityResult(success=True, state="succeeded")
+        return duration
