@@ -628,14 +628,14 @@ starts once all of them have finished — e.g. `MOVE(group=a)`, `SPEAK(group=a)`
   slot, so two would only run one after the other.
 
 **Fail-fast**: the first member to fail cancels the rest (a `MOVE` stops and a
-`SPEAK` goes quiet, as on a task cancel) and fails the run; those siblings read `CANCELED` /
-"Canceled: step <id> failed". A task cancel reaches every member. A pause reaches
-each member on its own terms — the group's `MOVE` is interrupted and re-sent on
-resume, a `WAIT` freezes, a `SPEAK` plays on — and the run holds before the next
-step as usual. `GET /api/v1/tasks/{id}` echoes each step's `group`. `group` is an
-optional key added to the stored step (no migration): templates and schedules
-without it run exactly as before, and an ungrouped step issues the same commands
-it always did, so pre-existing histories replay.
+`SPEAK` goes quiet, as on a task cancel) and fails the run; those siblings read
+`CANCELED` / "Canceled: step <id> failed". A task cancel reaches every member. A
+pause reaches each member on its own terms — the group's `MOVE` is interrupted
+and re-sent on resume, a `WAIT` freezes, a `SPEAK` plays on — and the run holds
+before the next step as usual. `GET /api/v1/tasks/{id}` echoes each step's
+`group`. `group` is an optional key added to the stored step (no migration):
+templates and schedules without it run exactly as before, and an ungrouped step
+issues the same commands it always did, so pre-existing histories replay.
 
 Details that matter when editing this path:
 
@@ -665,13 +665,15 @@ Details that matter when editing this path:
   response callback) comes second sees what the first did and cancels.
 - **A cancel only reaches an activity on a heartbeat.** The server never pushes;
   it answers the next heartbeat with "cancel requested". So a paused or cancelled
-  MOVE keeps driving for the heartbeat *send* interval plus the poll sleep. The
-  SDK throttles sends to 0.8 × `heartbeat_timeout` (2.4 s under MOVE's 3 s) by
-  default; the worker caps it at `HEARTBEAT_THROTTLE_MAX` (0.5 s,
-  `temporal/worker.py`) and `_wait_for_nav_goal` polls every
-  `NAV_POLL_INTERVAL_S` (0.25 s), so nav2 hears a cancel within ~0.75 s instead
-  of ~3.5 s. The heartbeat *timeout* is untouched; `test_activities.py` pins the
-  relation between the three.
+  MOVE keeps driving — and a cancelled SPEAK keeps talking — for the heartbeat
+  *send* interval plus the poll sleep. The SDK throttles sends to 0.8 ×
+  `heartbeat_timeout` by default: 2.4 s under MOVE's 3 s, a full minute under
+  SPEAK's 75 s. Both workers cap it at `HEARTBEAT_THROTTLE_MAX` (0.5 s,
+  `temporal/worker.py`), and both poll loops — `_wait_for_nav_goal`'s
+  `NAV_POLL_INTERVAL_S` and `await_speak`'s `SPEAK_POLL_INTERVAL_S`, 0.25 s
+  each — run at or under it, so nav2 hears a cancel within ~0.75 s instead of
+  ~3.5 s, and the speaker goes quiet as fast. The heartbeat *timeouts* are
+  untouched; `test_activities.py` pins the relations for both.
 - **MOVE heartbeats before it sends.** The heartbeat clock starts at activity
   start and `move()` has no loop to heartbeat from, so its two waits (server
   ready, goal accepted) are bounded by `NAV_GOAL_SEND_BUDGET_S` in the gateway,
@@ -690,14 +692,12 @@ Details that matter when editing this path:
   service synthesises inline, and a cold one loads its model first), so
   `SPEAK_HEARTBEAT_TIMEOUT` (75 s, `temporal/workflows.py`) outlasts
   `SPEAK_START_TIMEOUT_S`; the POST is shielded, so a cancel arriving during it
-  still finds the job id to stop. A long window does not slow a cancel: that
-  rides the next heartbeat's reply, paced by `HEARTBEAT_THROTTLE_MAX`, which
-  is why the worker *must* keep the throttle capped — at the SDK default
-  (0.8 × 75 s) a cancel would wait a minute. `test_activities.py` pins both
-  relations. The **5-minute `start_to_close`** stays, far shorter than the
-  others' hour; the gateway gives up on a backed-up speech queue at 240 s with
-  a sentence before it fires. `POST /api/v1/tts/speak` still uses the blocking
-  `speak()` (`wait=true`).
+  still finds the job id to stop. The long window does not slow a cancel
+  only because the throttle is capped (*A cancel only reaches an activity on
+  a heartbeat*, above). The **5-minute `start_to_close`** stays, far shorter
+  than the others' hour; the gateway gives up on a backed-up speech queue at
+  240 s with a sentence before it fires. `POST /api/v1/tts/speak` still uses
+  the blocking `speak()` (`wait=true`).
 - **Per-step state is a workflow query** (`get_step_states`), not a table.
   `GET /api/v1/tasks/{id}` degrades to an empty step list if the query fails (no
   worker polling yet) instead of failing the request.
