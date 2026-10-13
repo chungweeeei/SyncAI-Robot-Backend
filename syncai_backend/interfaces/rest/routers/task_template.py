@@ -282,9 +282,11 @@ def _check_step_ids(steps: List[TemplateStepRequest]) -> None:
 
 
 def _check_step_groups(steps: List[TemplateStepRequest]) -> None:
+    # Raised as the 400 itself rather than a ValueError for _check to wrap,
+    # which would drop the step it names.
     problem = step_group_problem(steps)
     if problem is not None:
-        raise ValueError(problem)
+        raise problem.refusal()
 
 
 def _check_map_scope(map_name: Optional[str], steps: List[TemplateStepRequest]) -> None:

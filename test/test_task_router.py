@@ -288,7 +288,7 @@ class TestTriggerTask:
         assert [step.group for step in steps] == ["a", "a"]
 
     @pytest.mark.parametrize(
-        "steps, phrase",
+        "steps, phrase, step_id",
         [
             # Two body steps in one group would queue on the one body slot.
             (
@@ -302,6 +302,8 @@ class TestTriggerTask:
                     {"id": "s1", "type": "STANDUP", "group": "a"},
                 ],
                 "more than one",
+                # The later body step, the one the console marks.
+                "s1",
             ),
             # A group is one place in the sequence.
             (
@@ -311,16 +313,20 @@ class TestTriggerTask:
                     {"id": "w2", "type": "WAIT", "params": {"seconds": 1}, "group": "a"},
                 ],
                 "adjacent",
+                "w2",
             ),
         ],
     )
-    def test_a_bad_grouping_is_a_400_with_a_sentence(
-        self, client, workflow_gw, steps, phrase
+    def test_a_bad_grouping_is_a_400_naming_the_step(
+        self, client, workflow_gw, steps, phrase, step_id
     ):
         response = client.post("/api/v1/tasks", json={**_move_task(), "steps": steps})
 
         assert response.status_code == 400
-        assert phrase in response.json()["detail"]
+        body = response.json()
+        assert phrase in body["detail"]
+        assert body["code"] == "invalid_step_group"
+        assert body["step_id"] == step_id
         assert workflow_gw.started == []
 
     def test_a_duplicate_id_surfaces_as_400(self, client, workflow_gw):

@@ -268,6 +268,10 @@ def test_a_bad_grouping_is_rejected_with_a_sentence(client):
     res = _create(client, steps=[dict(_move(), group="a"), dict(STANDUP, group="a")])
     assert res.status_code == 400
     assert "more than one" in res.json()["detail"]
+    # Named, so the editor can mark the row; it used to arrive wrapped in a
+    # ValueError that dropped everything but the sentence.
+    assert res.json()["code"] == "invalid_step_group"
+    assert res.json()["step_id"] == "2-standup"
 
 
 def test_a_group_is_stored_read_back_and_frozen_into_a_schedule(client, workflow_gw, dock):

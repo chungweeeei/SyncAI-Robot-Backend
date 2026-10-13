@@ -4,6 +4,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from enum import Enum
 
+from syncai_backend.exceptions import BadRequestError
+
 
 class BaseSchema(BaseModel):
     model_config = ConfigDict(
@@ -124,8 +126,36 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
 BODY_STEP_TYPES = frozenset({StepType.MOVE, StepType.STANDUP, StepType.LIEDOWN})
 
 
-def step_group_problem(steps) -> Optional[str]:
+# The ``code`` of every refusal step_group_problem makes. One code for both
+# rules: what a client does with it is mark ``step_id``, and that is the same
+# whichever rule the step broke.
+INVALID_STEP_GROUP = "invalid_step_group"
+
+
+class StepGroupProblem(str):
+    """step_group_problem's sentence, carrying the step it is about.
+
+    A ``str`` so every caller that raises it as a message keeps working; the
+    routers also read ``step_id`` into the 400 (see BadRequestError).
+    """
+
+    code = INVALID_STEP_GROUP
+    step_id: str
+
+    def __new__(cls, message: str, step_id: str) -> "StepGroupProblem":
+        obj = super().__new__(cls, message)
+        obj.step_id = step_id
+        return obj
+
+    def refusal(self) -> BadRequestError:
+        return BadRequestError(self, code=self.code, step_id=self.step_id)
+
+
+def step_group_problem(steps) -> Optional[StepGroupProblem]:
     """Why ``steps``' groups cannot run, as a sentence; None when they can.
+
+    The sentence names the step that breaks the rule as ``step_id``: the one
+    that rejoins a closed group, or the second MOVE/STANDUP/LIEDOWN of one.
 
     A group is a run of *adjacent* steps carrying the same ``group``, started
     together and waited out together (RobotWorkflow._run_group). Adjacent,
@@ -143,17 +173,19 @@ def step_group_problem(steps) -> Optional[str]:
             if current is not None:
                 closed.add(current)
             if group is not None and group in closed:
-                return (
+                return StepGroupProblem(
                     f"Steps in group '{group}' must be adjacent; step "
-                    f"'{step.id}' rejoins it after another step"
+                    f"'{step.id}' rejoins it after another step",
+                    step.id,
                 )
             current, body = group, []
         if group is not None and step.type in BODY_STEP_TYPES:
             body.append(step.id)
             if len(body) > 1:
-                return (
+                return StepGroupProblem(
                     f"Group '{group}' has more than one MOVE/STANDUP/LIEDOWN step "
-                    f"({', '.join(body)}); the robot can do only one at a time"
+                    f"({', '.join(body)}); the robot can do only one at a time",
+                    step.id,
                 )
     return None
 

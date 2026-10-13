@@ -4,7 +4,6 @@ from typing import List, Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, model_validator
 
-from syncai_backend.exceptions import BadRequestError
 from syncai_backend.gateways.workflow.schema import (
     Step,
     ScheduleTask,
@@ -131,7 +130,7 @@ def init_schedule_router(
     async def create_schedule(req: ScheduleRequest):
         problem = step_group_problem(req.steps)
         if problem is not None:
-            raise BadRequestError(problem)
+            raise problem.refusal()
         schedule_task = ScheduleTask(
             id=req.id,
             trigger=ScheduleTrigger(

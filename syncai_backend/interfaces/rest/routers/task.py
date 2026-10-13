@@ -360,7 +360,7 @@ def init_task_router(
         # A sentence, not a 422: see step_group_problem.
         problem = step_group_problem(req.steps)
         if problem is not None:
-            raise BadRequestError(problem)
+            raise problem.refusal()
 
         # A job that drives is stamped with the map that is loaded now, the
         # map its positions are about to be read in -- that is the record the

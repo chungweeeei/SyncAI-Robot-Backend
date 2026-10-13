@@ -165,6 +165,7 @@ def test_create_carries_groups_and_refuses_a_bad_one(client, workflow_gw):
                  {"id": "2-liedown", "type": "LIEDOWN", "group": "a"}])
     assert res.status_code == 400
     assert "more than one" in res.json()["detail"]
+    assert res.json()["step_id"] == "2-liedown"
     assert len(workflow_gw.created) == created
 
 

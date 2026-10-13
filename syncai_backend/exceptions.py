@@ -7,7 +7,24 @@ class UnauthorizedError(Exception):
 
 
 class BadRequestError(Exception):
-    pass
+    """A request that cannot be carried out as written (HTTP 400).
+
+    ``code`` and ``step_id`` are optional and ride next to ``detail``, as
+    ConflictError's ``code`` does. ``step_id`` names the step of a task body
+    the refusal is about, so the console can mark that row instead of leaving
+    the operator to find it from the sentence -- including for a rule the
+    console does not mirror.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: "str | None" = None,
+        step_id: "str | None" = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.step_id = step_id
 
 
 class ConflictError(Exception):
