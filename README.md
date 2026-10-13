@@ -485,7 +485,7 @@ maps them:
 | Exception | Status |
 |---|---|
 | `NotFoundError` | 404 |
-| `BadRequestError` | 400 |
+| `BadRequestError` | 400, with an optional `code` and `step_id` beside `detail` when the refusal is about one step of a task body (`invalid_step_group`; see Groups) |
 | `ConflictError` | **409**, with an optional machine-readable `code` beside `detail` (e.g. `conversion_running`, `gridmap_hand_edited`, `map_active`, `restart_refused` / `restart_running`, `recording_running`, `tts_queue_full`, `whep_session_pending`; each route's row lists its own). Clients branch on the code — e.g. re-convert's confirm-and-retry is only for `gridmap_hand_edited` — never on prose, which exists to be reworded |
 | `UnauthorizedError` | 401 |
 | `UpstreamError` | **502** — a downstream (Temporal or a ROS service) failed |
@@ -620,7 +620,9 @@ one must be purged before deploying.)
 string). Adjacent steps with the same `group` start together, and the next step
 starts once all of them have finished — e.g. `MOVE(group=a)`, `SPEAK(group=a)`,
 `STANDUP` speaks while it drives, then stands. Rules, checked on
-`POST /api/v1/tasks`, schedules and templates (400 with a sentence):
+`POST /api/v1/tasks`, schedules and templates (400 with a sentence, plus
+`code: "invalid_step_group"` and the `step_id` that breaks the rule — the step
+rejoining a closed group, or a group's second body step):
 
 - a group's members must be **adjacent** — the same name again after another
   step is refused, not read as a second group;

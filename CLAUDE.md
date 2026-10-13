@@ -169,7 +169,8 @@ That is why `ruff.toml` excludes isort — do not "organize imports".
 ### Errors
 
 Routers raise from `exceptions.py`; `server.py:register_exception_handlers` maps them:
-`NotFoundError`→404, `BadRequestError`→400, `ConflictError`→409 (optional
+`NotFoundError`→404, `BadRequestError`→400 (optional `code` and `step_id` beside
+`detail`, for a refusal about one step of a task body), `ConflictError`→409 (optional
 machine-readable `code` beside `detail`, e.g. `conversion_running`, `map_active`),
 `UnauthorizedError`→401, `UpstreamError`→502 (a downstream — Temporal or a ROS service —
 failed). Cross-field validation errors answer 400 with a sentence, not 422.
@@ -256,7 +257,9 @@ optional key — no migration): a group's members start together, the next step 
 for all of them, and the first failure cancels the rest and fails the run
 (`RobotWorkflow._run_group`). At most one MOVE/STANDUP/LIEDOWN per group, members
 adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
-router. That only works because activities are split by what they occupy: the body
+router that also names the offending step (`code: invalid_step_group`, `step_id`: the
+step rejoining a closed group, or the second body step), so the console marks that row.
+Raise it with `problem.refusal()`; wrapping it in a `ValueError` drops the step. That only works because activities are split by what they occupy: the body
 queue keeps its one slot (two runs never drive at once, nothing queues with its
 timeouts ticking), and SPEAK goes to the IO queue (behind the `speak-on-io-queue`
 patch; the body worker still registers `execute_speak` for runs from before it). A new
