@@ -339,7 +339,6 @@ class DeleteMapResponse(BaseModel):
     travels inside ``message``.
     """
 
-
     name: str = Field(..., description="The map that was deleted.")
     vertices_deleted: int = Field(
         ..., description="Stored vertices removed along with the map directory."
@@ -2054,7 +2053,6 @@ def init_map_router(
     @map_router.get("/api/v1/maps/{name}/image")
     def get_map_image_by_name(name: str, request: Request):
         """The map's gridmap as a full-size PNG (raw bytes, not base64 JSON)."""
-
         return _png_response(name, request, image_cache, render_png, "image")
 
     @map_router.get("/api/v1/maps/{name}/thumbnail")
@@ -2258,7 +2256,6 @@ def init_map_router(
         Cached on (size, mtime), not a content hash: map.pcd is only ever
         replaced wholesale, never edited in place.
         """
-
         _require(name)
         path = map_catalog_repo.pointcloud_path(name)
         if path is None:
