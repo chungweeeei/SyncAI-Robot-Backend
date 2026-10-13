@@ -26,6 +26,7 @@ def io_task_queue_for(body_queue: str) -> str:
     """The IO queue beside ``body_queue``, the queue a run itself is on."""
     return io_task_queue(body_queue.removesuffix(TASK_QUEUE_SUFFIX))
 
+
 # The two signals RobotWorkflow accepts, by the names that cross the wire. The
 # workflow declares its handlers under these and the gateway sends them, so
 # a rename has to land in both places -- which is why neither side spells
