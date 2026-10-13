@@ -1,10 +1,8 @@
 """Point-cloud helpers: voxel downsampling, rigid transform, wire packing.
 
-Shared by the live body_cloud subscriber and the static map-cloud endpoint so
-both produce the same on-the-wire layout: little-endian float32 xyz triplets.
-The frontend three.js viewer reads these straight into a BufferGeometry
-position attribute, so keeping the packing in one place keeps the two producers
-in lockstep.
+Shared by the live body_cloud subscriber and the map-cloud endpoint so both
+send the same layout (little-endian float32 xyz), which the three.js viewer
+reads straight into a BufferGeometry.
 """
 
 import numpy as np
@@ -73,10 +71,8 @@ def read_pcd_xyz(path: str) -> np.ndarray:
             buf = fh.read(dtype.itemsize * points_count)
             arr = np.frombuffer(buf, dtype=dtype, count=points_count)
         else:
-            # loadtxt collapses a single row of a structured dtype to a 0-d
-            # array, which would make the stack below a (3,) vector and the
-            # finite-row mask fail on axis 1. A one-point cloud is a legitimate
-            # file (a mapping run saved the instant it started), not an error.
+            # loadtxt returns a 0-d array for one row, which would break the
+            # axis-1 mask below; a one-point cloud is legitimate.
             arr = np.atleast_1d(np.loadtxt(fh, dtype=dtype, max_rows=points_count))
 
     xyz = np.stack([arr["x"], arr["y"], arr["z"]], axis=-1).astype(np.float64)
@@ -87,16 +83,12 @@ def read_pcd_xyz(path: str) -> np.ndarray:
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     """Keep one representative point per ``voxel_size`` cube.
 
-    ``points`` is an (N, 3) float array; returns an (M, 3) array with M <= N.
-    Reduces both bandwidth and the client's GPU load without distorting the
-    cloud's shape (unlike a plain stride, which thins dense and sparse regions
-    equally).
+    ``points`` is (N, 3); returns (M, 3), M <= N. Unlike a plain stride, it
+    thins dense regions more than sparse ones, so the shape is preserved.
     """
     if voxel_size <= 0 or points.shape[0] == 0:
         return points
 
-    # Quantise each point to its voxel index, then keep the first point that
-    # lands in each unique voxel.
     keys = np.floor(points[:, :3] / voxel_size).astype(np.int64)
     _, unique_idx = np.unique(keys, axis=0, return_index=True)
     return points[np.sort(unique_idx)]

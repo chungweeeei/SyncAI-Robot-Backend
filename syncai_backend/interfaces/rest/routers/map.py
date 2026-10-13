@@ -57,10 +57,8 @@ from syncai_backend.repositories.mapping.mapping import (
 )
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 
-# The conversion itself -- recipes, the running-thread registry and the sidecar
-# protocol -- lives a layer down; this module validates requests against it and
-# turns its refusals into status codes. GRIDMAP_BANDS_ABOVE_FLOOR is here only
-# to validate a re-convert's band overrides before the thread starts.
+# The conversion lives in services/; this module validates requests against it
+# and maps its refusals to status codes.
 from syncai_backend.services.gridmap_conversion import (
     FLOOR_REFERENCE_DEFAULT,
     GRIDMAP_BANDS_ABOVE_FLOOR,
@@ -70,10 +68,8 @@ from syncai_backend.services.gridmap_conversion import (
 )
 
 
-# Decimation for a stored map.pcd. Same numbers the point-cloud subscriber
-# applies to the live localizer/map_cloud topic (see PointCloudSubscriber),
-# duplicated rather than imported so this router does not depend on a
-# subscriber; if one moves, move the other.
+# Decimation for a stored map.pcd. Duplicates PointCloudSubscriber's numbers so
+# the router does not depend on a subscriber; keep the two in step.
 MAP_CLOUD_VOXEL_SIZE = 0.3
 MAP_CLOUD_MAX_POINTS = 300000
 
@@ -84,17 +80,13 @@ MAP_CLOUD_MAX_POINTS = 300000
 class VertexType(str, Enum):
     """Semantic role of a map vertex: what the robot does when it visits.
 
-    Persisted as a plain string in the ``map_vertices`` table; validated at the
-    REST boundary only.
+    Stored as a plain string in ``map_vertices``; validated at REST only.
     """
 
-    # A plain navigation stop (no pure path-only vertices exist in this
-    # system, so every ordinary nav target is GENERAL).
+    # A plain navigation stop.
     GENERAL = "GENERAL"
-    # An IoT device station (pickup/drop/conveyor, etc.). The name used to
-    # mirror ``StepType.ARTIFACT``; that step type went away with the conveyor
-    # integration (2026-08), but the vertex label stays — it marks a place on
-    # the map, existing rows carry it, and the frontend renders it.
+    # An IoT device station. Outlived ``StepType.ARTIFACT`` (removed 2026-08):
+    # existing rows carry it and the frontend renders it.
     ARTIFACT = "ARTIFACT"
     # A charging dock.
     CHARGER = "CHARGER"
@@ -107,9 +99,7 @@ class VertexType(str, Enum):
 class MapVertexRequest(BaseModel):
     """A vertex to create. The owning map comes from the URL, not the body.
 
-    Deliberately no ``map_name`` field: the create route is nested under
-    ``/api/v1/maps/{name}/vertices``, so accepting one here would let a request
-    name a different map than the path it was posted to.
+    No ``map_name`` field, so a body cannot contradict the path's map.
     """
 
     name: str = Field(..., min_length=1, description="Human-readable vertex name.")
@@ -122,10 +112,7 @@ class MapVertexRequest(BaseModel):
 class MapVertexUpdateRequest(BaseModel):
     """Fields to change on an existing vertex. All optional; omitted ones stay.
 
-    No ``map_name``, for the same reason the create model has none: the route is
-    nested under the owning map, so a body that renamed it would move the vertex
-    out from under the URL that just addressed it. Moving a vertex between maps
-    is a delete and a create.
+    No ``map_name``: moving a vertex between maps is a delete and a create.
     """
 
     name: Optional[str] = Field(None, min_length=1, description="New vertex name.")
@@ -158,11 +145,8 @@ class GridOrigin(BaseModel):
 class GridInfoResponse(BaseModel):
     """Geometry of a stored gridmap.
 
-    ``origin`` is the three-element origin from ``gridmap.yaml``, so its third
-    component is a **yaw**, not a z. An OccupancyGrid message's origin is a full
-    pose whose position is ``{x, y, z}``; the two are the same shape and are not
-    interchangeable, which is worth remembering if a live-topic endpoint ever
-    comes back.
+    ``origin`` is ``gridmap.yaml``'s, so its third component is a **yaw**, not
+    the z of an OccupancyGrid origin.
     """
 
     resolution: float = Field(..., description="Metres per cell.")
@@ -174,24 +158,15 @@ class GridInfoResponse(BaseModel):
 class GridStatus(str, Enum):
     """How this map's 2D gridmap stands: the conversion-status surface.
 
-    Five states, of which the sidecar on disk can only ever hold three (see
-    ``GridRecordStatus`` in the catalogue repo). ``interrupted`` and ``none`` are
-    derived — the first from a sidecar claiming to be mid-conversion with no
-    thread behind it, the second from the absence of both a grid and a record.
+    The sidecar holds three of these (``GridRecordStatus``); ``interrupted``
+    (sidecar says converting, no thread behind it) and ``none`` (no grid, no
+    record) are derived. Kept separate from ``GridRecordStatus``: this is the
+    client contract, that is the file vocabulary; ``_grid_status`` maps one to
+    the other.
 
-    A separate type from ``GridRecordStatus`` even though three of the values are
-    spelled the same, because this one is the promise made to a client and that
-    one is the vocabulary of a file on disk. ``_grid_status`` below is the only
-    place the two meet.
-
-    The distinction that matters is between ``none`` and the two failure states.
-    All three leave a map the nav stack cannot load, but they call for different
-    things from the operator: ``none`` means nobody has converted this map yet
-    (press Build grid), ``failed`` means the pipeline rejected this cloud and
-    the reason is in ``grid_error`` (read it before pressing anything), and
-    ``interrupted`` means the backend went away mid-conversion and a retry is
-    very likely to just work. Collapsing them into "no grid" is what this
-    endpoint used to do, and it sent every one of those to the log.
+    ``none`` (never converted), ``failed`` (reason in ``grid_error``) and
+    ``interrupted`` (retry will likely work) need different operator actions,
+    so do not collapse them into "no grid".
     """
 
     NONE = "none"
@@ -309,10 +284,8 @@ class StartMappingResponse(BaseModel):
 class MappingRunState(str, Enum):
     """The run state as REST reports it.
 
-    The repo's three states plus ``unknown``, which the repo represents as
-    *no sample* rather than a fourth value: no pgo has reported since this
-    process started (every navigating robot), or the last report is older than
-    its TTL (the mapping session is gone).
+    The repo's three states plus ``unknown``: no pgo sample yet (every
+    navigating robot) or the last one is older than its TTL.
     """
 
     IDLE = "idle"
@@ -362,9 +335,8 @@ class RenameMapResponse(BaseModel):
 class DeleteMapResponse(BaseModel):
     """DELETE /api/v1/maps/{name} — what the delete took with it.
 
-    Not the bare ``DeleteResponse`` the vertex delete uses: the card that issued
-    this request unmounts the moment it succeeds, so the count has to travel
-    inside the sentence the map library shows in its place.
+    Not the bare ``DeleteResponse``: the card unmounts on success, so the count
+    travels inside ``message``.
     """
 
     name: str = Field(..., description="The map that was deleted.")
@@ -472,10 +444,8 @@ class ActivateMapResponse(BaseModel):
 class GridRecipe(str, Enum):
     """The two pcd -> gridmap recipes an operator can convert with.
 
-    No "auto" member on purpose: the automatic pick was removed 2026-09 (the
-    comment above GRIDMAP_RECIPE in services/gridmap_conversion.py records the
-    field failure), so a request either takes the default or names the recipe it
-    wants.
+    No "auto" member: the automatic pick was removed 2026-09 (see GRIDMAP_RECIPE
+    in services/gridmap_conversion.py).
     """
 
     Z_BAND = "z-band"
@@ -485,12 +455,11 @@ class GridRecipe(str, Enum):
 class FloorReference(str, Enum):
     """Which floor the z-band recipe's bands are offsets from.
 
-    ``local`` measures the floor around every keyframe and bands each point
-    against the floor near it, so a map whose LIO trajectory drifted in z (a
-    metre across 0917_TP1F_test1) converts correctly end to end. ``global`` is
-    one floor level for the whole cloud — the pre-2026-09 behaviour, kept as
-    the escape hatch and as what ``local`` falls back to without a poses.txt.
-    Mirrors FLOOR_REFERENCES in services/gridmap_conversion.py.
+    ``local`` bands each point against the floor near its keyframe, so a map
+    whose LIO trajectory drifted in z converts correctly. ``global`` is one
+    level for the whole cloud: the escape hatch, and ``local``'s fallback
+    without a poses.txt. Mirrors FLOOR_REFERENCES in
+    services/gridmap_conversion.py.
     """
 
     LOCAL = "local"
@@ -500,13 +469,10 @@ class FloorReference(str, Enum):
 class ZBandOffsets(BaseModel):
     """Per-request overrides for the z-band recipe's bands.
 
-    Offsets from the **floor** — the one measured around the point under
-    ``floor_reference: local``, the cloud's single measured level under
-    ``global`` — the same convention as GRIDMAP_BANDS_ABOVE_FLOOR. Never
-    absolute z, which was the per-site guess the offsets exist to remove.
-    Omitted fields keep the recipe's values. The ranges are sanity rails, not
-    tuning advice: a floor band 2 m off the floor or an obstacle band 8 m tall
-    is a typo, not a site.
+    Offsets from the floor (per ``floor_reference``), as in
+    GRIDMAP_BANDS_ABOVE_FLOOR; never absolute z. Omitted fields keep the
+    recipe's values. The ranges are sanity rails against typos, not tuning
+    advice.
     """
 
     floor_zmin: Optional[float] = Field(None, ge=-2.0, le=2.0)
@@ -518,9 +484,8 @@ class ZBandOffsets(BaseModel):
 class ConvertGridRequest(BaseModel):
     """POST /api/v1/maps/{name}/grid/convert — (re)build the 2D gridmap.
 
-    Only ``recipe`` is surfaced in the frontend; the rest are the
-    tune-with-the-intermediates-in-front-of-you parameters (curl / MCP), per the
-    comment above GRIDMAP_RECIPE in services/gridmap_conversion.py.
+    Only ``recipe`` is surfaced in the frontend; the rest are tuning
+    parameters for curl / MCP.
     """
 
     recipe: GridRecipe = Field(
@@ -693,10 +658,8 @@ class SaveKeepoutResponse(BaseModel):
 def _validate_zones(zones: List[KeepoutZoneRequest]) -> List[KeepoutZone]:
     """Turn the request's zones into repo zones, or raise a 400 with a sentence.
 
-    The pydantic models above are structural only (a point has an x and a y),
-    so that these four rules answer 400 with one readable sentence like every
-    other cross-field refusal in this file, instead of the 422 list a
-    ``min_length`` or ``allow_inf_nan`` constraint would produce.
+    The pydantic models are structural only, so these rules answer 400 with a
+    sentence rather than pydantic's 422 list.
     """
     seen: set = set()
     result: List[KeepoutZone] = []
@@ -748,29 +711,16 @@ def _vertex_response(vertex: MapPoint) -> MapVertexResponse:
 def _grid_status(stored: StoredMap, converting: bool) -> Tuple[GridStatus, Optional[str]]:
     """Reconcile the on-disk conversion record with the live thread registry.
 
-    Lives here rather than in the repo because it needs both halves and the repo
-    only has one: a sidecar is disk state, "a conversion thread is running" is
-    this process's state, and the answer is a function of the two. Same division
-    as ``active``, which the router resolves because only it can see the INI.
+    Lives in the router because it needs both disk state and this process's
+    thread registry. The check order is the logic:
 
-    The order of the checks is the whole of the logic:
-
-    - A live thread wins over everything. Its sidecar already says ``converting``
-      too, but only usually — the write is best-effort and the thread does it
-      itself, so the registry is the authority while the process is up.
-    - A sidecar still saying ``converting`` with no thread behind it is an
-      ``interrupted`` conversion: the process that was running it is gone (a
-      backend restart, a killed byobu pane, a mode switch mid-conversion, since
-      ``switch_mode`` tears down the session the backend is a pane of). Nothing
-      is coming to finish it and nothing would ever clear the flag.
-    - ``failed`` outranks a grid being present, and that combination is real
-      rather than defensive: a *re*-conversion that fails leaves the previous
-      grid on disk, because ``archive_gridmap`` copies it aside instead of
-      moving it precisely so the active map never has a window with no file. The
-      map is loadable and the rebuild did not happen, and saying ``ok`` there
-      would report the stale grid as the requested one.
-    - Otherwise disk decides: a grid is a success (including every map converted
-      before the sidecar carried a status), no grid is ``none``.
+    - A live thread wins: the sidecar write is best-effort, so the registry is
+      the authority while the process is up.
+    - A sidecar saying ``converting`` with no thread is ``interrupted`` (backend
+      restart, killed pane, ``switch_mode``); nothing will clear it.
+    - ``failed`` outranks a present grid: a failed *re*-conversion leaves the
+      previous grid on disk, and ``ok`` would report it as the requested one.
+    - Otherwise a grid is ``ok`` (including pre-status sidecars), else ``none``.
     """
     if converting:
         return GridStatus.CONVERTING, None
@@ -806,10 +756,8 @@ def _summary(
         else None
     )
 
-    # Read the registry once and derive both fields from it, rather than asking
-    # twice: the two would otherwise be sampled either side of a conversion
-    # finishing and could disagree, which is the one thing a deprecated alias
-    # must never do.
+    # Read the registry once so grid_status and its deprecated alias can never
+    # disagree.
     converting = conversion_svc.is_converting(stored.name)
     status, error = _grid_status(stored, converting)
 
@@ -831,26 +779,15 @@ def _summary(
 def _content_tag(data: bytes) -> str:
     """Build a strong ETag over the gridmap's own bytes.
 
-    Deliberately not ``(mtime, size)``, which is the cheap and usual choice and
-    is broken here. An edited gridmap has the **same dimensions**, so the same
-    file size; and this workspace's filesystem hands out a coarse mtime — six
-    consecutive writes measured identical ``st_mtime_ns``. The pair would
-    therefore be unchanged across a save, and both this router's thumbnail cache
-    and the browser would keep serving the pre-edit image.
-
-    The extra cost is one blake2b pass (a few ms on 2.3 MB) over bytes the
-    handler has already read, against re-encoding a PNG it did not need to.
+    Not ``(mtime, size)``: an edited gridmap keeps its size and this filesystem's
+    mtime is coarse, so the pair survives a save and the pre-edit image would be
+    served. One blake2b pass costs a few ms.
     """
     return f'"{hashlib.blake2b(data, digest_size=16).hexdigest()}"'
 
 
 def _not_modified(request: Request, tag: str) -> bool:
-    """Report whether the client already holds this exact content.
-
-    Both endpoints send ``no-cache``, which means "revalidate", not "do not
-    store" — so the browser does come back with If-None-Match and this is what
-    turns that into a 304 instead of another 2.3 MB body.
-    """
+    """Report whether If-None-Match already names this content (for a 304)."""
     header = request.headers.get("if-none-match")
     return bool(header) and tag in [value.strip() for value in header.split(",")]
 
@@ -871,13 +808,9 @@ def init_map_router(
 
     map_router = APIRouter(prefix="", tags=["Map"])
 
-    # pgo's latched run state (IDLE / MAPPING / RESETTING, or None when it has
-    # not reported). The three run routes read it to answer the refusal pgo
-    # would give as a 409 with a code instead of a 502 with a sentence --
-    # check-then-act, not a lock: pgo's own precondition is what holds if the
-    # state moves between the read and the call, and its sentence then comes
-    # back as the uniform 502. None lets pgo answer, so a backend that never
-    # heard pgo behaves exactly as before the status existed.
+    # pgo's latched run state, or None if it has not reported. The run routes
+    # turn pgo's refusals into a coded 409 instead of a 502. Check-then-act,
+    # not a lock: pgo's own precondition still holds; None lets pgo answer.
     def _run_state() -> Optional[MappingState]:
         status = mapping_status_repo.get()
         return None if status is None else status.state
@@ -901,28 +834,19 @@ def init_map_router(
 
     # --- The loaded map -----------------------------------------------------
 
-    # Plain (non-async) handlers throughout: these walk directories, read PGM
-    # headers, encode PNGs and hit psycopg2 for the vertex counts, so FastAPI
-    # must run them in its worker thread pool rather than on the event loop.
+    # Plain (non-async) handlers throughout: they block on disk, PNG encoding
+    # and psycopg2, so FastAPI must run them in its thread pool.
 
-    # Renderings are re-encoded only when their source file changes. Four cards
-    # on the catalogue page would otherwise re-decode and re-scale four multi-
-    # megabyte PGMs on every visit; the cloud cache saves a ~20 MB .pcd parse.
-    # Keyed by map name, so each holds at most one entry per map on disk.
+    # Renderings are re-encoded only when their source changes. Keyed by map
+    # name, one entry per map.
     thumbnail_cache: Dict[str, Tuple[str, bytes]] = {}
     image_cache: Dict[str, Tuple[str, bytes]] = {}
     cloud_cache: Dict[str, Tuple[Tuple[int, int], bytes]] = {}
 
     def _vertex_count(name: str) -> int:
-        # map_vertices.map holds the bare directory name, the same spelling
-        # this catalogue uses. RobotState.map, by contrast, is a path
-        # ("map/dp2f/gridmap.yaml") — reconciling the two is exactly why `active`
-        # is resolved on this side and not in the UI.
-        #
-        # count_vertices, not len(list_vertices(...)): `list_maps` calls this
-        # once per map on disk, so the listing route would otherwise hydrate
-        # every vertex of every map into an ORM object on every page load, to
-        # produce one integer per map.
+        # count_vertices, not len(list_vertices(...)): called once per map on
+        # every listing, so avoid hydrating every vertex.
+
         return map_repo.count_vertices(map=name)
 
     def _require(name: str) -> StoredMap:
@@ -932,13 +856,10 @@ def init_map_router(
         return stored
 
     async def _running_tasks(change: str) -> List[ActiveTask]:
-        """What is running now, or a 409 if that cannot be known.
+        """What is running now, or 409 ``tasks_unknown`` if that cannot be known.
 
-        Refuse rather than assume idle. The gateway caches for
-        ACTIVE_TASK_CACHE_TTL_S, failures included, so an error here is a real
-        outage, and changing the map under a robot that might be mid-navigation
-        is not something to do on an unverified guess. ``change`` names what was
-        refused, for the sentence.
+        Refuse rather than assume idle: the gateway caches failures too, so an
+        error here is a real outage. ``change`` names what was refused.
         """
         try:
             tasks, _ = await workflow_gw.list_active_tasks()
@@ -959,29 +880,15 @@ def init_map_router(
     async def _refuse_while_a_job_holds(name: str) -> None:
         """409 ``task_running`` while a running job's positions are on ``name``.
 
-        Mounted as a dependency on every route that edits what the planner,
-        the costmaps or a job's waypoints read: the vertices, the floor plan,
-        its rebuild and the forbidden zones. Each of those reloads into the
-        running stack (or rewrites the rows a job's MOVE steps were resolved
-        from) when the map is the loaded one, which mid-run means changing the
-        map under a robot that is driving on it.
+        Guards every route that edits what the planner, costmaps or a job's
+        waypoints read (vertices, grid, rebuild, keepout). Async so the Temporal
+        call runs on the event loop while the plain ``def`` route still runs in
+        the threadpool.
 
-        An async dependency in front of plain ``def`` routes: FastAPI awaits it
-        on the event loop, where the Temporal client lives, and still runs the
-        blocking route in its threadpool -- the split activate has to do by
-        hand, for free.
-
-        A map other than the loaded one is let through without asking Temporal.
-        Activate refuses while anything runs, and a run is stamped with the map
-        loaded when it started, so a running job can only hold the loaded map;
-        asking anyway would only make editing an idle map depend on Temporal
-        being up.
-
-        Check-then-act, not a lock: a schedule that fires between this check and
-        the write still gets its map changed under it. The window is the active
-        task cache's TTL plus the write itself, and closing it would take a
-        lock both this route and the worker honour; execute_move's own check
-        is what stops the run from driving if the write was a rebuild.
+        A map other than the loaded one passes without asking Temporal: a run
+        can only hold the loaded map, and editing an idle map should not need
+        Temporal up. Check-then-act, not a lock; execute_move's own check stops
+        a run that slipped through the window.
         """
         active = map_catalog_repo.active_name()
         if name != active:
@@ -999,26 +906,15 @@ def init_map_router(
     def _refuse_if_in_use(name: str, *, verb: str, template_consequence: str) -> None:
         """The three 409s that guard destroying a map's contents, in order.
 
-        Shared by delete and by an import that replaces an existing map, which
-        destroys the same things (the directory and the vertex rows) and so has
-        to be refused for the same reasons:
+        Shared by delete and by an import that replaces a map:
 
-        - ``map_active``: map_server and the localizer opened ``map/<name>/…``
-          at launch; pulling the directory out from under them leaves them
-          holding nothing. Switching away with ``…/activate`` lifts this.
-        - ``conversion_running``: the conversion thread closed over the
-          directory path and would die writing its sidecar into a directory
-          that is gone (or, worse, into the *new* one).
-        - ``template_bound``: a template holding MOVE steps names this map's
-          vertices by id. Delete leaves it pointing at a map that is gone;
-          replace leaves it pointing at ids the new rows do not have. Either
-          way it can neither run nor be edited back into shape, and deleting
-          the templates instead would take saved work the operator never
-          mentioned — so the map is kept and the operator is told which
-          templates to unbind first, the one refusal that asks for work rather
-          than a map switch. ``include_map_independent=False`` leaves the
-          ``map_name IS NULL`` rows alone: a posture-only template runs
-          anywhere and this map going away means nothing to it.
+        - ``map_active``: map_server and the localizer hold ``map/<name>/``.
+        - ``conversion_running``: the thread would write its sidecar into a
+          directory that is gone (or into the *new* one).
+        - ``template_bound``: a template's MOVE steps name this map's vertex ids,
+          which would dangle. The operator is told which templates to unbind;
+          they are never deleted silently. Map-independent templates are
+          ignored.
         """
         if name == map_catalog_repo.active_name():
             raise ConflictError(
@@ -1072,24 +968,14 @@ def init_map_router(
     def create_map(request: CreateMapRequest):
         """Save the run as a new map -- and end it.
 
-        Since 2026-10 a successful ``pgo/save_maps`` returns pgo to IDLE: the
-        keyframes are freed, the empty map-cloud notice goes out (which is
-        what clears the console's "map so far" and the shared ``/dev/shm``;
-        this process deletes nothing there) and the next run waits for
-        ``POST /api/v1/mapping/start``. The conversion below reads ``map.pcd``
-        from the directory, so it does not care.
+        A successful ``pgo/save_maps`` returns pgo to IDLE (it clears
+        ``/dev/shm`` itself); the next run needs ``POST /api/v1/mapping/start``.
+        409 ``mapping_idle`` while pgo is IDLE, before any directory is made,
+        instead of pgo's ``NO POSES!`` as a 502.
 
-        A save while pgo is IDLE is refused here as 409 ``mapping_idle``
-        before any directory is created: under the state machine IDLE means
-        "nothing banked" by definition, and pgo's own ``NO POSES!`` as a 502
-        would say the robot is broken when the operator simply has not
-        pressed Start. Unknown lets pgo answer, as it always did.
-
-        The conversion does not start on the cloud the save just wrote: pgo
-        cleans map.pcd of people in a detached process after answering, and
-        the conversion thread waits for that first (see
-        ``gridmap_conversion.wait_for_map_clean``), so ``grid_status`` stays
-        ``converting`` for that long too -- seconds to a few minutes.
+        The conversion first waits for pgo to clean people out of map.pcd
+        (``gridmap_conversion.wait_for_map_clean``), so ``grid_status`` stays
+        ``converting`` for seconds to minutes.
         """
         _refuse_while_idle("save")
 
@@ -1126,22 +1012,10 @@ def init_map_router(
     def export_map(name: str, format: ArchiveFormat = ArchiveFormat.ZIP):
         """The map directory as one archive, with its vertices and an md5 manifest.
 
-        What goes in: every regular file under ``map/<name>/`` relative to the
-        map root — no top-level folder, since the name is an import-time
-        choice — except ``traversable_debug/`` (conversion intermediates,
-        hundreds of MB, nothing reads them back), plus ``syncai_map.json``
-        carrying the name, the vertices (name/type/x/y/theta, **not** ids: they
-        are regenerated on import) and an md5 per file. ``helpers/map_archive``
-        owns the layout.
-
-        409 ``conversion_running``: the conversion thread is about to
-        ``os.replace`` ``gridmap.*``, so the archive would hold a grid whose md5
-        disagrees with the file a moment later. The *active* map is fine to
-        export — reading it disturbs nothing.
-
-        Built in memory, like the ``/pointcloud`` response: a map is tens of MB
-        at most and the body is one ``Response``. Plain ``def`` because that
-        build is disk and zlib work.
+        Every file under ``map/<name>/`` except ``traversable_debug/``, plus
+        ``syncai_map.json`` (name, vertices without ids, md5 per file); layout
+        in ``helpers/map_archive``. 409 ``conversion_running``, since the grid
+        is about to be replaced. Exporting the active map is fine.
         """
         _require(name)
         if conversion_svc.is_converting(name):
@@ -1192,47 +1066,23 @@ def init_map_router(
     ):
         """Create — or replace — a map from an archive ``export_map`` produced.
 
-        The body is the archive itself, zip or tar.gz told apart by magic
-        bytes; raw rather than multipart for the reason ``save_map_grid``
-        gives, and because this process ships no multipart parser. The target
-        name is ``?name=`` when given, else the manifest's.
+        The raw body is the archive (zip or tar.gz by magic bytes); the target
+        is ``?name=`` or the manifest's name.
 
-        **Nothing is written until the archive has been judged.** The manifest
-        is required — an archive without one, or whose files do not match it
-        (a listed file missing, an unlisted file present, an md5 that
-        disagrees), is a 400 with the sentence from ``helpers/map_archive``,
-        as is any member that is a link or escapes its directory. Then this
-        route's own policy: ``map.pcd`` must be in it (no pointcloud, no map to
-        localise on), every vertex ``type`` must be one this API knows, and
-        the name must pass ``resolve_dir``.
+        Nothing is written until the archive is judged: a missing or mismatched
+        manifest, a link or escaping member is 400, as is no ``map.pcd``, an
+        unknown vertex type or a bad name. Replacing an existing map has
+        delete's 409s (``map_active`` / ``conversion_running`` /
+        ``template_bound``); 409 ``disk_low`` when the unpacked size exceeds
+        free space (the replaced map's space does not count).
 
-        A map of that name already on the robot is **replaced**, under the
-        refusals a delete has — 409 ``map_active`` / ``conversion_running`` /
-        ``template_bound`` — because a replace destroys the same things. And
-        409 ``disk_low`` when the unpacked size exceeds the free space on the
-        maps filesystem: the body is already in memory (caps are middleware's
-        job, see ``save_map_grid``), but what lands on the robot's disk is
-        bounded here, since ``map/`` filling up takes the nav stack's own
-        writes down with it. The replaced map's space is not counted as free —
-        it is only released once the database has followed.
-
-        Then, in order: unpack and verify into ``map/.import-<token>/``; one
-        ``os.rename`` publishes it (parking the replaced directory as
-        ``.import-old-<token>``); one database transaction deletes whatever
-        rows name the map and inserts the manifest's vertices; only then is
-        the parked directory removed. A database failure puts the directories
-        back the way they were — the compensation ``rename_map`` has, with the
-        ``rmtree`` kept for last the way ``delete_map`` keeps it. The DELETE
-        runs even when nothing was replaced: rows orphaned by a hand-deleted
-        directory would otherwise be adopted by the import, and the count is
-        reported so that is visible.
-
-        No conversion is started and an imported ``gridmap.recipe.json`` is
-        kept as it came: the archive is the map as its source robot had it.
+        Order: unpack and verify into ``map/.import-<token>/``, publish with one
+        ``os.rename`` (parking the old map as ``.import-old-<token>``), then one
+        transaction deletes every row naming the map (orphans too) and inserts
+        the manifest's vertices; a DB failure swaps the directories back, and
+        the parked ``rmtree`` runs last. No conversion is started.
         """
-        # Three phase timings ride on the success log line, so whether this
-        # route should ever go asynchronous is a question the journal answers
-        # from a real map on a real robot rather than an estimate.
+        # Phase timings on the success log decide whether this should go async.
         started = time.perf_counter()
         try:
             inspected = inspect_archive(payload)
@@ -1326,13 +1176,12 @@ def init_map_router(
             )
         db_ms = round((time.perf_counter() - started) * 1000)
 
-        # The irreversible step last, once everything that could fail has
-        # succeeded -- the rule delete_map states.
+        # The irreversible step last.
         if displaced is not None:
             map_catalog_repo.abort_import(displaced)
 
-        # Keyed by name: whatever a map of this name looked like earlier in
-        # this process's life, these renderings no longer describe it.
+        # Renderings of an earlier map of this name are stale.
+
         thumbnail_cache.pop(target, None)
         image_cache.pop(target, None)
         cloud_cache.pop(target, None)
@@ -1367,9 +1216,7 @@ def init_map_router(
                     if vertices_deleted
                     else "."
                 )
-                # Operator copy: the console shows this sentence as-is, so it
-                # names the page, not the endpoint (the convert route's own
-                # docs say which call that is).
+                # Operator copy shown as-is: name the page, not the endpoint.
                 + " Its floor plan, if any, came with it; rebuild one from the "
                 "Maps page if it needs it."
             ),
@@ -1379,24 +1226,10 @@ def init_map_router(
     def reset_mapping_run():
         """Discard the run in the robot's memory and start a new map.
 
-        The one route here that touches no file: it is about the *run*, not the
-        catalogue, which is why it sits under /api/v1/mapping/ rather than
-        /api/v1/maps/. Nothing on disk changes, so a client has no cache to
-        invalidate afterwards.
-
-        No request body, and no `save first` flag. A save is POST /api/v1/maps
-        and is a separate, deliberate act: the main use for this route is
-        abandoning a run that went wrong in its first thirty seconds, and a
-        combined endpoint would force a throwaway name and a throwaway
-        directory onto exactly that case. It would also owe a compound answer
-        for "the save worked but the reset did not", which nothing here wants.
-
-        Failures are 502 with pgo's own sentence, same as a failed save. The
-        one an operator actually hits is the wrong mode — pgo only exists in a
-        mapping session — and the gateway words it that way. While pgo is
-        IDLE there is nothing to discard and pgo refuses; that one is answered
-        here as 409 ``mapping_idle`` from the latched status, so the console
-        can tell "press Start" from "the stack is broken".
+        Touches no file. No body and no "save first" flag: saving is
+        POST /api/v1/maps, a separate act. 409 ``mapping_idle`` while pgo is
+        IDLE (nothing to discard); other failures are 502 with pgo's sentence
+        (typically: not in a mapping session).
         """
         _refuse_while_idle("discard")
 
@@ -1411,29 +1244,14 @@ def init_map_router(
     def start_mapping():
         """Begin a mapping run: ``pgo/start_mapping``, IDLE -> MAPPING.
 
-        The opening bracket of a run (2026-10): a mapping session comes up
-        with pgo idle and banking nothing, so the drive from wherever the
-        robot was powered on to the site's starting point is not part of any
-        map, and a save (``POST /api/v1/maps``) closes the run and leaves pgo
-        idle for the next one. Under ``/api/v1/mapping/`` like the reset: it
-        is about the run, touches no file, and leaves a client nothing to
-        invalidate but the run status.
+        A mapping session starts idle, so the drive to the starting point is
+        not mapped; a save closes the run. Always resets LIO (the map origin is
+        the odometry origin), so the robot must stay **stationary** until the
+        live scan returns.
 
-        No body. pgo's ``reset_lio`` is always true from here, for the reason
-        the reset route gives: the map's origin is the odometry origin, so
-        only a LIO reset starts the map where the robot stands. That re-init
-        is static and gravity-aligning, so the robot must be **stationary**
-        until the live scan returns; pgo's sentence says so and is rendered
-        verbatim.
-
-        409 ``mapping_running`` while the latched status says a run is on
-        (pgo would refuse too — a stale console tab must not be able to
-        discard a run with the wrong button), 409 ``mapping_busy`` while a
-        start or reset is in flight, otherwise pgo answers and a refusal or
-        absence is the uniform 502. This handler does not write the status
-        slot: the state travels the latched topic so every console and rviz
-        agree, the same reason the reset handler leaves the map-cloud repo
-        alone.
+        409 ``mapping_running`` while a run is on, 409 ``mapping_busy`` while a
+        start or reset is in flight, else 502 on pgo's refusal. The status slot
+        is left to the latched topic so every console agrees.
         """
         if _run_state() is MappingState.MAPPING:
             raise ConflictError(
@@ -1454,12 +1272,8 @@ def init_map_router(
     async def get_mapping_status():
         """pgo's run state, as it last reported it.
 
-        ``async`` because it only reads a slot under a lock — no ROS, no I/O
-        (the ``GET /api/v1/robot/restart`` precedent). ``unknown`` is a real
-        answer, not an error: it is what every navigating robot says, since
-        pgo exists only in a mapping session, and what a mapping robot says
-        for the first second after pgo comes up or once it has gone quiet for
-        longer than the repo's TTL.
+        ``async``: it only reads a slot, no I/O. ``unknown`` is a normal answer
+        (every navigating robot, or pgo quiet past the repo's TTL).
         """
         status = mapping_status_repo.get()
         if status is None:
@@ -1476,38 +1290,14 @@ def init_map_router(
     def rename_map(name: str, request: RenameMapRequest):
         """Rename a map: move its directory and re-key the rows that name it.
 
-        Every refusal comes before any mutation, in this order:
+        Refusals, before any mutation: 404; 409 ``map_active`` (map_server and
+        the localizer hold the path — switch away with ``…/activate`` first);
+        409 ``conversion_running`` (the thread holds the old path); 400 / 409
+        ``name_taken`` from ``rename_map_dir``.
 
-        - 404 for a map that is not there.
-        - 409 ``map_active`` for the map the stack is running on. This is the
-          one that matters. map_server and the FAST-LIO2 localizer opened
-          ``map/<name>/…`` during construction, from ``[map] name`` in the
-          instance INI; renaming the directory under them would leave both
-          holding a path that no longer exists, and leave ``active_name()``
-          naming a map the catalogue no longer lists — every card would read
-          ``active: false``. This refusal is not the dead end it used to be:
-          ``POST /api/v1/maps/{name}/activate`` moves the robot onto another map
-          in place, and once it has, the old name is renameable. The refusal
-          stands because that route re-points the two processes *and* rewrites
-          the INI together, and a rename is not entitled to do half of it. The
-          UI greys the control for the active map; this is what makes that more
-          than a suggestion.
-        - 409 ``conversion_running`` while a gridmap conversion is in flight.
-          The conversion thread closed over the old directory path when it
-          started, so a rename under it would make it die with ``OSError`` and
-          leave the catalogue reporting ``converting`` for a name that is gone.
-        - 400 / 409 ``name_taken`` from ``rename_map_dir`` for a bad or
-          already-used new name.
-
-        Filesystem first, database second. The directory move is the step most
-        likely to fail (target exists, permissions), and failing there needs no
-        compensation. The two UPDATEs -- vertices and template bindings -- run
-        in one transaction (``MapRepo.transaction``), so the DB half lands or
-        fails as a unit; if it fails the directory is moved back, because a
-        renamed map whose vertices still answer to the old name is worse than a
-        rename that did not happen. They used to be two sessions, and a failure
-        in the second left the vertices committed under a name the directory
-        had just been moved back from.
+        Filesystem first, database second: the move is the likeliest failure and
+        needs no compensation. Vertices and template bindings are re-keyed in
+        one transaction; if it fails the directory is moved back.
         """
         _require(name)
 
@@ -1537,9 +1327,8 @@ def init_map_router(
                     name, request.name, session=session
                 )
         except Exception as exc:
-            # Best-effort compensation. A second failure here is logged and
-            # reported, not raised over the first: the operator needs the
-            # sentence about the database, and the log needs the path state.
+            # Best-effort compensation; a second failure is logged, not raised
+            # over the first.
             old_dir = os.path.join(os.path.dirname(new_dir), name)
             try:
                 os.rename(new_dir, old_dir)
@@ -1569,9 +1358,7 @@ def init_map_router(
                 )
             )
 
-        # The renderings are keyed by name. A stale entry under the old name
-        # would never be *served* (_png_response re-hashes the file before
-        # consulting the cache) but it would sit there forever; drop it.
+        # Never served stale (the cache is content-tagged), but would leak.
         thumbnail_cache.pop(name, None)
         image_cache.pop(name, None)
         cloud_cache.pop(name, None)
@@ -1589,8 +1376,7 @@ def init_map_router(
             f"{templates_moved} task {'template' if templates_moved == 1 else 'templates'}."
         )
         if templates_moved:
-            # The schedule memo is frozen at registration and is a display
-            # label only (see routers/schedule.py); nothing here re-registers.
+            # A schedule's memo is frozen at registration (routers/schedule.py).
             message += " Schedules already registered keep the old map label."
         return RenameMapResponse(
             old_name=name,
@@ -1604,56 +1390,16 @@ def init_map_router(
     def delete_map(name: str):
         """Delete a map: remove its directory and the vertices that name it.
 
-        The refusals are rename's, in the same order and before any mutation,
-        plus one more:
+        404, then ``_refuse_if_in_use``'s 409s (``map_active``,
+        ``conversion_running``, ``template_bound``) before any mutation.
 
-        - 404 for a map that is not there.
-        - 409 ``map_active`` for the map the stack is running on. The argument
-          is rename's (see above) only harder: map_server and the FAST-LIO2
-          localizer opened ``map/<name>/…`` at launch, and where a rename would
-          leave them holding a stale path a delete leaves them holding nothing.
-          Switching away with ``POST /api/v1/maps/{name}/activate`` lifts this
-          one too — but note that it lifts it by loading the *other* map's files,
-          so the map being deleted is genuinely no longer open.
-        - 409 ``conversion_running``. The conversion thread closed over the
-          directory path and would die writing its own sidecar into a directory
-          that is gone, leaving the catalogue with no map and no record.
-        - 409 ``template_bound``, which has no rename counterpart because rename
-          could re-key the templates and this cannot. A template bound to a
-          deleted map is stuck: it will not dispatch, and ``_require_map``
-          refuses to *edit* it because the map it names does not exist, while
-          clearing its ``map_name`` is blocked for any template holding MOVE
-          steps. Deleting the templates instead would take saved work the
-          operator never mentioned. So the map is kept and the operator is told
-          which templates to unbind first — the one refusal that asks for work
-          rather than a map switch.
+        **Database first, filesystem last** (the inverse of rename): ``rmtree``
+        cannot be undone, so it goes last. A failed ``rmtree`` after the rows
+        are gone converges on retry; the reverse would leave orphaned rows that
+        a future map of the same name silently inherits.
 
-        All three live in ``_refuse_if_in_use``, shared with the import route
-        for the case where an archive replaces an existing map.
-
-        **Database first, filesystem last — the inverse of rename, on purpose.**
-        A rename puts the directory first because ``os.rename`` back is a real
-        compensation; ``shutil.rmtree`` has none, so here the irreversible step
-        goes last, once everything that can still fail has already succeeded.
-        The two failure modes are not symmetric:
-
-        - Rows first, ``rmtree`` fails: the map is still on disk, minus its
-          vertices. The operator retries and the delete converges, and those
-          annotations belonged to a map they had just asked to destroy.
-        - Directory first, the ``DELETE`` fails: the map is gone and its rows
-          survive where nothing can reach them (every vertex route resolves the
-          map first, which now 404s) until the next map saved under the same
-          name silently inherits them. That one does not converge, and nobody
-          would trace it back to a delete that half-failed weeks earlier.
-
-        What survives a successful delete and cannot be helped from here: a
-        Temporal schedule registered against this map. Schedules freeze
-        concrete, already-resolved steps and carry ``map_name`` only as a memo
-        fixed at registration, so one keeps firing coordinates from a map that
-        no longer exists. ``template_bound`` catches the templates, not a
-        schedule whose template was deleted afterwards, and reaching the
-        schedules would mean handing this router ``workflow_gw`` for a warning.
-        It is a sentence in the response instead.
+        Registered schedules keep firing their frozen steps; the response says
+        so.
         """
         _require(name)
         _refuse_if_in_use(
@@ -1667,9 +1413,7 @@ def init_map_router(
         try:
             vertices_deleted = map_repo.delete_vertices(name)
         except Exception as exc:
-            # Nothing to compensate -- that is the whole point of going first --
-            # but the operator has to be told the map is still there, or a
-            # failed delete reads as a delete that worked and did not refresh.
+            # Nothing to compensate, but say the map is still there.
             logger.error(
                 "Map delete failed while removing its vertices",
                 map=name,
@@ -1682,8 +1426,7 @@ def init_map_router(
 
         map_catalog_repo.delete_map_dir(name)
 
-        # Keyed by name, and unlike rename's there is no new name to move them
-        # to: drop them or they sit in the process until it restarts.
+        # Drop the renderings or they sit in memory until restart.
         thumbnail_cache.pop(name, None)
         image_cache.pop(name, None)
         cloud_cache.pop(name, None)
@@ -1703,19 +1446,12 @@ def init_map_router(
     def _carry_keepout(name: str, grid: GridInfo) -> Tuple[bool, str]:
         """Point filter_mask_server at ``name``'s keepout mask; never raises.
 
-        The mask pair is written first when the map has none: a map the nav
-        session has never booted into has no ``keepout.*`` (the launch writes
-        the blank pair at boot and only then), and there is nothing else to
-        hand ``load_map`` -- the *previous* map's zones must be replaced by
-        something, and an all-unknown mask of this map's geometry is that
-        something. Rasterised from ``keepout.json`` when one exists, so a map
-        whose zones were drawn while it was inactive gets them on the first
-        switch. Writing into the target's directory is the only option (the
-        yaml's ``image:`` is relative to itself) and also what makes the next
-        boot of this map find the pair.
+        A map the nav session never booted into has no ``keepout.*``, so the
+        pair is written first (from ``keepout.json`` if any, else blank) —
+        the previous map's zones must be replaced by something.
 
-        Returns ``(reloaded, note)``: the note is a sentence for the operator,
-        empty when there is nothing worth saying (mask reloaded, no zones).
+        Returns ``(reloaded, note)``; the note is an operator sentence, empty
+        when there is nothing to say.
         """
         zones = map_catalog_repo.read_keepout_zones(name)
         yaml_path = map_catalog_repo.keepout_yaml_path(name)
@@ -1750,57 +1486,27 @@ def init_map_router(
     async def activate_map(name: str):
         """Switch the robot onto another map, live, without restarting the stack.
 
-        For most of this file's history the answer to "can I switch maps?" was
-        no: map_server and the localizer read `[map] map` / `[map] pcd` during
-        construction, nothing in this backend wrote the INI, and so rename and
-        delete both told the operator to restart the stack. This is the route
-        that makes those refusals escapable, and it works because both
-        processes turned out to already have a runtime door — `map_server/load_map`
-        re-reads a yaml off disk, and `relocalize` takes a `pcd_path`.
+        Three parts must agree: the localizer's cloud (`relocalize`),
+        map_server's grid (`load_map`) and `[map] name` in the INI (what
+        `active_name()` reports and a restart reads). The localizer goes first
+        because a refusal there mutates nothing; each later step compensates the
+        earlier ones on failure. The INI is last and preflighted for
+        writability, since an unrecorded swap would leave REST naming the wrong
+        map.
 
-        Three moving parts have to end up agreeing, and the whole design is about
-        what happens when one of them does not:
+        All refusals come first. `stack_not_ready` (e.g. mapping mode) is
+        detected by service discoverability, not the cached RobotState, which
+        is absent on a robot that lost localization.
 
-        - the localizer's point cloud (what the robot matches against),
-        - map_server's occupancy grid (what the planner and both costmaps see),
-        - `[map] name` in the INI (what survives a restart, and what
-          `active_name()` — and therefore every card's `active` flag, the
-          dashboard's vertex scoping and the task templates' map binding —
-          reports right now).
-
-        Order is chosen so the likeliest failure is the cleanest one. The
-        localizer goes first because its refusals happen before it mutates
-        anything (`relocCB` returns early on a missing file, and
-        `ICPLocalizer::loadMap` swaps its buffers only as its last statement), so
-        a bad PCD leaves *nothing* changed. Each later step compensates the
-        earlier ones by putting the old map back. The INI is last and is
-        preflighted for writability, because a swap the INI does not record is
-        the worst of the available outcomes: the stack would be driving on one
-        map while every REST answer named another.
-
-        Every refusal is before any of that. Notably `stack_not_ready`, which is
-        how "the robot is in mapping mode" is detected — service discoverability
-        rather than the cached RobotState's mode, because RobotRepo's write is
-        gated on `localization_valid` and a robot that has lost localization
-        therefore has no cached mode at all. That robot is precisely the one
-        whose operator is reaching for this route.
-
-        What this deliberately does not do is guarantee the robot knows where it
-        is afterwards. `[initial_pose]` is zeroed rather than carried over — a
-        pose measured in the old map's frame is not wrong-looking in the new one,
-        it is wrong-looking nowhere, and it can drop the robot inside a wall with
-        every indicator green. The operator sets the real pose from the
-        dashboard. `localized` reports whether registration converged in the few
-        seconds after the swap, which is the only honest signal available.
+        `[initial_pose]` is zeroed: an old-frame pose is meaningless here. The
+        operator sets the pose; `localized` says whether registration converged
+        shortly after the swap.
         """
         stored = _require(name)
 
         previous = map_catalog_repo.active_name()
         if name == previous:
-            # The no-op, not a failure — same shape as sys_manager's switch_mode
-            # answering "Already in AUTO; nothing to do". Tearing the localizer
-            # down and rebuilding it onto the map it already holds would only
-            # throw away a good registration.
+            # The no-op: reloading would only throw away a good registration.
             return ActivateMapResponse(
                 name=name,
                 previous=previous,
@@ -1818,11 +1524,8 @@ def init_map_router(
 
         status, grid_error = _grid_status(stored, False)
         if status != GridStatus.OK:
-            # map_server throws out of its constructor on an unloadable yaml and
-            # main() has no try/catch, so at *launch* this would take the whole
-            # AUTO session down. Here it would only fail the load_map call, but
-            # refusing up front is what keeps that from being discovered with the
-            # localizer already swapped.
+            # Refuse up front, before the localizer is swapped (and an
+            # unloadable yaml would crash map_server at the next launch).
             detail = f" ({grid_error})" if grid_error else ""
             raise ConflictError(
                 f"'{name}' has no usable gridmap{detail}. Build one from the "
@@ -1848,17 +1551,15 @@ def init_map_router(
 
         ini_path = system_ini_path()
         if not os.access(ini_path, os.W_OK):
-            # Preflighted so the last step of the swap cannot realistically fail
-            # after the robot has already moved onto the new map.
+            # Preflighted so the swap's last step cannot fail after the move.
             raise ConflictError(
                 f"The system INI ({ini_path}) is not writable, so a switch "
                 "could not be recorded and would not survive a restart.",
                 code="ini_not_writable",
             )
 
-        # Any job, not only one holding a map: a switch re-points the localizer,
-        # and a robot standing up or speaking is still a robot that should not
-        # lose its position mid-job. Stricter than _refuse_while_a_job_holds.
+        # Any job, not only one holding a map (stricter than
+        # _refuse_while_a_job_holds): a switch re-points the localizer.
         active_tasks = await _running_tasks("a map switch")
 
         if active_tasks:
@@ -1870,19 +1571,11 @@ def init_map_router(
                 code="task_running",
             )
 
-        # Everything from here on is blocking: two wait_for_service probes,
-        # a relocalize that can take a minute, a load_map, an INI write and a
-        # convergence poll. This route has to be `async def` because confirming
-        # the robot is idle is a Temporal await and the client belongs to the
-        # uvicorn loop -- so the blocking half goes to a worker thread instead,
-        # which is what the rest of this file gets for free by being plain
-        # `def`. Left on the loop it froze every WebSocket (telemetry,
-        # pointcloud, and the teleop watchdog that stops the robot) for the
-        # length of the swap.
-        #
-        # The preflight above stays on the loop deliberately: it is stat calls
-        # and one small INI read, and moving it would buy microseconds while
-        # changing the order failures are reported in.
+        # The route is `async def` for the Temporal await (the client belongs to
+        # the uvicorn loop); everything below blocks for up to a minute, so it
+        # runs in a worker thread. On the loop it froze every WebSocket,
+        # including the teleop watchdog.
+
         def _switch() -> ActivateMapResponse:
             if not map_gw.nav_services_ready():
                 raise ConflictError(
@@ -1899,9 +1592,8 @@ def init_map_router(
             def _restore_localizer(reason: str) -> str:
                 """Put the localizer back on the old cloud. Returns a sentence."""
                 if previous_pcd is None:
-                    # Either the INI named no map at all (which is itself what makes
-                    # the write below fail, so this is the *likely* pairing, not an
-                    # exotic one) or the map it named has since lost its map.pcd.
+                    # The INI named no map (the likely case when its write fails),
+                    # or that map lost its map.pcd.
                     where = (
                         f"'{previous}' has no map.pcd"
                         if previous
@@ -1928,8 +1620,7 @@ def init_map_router(
 
             swapped, detail = map_gw.swap_localizer_map(pcd_path, 0.0, 0.0, 0.0)
             if not swapped:
-                # Nothing has changed: this is the one step whose failure needs no
-                # compensation at all.
+                # Nothing has changed yet, so nothing to compensate.
                 logger.error("Map switch failed at the localizer", map=name, error=detail)
                 raise UpstreamError(
                     f"Could not point the localizer at '{name}': {detail}. The robot "
@@ -1950,21 +1641,16 @@ def init_map_router(
                 logger.error(
                     "Map switch failed at the INI write", map=name, error=str(exc)
                 )
-                # Undone in the order they were done, and as statements rather than
-                # inside the message below: built by concatenation these run in
-                # argument-evaluation order, which reads as the reverse of what it
-                # does and would silently flip if the sentences were reordered.
+                # Undone in the order done, as statements: inside the message
+                # concatenation the order would follow the sentences.
                 restored_cloud = _restore_localizer("INI write failed")
 
                 previous_yaml = (
                     map_catalog_repo.gridmap_yaml_path(previous) if previous else None
                 )
                 if previous_yaml is None:
-                    # The map the stack launched on has since lost its gridmap.yaml
-                    # (map_server loaded that file to start at all), or the INI named
-                    # no map. Say so rather than leave map_server quietly serving a
-                    # grid that no longer matches the cloud the localizer went back
-                    # to.
+                    # Say so rather than leave map_server quietly serving a grid
+                    # that does not match the restored cloud.
                     where = (
                         f"'{previous}' has no gridmap.yaml"
                         if previous
@@ -1988,18 +1674,12 @@ def init_map_router(
                     + restored_grid
                 )
 
-            # The switch is recorded; from here on nothing can fail it. The
-            # keepout mask is carried over best-effort *after* that commit
-            # point, on purpose: filter_mask_server still holds the previous
-            # map's zones (the launch derives the mask path once, at boot, and
-            # load_map above moved only the gridmap), so they have to be
-            # replaced with this map's -- but a mask problem is not a reason
-            # to tell the operator the switch failed when the localizer, the
-            # grid and the INI all moved. It rides in the message instead.
+            # The switch is recorded; nothing can fail it now. The keepout mask
+            # (still the previous map's) is carried over best-effort after this
+            # commit point: a mask problem goes in the message, not a failure.
             keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
 
-            # Only the vertex-scoping consumers care, and they re-query; the
-            # renderings are keyed by map name, so nothing cached is now stale.
+            # Renderings are keyed by map name, so nothing cached is stale.
             localized = map_gw.localization_converged()
 
             logger.info(
@@ -2036,10 +1716,8 @@ def init_map_router(
 
     # --- Localization -------------------------------------------------------
 
-    # Held across one auto_localize call. The localizer serves it in a mutually
-    # exclusive callback group, so a second press would only queue behind the
-    # first and time out here -- or, worse, run a second search right after
-    # the first one succeeded. Not a queue: a press while one runs is a 409.
+    # Held across one auto_localize call: a second press would queue behind the
+    # first in the localizer and time out or search again. It is a 409 instead.
     auto_localize_lock = threading.Lock()
 
     @map_router.post(
@@ -2049,26 +1727,13 @@ def init_map_router(
         """Find the robot on the loaded map with no hint — the localizer's
         ``auto_localize``, the recovery for a kidnapped robot.
 
-        The operator's alternative to dragging an initial pose: carried
-        somewhere, booted away from ``[initial_pose]``, or simply lost. No
-        body, because the point is that no hint is needed. Blocks until the
-        localizer answers — up to ~15 s by its own deadlines — and a 200 is a
-        *result*: localized, nothing to poll, unlike the map switch's
-        ``relocalize``.
+        No body. Blocks up to ~15 s; a 200 means localized, nothing to poll.
+        Writes nothing (not the INI's ``[initial_pose]``).
 
-        Refusals: 409 ``task_running`` while any job runs (this moves the
-        map frame under the robot, which mid-drive is a jump in where the
-        planner thinks it is — the same "any job" strictness as activate),
-        409 ``tasks_unknown`` when Temporal cannot say, 409
-        ``localize_running`` while a search is already in flight. Everything
-        the localizer says — not in AUTO mode, no ``poses.txt``, ambiguous
-        surroundings, did not converge — is the uniform 502 with its
-        sentence; the srv carries no code to tell them apart and prose is
-        not matched (gateways/failure.py). Writes nothing: not the INI's
-        ``[initial_pose]``, not a file.
-
-        ``async`` for the Temporal await, blocking half on a worker thread —
-        activate's split, for activate's reason.
+        409 ``task_running`` while any job runs (it moves the map frame under
+        the robot), 409 ``tasks_unknown``, 409 ``localize_running``. Every
+        localizer refusal is the uniform 502 with its sentence. ``async`` for
+        the Temporal await, blocking half on a worker thread, as activate.
         """
         active_tasks = await _running_tasks("finding the robot")
         if active_tasks:
@@ -2103,17 +1768,15 @@ def init_map_router(
                 x=found.x,
                 y=found.y,
                 z=found.z,
-                # Radians in, degrees out: the REST vocabulary, as in
-                # set_initial_pose.
+                # REST speaks degrees.
                 theta=math.degrees(found.yaw),
                 fitness=found.fitness,
                 inlier_ratio=found.inlier_ratio,
                 candidates=found.candidates,
             )
 
-        # No await between the acquire above and this submit, so _localize
-        # always runs and always releases -- a client that drops the request
-        # meanwhile only stops waiting for the answer.
+        # No await between the acquire and this submit, so _localize always
+        # runs and releases the lock even if the client goes away.
         return await asyncio.to_thread(_localize)
 
     @map_router.post(
@@ -2124,19 +1787,10 @@ def init_map_router(
     def convert_map_grid(name: str, request: ConvertGridRequest):
         """(Re)build a map's 2D gridmap from its map.pcd, in the background.
 
-        This is the formal home of what used to be done with a one-off script
-        that never made it into the repo: choosing the recipe when the default
-        is wrong for the site (a warehouse too large to hand-edit wants
-        traversability), re-converting after a parameter override, and getting
-        the traversability pipeline's intermediate clouds for tuning a site the
-        defaults cannot handle — the next outdoor venue tunes from those, not
-        from constants guessed in advance.
-
-        Two 409s can come back and the client must tell them apart (the `code`
-        field): `conversion_running` means try later; `gridmap_hand_edited`
-        means the current grid holds operator edits and the caller has to
-        confirm with `overwrite_edits` — even then the edited grid survives as
-        gridmap_prev.pgm.
+        Picks the recipe, applies parameter overrides, and can dump the
+        traversability intermediates for tuning. 409 `conversion_running`:
+        try later; 409 `gridmap_hand_edited`: confirm with `overwrite_edits`
+        (the edited grid survives as gridmap_prev.pgm).
         """
         stored = _require(name)
         if not stored.has_pointcloud:
@@ -2144,9 +1798,7 @@ def init_map_router(
                 f"Map '{name}' has no map.pcd — there is nothing to convert."
             )
 
-        # Cross-field validation as readable 400s rather than schema 422s: which
-        # parameter belongs to which recipe is domain knowledge, and the FastAPI
-        # 422 for it would name a field, not the mismatch.
+        # Cross-field validation as readable 400s, not schema 422s.
         if request.recipe is GridRecipe.Z_BAND and request.gap_fill_size is not None:
             raise BadRequestError(
                 "gap_fill_size tunes the traversability recipe; the z-band "
@@ -2173,10 +1825,8 @@ def init_map_router(
         if request.z_band_offsets is not None:
             band_overrides = request.z_band_offsets.model_dump(exclude_none=True)
             merged = {**GRIDMAP_BANDS_ABOVE_FLOOR, **band_overrides}
-            # Ordering is checked on the *merged* bands: a request overriding one
-            # end of a band can invert it against the recipe's other end, and
-            # that inversion selects no points and fails half a minute later in
-            # the thread, where nothing answers the operator.
+            # Check the *merged* bands: overriding one end can invert a band,
+            # which would otherwise fail later in the thread, unseen.
             if merged["floor_zmin"] >= merged["floor_zmax"]:
                 raise BadRequestError(
                     f"floor band is inverted: floor_zmin {merged['floor_zmin']} "
@@ -2223,10 +1873,8 @@ def init_map_router(
             "param_overrides": param_overrides,
         }
 
-        # An active map that re-converts must reach map_server, or it keeps
-        # serving the grid the operator just replaced — the same reload the
-        # gridmap-editor save does, deferred into the thread because the grid
-        # does not exist yet when this handler answers.
+        # An active map must reload map_server once the new grid exists, so
+        # the reload runs in the conversion thread.
         on_success: Optional[Callable[[], None]] = None
         if name == map_catalog_repo.active_name():
 
@@ -2260,8 +1908,7 @@ def init_map_router(
             archive=lambda: map_catalog_repo.archive_gridmap(name),
             on_success=on_success,
         )
-        # started=False cannot happen past the has_pointcloud gate above short of
-        # a race deleting map.pcd; report it honestly rather than asserting.
+        # started=False needs a race deleting map.pcd; report it, do not assert.
         return ConvertGridResponse(
             name=name,
             started=started,
@@ -2283,9 +1930,7 @@ def init_map_router(
 
     @map_router.get("/api/v1/maps/{name}/vertices", response_model=List[MapVertexResponse])
     def list_map_vertices(name: str, type: Optional[VertexType] = None):
-        # _require first: without it an unknown map name returns [] — the same
-        # answer as a real map with no vertices yet, which is the harder of the
-        # two states to debug from the UI side.
+        # _require first, so an unknown map is a 404 rather than [].
         _require(name)
         vertices = map_repo.list_vertices(map=name, type=type.value if type else None)
         return [_vertex_response(vertex) for vertex in vertices]
@@ -2315,15 +1960,8 @@ def init_map_router(
     def _require_vertex(name: str, vertex_id: uuid.UUID) -> MapPoint:
         """Fetch a vertex, but only as a member of ``name``.
 
-        A vertex id is unique on its own, so the map name in the URL is not
-        needed to find the row — it is here to be checked. Without this a client
-        could read or delete any vertex through any map's URL, and the response
-        would contradict the path it came from.
-
-        A row that exists but belongs elsewhere is a 404 rather than a 403: from
-        this URL's point of view the resource genuinely is not there, and saying
-        "wrong map" would confirm the id exists to a caller who addressed the
-        wrong map.
+        The id alone finds the row; the URL's map is checked so no vertex is
+        reachable through another map's URL. A row on another map is a 404.
         """
         _require(name)
         vertex = map_repo.get_vertex(vertex_id=vertex_id)
@@ -2365,10 +2003,7 @@ def init_map_router(
     def _read_gridmap(name: str) -> bytes:
         """Read the map's gridmap.pgm bytes, 404ing with the reason if absent.
 
-        No endpoint serves these bytes as-is. /image is the wire format for the
-        grid: a lossless full-size PNG of the same cells, which every browser
-        can already decode, against a P5 the client would need a parser for —
-        one that has to tolerate the ``#`` comment line GIMP writes.
+        Never served raw: /image's lossless PNG is the grid's wire format.
         """
         _require(name)
         path = map_catalog_repo.gridmap_path(name)
@@ -2393,18 +2028,13 @@ def init_map_router(
     ) -> Response:
         """Serve a PNG rendered from the map's gridmap, cached and revalidated.
 
-        Shared by /image and /thumbnail because the only thing that differs
-        between them is the render call: both key their cache and their ETag on
-        the *source* .pgm bytes rather than the encoded PNG, so a rendering that
-        is a deterministic function of the gridmap changes exactly when the
-        gridmap does.
+        Cache and ETag key on the *source* .pgm bytes, not the encoded PNG.
         """
         payload = _read_gridmap(name)
         tag = _content_tag(payload)
         headers = {"ETag": tag, "Cache-Control": "no-cache"}
 
-        # Before rendering, not after: a client holding the current image must not
-        # cost us a PNG encode we then throw away.
+        # Before rendering, so a 304 costs no PNG encode.
         if _not_modified(request, tag):
             return Response(status_code=304, headers=headers)
 
@@ -2422,12 +2052,7 @@ def init_map_router(
 
     @map_router.get("/api/v1/maps/{name}/image")
     def get_map_image_by_name(name: str, request: Request):
-        """The map's gridmap as a full-size PNG.
-
-        Raw bytes, not the base64-in-JSON envelope the loaded-map endpoint uses:
-        the consumer is an <img>/texture load, and base64 would cost a third
-        more bytes for a value nothing reads as a string.
-        """
+        """The map's gridmap as a full-size PNG (raw bytes, not base64 JSON)."""
         return _png_response(name, request, image_cache, render_png, "image")
 
     @map_router.get("/api/v1/maps/{name}/thumbnail")
@@ -2446,57 +2071,31 @@ def init_map_router(
     ):
         """Write an edited gridmap back, and reload it if it is the live one.
 
-        The body is the cells themselves: exactly ``width * height`` bytes in
-        .pgm row order (row 0 is the top of the map, max y). Raw rather than a
-        PNG or base64-in-JSON because it is what the editor already holds — the
-        client's buffer goes out as a memcpy and the server writes it into a P5
-        body verbatim, so there is no encode, no decode, and no chance of a
-        colour-managed round trip shifting 205 to 204. (The GET side had to pass
-        ``colorSpaceConversion: "none"`` to stop exactly that.) The cost is ~1.6
-        MB on the wire per save, on a robot LAN, once per operator edit.
+        The body is exactly ``width * height`` raw cells in .pgm row order (row
+        0 is max y): no encode/decode, so no colour-managed round trip can shift
+        205 to 204.
 
-        A plain ``def``, like everything else here, and that is load-bearing: this
-        handler fsyncs a multi-megabyte write and then parks on
-        ``MapGateway.reload_map`` for up to 25 s. On the event loop that would
-        stall every other request in the process, the telemetry WebSocket
-        included. ``bytes = Body(...)`` is what makes it possible — FastAPI reads
-        the body in its async layer and hands the finished bytes to the
-        threadpool. The alternative (``async def`` + ``await request.body()`` +
-        ``run_in_threadpool`` twice) buys nothing — a ``bytes`` body parameter
-        already receives the raw payload whatever the Content-Type header says;
-        the ``media_type`` here is OpenAPI documentation, not enforcement — and
-        needs two threadpool hops a later edit can silently drop.
+        Plain ``def`` (load-bearing): it fsyncs and parks on ``reload_map`` for
+        up to 25 s; ``bytes = Body(...)`` reads the body on the loop and hands
+        it to the threadpool.
 
-        Cell *values* are deliberately not validated. map_io.cpp classifies by
-        range (occupied <= 89, unknown 90..205, free >= 206) under the
-        ``negate: 0 / 0.65 / 0.196`` every gridmap.yaml here carries, and two of
-        the real maps already contain 255s from a round of hand-editing in GIMP.
-        A ``{0, 205, 254}`` whitelist would refuse to save a map this same round
-        trip just handed the client. The length is the only thing that can make a
-        file map_server would misread.
-
-        No body-size cap either: the payload is already in memory by the time
-        this runs, so rejecting on Content-Length would mean streaming, and this
-        whole API is unauthenticated on a robot LAN — a cap is middleware's job.
+        Cell values are not validated: map_server classifies by range and real
+        maps carry hand-edited 255s; only the length can make a misread file.
+        No size cap: that is middleware's job.
         """
         stored = _require(name)
 
         if conversion_svc.is_converting(name):
-            # The conversion thread is about to os.replace() gridmap.pgm and
-            # gridmap.yaml with whatever it computes. A save landing in that
-            # window is silently overwritten, and the once-only gridmap_raw.pgm
-            # snapshot write_gridmap takes could capture the half-finished grid
-            # as the "original". Same refusal rename, delete and activate make.
+            # The conversion would overwrite the save, and the once-only
+            # gridmap_raw.pgm snapshot could capture a half-finished grid.
             raise ConflictError(
                 f"A gridmap conversion for '{name}' is running; save the edit "
                 "once it has finished, or the conversion will overwrite it.",
                 code="conversion_running",
             )
 
-        # stored.grid rather than a fresh read: _read_grid has already parsed the
-        # .pgm header *and* gridmap.yaml, so one None test covers "no pgm", "no
-        # yaml" and "torn pgm" — and it makes "the two agree" a precondition of
-        # saving, which matters because map_server re-reads both a few lines down.
+        # stored.grid parsed both the .pgm header and gridmap.yaml, so one None
+        # test covers missing or torn files before map_server re-reads both.
         if stored.grid is None:
             raise NotFoundError(
                 f"Map '{name}' has no gridmap. Convert its map.pcd first "
@@ -2512,15 +2111,8 @@ def init_map_router(
 
         written = map_catalog_repo.write_gridmap(name, payload)
 
-        # No cache eviction here, and that is the design rather than an oversight.
-        # thumbnail_cache and image_cache are in this same closure, so reaching
-        # them is trivial — but _png_response re-reads the file and re-hashes it
-        # *before* consulting the cache, so a stale entry can never be served.
-        # Evicting would add a second place that has to remember the caches exist,
-        # making /image's correctness look like it depends on this handler; and
-        # popping before the write would be actively wrong, throwing away a valid
-        # rendering if the write then failed. There is no thumbnail file on disk
-        # to update either: /thumbnail renders from these bytes on demand.
+        # No cache eviction by design: _png_response re-hashes the file before
+        # consulting the cache, so a stale entry is never served.
         tag = _content_tag(written)
         response.headers["ETag"] = tag
 
@@ -2534,9 +2126,7 @@ def init_map_router(
                 message=(f"Saved {name}"),
             )
 
-        # None only if gridmap.yaml vanished since stored.grid was read — the same
-        # race the repo's own isfile check covers. Handled as a failed reload
-        # rather than left to hand the gateway a None it would abspath().
+        # None only on a race; handled as a failed reload.
         yaml_path = map_catalog_repo.gridmap_yaml_path(name)
         if yaml_path is None:
             reloaded, detail = False, "gridmap.yaml is missing"
@@ -2544,18 +2134,11 @@ def init_map_router(
             reloaded, detail = map_gw.reload_map(yaml_path)
 
         if not reloaded:
-            # Still a 200. The bytes are on disk and every GET now returns them,
-            # so a 5xx would tell the operator the save failed when it did not —
-            # and they would either press save again or re-edit a grid they
-            # believe was lost. `reloaded` is the machine-readable half of the
-            # answer, `message` the human one. 202/207 were considered and
-            # dropped: no client here understands them, and nothing is partial or
-            # queued — the request completed, one of its two effects did not.
+            # Still a 200: the save worked, so a 5xx would mislead the operator.
+            # `reloaded` says the reload did not.
             logger.error("Saved gridmap but map_server did not reload", map=name, error=detail)
-            # `detail` rides in the message, not only in the log: the gateway
-            # goes out of its way to distinguish "service not there" from
-            # "map_server rejected it" from a timeout, and the operator staring
-            # at a stale map is the one who needs that distinction.
+            # `detail` goes to the operator too: it tells absent, rejected and
+            # timed out apart.
             return SaveGridmapResponse(
                 name=name,
                 etag=tag,
@@ -2576,12 +2159,8 @@ def init_map_router(
     def get_map_keepout(name: str):
         """The map's forbidden zones, as polygons in map-frame metres.
 
-        Read from ``keepout.json``, the source of truth this API writes, not
-        from the mask: the mask is the rasterised *result* and cannot be turned
-        back into the polygons the console edits. A map with a mask but no
-        json -- the blank pair the nav session writes at boot, or a GIMP-drawn
-        one -- therefore answers ``zones: []``; the next PUT overwrites that
-        mask with what the console drew.
+        Read from ``keepout.json`` (the source of truth), not the mask, so a
+        mask with no json answers ``zones: []``.
         """
         _require(name)
         zones = map_catalog_repo.read_keepout_zones(name)
@@ -2599,27 +2178,14 @@ def init_map_router(
     def save_map_keepout(name: str, request: SaveKeepoutRequest):
         """Replace the map's forbidden zones, and reload them if it is the live map.
 
-        The same shape as ``save_map_grid`` above, step for step, and for the
-        same reasons: a plain ``def`` because it fsyncs three files and then
-        parks on a ROS service for up to 25 s; a 409 while the map's gridmap is
-        being converted, because the conversion may change the geometry the
-        mask is rasterised against; a 404 for a map with no gridmap at all,
-        because there is no geometry to rasterise against; and a **200 with
-        ``reloaded: false``** when the save worked but ``filter_mask_server``
-        did not take the reload -- the files are on disk, every GET returns the
-        new zones, and they apply when the nav stack next boots this map, so a
-        5xx would tell the operator the save failed when it did not.
+        Shaped like ``save_map_grid``: plain ``def``, 409 while converting (the
+        geometry may change), 404 with no gridmap, and 200 ``reloaded: false``
+        when the save worked but ``filter_mask_server`` did not reload.
 
-        The body is the *whole* list. ``[]`` is a valid body and is how zones
-        are cleared: it rewrites the mask all-unknown and reloads it. Deleting
-        the files instead would clear nothing -- the running KeepoutFilter
-        keeps the last mask it was sent -- and the nav session would only write
-        a blank pair back at the next boot.
-
-        The mask is rasterised here rather than in the console because the
-        console holds polygons in metres and the two must agree cell for cell
-        with ``gridmap.pgm``; ``helpers/keepout.py`` owns that convention (and
-        the reason the background is 205, not 254).
+        The body is the *whole* list; ``[]`` clears the zones by rewriting the
+        mask all-unknown (deleting files would not clear the running filter).
+        Rasterised here to match ``gridmap.pgm`` cell for cell; see
+        ``helpers/keepout.py``.
         """
         stored = _require(name)
 
@@ -2651,9 +2217,7 @@ def init_map_router(
                 message=f"{saved}.",
             )
 
-        # None only on a race with a delete: write_keepout just put both files
-        # there. Handled as a failed reload rather than as a None handed to the
-        # gateway to abspath().
+        # None only on a race with a delete; handled as a failed reload.
         yaml_path = map_catalog_repo.keepout_yaml_path(name)
         if yaml_path is None:
             reloaded, detail = False, "keepout.yaml is missing"
@@ -2686,18 +2250,11 @@ def init_map_router(
     def get_map_pointcloud_by_name(name: str):
         """The map's saved map.pcd, packed for the viewer.
 
-        Wire format matches the live endpoint and the WebSocket stream: a
-        little-endian uint32 point count followed by ``3 * count`` little-endian
-        float32 xyz values. Decimated with the same voxel size and cap the
-        point-cloud subscriber applies to ``localizer/map_cloud``, so a client
-        gets a comparable cloud whichever endpoint it reads.
+        Same wire format and decimation as the live stream: LE uint32 count,
+        then ``3 * count`` LE float32 xyz.
 
-        Cached on the file's (size, mtime) rather than a content hash: parsing a
-        ~20 MB .pcd is the expensive part and hashing it first would mean
-        reading the whole file anyway. The objection that made ``_content_tag``
-        hash gridmap bytes does not apply here — nothing edits map.pcd in place,
-        it is only ever replaced wholesale by pgo/save_maps, which changes the
-        point count and so the size.
+        Cached on (size, mtime), not a content hash: map.pcd is only ever
+        replaced wholesale, never edited in place.
         """
         _require(name)
         path = map_catalog_repo.pointcloud_path(name)

@@ -43,10 +43,7 @@ class MapRepo:
             try:
                 yield session
             except ConflictError:
-                # A domain outcome this repo produced on purpose (a duplicate
-                # vertex name), not a database that misbehaved. Logging it at
-                # ERROR with a traceback would put a stack trace in the journal
-                # every time an operator types a name twice.
+                # A domain outcome (duplicate name), not a DB fault: no traceback.
                 raise
             except Exception:
                 self.logger.error(f"[MapRepo][{op}] database operation failed", exc_info=True)
@@ -56,14 +53,10 @@ class MapRepo:
     def transaction(self, op: str) -> Generator[Session, None, None]:
         """One session for several writes that must land or fail together.
 
-        Yields a session; commits when the block exits cleanly, and lets the
-        sessionmaker's context manager roll back when it does not. Exists for
-        the map rename: ``move_vertices`` and ``TaskTemplateRepo.rebind_map``
-        used to each open and commit their own session, so a failure in the
-        second left the vertices already re-keyed to a name the directory had
-        just been moved back from -- permanently orphaned waypoints. Both repos
-        take a ``session`` argument for exactly this caller; the two tables
-        share one engine, so a session from this repo's maker serves both.
+        Commits on a clean exit, rolls back otherwise. Used by the map rename
+        and import so e.g. ``move_vertices`` and ``TaskTemplateRepo.rebind_map``
+        cannot half-land (orphaned waypoints). Both tables share one engine, so
+        this session serves both repos' ``session=`` argument.
         """
         with self._session(op=op) as session:
             yield session
@@ -77,17 +70,11 @@ class MapRepo:
     ) -> list[MapPoint]:
         """Batch-insert vertices in a single transaction.
 
-        Each dict carries the column values (name/type/x/y/theta).
-        All rows are committed together, so a failure inserts none of them.
+        All rows land together or none do. With ``session``, they are flushed
+        into the caller's transaction, not committed (see ``transaction``).
 
-        With ``session`` given, the rows are flushed into the caller's
-        transaction and *not* committed here -- see ``transaction``. The map
-        import uses that to replace a map's vertices atomically: its
-        ``delete_vertices`` and this insert either both land or neither does.
-
-        Raises ConflictError when a name is already taken on this map, or when
-        the batch repeats one within itself — ``uq_map_vertices_map_name``
-        cannot tell those apart, and neither answer differs to the caller.
+        Raises ConflictError when a name is taken on this map or repeated in
+        the batch (``uq_map_vertices_map_name`` cannot tell which).
         """
         rows = [MapPoint(map=map, **fields) for fields in vertices]
         names = [fields["name"] for fields in vertices]
@@ -107,9 +94,8 @@ class MapRepo:
             try:
                 own.commit()
             except IntegrityError as exc:
-                # The constraint is the check; this only translates it. A
-                # SELECT-then-INSERT here would race, and would have to be
-                # repeated in update_vertex -- see MapPoint.__table_args__.
+                # The constraint is the check (a SELECT first would race); see
+                # MapPoint.__table_args__.
                 raise ConflictError(
                     self._name_taken_detail(map, names), code="vertex_name_taken"
                 ) from exc
@@ -119,11 +105,8 @@ class MapRepo:
     def _name_taken_detail(map: str, names: list[str]) -> str:
         """The 409 sentence for a rejected insert.
 
-        The database reports the constraint, not which row tripped it, and a
-        batch arrives as one statement. Rather than issue another query on the
-        error path to find out, the message names the whole submitted set and
-        says the collision is somewhere in it — true for both the "already on
-        the map" and the "repeated within this batch" case.
+        The constraint does not say which row tripped it, so a batch's message
+        names the whole set.
         """
         if len(names) == 1:
             return f"A vertex in '{map}' is already named '{names[0]}'."
@@ -137,9 +120,7 @@ class MapRepo:
     def _scope(stmt, map: Optional[str], type: Optional[str]):
         """AND the two optional filters onto a statement over ``map_vertices``.
 
-        Shared by ``list_vertices`` and ``count_vertices`` so the two can never
-        disagree about what they are describing — a count that does not match
-        the listing it labels is the whole bug class this exists to prevent.
+        Shared so ``list_vertices`` and ``count_vertices`` cannot disagree.
         """
         if map is not None:
             stmt = stmt.where(MapPoint.map == map)
@@ -152,43 +133,23 @@ class MapRepo:
     ) -> list[MapPoint]:
         """Vertices matching both filters, oldest first.
 
-        The filters are optional and AND together; omitting both lists every
-        vertex on the robot, and callers treat an empty result as normal (a map
-        with no vertices yet), so this must never raise on zero rows.
-
-        Unbounded on purpose — the REST listing answers the whole set — so every
-        row becomes a fully instrumented ORM object. Callers that only need *how
-        many* must use ``count_vertices``, and callers that only need *some*
-        must use ``get_vertices``; both exist because doing either through this
-        method hydrates the entire map to throw most of it away.
+        Optional filters, ANDed; zero rows is normal. Unbounded, so use
+        ``count_vertices`` for a count and ``get_vertices`` for a subset.
         """
         with self._session(op="list_vertices") as session:
             stmt = self._scope(select(MapPoint), map, type)
-            # id is a random UUID, so order by creation time for a stable,
-            # meaningful listing order.
+            # id is a random UUID; creation time gives a stable order.
             stmt = stmt.order_by(MapPoint.created_at)
-            # scalars(), not query(): Session.query() takes entities, not an
-            # already-built Select, and returns Rows rather than MapPoints.
             return list(session.scalars(stmt).all())
 
     def count_vertices(self, map: Optional[str] = None, type: Optional[str] = None) -> int:
         """How many vertices match the same filters ``list_vertices`` takes.
 
-        A ``SELECT count(*)``, not ``len(list_vertices(...))``: the map
-        catalogue labels every card with its vertex count, so the cheap version
-        of this question is asked once per map on disk per page load, and the
-        expensive version answers it by building one ORM object per row —
-        identity map, instrumented attributes and all — purely to call ``len``
-        on the list and drop it. The count belongs in the database, where it is
-        an index scan and one integer on the wire.
-
-        No ``order_by``: it cannot change a count, and sorting rows only to
-        count them is work PostgreSQL would otherwise have to do.
+        A ``SELECT count(*)``: the catalogue asks once per map per page load,
+        and ``len(list_vertices(...))`` would hydrate every row.
         """
         with self._session(op="count_vertices") as session:
             stmt = self._scope(select(func.count()).select_from(MapPoint), map, type)
-            # scalar_one(): count(*) always returns exactly one row, and a None
-            # here would be a bug rather than an empty result.
             return session.scalars(stmt).one()
 
     def get_vertex(self, vertex_id: uuid.UUID) -> Optional[MapPoint]:
@@ -200,21 +161,13 @@ class MapRepo:
     ) -> list[MapPoint]:
         """The vertices of ``map`` whose ids are in ``vertex_ids``.
 
-        Both conditions matter. The ids narrow the query to what a caller
-        actually referenced, instead of loading a whole map to look a handful of
-        them up. The ``map`` filter is what makes a *present* row mean "exists
-        **and** belongs here" — task templates rely on absence from the result
-        to tell an operator a step points at another map's vertex, so widening
-        this to an id-only lookup would silently accept cross-map references.
-
-        Ids the map does not hold are simply absent from the result; callers
-        distinguish "deleted" from "belongs elsewhere" themselves, with
-        ``get_vertex``, only for the ids that came back missing.
+        Keep the ``map`` filter: task templates rely on absence to reject a
+        step pointing at another map's vertex. Callers tell "deleted" from
+        "elsewhere" with ``get_vertex`` on the missing ids.
         """
         ids = list(vertex_ids)
         if not ids:
-            # `IN ()` is legal in SQLAlchemy 2.0 but still a round trip to ask
-            # the database about nothing.
+            # Skip a round trip for `IN ()`.
             return []
 
         with self._session(op="get_vertices") as session:
@@ -229,9 +182,8 @@ class MapRepo:
     def update_vertex(self, vertex_id: uuid.UUID, **fields) -> Optional[MapPoint]:
         """Apply ``fields`` to one vertex; None when no such vertex exists.
 
-        Raises ConflictError when the rename would collide with another vertex
-        on the same map. Renaming to the name it already has is not a collision
-        -- the row is excluded from its own constraint check.
+        Raises ConflictError when a rename collides with another vertex on the
+        same map (renaming to its own name does not).
         """
         # Only these columns may be updated through the API.
         allowed = {"name", "type", "x", "y", "theta"}
@@ -242,9 +194,7 @@ class MapRepo:
             if vertex is None:
                 return None
 
-            # Read for the error message before the commit that may fail: a
-            # rolled-back session expires its objects, so touching the instance
-            # afterwards would re-query inside a dead transaction.
+            # Read before the commit: a rollback expires the instance.
             owning_map = vertex.map
             new_name = changes.get("name", vertex.name)
 
@@ -275,22 +225,13 @@ class MapRepo:
     ) -> int:
         """Re-key every vertex of ``old_map`` to ``new_map``; return how many.
 
-        With ``session`` given, the UPDATE runs inside the caller's transaction
-        and is *not* committed here -- see ``transaction``. Without it, the
-        method is its own transaction, as every other write in this repo is.
+        The DB half of a map rename (the name is a foreign key by convention).
+        With ``session``, runs in the caller's transaction, uncommitted. Not
+        part of ``update_vertex``'s ``allowed`` set: moving one vertex to
+        another map is deliberately not API.
 
-        The cascade half of a map rename: ``map_vertices.map`` holds the bare
-        directory name with no foreign key behind it, so when the directory
-        moves the rows have to be told. A separate method rather than widening
-        ``update_vertex``'s ``allowed`` set, because that set *is* the
-        per-vertex API surface and "move one vertex to another map" is
-        deliberately not on it (the MCP tools document a move as delete +
-        create). This is a whole-map operation with one legitimate caller.
-
-        One ``UPDATE`` statement, not a load-modify-save loop: a conference map
-        carries dozens of vertices and the router is holding a half-renamed map
-        while this runs. ``updated_at`` is set by hand because ``onupdate``
-        fires for ORM unit-of-work flushes, not for a Core bulk update.
+        ``updated_at`` is set by hand: ``onupdate`` does not fire for a Core
+        bulk update.
         """
         statement = (
             update(MapPoint)
@@ -308,23 +249,9 @@ class MapRepo:
     def delete_vertices(self, map: str, session: Optional[Session] = None) -> int:
         """Delete every vertex of ``map``; return how many rows went.
 
-        With ``session`` given, the DELETE runs inside the caller's transaction
-        and is *not* committed here -- see ``transaction`` and the import note
-        on ``create_vertices``. Without it, the method is its own transaction.
-
-        The cascade half of a map delete, and the counterpart to
-        ``move_vertices``: ``map_vertices.map`` holds the bare directory name
-        with no foreign key behind it, so nothing removes these rows when the
-        directory goes. Left behind they are not merely untidy — they are
-        unreachable (every vertex route resolves the map first and now 404s) and
-        they would be silently adopted by the next map saved under the same
-        name, handing a fresh mapping run someone else's waypoints.
-
-        One ``DELETE`` statement rather than a loop over ``delete_vertex``, for
-        the same reason ``move_vertices`` is one ``UPDATE``: this is a
-        whole-map operation with one legitimate caller, and the router is
-        holding a half-deleted map while it runs. No ``updated_at`` to set —
-        the rows are gone, not changed.
+        The DB half of a map delete or import. With ``session``, runs in the
+        caller's transaction, uncommitted. Left behind, the rows would be
+        adopted by the next map saved under the same name.
         """
         statement = delete(MapPoint).where(MapPoint.map == map)
         if session is not None:

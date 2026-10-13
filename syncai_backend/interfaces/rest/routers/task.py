@@ -37,24 +37,18 @@ from syncai_backend.services.gridmap_conversion import GridmapConversionService
 class TaskStatus(str, Enum):
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
-    # The run is holding (POST /tasks/{id}/pause took effect). Not terminal:
-    # to the orchestrator a held run is still running, which is also why
-    # /active_tasks keeps listing it as IN_PROGRESS — the list cannot see
-    # inside the run, GET /tasks/{id} can.
+    # The run is holding. Not terminal: a held run is still running to
+    # Temporal, so /active_tasks lists it as IN_PROGRESS; only GET /tasks/{id}
+    # sees the hold.
     PAUSED = "PAUSED"
-    # Only ever answered by POST /tasks/{id}/pause, never by the status
-    # mapping — the same reasoning as CANCELING below: a pause is a *request*,
-    # and a step that cannot be interrupted (SPEAK, a posture) finishes before
-    # the run holds. PAUSED is what GET says once it has.
+    # Only answered by POST /tasks/{id}/pause: a pause is a request, and an
+    # uninterruptible step (SPEAK, a posture) finishes before the run holds.
     PAUSING = "PAUSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
-    # Only ever answered by DELETE /tasks/{id}, never by the status mapping:
-    # a delete is a cancel *request*, and Temporal is free to let the workflow
-    # finish COMPLETED before the cancellation lands. The old response said
-    # CANCELED outright — a lie the frontend had already noticed and was
-    # discarding (see its task.ts).
+    # Only answered by DELETE /tasks/{id}: a cancel is a request, and the run
+    # may still finish COMPLETED before it lands. Do not answer CANCELED.
     CANCELING = "CANCELING"
 
 
@@ -72,19 +66,15 @@ class StepRequest(BaseModel):
     )
     group: Optional[str] = Field(default=None, description=GROUP_DESCRIPTION)
 
-    # Same check as Step, repeated here so a mismatched body is rejected at the
-    # request boundary (422) instead of raising a ValidationError inside the
-    # handler when the Step is built (500).
+    # Same check as Step, so a mismatched body is a 422 here, not a 500 later.
     @model_validator(mode="after")
     def _check_params(self) -> "StepRequest":
         validate_step_params(self.type, self.params)
         return self
 
 
-# No `timestamp` field: the old required one was received and then never read
-# by anything, which made every client invent a value to satisfy validation.
-# Existing callers (console, MCP) still send it and pydantic ignores unknown
-# fields by default, so dropping it is backward compatible.
+# No `timestamp` field: it was never read. Callers that still send it are fine,
+# pydantic ignores unknown fields.
 class TaskRequest(BaseModel):
     id: str = Field(
         ..., description="Unique identifier of the task", examples=["robot01-task-001"]
@@ -92,8 +82,7 @@ class TaskRequest(BaseModel):
     steps: List[StepRequest] = Field(
         ..., description="List of steps to be executed", examples=[]
     )
-    # Both optional, so the MCP server and curl keep dispatching unchanged;
-    # such a run is simply unlabelled in the history.
+    # Optional, so the MCP server and curl dispatch unchanged (unlabelled).
     kind: Optional[TaskKind] = Field(
         default=None,
         description=(
@@ -110,11 +99,8 @@ class TaskRequest(BaseModel):
         description="The task template this dispatch came from, if any.",
         examples=["Morning patrol"],
     )
-    # The caller's expectation, not the record. The map a run is stamped with
-    # is the one loaded when it is accepted, read here; this only lets a
-    # caller say "these positions were planned on X" and be refused when the
-    # robot has moved to Y since the screen was drawn. Optional for the same
-    # callers as kind/name.
+    # The caller's expectation, not the record: a run is stamped with the map
+    # loaded at dispatch; this only gets it refused if that has changed.
     map_name: Optional[str] = Field(
         default=None,
         min_length=1,
@@ -176,9 +162,7 @@ class StepState(BaseModel):
 class MoveMessageSource(Protocol):
     """The one thing the task-state read needs from the robot gateway.
 
-    A Protocol rather than RobotGateway itself so this router stays free of
-    rclpy: it is the router the console polls every second, and its tests run
-    without a ROS install.
+    A Protocol so this router stays free of rclpy and testable without ROS.
     """
 
     def get_move_message(self) -> str: ...
@@ -318,9 +302,7 @@ def _utc(moment: Optional[datetime]) -> Optional[datetime]:
 
 
 def _check_window(since: Optional[datetime], until: Optional[datetime]) -> None:
-    # Cross-field, so not a pydantic bound: the house rule is a 400 with a
-    # sentence (see CLAUDE.md), and an empty window is a caller mistake, not
-    # a query to send.
+    # Cross-field, so a 400 with a sentence rather than a pydantic bound.
     if since is not None and until is not None and until < since:
         raise BadRequestError("until must not be before since")
 
@@ -362,11 +344,9 @@ def init_task_router(
         if problem is not None:
             raise problem.refusal()
 
-        # A job that drives is stamped with the map that is loaded now, the
-        # map its positions are about to be read in -- that is the record the
-        # map routes lock on and the history shows. A job that does not drive
-        # holds no map, so it is neither stamped nor refused for one: standing
-        # the robot up mid-rebuild, or on the "wrong" map, is harmless.
+        # A job that drives is stamped with the loaded map (what the map
+        # routes lock on and the history shows). One that does not drive holds
+        # no map and is neither stamped nor refused.
         map_name: Optional[str] = None
         if any(step.type is StepType.MOVE for step in req.steps):
             active = map_catalog_repo.active_name()
@@ -405,27 +385,16 @@ def init_task_router(
             message=f"Task {req.id} accepted and queued for execution.",
         )
 
-    # Not /api/v1/tasks/active. FastAPI matches by declaration order, so that
-    # path only works while it is declared above /api/v1/tasks/{id} — the day
-    # someone reorders these decorators it silently becomes a lookup for a task
-    # literally named "active" and answers 404. The same collision is why
-    # /api/v1/task_templates was chosen over /api/v1/tasks/templates; see the
-    # note in interfaces/rest/server.py.
+    # Not /api/v1/tasks/active: /api/v1/tasks/{id} would shadow it depending on
+    # declaration order (see interfaces/rest/server.py).
     #
-    # Plural, and a list, because "one robot does one thing" is not an invariant
-    # this endpoint can rely on: ScheduleOverlapPolicy.SKIP constrains a single
-    # schedule against itself, and a direct POST /api/v1/tasks bypasses it
-    # entirely, so an operator dispatch during a scheduled run leaves two
-    # executions Running. Two is not an error, and reporting one of them would
-    # be the lie.
-    #
-    # Never 404s: an empty list is a valid answer. "Nothing is running" is not a
-    # missing resource.
+    # A list: SKIP only stops a schedule overlapping itself, so a direct dispatch
+    # during a scheduled run leaves two executions running. Never 404s.
     @task_router.get("/api/v1/active_tasks", response_model=ActiveTasksResponse)
     async def list_active_tasks():
         tasks, as_of = await workflow_gw.list_active_tasks()
         # Only read when some run lacks the attribute (see map_in_use), so the
-        # console's 2 s poll of an idle or up-to-date robot costs no INI read.
+        # console's 2 s poll usually costs no INI read.
         active = (
             map_catalog_repo.active_name()
             if any(not task.map_name for task in tasks)
@@ -450,12 +419,9 @@ def init_task_router(
             as_of=as_of,
         )
 
-    # Not /api/v1/tasks/history, for the same reason as active_tasks above.
-    #
-    # Straight from Temporal's visibility index — the database stores no runs —
-    # so it reaches back exactly as far as the namespace retention, and a run
-    # older than that is not here. Per-step detail for a row is
-    # GET /api/v1/tasks/{id}, as for a running task.
+    # Not /api/v1/tasks/history, as for active_tasks. Read from Temporal's
+    # visibility index (no runs are stored here), so it reaches back only as
+    # far as namespace retention.
     @task_router.get("/api/v1/task_history", response_model=TaskHistoryResponse)
     async def list_task_history(
         page_size: int = Query(
@@ -518,10 +484,7 @@ def init_task_router(
             next_page_token=_encode_page_token(next_token),
         )
 
-    # The same filter as task_history, counted instead of listed: the numbers
-    # the history dashboard shows above its list. One visibility count RPC.
-    # Declared as its own static path -- `task_history` has no path parameter,
-    # so nothing shadows it.
+    # The task_history filter, counted instead of listed (one count RPC).
     @task_router.get(
         "/api/v1/task_history/stats", response_model=TaskHistoryStatsResponse
     )
@@ -567,18 +530,14 @@ def init_task_router(
                 TaskHistoryStatus.FAILED: stats.failed,
                 TaskHistoryStatus.CANCELED: stats.canceled,
             },
-            # Computed here, once, so no client has to agree with another about
-            # what a rate of nothing is: it is null, never 0.
+            # Null, never 0, when nothing finished.
             success_rate=stats.completed / stats.total if stats.total else None,
         )
 
     def _step_message(step: Step) -> str:
-        # Read live from the gateway, not stored on the workflow's Step: the
-        # navigator's sentence changes many times a second, and the workflow
-        # cannot see an activity's progress anyway. Only a MOVE that is
-        # running has a goal to ask about -- a PAUSED one has cancelled its
-        # goal, and between Temporal retry attempts there is none, which the
-        # gateway answers with "" and the console reads as plain "running".
+        # Read live from the gateway: the workflow cannot see an activity's
+        # progress. Only a running MOVE has a goal; between retry attempts the
+        # gateway answers "".
         if step.type is StepType.MOVE and step.status is StepStatus.IN_PROGRESS:
             return robot_gw.get_move_message()
         return ""
@@ -616,13 +575,10 @@ def init_task_router(
             ),
         )
 
-    # The hold. Both verbs are requests delivered as workflow signals, so like
-    # DELETE they answer with what was asked, not with what the robot is doing:
-    # PAUSING here, and PAUSED only from GET once the workflow has actually
-    # stopped. A MOVE is interrupted at once (its nav goal is cancelled and
-    # re-sent on resume), a WAIT's countdown freezes (and resumes with what was
-    # left); a SPEAK or posture step finishes first and the run holds before
-    # the next one. 409 `task_not_running` once the run is closed.
+    # The hold: both verbs are workflow signals, so like DELETE they answer
+    # what was asked (PAUSING); GET reports PAUSED once it holds. A MOVE stops
+    # at once and is re-sent on resume, a WAIT freezes, SPEAK and postures
+    # finish first. 409 `task_not_running` once the run is closed.
     @task_router.post("/api/v1/tasks/{id}/pause", response_model=TaskResponse)
     async def pause_task(id: str):
         await workflow_gw.pause_task(task_id=id)

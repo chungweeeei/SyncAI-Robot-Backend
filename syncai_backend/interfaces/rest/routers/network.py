@@ -66,9 +66,7 @@ def init_network_router(
 ) -> APIRouter:
     network_router = APIRouter(prefix="", tags=["Network"])
 
-    # Plain (non-async) handlers: the gateway calls block for up to tens of
-    # seconds waiting on ROS services, so FastAPI must run them in its worker
-    # thread pool instead of on the event loop.
+    # Plain `def`: the gateway calls block for up to tens of seconds on ROS.
 
     @network_router.get(
         "/api/v1/network/wifi/scan", response_model=ScanWifiNetworksResponse

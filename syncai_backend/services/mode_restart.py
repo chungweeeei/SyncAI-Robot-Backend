@@ -1,19 +1,11 @@
-"""The live mode's restart, as something that can be asked about afterwards.
+"""The latest restart_mode dispatch and how it ended.
 
-POST /api/v1/robot/restart used to answer "dispatched" and forget: the gateway
-waits two seconds for sys_manager, and sys_manager only answers once the
-rebuild is over, tens of seconds later. While the backend was a byobu pane that
-was all it could do -- the process died with the session it had asked to
-rebuild. Run as its own container it survives, so the answer does arrive, and
-it is the only statement anywhere that the rebuild worked. GET /robot/state
-cannot stand in for it: the backend keeps serving the last frame robot_state
-published, so the poll stays green through the whole outage.
+sys_manager answers only once the rebuild is over (tens of seconds), so this
+record is the only statement that the rebuild worked. GET /robot/state cannot
+stand in: it keeps serving the last robot_state frame through the outage.
 
-So this object holds one record -- the latest restart and how it ended -- and
-the router reads it. In memory, and that is not a caveat to work around: the
-outcome belongs to the rebuild this process watched. A backend that was itself
-restarted meanwhile reports `idle`, which is the honest answer; it did not see
-how the last one went.
+Kept in memory on purpose: the outcome belongs to the rebuild this process
+watched, so a backend restarted meanwhile honestly reports `idle`.
 """
 
 import threading
@@ -27,11 +19,9 @@ import structlog
 from syncai_backend.exceptions import ConflictError
 
 
-# How long a dispatched restart may go unanswered before it is reported as
-# failed. sys_manager's rebuild is ~40 byobu commands with sleep offsets, well
-# under a minute; three is room for a slow Jetson, and past it the likelier
-# story is a sys_manager that died mid-rebuild and will never answer. Without
-# a ceiling that record would say `restarting` forever and block the next one.
+# How long a restart may go unanswered before it is reported failed. The
+# rebuild takes under a minute; past three, sys_manager likely died mid-rebuild.
+# Without a ceiling the record would say `restarting` forever and block the next.
 RESTART_DEADLINE = timedelta(minutes=3)
 
 RESTART_RUNNING = "restart_running"
@@ -73,18 +63,17 @@ class ModeRestartService:
         self._now = now
         self._lock = threading.Lock()
         self._record = IDLE
-        # Identifies the attempt a late answer belongs to. A restart that hit
-        # the deadline and was followed by a new one must not have its own
-        # answer, arriving at last, overwrite the new one's record.
+        # The attempt a late answer belongs to: an expired restart's answer
+        # must not overwrite a newer attempt's record.
         self._attempt: Optional[object] = None
 
     def start(self) -> Tuple[Optional[bool], str]:
-        """Dispatch a restart. The gateway's three-valued answer, passed on.
+        """Dispatch a restart; return the gateway's three-valued answer.
 
-        ``(False, msg)`` is a refusal or an unreachable sys_manager: nothing
-        was touched, so the previous record stands. ``(True, msg)`` finished
-        inside the ack window; ``(None, msg)`` is under way and GET reports
-        the rest. Raises ConflictError(code="restart_running") while one is.
+        ``(False, msg)``: refused or unreachable, the previous record stands.
+        ``(True, msg)``: finished inside the ack window. ``(None, msg)``: under
+        way, GET reports the rest. Raises ConflictError(code="restart_running")
+        while one is.
         """
         attempt = object()
         with self._lock:
@@ -95,8 +84,8 @@ class ModeRestartService:
                     code=RESTART_RUNNING,
                 )
             previous = current
-            # Recorded before the call, which blocks for up to the ack window:
-            # a second press in that window must see this one as running.
+            # Recorded before the blocking call so a second press in the ack
+            # window sees this one as running.
             self._record = RestartRecord(
                 RestartStatus.RESTARTING, "", self._now(), None
             )
@@ -136,8 +125,7 @@ class ModeRestartService:
         )
 
     def _expire(self, record: RestartRecord) -> RestartRecord:
-        # Callers hold _lock. Applied on read rather than by a timer: the
-        # record only matters when someone asks for it.
+        # Callers hold _lock. Applied on read rather than by a timer.
         if (
             record.status is RestartStatus.RESTARTING
             and record.started_at is not None

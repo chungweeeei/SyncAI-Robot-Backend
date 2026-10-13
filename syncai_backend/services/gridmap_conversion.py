@@ -1,33 +1,17 @@
-"""The pcd -> gridmap conversion, as a service the map router drives.
+"""The pcd -> gridmap conversion behind POST /api/v1/maps and .../grid/convert.
 
-This is the work POST /api/v1/maps and POST /api/v1/maps/{name}/grid/convert
-set going, and none of it is HTTP. It lived in the map router until it had
-grown a recipe vocabulary, a thread, a process-wide registry and an on-disk
-status protocol inside a module whose job is request parsing -- roughly 450
-lines that no route could be read without. Worse, the registry was module
-state, which the rest of this backend deliberately does not have: every other
-collaborator is built in main.py and injected, and a module-level set cannot be
-isolated between tests or reached by anything outside that one file.
+Built once in main.py and injected (no module-level registry), so tests get a
+fresh one. It owns the recipes, the registry of running threads and the sidecar
+those threads write; the router only validates and maps refusals to statuses.
 
-So it is an object now, constructed once in main.py and handed to the router.
-What it owns is the whole answer to "is this map being converted, and how did
-the last attempt go": the in-memory registry of running threads, the recipes,
-and the sidecar those threads write. The router keeps what it should have kept
-all along -- validating a request, and turning a refusal into a status code.
+Two halves of one state:
 
-Two halves of the same state, on purpose:
+- **the registry** is authoritative only while this process is up.
+- **the sidecar** (GRIDMAP_RECIPE_SIDECAR, next to the pgm) survives, so it is
+  written before any work starts: `converting` with no thread behind it is how
+  the router's _grid_status detects `interrupted`.
 
-- **the registry** is authoritative only while this process is up, and that is
-  not a caveat to work around. A set in memory cannot say anything about a
-  conversion whose process is gone.
-- **the sidecar** (GRIDMAP_RECIPE_SIDECAR, next to the pgm) is the half that
-  survives, which is why it is written before any work starts. A record saying
-  `converting` with no thread behind it is how an interrupted conversion is
-  detected at all; MapCatalogRepo reads it back and the router's _grid_status
-  turns that pairing into `interrupted`.
-
-Nothing here imports open3d. The traversability recipe imports it inside the
-thread body, which is load-bearing and explained at the import itself.
+Nothing here imports open3d at module scope (see the import in start).
 """
 
 import json
@@ -57,116 +41,53 @@ from syncai_backend.repositories.map.catalog import (
 )
 
 
-# POST /api/v1/maps has two recipes. **Every save converts with the z-band one**
-# (GRIDMAP_RECIPE below); the traversability one runs only when an operator
-# explicitly asks for it through POST /api/v1/maps/{name}/grid/convert. Neither
-# is a fallback for the other; they answer different questions and disagree
-# about what an unknown cell means, which is exactly why the choice is recorded
-# on disk rather than left implicit.
+# Two recipes. **Every save converts with z-band** (GRIDMAP_RECIPE below);
+# traversability runs only when an operator asks via .../grid/convert. They
+# disagree about what an unknown cell means, so the choice is recorded on disk.
 #
-# **The default, z-band**, produces a genuine trinary map: walls where obstacles
-# were observed, unknown where nothing was. Unknown is *recoverable* —
-# costmap_layer.cpp:90 lets the obstacle layer's live observations overwrite a
-# NO_INFORMATION master cell, while a LETHAL one can never be lowered, so a map
-# that says "unknown" here can still grow as the robot drives and a map that
-# says "wall" cannot. It is also cheap to finish by hand in the gridmap editor,
-# which is how every gridmap on this fleet was actually made: dp2f still carries
-# the pre-edit gridmap_raw.pgm next to the edited gridmap.pgm, and the edit
-# lifted its largest connected free region from 89.1% to 94.4% of all free
-# cells.
+# **z-band** gives a trinary map. Unknown is recoverable (costmap_layer.cpp:90
+# lets live observations overwrite NO_INFORMATION, never LETHAL) and cheap to
+# finish by hand in the gridmap editor, which is how the fleet's maps are made.
 #
-# **The opt-in, traversability** (helpers.traversable: segment the floor by
-# lidar return intensity, surface normal and height, repair it, then project
-# it), is for the site nobody hand-edits — dp1f is 6338 m² of bounding box — and
-# sidesteps the z-band's real weakness: classifying a cell by *where* its points
-# are in z cannot distinguish a drivable aisle from a kerb top or a ramp. What
-# it costs is not small: the output has **no unknown cells**. The input cloud is
-# taken as the whole of the drivable world, so every cell it does not cover
-# comes out occupied — the padding ring included, and any real floor the
-# segmentation wrongly rejected included. That is the safe direction for the
-# planner, but it is unforgiving, and by the note above it is also permanent:
-# unobserved area walled off this way can never be cleared by driving there.
+# **traversability** (helpers.traversable: segment the floor by intensity,
+# normal and height, repair, project) is for sites nobody hand-edits, and tells
+# a drivable aisle from a kerb top or ramp, which z-banding cannot. Its output
+# has **no unknown cells**: anything the floor cloud does not cover is occupied,
+# permanently, since driving there cannot clear it.
 #
-# There used to be an automatic pick between the two, by bounding-box footprint
-# against a 3000 m² threshold (LARGE_SITE_AREA_M2, removed 2026-09), and it is
-# gone because it failed in the field three saves out of three: a MID360 sees
-# through glass, so a 25x32 m conference hall came in at 3128-3512 m² of bbox —
-# out-of-hall structure seen 2.5-6.5 m up — and was routed into the
-# traversability recipe, whose no-ground-means-occupied inversion turned a
-# furniture-occluded floor into a 55-59%-occupied blob with no wall geometry and
-# no unknown cells. Measured floor area was considered as the replacement
-# metric and rejected as the *decision* input: on this fleet it splits the six
-# clouds 171-572 vs 926-1307 m², so any threshold in that gap is calibrated on
-# exactly these six clouds, and the next venue (a different ceiling, glass, an
-# outdoor lot) has no reason to land on the same side. What decides instead is
-# the asymmetry of the failure directions: a wrongly-chosen z-band map is
-# coarse but recoverable (unknown cells, hand-editable, drivable-clearable); a
-# wrongly-chosen traversability map is permanently walled. So the recoverable
-# recipe is the unconditional default and the unforgiving one is a decision a
-# person makes. Both areas are still measured and recorded in the sidecar —
-# diagnostics, not policy.
+# Do not reintroduce an automatic pick (a 3000 m² bbox threshold was removed
+# 2026-09): glass inflated a conference hall's bbox past it and traversability
+# turned the hall into an occupied blob. Floor area was rejected as the input
+# too, since any threshold is calibrated on six clouds. A wrong z-band map is
+# recoverable and a wrong traversability map is not, so the latter is a
+# person's decision. Both areas are still recorded in the sidecar, as
+# diagnostics.
 #
-# The parameters stay empty because the helper's own defaults are now the tuned
-# ones (its module docstring carries the measurement that moved them). A site
-# that needs them changed needs them changed with the intermediate clouds in
-# front of you, not guessed here — dp1f is the live example: it converts, and
-# converts well, but its bottom aisle needs a wider gap_fill_size to bridge a
-# doorway the floor sampling missed; the re-convert endpoint takes exactly that
-# override.
+# Empty: the helper's defaults are the tuned ones. Tune per site with the debug
+# intermediates in hand via the re-convert endpoint (e.g. dp1f's gap_fill_size).
 TRAVERSABLE_SEGMENT_RECIPE: Dict[str, object] = {}
 TRAVERSABLE_REPAIR_RECIPE: Dict[str, object] = {}
 TRAVERSABLE_GRID_RECIPE: Dict[str, object] = {}
 
-# Cell size for the measured-floor-area diagnostic in measure_cloud. 0.5 m
-# because a pgo map.pcd is voxel-downsampled: at finer cells the sparse floor
-# sampling under-counts (the same six clouds measure 119-998 m² at 0.2 m vs
-# 171-1307 m² at 0.5 m), and a driven cell should count as floor even when only
-# one return landed in it. Boundary over-count is bounded by perimeter x cell —
-# ~30 m² on a 570 m² hall — noise for a diagnostic.
+# Cell size for measure_cloud's floor-area diagnostic. 0.5 m because map.pcd is
+# voxel-downsampled and finer cells under-count the sparse floor.
 FLOOR_AREA_CELL_M = 0.5
 
-# GRIDMAP_RECIPE_SIDECAR (imported above, named by the catalogue repo) is where
-# a conversion records itself. Written next to the pgm because the catalogue
-# would otherwise hold maps from two recipes with nothing on disk saying which
-# produced what, and the two disagree about the meaning of an unknown cell — a
-# map with no unknown cells at all is either a traversability output or a z-band
-# output of a fully observed site, and there is no way to tell from the pgm.
-# Tiny, so its effect on the size _walk_stats reports is noise.
-#
-# Since 2026-09 it also carries a ``status``, written at three points in the
-# conversion (converting / ok / failed), and **that is what makes a conversion's
-# outcome visible at all**. Before it, a failure logged and returned: the map
-# came back with grid: null and grid_converting: false, i.e. exactly what a map
-# that was never converted looks like, and the reason existed only in
-# log/stack/<robot_id>/backend/current. A process-local registry could not fix
-# that — the registry dies with the process, so a backend restarted
-# mid-conversion left the same silence. The record has to be on disk next to the
-# artefact it describes, because that is the only thing that outlives both the
-# thread and the process.
+# GRIDMAP_RECIPE_SIDECAR records which recipe made the grid (the pgm cannot
+# tell) and a ``status`` (converting / ok / failed). It is on disk next to the
+# grid because it must outlive the thread and the process; without it a failed
+# conversion looks like a map never converted.
 
-# Where the segmentation's intermediate clouds go when a request asks for them
-# (``debug: true`` on the re-convert endpoint). Off by default because
-# MapCatalogRepo._walk_stats recurses, so five extra clouds would triple the
-# size every catalogue card reports for a map. When a site's grid comes out
-# wrong — the next outdoor lot, say — the per-request flag is the tuning
-# interface: convert with debug, read the intermediates out of the map
-# directory, adjust, re-convert.
-#
-# The process-wide override that used to sit beside this as a reassignable
-# module constant is the service's ``debug_subdir`` argument now: same effect,
-# but it is set where the service is built instead of by whoever reached in.
+# Where the segmentation's intermediates go with ``debug: true`` on re-convert.
+# Off by default: MapCatalogRepo._walk_stats recurses, so they would inflate
+# every catalogue card's size. The service's ``debug_subdir`` forces it on.
 TRAVERSABLE_DEBUG_SUBDIR_NAME = "traversable_debug"
 
 
-# The z-band recipe's non-band parameters. The bands themselves are below,
-# because they are no longer constants.
+# The z-band recipe's non-band parameters (bands below).
 #
-# obstacle_close is 1, not the 2 this recipe shipped with. At 2 the 10 cm
-# morphological closing sealed a doorway a robot had demonstrably driven through
-# — 16 of that map's 212 keyframe poses landed on occupied cells, all within
-# 5-14 cm of free space. At 1 that drops to 9, all of them poses that brushed a
-# wall, and the walls and pillars survive intact. Raising it back closes real
-# gaps at the cost of closing real doors; lower it before raising it.
+# obstacle_close is 1, not 2: at 2 the closing sealed a doorway the robot had
+# driven through. Raising it closes real doors; lower it before raising it.
 GRIDMAP_RECIPE = dict(
     free_mode="floor",
     min_points=2,
@@ -176,37 +97,15 @@ GRIDMAP_RECIPE = dict(
     fill_holes_max_size=20000,
 )
 
-# The z-band recipe's bands, as offsets from the **floor** rather than absolute
-# z. These are the numbers every gridmap on the fleet before 2026-08 was built
-# with (-0.95 / -0.25 / -0.3 / 1.5 absolute), minus the floor level of dp1f, the
-# site they were picked on: -0.66. On dp1f they therefore resolve to exactly
-# what they always were.
+# The z-band recipe's bands, as offsets from the **floor**, not absolute z:
+# LIO z=0 is the lidar's height at the start pose, so absolute bands moved with
+# mount, chassis and slope (fleet floors span -0.36 to -0.73). They are the old
+# absolute bands minus dp1f's floor (-0.66).
 #
-# They are offsets because absolute they were a per-site guess by construction —
-# z=0 in a LIO map is the lidar mount height at the mapping start pose, so a
-# different mount, a different chassis or a start pose on a slope moves the
-# whole band while the floor stays where it is. The measured floor levels on
-# this fleet span -0.36 to -0.73, and 37 cm is more than the floor band is wide.
-# Held absolute on the shallowest of those sites, the bands put 26 of 212
-# keyframe poses in unknown space and 35 on occupied cells — the robot's own
-# path, walled off. Recentred, that is 0 and 10. dp1f is unchanged and dp2f
-# moves by 4 cm, which is the raw-cloud estimate disagreeing with the
-# flat-points one (see pcd_to_gridmap.floor_level) and well inside the band.
-#
-# *Which* floor they are offsets from is FLOOR_REFERENCE_DEFAULT below. One
-# floor level per cloud (``global``) was enough until 0917_TP1F_test1 (2026-09):
-# a 110 x 117 m venue whose LIO trajectory drifted a metre in z across the site
-# (keyframe z -0.48 to +0.51) — the floor band is 0.7 m tall, so half the venue
-# had its floor drift out of it and into the obstacle band, and came out as
-# speckle over unknown while the other half converted fine. The three good
-# maps drift 0.03-0.46 m, which is why they never showed it. No band setting
-# fixes a map whose two halves need different ones; measuring the floor around
-# every keyframe and banding each point against the floor *near it*
-# (pcd_to_gridmap.local_floor_levels) does — TP1F's free area went from 937 to
-# 1670 m², dp2f gained two wings that had been unknown, dp1f and vis_B2 moved
-# by 1-2%, the undrifted 09172f changed by 170 cells. So ``local`` is the
-# default and the global estimate is what the conversion falls back to when
-# there is no poses.txt to measure from.
+# Per-keyframe floor (``local``, pcd_to_gridmap.local_floor_levels) is the
+# default because a map whose LIO drifted ~1 m in z (0917_TP1F_test1) had half
+# its floor fall into the obstacle band under one global level. ``global`` is
+# the fallback when there is no poses.txt.
 GRIDMAP_BANDS_ABOVE_FLOOR = dict(
     floor_zmin=-0.29,
     floor_zmax=0.41,
@@ -214,9 +113,8 @@ GRIDMAP_BANDS_ABOVE_FLOOR = dict(
     zmax=2.16,
 )
 
-# Where the z-band recipe's floor is measured: ``local`` (per keyframe, see
-# above) or ``global`` (one level for the cloud, the pre-2026-09 behaviour and
-# the fallback without poses.txt). The router's FloorReference enum mirrors it.
+# Where the z-band floor is measured (see above). The router's FloorReference
+# enum mirrors it.
 FLOOR_REFERENCES = ("local", "global")
 FLOOR_REFERENCE_DEFAULT = "local"
 
@@ -234,26 +132,14 @@ def measure_cloud(
 ) -> CloudMeasure:
     """Measure the cloud: bbox footprint, covered floor area, floor level.
 
-    This is what remains of pick_recipe (removed 2026-09): the measurements
-    survived the decision. The z-band conversion needs ``floor_z`` to recentre
-    its bands when its floor reference is ``global`` (no poses.txt, or asked
-    for), and the two areas go into the recipe sidecar as diagnostics — the
-    module comment above GRIDMAP_RECIPE records why neither is allowed to
-    *choose* the recipe any more. ``floor_area_m2`` counts FLOOR_AREA_CELL_M
-    cells covered by points inside the z-band recipe's own floor band, so it
-    reads as "the floor area that recipe would call observed"; footprint is the
-    raw bbox, kept because comparing the two is what exposes a glass-inflated
-    cloud at a glance (conference: 3512 m² of bbox over 572 m² of floor).
+    ``floor_z`` recentres the z-band bands under the ``global`` reference; the
+    areas are sidecar diagnostics only (never a recipe pick). ``floor_area_m2``
+    counts FLOOR_AREA_CELL_M cells inside the z-band floor band; set against the
+    bbox footprint it exposes a glass-inflated cloud.
 
-    The floor level here is the raw-cloud estimate. The traversability pipeline
-    measures its own, from flat points, and ignores this one — the two agree to
-    within 4 cm on this fleet, but the flat estimate is the better-founded of
-    the two and that pipeline can afford it.
-
-    Reads the cloud, which the conversion then reads again. That is one extra
-    pass over ~20 MB inside a background thread that may be about to spend tens
-    of seconds in open3d, against the alternative of threading an array through
-    two conversions whose input types differ.
+    ``floor_z`` is the raw-cloud estimate; traversability measures its own.
+    Reads the cloud a second time rather than threading an array through two
+    conversions with different input types.
     """
     xyz = read_pcd_xyz(pcd_path)
     if len(xyz) == 0:
@@ -292,12 +178,7 @@ def measure_cloud(
 
 
 def iso_now() -> str:
-    """UTC, ISO 8601, ``Z``-suffixed — the timestamp spelling the REST layer uses.
-
-    The same shape ``MapSummaryResponse.modified_at`` is serialised with, so the
-    sidecar's timestamps and the catalogue's agree without the client having to
-    parse two conventions.
-    """
+    """UTC, ISO 8601, ``Z``-suffixed, like ``MapSummaryResponse.modified_at``."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -306,43 +187,25 @@ def write_recipe_sidecar(
 ) -> None:
     """Record the state of this map's conversion, next to the gridmap.
 
-    Called three times per conversion — once on entry with ``converting`` and
-    once on the way out with ``ok`` or ``failed`` — so each call overwrites the
-    last, and the file always describes the most recent attempt rather than
-    accumulating history. The one generation that is kept is the previous
-    *successful* record, which ``MapCatalogRepo.archive_gridmap`` moves aside to
-    ``gridmap_prev.recipe.json`` alongside the grid it describes.
+    Each call overwrites the last, so the file describes the latest attempt;
+    ``MapCatalogRepo.archive_gridmap`` keeps the previous successful one as
+    ``gridmap_prev.recipe.json``.
 
-    Best-effort: a sidecar that fails to write must not lose a gridmap that
-    converted fine, so this logs and returns rather than raising into the
-    conversion thread's handler. The cost of that on the ``converting`` write is
-    worth naming — the interrupted-conversion state is derived from it, so a
-    conversion whose first write failed and whose process then died reads as a
-    map that was never converted. Losing the diagnosis is the acceptable half of
-    the trade; losing the grid is not.
+    Best-effort (logs, never raises): losing the diagnosis is acceptable,
+    losing a converted grid is not.
     """
     path = os.path.join(directory, GRIDMAP_RECIPE_SIDECAR)
     try:
-        # Temp file + os.replace, the same way the yaml beside it is written.
-        # This used to be a plain open("w"), the one non-atomic write in the
-        # map directory: a listing that landed mid-write on the `failed`
-        # record of a re-conversion saw a torn sidecar, which the reader
-        # tolerates by returning None -- and _grid_status then fell through to
-        # "the grid on disk decides", reporting `ok` for a grid whose rebuild
-        # had just failed. A flicker rather than corruption, but a wrong answer
-        # from the one place the operator looks.
+        # Atomic: a torn sidecar reads as None, and _grid_status would then
+        # report `ok` for a grid whose rebuild had just failed.
         write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     except OSError as exc:
         logger.warning("Could not write gridmap recipe sidecar", path=path, error=str(exc))
 
 
-# How long a conversion waits for the robot's map cleaning (MAP_CLEAN_SIDECAR)
-# before converting whatever map.pcd is on disk. The longest clean measured on
-# the robot is dp1f_1008_2_v2's 2004 keyframes: 142 s, 208 s with the octomap
-# on. Cleans are also serialised per host by a flock, so a save landing behind
-# another map's clean queues for that one first. 15 min covers both several
-# times over and is still short enough that a clean that hung does not leave a
-# fresh map without a grid for the rest of the day.
+# How long a conversion waits for the robot's map cleaning (MAP_CLEAN_SIDECAR).
+# The longest clean measured is ~208 s, and cleans queue per host behind a
+# flock; 15 min covers that and still bounds a hung clean.
 MAP_CLEAN_TIMEOUT_S = 900.0
 # One stat + a ~700 B read per poll; a clean runs for tens of seconds at least.
 MAP_CLEAN_POLL_S = 2.0
@@ -371,43 +234,27 @@ def wait_for_map_clean(
 ) -> Dict[str, object]:
     """Block until the robot's map cleaning of ``directory`` is over; say how it ended.
 
-    Why a conversion has to wait at all: pgo_node's save_maps answers as soon as
-    the *raw* map.pcd is on disk and only then spawns ``clean_map``, a detached
-    process that replaces map.pcd seconds to minutes later with a copy without
-    people and one-off returns. POST /api/v1/maps converted straight after the
-    save answered, so every gridmap made at save time came from the raw cloud:
-    a person who walked beside the robot was a trail of obstacles on the 2D
-    map while the map.pcd next to it was already clean (map ``test``,
-    2026-10-12: the grid was finished 6 s after the save, the clean 28 s after
-    it, and re-converting removed 4090 of the grid's 9932 occupied cells).
-    Waiting was chosen over "convert now, re-convert when the clean lands":
-    that converts twice, puts a grid with people in it in front of the operator
-    for minutes, and would have to skip -- or overwrite -- a grid the operator
-    hand-edited in between.
+    save_maps answers once the *raw* map.pcd is on disk, then a detached
+    ``clean_map`` replaces it with a copy without people. Converting at once
+    put people in the grid as obstacles. Waiting beats "re-convert when the
+    clean lands", which converts twice and could overwrite a hand edit.
 
-    Polls the sidecar rather than anything live because the sidecar is the only
-    surface the clean has: it is not a ROS node, and it outlives the mode
-    switch that kills the mapping session.
+    Polls the sidecar: it is the clean's only surface (not a ROS node, and it
+    outlives the mode switch).
 
-    The returned dict goes into the gridmap sidecar as ``map_clean``, so the
-    record says which cloud the grid was made from. Its ``status``:
+    The result goes into the gridmap sidecar as ``map_clean``. Its ``status``:
 
-    - ``absent``: no sidecar, nothing to wait for (a save without patches, the
-      cleaning turned off, a map imported or saved before 2026-10).
+    - ``absent``: no sidecar, nothing to wait for.
     - ``ok``: map.pcd is the cleaned cloud.
     - ``failed``: the clean gave up and left the raw cloud; its ``error`` is
       copied along.
-    - ``stale``: the sidecar says ``converting`` but started longer ago than
-      ``timeout_s`` -- a clean killed hard (OOM, ``docker stop``) never writes
-      its outcome, and nothing would ever finish it.
+    - ``stale``: ``converting`` but started over ``timeout_s`` ago (a clean
+      killed hard never writes its outcome).
     - ``timed_out``: still ``converting`` after ``timeout_s`` of waiting here.
 
-    Never raises: every outcome but ``ok`` converts the raw cloud, which is
-    what this did before it waited, and a grid is what the operator needs. A
-    sidecar that cannot be read or parsed is taken as mid-write and retried
-    until the deadline rather than read as ``absent``: clean_map writes it
-    atomically, so a torn read is not expected, and converting the raw cloud
-    on a misread would bring back exactly the people this exists to remove.
+    Never raises: every outcome but ``ok`` converts the raw cloud. An
+    unreadable sidecar is retried until the deadline, not taken as ``absent``,
+    so a misread cannot bring the people back.
     """
     path = os.path.join(directory, MAP_CLEAN_SIDECAR)
     started = monotonic()
@@ -473,12 +320,8 @@ class GridmapConversionService:
     """Runs pcd -> gridmap conversions and tracks the ones in flight.
 
     One instance per process, built in main.py. ``debug_subdir`` forces the
-    segmentation's intermediate clouds on for *every* conversion; leave it None
-    and the per-request ``debug`` flag decides. It is a constructor argument
-    rather than the module constant it used to be so that turning it on is a
-    wiring decision someone can see, not an attribute somebody reassigned.
-    ``map_clean_timeout_s`` / ``map_clean_poll_s`` bound the wait for the
-    robot's map cleaning every conversion starts with (wait_for_map_clean).
+    intermediates on for every conversion; None leaves it to the per-request
+    ``debug`` flag. ``map_clean_*`` bound wait_for_map_clean.
     """
 
     def __init__(
@@ -494,13 +337,8 @@ class GridmapConversionService:
         self._map_clean_timeout_s = map_clean_timeout_s
         self._map_clean_poll_s = map_clean_poll_s
 
-        # Maps with a conversion thread currently running, guarded by the lock.
-        # Membership is what refuses a second concurrent conversion of the same
-        # map -- two threads writing the same gridmap.pgm would interleave their
-        # outputs -- and what the catalogue's `converting` status reads.
-        #
-        # See the module docstring for why this half of the state is allowed to
-        # be this forgetful, and what covers the rest.
+        # Maps with a conversion running, under the lock. Refuses a second
+        # concurrent conversion of a map and backs the `converting` status.
         self._active: set = set()
         self._lock = threading.Lock()
 
@@ -523,45 +361,25 @@ class GridmapConversionService:
         archive: Optional[Callable[[], None]] = None,
         on_success: Optional[Callable[[], None]] = None,
     ) -> bool:
-        """Kick off the pcd -> gridmap conversion in the background; report whether.
+        """Start the pcd -> gridmap conversion on a daemon thread; report whether.
 
-        A daemon thread rather than the handler's own thread because the conversion
-        takes tens of seconds on a large site and POST /api/v1/maps must answer as
-        soon as the pcd is on disk. In-process (not a subprocess) since the pipeline
-        moved into helpers: the heavy passes are numpy/scipy/open3d, which release
-        the GIL, so the FastAPI threadpool keeps serving while it runs. The old
-        600 s subprocess timeout went with it — the helpers bound the grid size
-        themselves, so the pipeline cannot run away.
+        In-process: the heavy passes release the GIL, and the helpers bound the
+        grid size themselves.
 
-        ``recipe_request`` defaults to z-band for every caller — the module comment
-        above GRIDMAP_RECIPE records why there is no automatic pick any more.
-        ``floor_reference`` (z-band only) is which floor the bands are offsets
-        from: ``local`` per keyframe, the default and the fix for a z-drifted
-        map; ``global`` one level per cloud, the older behaviour. ``local``
-        degrades to ``global`` — with a warning and a ``floor_reference_fallback``
-        in the sidecar — when poses.txt is missing or unreadable, the same way the
-        pose-connectivity filter degrades, because losing the whole gridmap to a
-        missing trajectory would cost more than the drift correction saves. The
-        keyword-only extras exist for the re-convert endpoint: ``band_offset_
-        overrides`` merges over GRIDMAP_BANDS_ABOVE_FLOOR (still as offsets from the
-        floor), ``grid_overrides`` over TRAVERSABLE_GRID_RECIPE
-        (gap_fill_size), ``debug`` writes the segmentation's intermediate clouds
-        into the map directory, ``override`` is recorded verbatim in the sidecar,
-        ``archive`` runs synchronously once the slot is held (setting the previous
-        grid aside — synchronous so a 409'd concurrent request can never archive a
-        half-written grid), and ``on_success`` runs in the thread after the sidecar
-        (the active-map reload).
+        ``floor_reference`` (z-band only): ``local`` degrades to ``global``, with
+        ``floor_reference_fallback`` in the sidecar, when poses.txt is unusable.
+        For the re-convert endpoint: ``band_offset_overrides`` merges over
+        GRIDMAP_BANDS_ABOVE_FLOOR, ``grid_overrides`` over
+        TRAVERSABLE_GRID_RECIPE, ``debug`` writes the intermediates, ``override``
+        is recorded verbatim. ``archive`` runs synchronously once the slot is
+        held, so a 409'd concurrent request never archives a half-written grid;
+        ``on_success`` runs in the thread after the sidecar (active-map reload).
 
-        Raises ConflictError while a conversion for this map is already running.
-        Acquisition happens in here, before the thread starts, precisely so there is
-        no check-then-start race for the endpoint to lose.
+        Raises ConflictError if this map is already converting; the slot is
+        taken here, so there is no check-then-start race.
 
-        The return value only says the thread started, never that the grid appeared:
-        a segmentation that rejects the whole floor fails *after* this has answered
-        True and the route has 200'd. What the caller reports is therefore "started",
-        and the outcome arrives through the sidecar the thread writes — which the
-        catalogue reads back as ``grid_status``, so an operator who set a conversion
-        going watches it there rather than in the log.
+        True means only that the thread started; the outcome arrives through
+        the sidecar, read back as ``grid_status``.
         """
         logger = self._logger
 
@@ -569,9 +387,8 @@ class GridmapConversionService:
         if not os.path.isfile(pcd_path):
             logger.warning("Skipping gridmap conversion: no map.pcd", map=name)
             return False
-        # A programming error, not a request error: the router's enum has
-        # already narrowed the value. Checked before the slot is taken so a
-        # typo in a caller cannot archive a grid and then leave the map wedged.
+        # A programming error (the router's enum narrows it), checked before
+        # the slot is taken so it cannot archive a grid and wedge the map.
         if floor_reference not in FLOOR_REFERENCES:
             raise ValueError(f"unknown floor_reference: {floor_reference!r}")
 
@@ -608,11 +425,9 @@ class GridmapConversionService:
             def _record(
                 status: GridRecordStatus, **extra: object
             ) -> Dict[str, object]:
-                """Build a sidecar payload, with the keys every state shares.
+                """Build a sidecar payload with the keys every state shares.
 
-                The status goes in as the enum member, not ``.value``: it is a
-                ``str`` subclass, so ``json.dumps`` writes the bare
-                ``"converting"`` / ``"ok"`` / ``"failed"`` the reader expects.
+                The enum is a ``str`` subclass, so ``json.dumps`` writes it bare.
                 """
                 payload: Dict[str, object] = {
                     "status": status,
@@ -628,24 +443,13 @@ class GridmapConversionService:
 
             map_clean: Optional[Dict[str, object]] = None
 
-            # Before any work, so that a process that dies mid-conversion leaves a
-            # record saying so. This is the write the `interrupted` state is derived
-            # from; without it the only trace of an abandoned conversion is a map
-            # that looks like it was never converted at all.
+            # Before any work: `interrupted` is derived from this record.
             write_recipe_sidecar(bound, directory, _record(GridRecordStatus.CONVERTING))
 
-            # Then wait for the robot to finish cleaning map.pcd, if it is
-            # cleaning it (wait_for_map_clean has why). Every conversion, not
-            # only the one a save starts: a re-convert requested during the
-            # clean would otherwise read the raw cloud just the same -- or the
-            # raw cloud in measure_cloud and the clean one in the pass after it,
-            # since the clean's rename can land between the two reads.
-            #
-            # The slot stays held throughout, so the map reads `converting` and
-            # rename / delete / activate keep refusing it with
-            # conversion_running. That is the right answer for those too: a
-            # rename moves the directory out from under clean_map, and a map
-            # with no grid yet cannot be activated anyway.
+            # Every conversion waits, not just a save's: otherwise a re-convert
+            # could read the raw cloud, or a different cloud in each pass. The
+            # slot stays held, so rename / delete / activate keep refusing with
+            # conversion_running (a rename would move the dir under clean_map).
             map_clean = wait_for_map_clean(
                 bound,
                 directory,
@@ -654,20 +458,11 @@ class GridmapConversionService:
             )
 
             try:
-                # Measured whichever recipe runs: z-band needs floor_z to place its
-                # bands, and both areas go into the sidecar as diagnostics.
                 measure = measure_cloud(bound, pcd_path)
                 if recipe_request == "traversability":
-                    # Imported here, not at module scope, and that is load-bearing:
-                    # this would be the only module-level import of
-                    # helpers.traversable in the backend, and it pulls in open3d
-                    # (~100 MB). At module scope every backend start would pay that
-                    # for a conversion that runs only when an operator asks for it.
-                    #
-                    # Inside the try, not just inside the function: an ImportError
-                    # raised above it escapes _run entirely, and the handler below
-                    # never sees it. Inside the branch as well, so the default
-                    # z-band path never pays the import at all.
+                    # Imported here, inside the try, on purpose: it pulls in
+                    # open3d (~100 MB), which only this branch should pay for,
+                    # and an ImportError must reach the handler below.
                     from syncai_backend.helpers.traversable import build_traversable_cloud
 
                     cloud = build_traversable_cloud(
@@ -684,13 +479,8 @@ class GridmapConversionService:
                         "grid": dict(traversable_grid),
                     }
                 else:
-                    # Both z-band passes that need the keyframe trajectory — the
-                    # local floor reference and the pose-connectivity filter — read
-                    # it from the poses.txt pgo writes next to the pcd. Missing or
-                    # unreadable poses degrade the conversion with a warning, never
-                    # fail it: the filter is a cleanup pass and the local floor a
-                    # correction, and losing the whole gridmap to a malformed
-                    # poses.txt would cost far more than either saves.
+                    # poses.txt feeds the local floor and the pose-connectivity
+                    # filter. Unusable poses degrade with a warning, never fail.
                     poses = None
                     poses_path = os.path.join(directory, "poses.txt")
                     try:
@@ -710,10 +500,8 @@ class GridmapConversionService:
 
                     def _bands(reference: str) -> Dict[str, float]:
                         if reference == "local":
-                            # Offsets applied as-is: the helper flattens every
-                            # point to its height above the floor near it, so the
-                            # bands are already relative to the floor wherever the
-                            # point is.
+                            # As-is: the helper bands each point against the
+                            # floor near it.
                             return dict(bands_offsets)
                         return {
                             key: round(offset + measure.floor_z, 3)
@@ -741,13 +529,8 @@ class GridmapConversionService:
                     try:
                         pass_stats = _convert(reference)
                     except LocalFloorError as exc:
-                        # The trajectory and the cloud disagree so badly that no
-                        # keyframe has a floor under it. That is the same input
-                        # mismatch the pose filter answers by leaving the grid
-                        # unfiltered, and it gets the same answer here: the
-                        # conversion the fleet had before the local reference
-                        # existed, plus a record of why. One extra read of the
-                        # cloud, on a path that should never be taken.
+                        # No keyframe has a floor under it: fall back to the
+                        # global level and record why.
                         bound.warning(
                             "local floor reference unusable; converting against "
                             "the global floor level",
@@ -756,10 +539,8 @@ class GridmapConversionService:
                         reference = "global"
                         fallback = str(exc)
                         pass_stats = _convert(reference)
-                    # floor_z is recorded under both references: under ``global``
-                    # it is what the bands were recentred on, under ``local`` it is
-                    # the diagnostic that, set against local_floor's floor_min/max,
-                    # shows how far the site drifted from any one level.
+                    # floor_z under ``local`` is a drift diagnostic, set against
+                    # local_floor's floor_min/max.
                     params = {
                         **GRIDMAP_RECIPE,
                         **_bands(reference),
@@ -769,10 +550,8 @@ class GridmapConversionService:
                     }
                     if fallback is not None:
                         params["floor_reference_fallback"] = fallback
-            # ValueError is a helper's own diagnosis: an empty cloud, an intensity
-            # window that selected no ground, no cluster large enough to be a floor,
-            # an oversized grid. OSError is the pcd or the map directory going away
-            # under it. RuntimeError is open3d's channel for a cloud it cannot read.
+            # ValueError: a helper's diagnosis (empty cloud, no floor, oversized
+            # grid). OSError: files gone. RuntimeError: open3d cannot read the cloud.
             except (ValueError, OSError, RuntimeError) as exc:
                 hint = (
                     "for the traversability recipe, re-convert through "
@@ -788,11 +567,7 @@ class GridmapConversionService:
                     error=str(exc),
                     hint=hint,
                 )
-                # The same diagnosis the log line carries, put where a client can
-                # reach it. The log is the record for whoever is on the robot; this
-                # is the one the operator console reads back onto the map's card,
-                # and until it existed a failed conversion was indistinguishable
-                # from a map nobody had converted.
+                # The log line's diagnosis, where the console can read it.
                 write_recipe_sidecar(
                     bound,
                     directory,
@@ -804,10 +579,8 @@ class GridmapConversionService:
                     ),
                 )
                 return
-            # Separate, and not folded into the tuple above: this one is an
-            # environment fault, not a bad map. Without it the ImportError would kill
-            # the thread and land as a bare traceback on stderr, where nothing
-            # correlates it with the map that was being saved.
+            # An environment fault, not a bad map; uncaught it would be a bare
+            # traceback on stderr with no map attached.
             except ImportError as exc:
                 hint = "pip3 install -r src/syncai_backend/requirements.txt in the container"
                 logger.error(
@@ -816,10 +589,8 @@ class GridmapConversionService:
                     error=str(exc),
                     hint=hint,
                 )
-                # Worth the operator seeing verbatim rather than as a generic
-                # failure: nothing about this map or its cloud is wrong, and
-                # re-converting it will fail identically until the container is
-                # fixed. The sentence names the fix.
+                # Verbatim: re-converting fails identically until the container
+                # is fixed.
                 write_recipe_sidecar(
                     bound,
                     directory,
@@ -849,8 +620,7 @@ class GridmapConversionService:
             logger.info("Gridmap conversion finished", map=name, recipe=recipe_request)
 
             if on_success is not None:
-                # Guarded like the conversion itself: a failed active-map reload must
-                # not read as a failed conversion — the grid is on disk either way.
+                # A failed reload must not read as a failed conversion.
                 try:
                     on_success()
                 except (ValueError, OSError, RuntimeError) as exc:
@@ -861,9 +631,8 @@ class GridmapConversionService:
                     )
 
         def _run_and_release() -> None:
-            # try/finally around the whole body: an exception nothing above caught
-            # must still free the slot, or the map is unconvertible until a backend
-            # restart — a wedge no log line would explain.
+            # Any uncaught exception must still free the slot, or the map is
+            # unconvertible until a restart.
             try:
                 _run()
             finally:

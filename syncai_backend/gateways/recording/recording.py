@@ -12,59 +12,37 @@ import structlog
 from syncai_backend.gateways.failure import Failure, fail
 
 
-# The LIO inputs, and the reason this API exists at all. pgo accumulates its
-# keyframes in RAM and ``save_maps`` is the only thing that serialises them, so
-# a mapping run that ends without a save is gone -- and the only remedy after
-# the fact is replaying these two topics into the LIO chain. They are the pair
-# the (since-deleted) doc/record-lidar.md procedure recorded; recover its full
-# text with `git show a1804af^:doc/record-lidar.md`.
-#
-# Relative, like every topic name in this workspace: see _resolve_topics.
+# The LIO inputs: replaying them is the only way to recover a mapping run that
+# ended without ``save_maps``. Relative, like every topic name here.
 DEFAULT_TOPICS = ("livox/lidar", "livox/imu")
 
-# One split, and the reason the number is not a tuning knob: 2 GB is the size
-# rosbag2 is told to cut a file at, so a start with less than that free cannot
-# even finish the file it is opening.
-#
-# Refusing is the recoverable direction. Filling the partition takes postgres,
-# the byobu multilogs and the running stack with it, and the operator's remedy
-# for the refusal -- deleting an old recording -- is a route this same router
-# serves.
+# One split: with less free, a start cannot finish the file it opens. Refusing
+# is recoverable; a full partition takes postgres and the stack down with it.
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 
-# What each split is cut at. The old hand-pasted procedure's value, kept
-# because it is also what makes a long run copyable off the robot in pieces.
+# What each split is cut at, so a long run copies off the robot in pieces.
 MAX_BAG_SIZE_BYTES = 2000000000
 
 # Reserved: GET /api/v1/recordings/active would otherwise shadow a recording
 # directory legitimately called that.
 RESERVED_NAMES = frozenset({"active"})
 
-# The stop ladder. SIGINT first because it is the only signal rosbag2 handles
-# as "finish and flush": a bag killed any other way has no metadata.yaml and is
-# unplayable until `ros2 bag reindex`. The rest is MdnsManager.kill_mdns's
-# terminate -> kill escalation.
+# The stop ladder. SIGINT is the only signal rosbag2 answers by flushing; any
+# other leaves no metadata.yaml (unplayable until `ros2 bag reindex`).
 #
-# The SIGINT rung is a stall timeout, not a deadline. With file compression on,
-# rosbag2 answers SIGINT by zstd-compressing the split still open -- up to 2 GB,
-# ~50 s at the ~40 MB/s an Orin manages -- and only then finalises the earlier
-# splits' archives and writes metadata.yaml. A fixed 15 s cut that short and
-# SIGKILLed it mid-compression (dp1f_1006, 2026-10-06: both .zstd files
-# truncated, no metadata). So the recorder keeps its SIGINT for as long as the
-# bag directory keeps changing, and is escalated only after
-# _SIGINT_STALL_TIMEOUT of no writes at all -- a writer that is wedged rather
-# than slow. _SIGINT_MAX_TIMEOUT bounds the blocking POST whatever happens.
+# The SIGINT rung is a stall timeout, not a deadline: with compression on,
+# rosbag2 first zstd-compresses the open split (~50 s for 2 GB on an Orin). A
+# fixed 15 s deadline once SIGKILLed it mid-compression and truncated the bag,
+# so escalate only after _SIGINT_STALL_TIMEOUT of no writes.
+# _SIGINT_MAX_TIMEOUT bounds the blocking POST.
 _SIGINT_STALL_TIMEOUT = 15.0
 _SIGINT_MAX_TIMEOUT = 300.0
 _SIGINT_POLL_INTERVAL = 1.0
 _SIGTERM_TIMEOUT = 5.0
 _SIGKILL_TIMEOUT = 2.0
 
-# How long a freshly spawned recorder has to prove it is still alive. Same
-# liveness probe as MdnsManager.publish_mdns: a bad topic name, an unwritable
-# directory or a missing `ros2` on PATH all kill the child within milliseconds,
-# and catching that here is what turns it into the POST's own error instead of
-# a 201 followed by a bag that never appears.
+# How long a fresh recorder must stay alive. Bad arguments kill it within
+# milliseconds; catching that makes it the POST's error, not a silent 201.
 _LIVENESS_PROBE = 0.5
 
 
@@ -83,31 +61,19 @@ class _Active(NamedTuple):
 class RecordingGateway:
     """``ros2 bag record`` as a supervised child process.
 
-    A subprocess rather than ``rosbag2_py`` in this process, and that is a
-    choice rather than a constraint -- both work in this image. A recorder
-    subscribing to the 20 Hz lidar cloud would otherwise share the backend's
-    MultiThreadedExecutor with the telemetry, point-cloud and TF callbacks, and
-    hold the GIL against uvicorn's threadpool and the Temporal worker while it
-    serialises every message. Out of process it competes for CPU and nothing
-    else, and a recorder that wedges or dies takes nothing down with it.
+    A subprocess rather than ``rosbag2_py``, so the lidar recorder does not
+    share this executor or hold the GIL; a wedged recorder takes nothing down.
 
     Two properties of the child are load-bearing:
 
-      - It is **not** put in its own session (no ``start_new_session``). A
-        ``switch_mode`` kills the byobu session this backend is a pane of; a
-        recorder in its own session would survive that, keep writing, and be
-        unstoppable through any API, because the only handle on it is the slot
-        in this object. Sharing the process group means the teardown takes it
-        too, and the half-written directory reports itself as ``interrupted``.
-      - Its stdout and stderr are **inherited**, not piped. A pipe nobody drains
-        deadlocks the recorder at 64 KiB, and inherited they land in the
-        backend's byobu multilog next to everything else. (MdnsManager sends
-        avahi-publish to DEVNULL; that process has nothing to say and rosbag2
-        does.)
+      - **No** ``start_new_session``: ``switch_mode`` kills the byobu session
+        this backend runs in, and a recorder in its own session would survive
+        unstoppable. Sharing it means the bag reads ``interrupted``.
+      - stdout/stderr are **inherited**, not piped: an undrained pipe
+        deadlocks the recorder at 64 KiB.
 
-    One recording at a time. The slot is claimed under the lock before the
-    spawn, so there is no check-then-start race -- the same shape as
-    GridmapConversionService's registry and WebRtcGateway's session slots.
+    One recording at a time; the slot is claimed under the lock before the
+    spawn, so there is no check-then-start race.
     """
 
     def __init__(
@@ -120,9 +86,8 @@ class RecordingGateway:
         self._robot_id = robot_id
         self._records_dir = records_dir
 
-        # Never held across the wait in stop(): status() is the route a console
-        # polls at 1 Hz and must stay answerable while a 2 GB file is being
-        # closed. The lock covers the slot, not the child.
+        # Covers the slot, not the child; never held across stop()'s wait, so
+        # status() stays answerable.
         self._lock = threading.Lock()
         self._active: Optional[_Active] = None
 
@@ -131,15 +96,8 @@ class RecordingGateway:
     def _resolve_topics(self, topics: List[str]) -> List[str]:
         """Expand relative topic names under this robot's namespace.
 
-        ``livox/lidar`` becomes ``/robot01/livox/lidar``; an absolute name is
-        passed through untouched. This is the workspace's namespacing rule
-        (CLAUDE.md, "The robot_id convention") pushed out to the API edge: the
-        caller writes what the params YAML and every subscriber write, and the
-        same request body records the right thing on any robot in the fleet.
-
-        The escape hatch matters as much as the rule: ``/tf``, ``/tf_static``
-        and ``/rosout`` are genuinely fleet-wide, and a bag meant for replay
-        usually wants them.
+        ``livox/lidar`` becomes ``/robot01/livox/lidar``; absolute names (e.g.
+        ``/tf``, ``/tf_static``) pass through untouched.
         """
         resolved = []
         for topic in topics:
@@ -153,10 +111,8 @@ class RecordingGateway:
     def _reap(self) -> None:
         """Drop the slot if the child is gone. Caller must hold the lock.
 
-        A recorder can die on its own -- the disk filled, the sqlite writer
-        failed, somebody killed the pane. Without this the slot would stay
-        claimed and every later start would answer 409 against a process that
-        does not exist, a wedge no log line explains.
+        A recorder can die on its own; without this every later start would
+        answer 409 against a process that no longer exists.
         """
         active = self._active
         if active is None or active.process.poll() is None:
@@ -193,8 +149,7 @@ class RecordingGateway:
         with self._lock:
             self._reap()
             active = self._active
-        # Outside the lock: _describe walks the bag directory, and the stop path
-        # must not queue behind a poll.
+        # Outside the lock: _describe walks the bag directory.
         return self._describe(active) if active is not None else None
 
     def start(
@@ -202,11 +157,9 @@ class RecordingGateway:
     ) -> Tuple[bool, str, Dict]:
         """Spawn a recorder. Returns (success, message, payload).
 
-        ``name`` and the free-space floor are checked under the same lock that
-        claims the slot, so a second request cannot slip between the check and
-        the spawn. The directory itself is not created here -- ``-o`` is the
-        recorder's own argument and it refuses an existing path, which is the
-        backstop behind the name check the router already did.
+        Checks run under the lock that claims the slot. The directory is not
+        created here: the recorder's ``-o`` refuses an existing path, which
+        backs up the router's name check.
         """
         resolved = self._resolve_topics(topics)
         path = os.path.join(self._records_dir, name)
@@ -240,11 +193,7 @@ class RecordingGateway:
             command = _build_command(path, resolved, compression)
             try:
                 # No start_new_session, no PIPE: see the class docstring. cwd is
-                # the records root's parent rather than inherited, so nothing
-                # about this depends on where the backend was started from --
-                # `-o` is absolute anyway, but a relative fallback landing in
-                # someone's shell cwd is the kind of surprise this workspace has
-                # already had once with config/system.ini.
+                # fixed so nothing depends on where the backend was started.
                 process = subprocess.Popen(command, cwd=os.path.expanduser("~"))
             except FileNotFoundError:
                 return (
@@ -256,9 +205,7 @@ class RecordingGateway:
             except OSError as exc:
                 return False, f"could not start ros2 bag record: {exc}", {}
 
-            # The liveness probe, MdnsManager's shape. A recorder that is going
-            # to fail on its arguments does it immediately, and that failure
-            # belongs to this POST rather than to whoever next reads the log.
+            # The liveness probe (see _LIVENESS_PROBE).
             try:
                 process.wait(timeout=_LIVENESS_PROBE)
                 return (
@@ -295,16 +242,12 @@ class RecordingGateway:
     def stop(self) -> Tuple[bool, str, Dict]:
         """Stop the live recorder and wait for it to flush its metadata.
 
-        Blocking: typically a few seconds, about a minute when compression has
-        a full split left to compress, and ~5 min in the worst case (see
-        _SIGINT_MAX_TIMEOUT). That is why the route is a
-        plain ``def`` handler: FastAPI runs it on a worker thread, and the
-        caller genuinely wants to know whether the bag is playable, which is
-        only knowable once the child is gone.
+        Blocking: seconds, ~a minute with compression, up to
+        _SIGINT_MAX_TIMEOUT; hence a plain ``def`` route. The caller wants to
+        know whether the bag is playable.
 
-        The slot is released before the signal, not after. A stop that hangs on
-        the last rung must not leave the API refusing every later start against
-        a child nobody can reach any more.
+        The slot is released before the signal, so a hung stop cannot wedge
+        later starts.
         """
         with self._lock:
             self._reap()
@@ -359,9 +302,8 @@ def _build_command(path: str, topics: List[str], compression: bool) -> List[str]
         str(MAX_BAG_SIZE_BYTES),
     ]
     if compression:
-        # File mode, not message mode: message mode compresses on the writer's
-        # own path and shows up as dropped messages under load, while file mode
-        # only works on a split that is already closed.
+        # File mode: message mode compresses on the writer's path and drops
+        # messages under load.
         command += [
             "--compression-mode",
             "file",
@@ -374,11 +316,9 @@ def _build_command(path: str, topics: List[str], compression: bool) -> List[str]
 def _terminate(logger: structlog.stdlib.BoundLogger, active: _Active) -> str:
     """Walk the stop ladder; return which rung ended it.
 
-    SIGINT is the one that matters: rosbag2 installs a handler for it and
-    answers by closing the storage and writing metadata.yaml. The two rungs
-    below it exist for a writer that is wedged rather than slow, and both of
-    them cost the bag its metadata -- recoverable with `ros2 bag reindex`, which
-    is why the result is reported rather than raised.
+    Only SIGINT yields metadata.yaml; the lower rungs are for a wedged writer
+    and leave a bag for `ros2 bag reindex`, so the result is reported, not
+    raised.
     """
     process = active.process
     if process.poll() is not None:
@@ -407,9 +347,8 @@ def _terminate(logger: structlog.stdlib.BoundLogger, active: _Active) -> str:
         process.kill()
         process.wait(timeout=_SIGKILL_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        # Unreachable short of a child stuck in uninterruptible IO. Reported
-        # rather than raised: the slot is already released and the operator's
-        # next start must not be refused over it.
+        # Only a child stuck in uninterruptible IO. Reported, not raised: the
+        # slot is already released.
         logger.error(
             "[RecordingGateway] Could not kill the recorder",
             recording=active.name,
@@ -424,10 +363,8 @@ def _wait_while_writing(
 ) -> bool:
     """Wait for a SIGINTed recorder to exit; True if it did.
 
-    Gives up after _SIGINT_STALL_TIMEOUT with no change under the bag directory,
-    or after _SIGINT_MAX_TIMEOUT in total. "Change" is any file's size or mtime
-    moving, which covers every phase of rosbag2's shutdown: the sqlite close,
-    the .zstd growing, the uncompressed split being deleted, metadata.yaml.
+    Gives up after _SIGINT_STALL_TIMEOUT with no file size/mtime change in the
+    bag directory, or after _SIGINT_MAX_TIMEOUT in total.
     """
     process = active.process
     started = time.monotonic()
@@ -481,9 +418,8 @@ def _dir_progress(path: str) -> Tuple[Tuple[str, int, int], ...]:
 def _dir_size(path: str) -> int:
     """Bytes under ``path``, or 0 if it is not there yet.
 
-    Duplicated from the catalogue repo's _walk_stats rather than imported: this
-    is the live bag and the only number wanted is the total, and a gateway
-    reaching into a repository would invert the layering.
+    Duplicated from the catalogue repo's _walk_stats: a gateway importing a
+    repository would invert the layering.
     """
     total = 0
     for root, _dirs, files in os.walk(path):

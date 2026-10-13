@@ -1,43 +1,25 @@
 """Intensity-based traversability segmentation and ground repair.
 
-The second pcd → grid recipe on this stack, and a deliberately different one
-from ``helpers/pcd_to_gridmap.py``. That module slices the cloud by height: a
-cell is occupied when enough points sit in the obstacle z-band, free when the
-floor band was observed. It is cheap, it is what every gridmap on the fleet was
-built with, and it fails in exactly one way — it has no idea whether the
-"floor" it observed is *drivable*. A ramp, a 25 cm kerb top and the flat aisle
-all land in the same band on a site that is not perfectly level, and z=0 in a
-LIO map is the lidar mount height at the mapping start pose, so the bands are
-a per-site guess to begin with.
+The second pcd -> grid recipe. ``helpers/pcd_to_gridmap.py`` slices by height
+and cannot tell whether the observed "floor" is drivable (a ramp, a kerb top
+and an aisle share a band). This one segments by what the surface *is*,
+ported from the offline ``SyncAI-Robot-Pointcloud-ProcessAndConversion`` tool:
 
-This module segments the cloud by what the surface *is* instead of where it is,
-using the pipeline developed offline in ``SyncAI-Robot-Pointcloud-
-ProcessAndConversion`` (three standalone scripts, ported here so the backend can
-run it without a checkout next to the install space — the same motivation that
-folded the retired ``tools/pcd_to_gridmap.py`` CLI into a helper):
+  1. ``segment_traversable`` — split into ground / ramp / obstacle by return
+     intensity, normal z, and height above the measured floor.
+  2. ``repair_ground`` — merge coplanar fragments, fill their holes, stitch
+     across gaps and single steps.
+  3. ``convert_traversable_to_gridmap`` (in ``pcd_to_gridmap.py``) — project
+     the ground; no traversable point means occupied.
 
-  1. ``segment_traversable``  — split the cloud into flat ground / ramp /
-     obstacle using lidar return intensity, the surface normal's z, and height
-     above the measured floor level.
-  2. ``repair_ground``        — a LIO map samples a continuous floor with holes
-     and dashes; merge the coplanar fragments back into whole planes, fill
-     their interiors, and stitch across gaps and single steps.
-  3. ``convert_traversable_to_gridmap`` (in ``pcd_to_gridmap.py``) — project the
-     repaired ground and treat "no traversable point here" as occupied.
+**This is the only module that imports open3d (~100 MB); nothing imports it at
+startup.** Import it inside the function that needs it. Stage 3 lives in
+``pcd_to_gridmap`` to keep that module open3d-free.
 
-Stage 3 lives in the other module on purpose: it is pure numpy/scipy, and
-keeping it there means ``pcd_to_gridmap`` stays free of open3d. The map router
-imports that module at startup, and open3d is a ~100 MB import — paying it on
-every backend start, on a robot that mostly never converts a map, is not worth
-it. **Nothing imports this module at startup.** Import it inside the function
-that needs it.
-
-Nothing runs this recipe automatically: ``POST /api/v1/maps`` always converts
-with the z-band one, and this runs only when an operator asks for it through
-``POST /api/v1/maps/{name}/grid/convert`` — the comment above ``GRIDMAP_RECIPE``
-in ``services/gridmap_conversion.py`` records why the automatic pick was removed.
-It is worth running by hand on a site whose grid came out wrong, because
-``debug_dir`` is the only way to see which stage rejected the floor:
+Runs only on request (``POST /api/v1/maps/{name}/grid/convert``); see
+``GRIDMAP_RECIPE`` in ``services/gridmap_conversion.py`` for why it is not
+picked automatically. By hand, ``debug_dir`` shows which stage rejected the
+floor:
 
     from syncai_backend.helpers.traversable import build_traversable_cloud
     from syncai_backend.helpers.pcd_to_gridmap import convert_traversable_to_gridmap
@@ -45,25 +27,13 @@ It is worth running by hand on a site whose grid came out wrong, because
                                     debug_dir="map/dp2f/traversable_debug")
     convert_traversable_to_gridmap(logger, cloud, "map/dp2f/gridmap")
 
-Stage 2's defaults are the values the offline tool shipped with, which means the
-``__main__`` block's arguments rather than the function signature's — the two
-disagreed (0.02/0.35/0.15/0.22 vs 0.04/0.80/0.07/0.31) and the ReadMe's tuning
-guide documents the ``__main__`` set as the recommended one.
+Stage 2's defaults are the offline tool's ``__main__`` values (its documented
+recommendation), not its function signature's.
 
-Stage 1's ground-density defaults are **not** the offline tool's, and the
-measurement that moved them is worth keeping. The tool shipped
-``ground_ror_radius=0.05`` with ``ground_ror_nb_points=3`` — three neighbours
-inside a 5 cm ball, i.e. roughly 500 floor points per m². Run against the
-gridmaps this fleet actually has, that gate keeps 6% of the ground candidates on
-dp1f, 8% on dp2f and 20% on the map that prompted this; the survivors are too
-thin and too fragmented for DBSCAN to assemble a floor, so the recipe produced a
-blob or raised. It is not a density the MID360 reaches on a driven LIO map at
-any map size — the one cloud on the fleet that does clear it samples its floor
-at 1549 points per m², 5–7× the others, and its dominant flat surface is a
-ceiling 8.4 m up. So the radius is 0.25 here, DBSCAN's eps follows it to 0.50,
-and ``ground_min_cluster_points`` drops from 1000 to 200 (at 0.05 the largest
-cluster on that map was 163 points). Failures raise ``ValueError``; the caller
-decides how to report them.
+Stage 1's ground-density defaults are **not** the tool's: its 3 neighbours in
+0.05 m (~500 points/m²) kept only 6-20% of ground candidates on the fleet's
+maps, too few for DBSCAN. Hence radius 0.25, eps 0.50 and
+``ground_min_cluster_points`` 200 (was 1000). Failures raise ``ValueError``.
 """
 
 import os
@@ -76,14 +46,11 @@ import structlog
 from scipy import ndimage
 from scipy.spatial import Delaunay, QhullError, cKDTree
 
-# The only import from the sibling conversion module, and it goes this way round
-# on purpose: pcd_to_gridmap must stay free of open3d (the map router imports it
-# at startup), so shared pure-numpy code lives there and is pulled in here.
+# Shared numpy code lives in pcd_to_gridmap, which must stay open3d-free.
 from syncai_backend.helpers.pcd_to_gridmap import floor_level
 
 
-# Field names a PCD may carry the lidar return intensity under. FAST-LIO writes
-# "intensity"; the other three are what other exporters on the fleet have used.
+# Intensity field names; FAST-LIO writes "intensity", other exporters the rest.
 _INTENSITY_KEYS = ("intensity", "scalar_intensity", "i", "reflectivity")
 
 
@@ -91,10 +58,8 @@ _INTENSITY_KEYS = ("intensity", "scalar_intensity", "i", "reflectivity")
 class SegmentedCloud:
     """What ``segment_traversable`` split the map into.
 
-    ``ground`` is the only surface stage 2 repairs and stage 3 projects.
-    ``slope`` and the two obstacle clouds are diagnostics — write them out with
-    ``debug_dir`` and open them in a viewer when a site's segmentation looks
-    wrong, which is what the offline tool's four output PCDs were for.
+    Only ``ground`` is repaired and projected; ``slope`` and the obstacle
+    clouds are diagnostics (see ``debug_dir``).
     """
 
     ground: o3d.geometry.PointCloud
@@ -108,15 +73,9 @@ def _load_cloud(
 ) -> Tuple[o3d.geometry.PointCloud, np.ndarray, np.ndarray]:
     """Read a PCD and return it with per-point normals and intensity.
 
-    Normals are estimated when the file has none (FAST-LIO's ``map.pcd`` is
-    ``x y z intensity``, so that is the normal case) and are estimated **on the
-    returned cloud**, not on a throwaway copy. The offline tool estimated them
-    on one ``to_legacy()`` result and returned a second, fresh one; the returned
-    cloud therefore had no normals, and the obstacle-cleaning pass — which reads
-    ``np.asarray(pcd.normals)`` off a subset of it — silently got a (0, 3) array,
-    an all-empty ceiling mask, and produced an **empty obstacle cloud** on every
-    intensity-only map. It never raised, so it looked like the map simply had no
-    walls.
+    Normals are estimated when missing (the FAST-LIO case) **on the returned
+    cloud**: the offline tool estimated them on a throwaway copy, and the
+    obstacle pass then silently produced an empty cloud.
     """
     tensor_pcd = o3d.t.io.read_point_cloud(pcd_path)
     pcd = tensor_pcd.to_legacy()
@@ -129,16 +88,10 @@ def _load_cloud(
         pcd.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=normal_max_nn)
         )
-        # Normals from PCA are sign-ambiguous — neighbouring floor points come
-        # out ±1 at random — so without this the flat floor would split roughly
-        # in half at every nz threshold below.
-        #
-        # The cost, and it is the reason height gating exists in this module: it
-        # also flattens the one distinction the sign carried. After this, nz ∈
-        # [0, 1] for every point in the cloud, so a ceiling reads nz≈+1 exactly
-        # like a floor. Nothing downstream may infer "faces up" from a positive
-        # nz, and any test written as ``nz < <negative>`` is dead — one was, for
-        # as long as this call has been here.
+        # PCA normals are sign-ambiguous, which would split the floor at every
+        # nz threshold. After this nz ∈ [0, 1], so a ceiling reads nz≈+1 like a
+        # floor: never infer "faces up" from nz (hence the height gating), and
+        # any ``nz < <negative>`` test is dead.
         pcd.orient_normals_to_align_with_direction(np.array([0.0, 0.0, 1.0]))
     normals = np.asarray(pcd.normals)
 
@@ -148,10 +101,8 @@ def _load_cloud(
             intensity = tensor_pcd.point[key].numpy().reshape(-1).astype(np.float64)
             break
     if intensity is None:
-        # Not fatal: with no intensity the percentile gate opens fully and the
-        # segmentation degrades to a normals-only one, which still separates
-        # floor from wall. Worth a warning because the intensity gate is what
-        # rejects painted markings and wet patches.
+        # Not fatal: degrades to normals only, losing the rejection of painted
+        # markings and wet patches.
         logger.warning("pcd carries no intensity field; segmenting on normals only", pcd=pcd_path)
         intensity = np.zeros(len(points))
 
@@ -177,16 +128,10 @@ def _clean_ground(
 ) -> o3d.geometry.PointCloud:
     """Drop sparse flyers and disconnected crumbs from the raw ground slice.
 
-    Two passes, and they reject different things. The radius filter is a local
-    *density* test — it removes the handful of points a single bad return leaves
-    floating in the middle of nowhere. DBSCAN then removes whole islands that
-    are dense but too small to be floor (a table top caught by the intensity
-    gate, a patch of ceiling that survived).
-
-    ``min_cluster_points`` keeps **every** cluster above the threshold rather
-    than only the largest. A site with two aisles joined by a doorway the lidar
-    never saw through is two clusters, and keeping only the biggest would delete
-    half the map.
+    A radius filter removes isolated flyers; DBSCAN removes dense islands too
+    small to be floor (table tops, ceiling patches). **Every** cluster reaching
+    ``min_cluster_points`` is kept, not just the largest: two aisles behind an
+    unseen doorway are two clusters.
     """
     if len(ground.points) == 0:
         raise ValueError(
@@ -211,9 +156,7 @@ def _clean_ground(
         dense.cluster_dbscan(eps=dbscan_eps, min_points=dbscan_min_points, print_progress=False)
     )
     if labels.size == 0 or labels.max() < 0:
-        # Every point is noise to DBSCAN. Returning the density-filtered cloud
-        # is the useful failure: the caller still gets a floor, just an
-        # unfiltered one, and the log says the clustering did nothing.
+        # All noise to DBSCAN: still return a floor, just unclustered.
         logger.warning("ground DBSCAN found no cluster; keeping the density-filtered cloud")
         return dense
 
@@ -249,32 +192,15 @@ def _clean_obstacles(
 ) -> o3d.geometry.PointCloud:
     r"""Reduce everything-that-is-not-floor to the solid parts a robot can hit.
 
-    Three passes, each aimed at one thing the LIO map contains that is not an
-    obstacle at the robot's height:
+    1. **Ceilings**: near-horizontal (\|nz\| >= ``ceiling_nz``) *and* above
+       ``floor_z + ceiling_height``; either test alone would cut rack tops or
+       the floor. Do not go back to a signed ``nz < ceiling_nz`` test: normals
+       are aligned to +z, so it removed nothing.
+    2. **Foliage**: PCA scattering λ3/Σλ is near 0 on a plane and large in a
+       canopy. The expensive pass.
+    3. **Motion residue**: a generous radius filter removes people's trails.
 
-    1. **Ceilings.** A near-horizontal surface higher than
-       ``floor_z + ceiling_height``: overhead structure, beams, the underside of
-       racking. Both halves of that test are needed — height alone would delete
-       the top of a tall rack the robot can still collide with the base of, and
-       flatness alone deletes the floor.
-
-       This used to be a pure normal test (``nz < ceiling_nz``, -0.2) and it was
-       **dead code**: ``_load_cloud`` aligns every normal to +z, so no point in
-       any cloud ever had nz below zero, let alone -0.2, and the pass removed
-       exactly nothing. It read as working because it logged a plausible count —
-       the input's, unchanged. ``ceiling_nz`` is kept as the flatness threshold,
-       now compared against \|nz\| and positive, since the sign it used to rely
-       on no longer exists by the time this runs.
-    2. **Foliage.** The local PCA scattering ratio λ3/Σλ is near 0 for a plane
-       and large for a volume of scattered returns, so a tree canopy or its
-       shadow scores far above a wall or a sign. This is the only pass that
-       needs neighbourhood covariances, and it is the expensive one.
-    3. **Motion residue.** A person walking through the mapping run leaves a
-       sparse ribbon of points; a radius filter with a generous radius removes
-       it along with flyers.
-
-    Returned empty rather than raising when nothing survives — a corridor map
-    genuinely can be all floor, and this cloud is diagnostic anyway.
+    May return empty (a corridor can be all floor); this cloud is diagnostic.
     """
     if len(obstacles.points) == 0:
         return obstacles
@@ -294,8 +220,7 @@ def _clean_obstacles(
         return kept
 
     kept.estimate_covariances(o3d.geometry.KDTreeSearchParamKNN(knn=scatter_knn))
-    # eigvalsh returns ascending eigenvalues, so column 0 is the smallest —
-    # the plane-normal direction, near zero for a flat surface.
+    # eigvalsh is ascending: column 0 is the normal direction's eigenvalue.
     eigenvalues = np.linalg.eigvalsh(np.asarray(kept.covariances))
     scattering = eigenvalues[:, 0] / (eigenvalues.sum(axis=1) + 1e-8)
     kept = kept.select_by_index(np.flatnonzero(scattering < max_scattering))
@@ -336,35 +261,22 @@ def segment_traversable(
 ) -> SegmentedCloud:
     """Split a LIO map into traversable ground, ramps and obstacles.
 
-    The gate is intensity **and** normal direction **and** height, and it needs
-    all three. Intensity alone cannot tell a floor from a same-material wall;
-    the normal alone accepts every flat surface in the building, table tops and
-    pallet tops included — and, because ``_load_cloud`` aligns normals to +z,
-    the ceiling as well. Height is what separates the floor from the ceiling
-    (see ``pcd_to_gridmap.floor_level``); the other two select "flat, and made of what the
-    floor is made of".
+    Ground needs intensity **and** normal **and** height: intensity alone
+    accepts same-material walls, the normal alone every flat surface including
+    the ceiling; height (``floor_level``) separates floor from ceiling.
 
-    ``ground_z_range`` is an absolute ``(zmin, zmax)`` band and is normally left
-    ``None``: the floor level is then estimated per cloud and the band becomes
-    ``floor ± ground_z_margin``. That is the difference between this and the
-    z-band recipe in ``pcd_to_gridmap`` — the band is *measured* here, not a
-    per-site constant, so it still transfers across sites. Pass an explicit
-    range only for a cloud whose logged ``floor_z`` came out wrong.
+    ``ground_z_range`` (absolute) is normally None: the band is then the
+    measured floor ± ``ground_z_margin``. Override only when the logged
+    ``floor_z`` is wrong.
 
-    ``intensity_percentiles`` is a window over the *non-zero* intensities of
-    this cloud, not an absolute range: return intensity depends on the lidar
-    model, the surface and the range, so a fixed [5, 100] that fits one site
-    fits no other. The floor is by far the largest surface in a driven map, so
-    it dominates the histogram's bulk — the window's job is only to cut the
-    zero-return noise below it and the retroreflective signage above it.
+    ``intensity_percentiles`` is a window over this cloud's non-zero
+    intensities, since absolute intensity varies by lidar, surface and range;
+    it cuts zero-return noise and retroreflective signage.
 
-    ``ground_nz`` is deliberately severe (nz ≥ 0.99, i.e. within ~8° of level):
-    stage 2 is what recovers the area this rejects, and letting a 20° surface
-    into the "flat" class would have stage 2 stitch across a slope as if it were
-    a step. Ramps come back separately in ``slope`` (``slope_nz`` covers roughly
-    40°–60° off level) and are **not** merged into ``ground`` — the planar nav
-    stack has no notion of a gradient, so a ramp projected into the grid reads
-    as ordinary free space the controller will drive at full speed.
+    ``ground_nz`` is strict (0.99, ~8°) because stage 2 recovers what it
+    rejects and would otherwise stitch across slopes. Ramps (``slope_nz``,
+    ~40-60°) are **not** merged into ``ground``: the planar nav stack would
+    drive them as flat free space at full speed.
     """
     pcd, normals, intensity = _load_cloud(logger, pcd_path, normal_radius, normal_max_nn)
     nz = normals[:, 2]
@@ -384,9 +296,7 @@ def segment_traversable(
         intensity_mask = np.ones(len(nz), dtype=bool)
 
     flat_mask = intensity_mask & (nz >= ground_nz)
-    # The floor level is measured from the flat candidates, not from the whole
-    # cloud: the cloud's own z histogram is dominated by walls, which span every
-    # height and bias any peak-finding toward whatever the lidar dwelled on.
+    # Measured on flat candidates, not the whole cloud, which walls dominate.
     points = np.asarray(pcd.points)
     if ground_z_range is None:
         if not flat_mask.any():
@@ -409,13 +319,9 @@ def segment_traversable(
         flat=int(flat_mask.sum()),
         in_band=int(ground_mask.sum()),
     )
-    # Not height-gated, and deliberately: a ramp spans the very heights the band
-    # excludes, so banding it would delete the top of every ramp. `slope` is a
-    # diagnostic — it is never merged into `ground` (see below) — so a ceiling
-    # leaking in here costs nothing.
+    # Not height-gated: that would cut ramp tops, and `slope` is diagnostic only.
     slope_mask = intensity_mask & (nz >= slope_nz[0]) & (nz < slope_nz[1])
-    # Anything the two gates did not claim, *before* either was denoised — the
-    # points a filter drops are noise, not obstacles, and must not reappear here.
+    # Taken before denoising: points a filter drops are noise, not obstacles.
     other_mask = ~(ground_mask | slope_mask)
 
     obstacle_raw = pcd.select_by_index(np.flatnonzero(other_mask))
@@ -455,10 +361,7 @@ def segment_traversable(
 def _find_root(parent: dict, node: int) -> int:
     """Union-find root with path compression, iteratively.
 
-    Iterative because the offline tool's recursive version recurses once per
-    link on the path and a fragmented floor produces thousands of fragments —
-    deep enough to hit CPython's recursion limit inside a background conversion
-    thread, where the RecursionError would surface only as a log line.
+    Iterative: thousands of fragments can exceed the recursion limit.
     """
     root = node
     while parent[root] != root:
@@ -471,11 +374,8 @@ def _find_root(parent: dict, node: int) -> int:
 def _row_stride(points: np.ndarray, origin: np.ndarray, grid_res: float, dilation: int) -> int:
     """The row pitch that packs a (cell x, cell y) pair into one int64 key.
 
-    Derived from the extent of **all** the points being compared, not of one
-    fragment: two fragments' keys mean the same cell only if they were packed
-    with the same stride, so a per-fragment stride silently makes the overlap
-    test below compare unrelated numbers. It reads as working, because two
-    fragments that happen to span the same rows do get the same stride.
+    Must come from **all** the points compared, not one fragment: keys from
+    different strides compare unrelated numbers, silently.
     """
     rows = int((points[:, 1].max() - origin[1]) / grid_res)
     # A cell's dilated key reaches iy + 2 * dilation (see _footprint_keys).
@@ -487,23 +387,16 @@ def _footprint_keys(
 ) -> np.ndarray:
     """The cluster's 2D cell footprint, dilated, as a sorted array of int64 keys.
 
-    Dilating by a couple of cells is what lets two fragments that merely *touch*
-    count as overlapping — LIO splits one physical floor into fragments whose
-    edges interleave without sharing a cell.
-
-    Keys rather than the offline tool's ``set`` of ``(x, y)`` tuples: the
-    dilation there was a 25-iteration Python loop over every cell of every
-    cluster, and the overlap test that follows is O(clusters²). Packing (x, y)
-    into one int64 makes the dilation a single broadcast and the test an
-    ``intersect1d``.
+    Dilation lets fragments that merely touch count as overlapping. Packed
+    int64 keys make the dilation one broadcast and the O(clusters²) overlap
+    test an ``intersect1d``.
     """
     ix = ((points[:, 0] - origin[0]) / grid_res).astype(np.int64)
     iy = ((points[:, 1] - origin[1]) / grid_res).astype(np.int64)
 
     offsets = np.arange(-dilation, dilation + 1, dtype=np.int64)
     dx, dy = (mesh.ravel() for mesh in np.meshgrid(offsets, offsets, indexing="ij"))
-    # +dilation keeps both indices non-negative (they start at 0, so the -d
-    # offset can only reach -d), which is what makes the packing one-to-one.
+    # +dilation keeps indices non-negative, so the packing is one-to-one.
     kx = (ix[:, None] + dx[None, :]).ravel() + dilation
     ky = (iy[:, None] + dy[None, :]).ravel() + dilation
     return np.unique(kx * stride + ky)
@@ -521,15 +414,9 @@ def _merge_coplanar(
 ) -> list:
     """Group DBSCAN fragments that are the same physical plane.
 
-    Two fragments belong together when their 2D footprints touch *and* they sit
-    at the same height. Both halves matter: footprints alone would merge a step
-    with the floor it overhangs, height alone would merge two unconnected aisles
-    that happen to be level. Transitivity comes from union-find, so a floor
-    broken into a chain of fragments reassembles even though the ends of the
-    chain never touch.
-
-    Height is the **median** z, not the mean — a fragment with a few points
-    smeared onto the wall it meets would otherwise read as raised.
+    Merged when footprints touch *and* heights match (either alone merges a
+    step with its floor, or two level but separate aisles); union-find makes
+    it transitive. Height is the median z, robust to points on a wall.
     """
     footprints = {}
     heights = {}
@@ -565,17 +452,10 @@ def _fill_and_outline(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Fill a plane's interior holes and return (filled points, boundary points).
 
-    A LIO floor is a voxel-downsampled surface, so it arrives as a speckled
-    sheet with holes wherever the lidar's rings missed. ``binary_fill_holes``
-    closes every pocket fully enclosed by the plane — which is exactly the
-    conservative choice here, because a pocket that reaches the plane's edge
-    (i.e. is not enclosed) might be a real obstacle footprint and is left alone.
-
-    Both outputs are flattened onto the plane's mean height. That is a
-    simplification the offline tool made and it is safe *because* this only ever
-    runs on fragments already within ``same_plane_z`` of each other; the
-    boundary z is then what the stitching pass compares against, so keeping it
-    per-point would make the step test depend on which edge point was sampled.
+    Only fully enclosed pockets are filled; one reaching the edge may be an
+    obstacle footprint. Both outputs sit at the plane's mean height (safe, as
+    fragments are within ``same_plane_z``), so the stitching step test does not
+    depend on which edge point was sampled.
     """
     min_p = points.min(axis=0)
     span = points.max(axis=0) - min_p
@@ -587,10 +467,8 @@ def _fill_and_outline(
             "raise grid_res or check the segmentation for a plane spanning the whole site"
         )
 
-    # +1 leaves a one-cell empty margin, so a plane touching its own bounding
-    # box still has background on all four sides: binary_fill_holes treats the
-    # array edge as background, and binary_erosion would otherwise clip the
-    # boundary ring the stitching pass needs.
+    # +1: a one-cell empty margin, so fill_holes and erosion see background on
+    # every side.
     ix = ((points[:, 0] - min_p[0]) / grid_res).astype(np.int64) + 1
     iy = ((points[:, 1] - min_p[1]) / grid_res).astype(np.int64) + 1
 
@@ -609,8 +487,7 @@ def _fill_and_outline(
 
     holes = ndimage.binary_fill_holes(occupied) & ~occupied
     filled = to_world(*np.nonzero(holes))
-    # Holes count as plane from here on, so the boundary is the outline of the
-    # *repaired* plane rather than of its holes as well.
+    # Boundary of the repaired plane, not of its holes.
     occupied |= holes
     boundary = to_world(*np.nonzero(occupied & ~ndimage.binary_erosion(occupied)))
     return filled, boundary
@@ -626,17 +503,10 @@ def _stitch(
 ) -> Optional[np.ndarray]:
     """Sample points across the gap between two plane boundaries.
 
-    Only the boundary points within ``max_gap`` of the *other* plane take part,
-    so two planes that touch along one edge are bridged there and not across
-    their full extent. Delaunay over the union then gives triangles, and only
-    those with a vertex on each side — a triangle wholly inside one plane's own
-    boundary ring would re-fill area that is already there.
-
-    The per-triangle edge cap is the second guard: Delaunay triangulates the
-    convex hull, so it happily spans the empty space *around* two nearby planes
-    with long thin triangles. Dropping any triangle with an edge over
-    ``1.5 * max_gap`` removes those without dropping the legitimately stretched
-    ones along the seam.
+    Only boundary points within ``max_gap`` of the other plane take part, and
+    only Delaunay triangles with a vertex on each side are kept. Triangles with
+    an edge over ``1.5 * max_gap`` are dropped: Delaunay fills the convex hull
+    around the planes too.
     """
     tree_b = cKDTree(boundary_b[:, :2])
     near_a = boundary_a[tree_b.query(boundary_a[:, :2], distance_upper_bound=max_gap)[0] < np.inf]
@@ -649,9 +519,7 @@ def _stitch(
     try:
         simplices = Delaunay(combined[:, :2]).simplices
     except QhullError:
-        # Collinear or duplicate seam points — a single-cell-wide contact strip
-        # has no 2D triangulation. The offline tool let this propagate and abort
-        # the whole conversion; skipping this one pair loses one seam.
+        # Collinear seam points: skip this seam rather than abort the conversion.
         return None
 
     corners = combined[simplices]
@@ -679,8 +547,7 @@ def _stitch(
     corners, area = corners[keep], area[keep]
     counts = np.maximum(1, (area * density).astype(np.int64))
     which = np.repeat(np.arange(len(counts)), counts)
-    # Uniform barycentric sampling: draw in the unit square and reflect the half
-    # that lands outside the triangle back into it.
+    # Uniform barycentric sampling (reflect u + v > 1 back into the triangle).
     u = rng.random((which.size, 1))
     v = rng.random((which.size, 1))
     outside = (u + v > 1).ravel()
@@ -709,32 +576,16 @@ def repair_ground(
 ) -> o3d.geometry.PointCloud:
     """Close the gaps a LIO map leaves in a floor that is continuous in reality.
 
-    Three kinds of missing area, three passes:
+    * **Holes inside a plane**: enclosed pockets filled.
+    * **Seams between coplanar fragments**: stitched after merging.
+    * **Single steps**: stitched when the height difference is in
+      ``[min_step, max_step]``, so a crossable kerb gets a surface and a deep
+      drop does not. ``min_step`` is low (7 cm) because the lidar understates
+      step height.
 
-    * **Holes inside a plane** — ring gaps and occlusion shadows. Filled by
-      rasterising the plane and closing its enclosed pockets.
-    * **Seams between coplanar fragments** — the same floor, split by DBSCAN
-      because the points thin out along a line the lidar grazed. Stitched after
-      the fragments are merged into one plane.
-    * **Single steps** — a kerb or a threshold whose vertical face the lidar
-      barely saw. Stitched when the height difference falls in
-      ``[min_step, max_step]``, so the ramp-like transition the robot can
-      actually cross gets a surface and a 60 cm drop does not.
-
-    ``min_step`` is well below any real step height (7 cm) on purpose: the top
-    surface of a step is the part the lidar keeps *worst*, so the measured
-    height difference between two fragments understates the real one. Widening
-    the window downward costs nothing — a difference under ``same_plane_z``
-    already merged as one plane in the previous pass.
-
-    Returns a new cloud: the input in grey plus the generated points in **red**,
-    which is how a site's repair gets eyeballed in a viewer before the grid is
-    trusted. Generated points are voxel-downsampled to just under the grid
-    pitch, since the triangle sampling deliberately over-samples.
-
-    Sampling is seeded (``seed``), unlike the offline tool's bare
-    ``np.random.rand``, so re-converting a map reproduces it — the same reason
-    ``convert_pcd_to_gridmap`` computes in float32.
+    Returns the input in grey plus generated points in **red** (for eyeballing
+    in a viewer), the latter voxel-downsampled to just under the grid pitch.
+    Sampling is seeded so a re-conversion reproduces the map.
     """
     points = np.asarray(ground.points)
     if len(points) == 0:
@@ -785,9 +636,7 @@ def repair_ground(
         points=int(sum(len(chunk) for chunk in generated)),
     )
 
-    # Points per m² of stitched surface. 1.5/grid_res² lands the seam at roughly
-    # the plane's own raster density, so the seam does not read as a denser
-    # (or sparser) region than the floor it joins.
+    # Points per m², about the plane's own raster density.
     density = fill_density / (grid_res * grid_res)
     rng = np.random.default_rng(seed)
     seams = 0
@@ -830,14 +679,9 @@ def build_traversable_cloud(
 ) -> np.ndarray:
     """Run segmentation then repair, and return the traversable cloud as (N, 3).
 
-    An ndarray rather than a ``PointCloud`` because the only consumer is
-    ``convert_traversable_to_gridmap``, and handing it plain xyz is what keeps
-    ``pcd_to_gridmap`` free of open3d (see this module's docstring).
-
-    ``debug_dir`` writes the intermediates the offline tool wrote as its four
-    output PCDs, plus the repaired ground. They are the only way to tell a bad
-    intensity window from a bad step range when a site's grid comes out wrong,
-    and they are worth ~4× the map's size on disk, so they are opt-in.
+    An ndarray, so ``pcd_to_gridmap`` stays open3d-free. ``debug_dir``
+    (opt-in, ~4x the map's size) writes the intermediate clouds and the
+    repaired ground.
     """
     segmented = segment_traversable(logger, pcd_path, **(segment or {}))
     repaired = repair_ground(logger, segmented.ground, **(repair or {}))

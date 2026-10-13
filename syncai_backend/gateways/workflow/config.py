@@ -1,15 +1,11 @@
-# The task queue is per-robot: its name is the robot_id (see temporal/worker.py
-# and WorkflowGateway).
+# The task queue is per-robot: its name is the robot_id.
 WORKFLOW_TYPE_NAME = "RobotWorkflow"
 
-# Two queues per robot, split by what an activity occupies. The body queue
-# carries the workflow and every activity that moves the robot (MOVE, the
-# posture steps): its worker takes one activity at a time, so two runs can
-# never drive at once and an activity never ticks its timeouts queued behind
-# another (see run_worker). The IO queue carries the activities that only talk
-# to another service (SPEAK), several at a time, which is what lets a run
-# speak while it drives (Step.group). The workflow finds the IO queue from its
-# own, so neither side spells the suffix itself.
+# Two queues per robot, split by what an activity occupies. The body queue carries
+# the workflow and every activity that moves the robot; its worker takes one activity
+# at a time, so two runs never drive at once and nothing ticks its timeouts queued
+# (see run_worker). The IO queue carries activities that only talk to another service
+# (SPEAK), several at a time, so a run can speak while it drives (Step.group).
 TASK_QUEUE_SUFFIX = ".ROBOT_TASK_QUEUE"
 IO_TASK_QUEUE_SUFFIX = ".ROBOT_IO_QUEUE"
 
@@ -27,88 +23,65 @@ def io_task_queue_for(body_queue: str) -> str:
     return io_task_queue(body_queue.removesuffix(TASK_QUEUE_SUFFIX))
 
 
-# The two signals RobotWorkflow accepts, by the names that cross the wire. The
-# workflow declares its handlers under these and the gateway sends them, so
-# a rename has to land in both places -- which is why neither side spells
-# the string itself. Both are idempotent flags, not events: a second pause
-# while paused, or a resume while running, is accepted and changes nothing.
+# RobotWorkflow's signals, by their wire names; shared by workflow and gateway so a
+# rename lands in both. Idempotent flags: a second pause, or a resume while running,
+# changes nothing.
 PAUSE_SIGNAL = "pause"
 RESUME_SIGNAL = "resume"
 
-# The third signal, sent by an activity rather than the gateway: "the step I am
-# running has started" (a MOVE's goal accepted, a SPEAK's utterance queued). A
-# group starts its members in list order, each once the one before it has
-# started (RobotWorkflow._run_group), and this is how the workflow learns it --
-# a workflow cannot see an activity's heartbeats. Its payload is the
-# activity's own id, which the workflow minted with group_activity_id; only an
-# activity whose id has that shape reports, so a lone step adds no event to
-# its run's history.
+# Sent by an activity: "my step has started" (MOVE goal accepted, SPEAK utterance
+# queued). A group starts its members in list order, each once the one before has
+# started (RobotWorkflow._run_group); a workflow cannot see heartbeats, so this is how
+# it learns. The payload is the activity id minted by group_activity_id; only ids of
+# that shape report, so a lone step adds no history event.
 STEP_STARTED_SIGNAL = "step_started"
 _GROUP_ACTIVITY_ID_MARK = "#"
 
 
 def group_activity_id(step_id: str, dispatch: int) -> str:
-    """The id a group member's activity is scheduled under: its step plus a
-    per-run dispatch count, so a MOVE re-sent after a pause gets a fresh one."""
+    """A group member's activity id: step id plus a per-run dispatch count, so a MOVE
+    re-sent after a pause gets a fresh one."""
     return f"{step_id}{_GROUP_ACTIVITY_ID_MARK}{dispatch}"
 
 
 def reports_start(activity_id: str) -> bool:
-    """Whether the activity scheduled as ``activity_id`` is a group member
-    whose run waits on its STEP_STARTED_SIGNAL. Temporal's own ids are
-    sequence numbers, so they never carry the mark."""
+    """Whether ``activity_id`` is a group member whose run waits on its
+    STEP_STARTED_SIGNAL. Temporal's own ids are sequence numbers, never marked."""
     return _GROUP_ACTIVITY_ID_MARK in activity_id
 
 
 # --- "What is running right now" (GET /api/v1/active_tasks) -----------------
 #
-# That endpoint is answered by one Temporal visibility query, cached in a single
-# slot on the gateway. The numbers below are the whole cost model, so they are
-# derived here rather than left as literals at the call site.
-#
-# One refresh is ONE RPC: the visibility list already carries status, start
-# time, task queue and the search attributes, so neither describe() nor the
-# get_step_states query is needed. With the TTL below the refresh rate is
-# therefore capped at 1/1.5 s = 0.67 RPC/s for the whole robot -- independent of
-# how many browser tabs, MCP clients or curl loops are asking, because they all
-# replay the same snapshot.
-#
-# The frontend polls at 2000 ms, deliberately LONGER than this TTL: a single tab
-# then misses on every poll (0.5 RPC/s) and every additional client is absorbed
-# for free. A TTL >= the poll interval would only make the served snapshot older
-# than the poll without saving anything further. Worst-case staleness an
-# operator sees is TTL + poll ~ 3.5 s, on a state that changes a few times an
-# hour.
+# One visibility query (it already carries status, start time, queue and search
+# attributes, so no describe/query), cached in one slot on the gateway: at most
+# 1/TTL = 0.67 RPC/s per robot however many clients poll. The frontend polls at 2 s,
+# deliberately longer than the TTL; a TTL >= the poll interval would only age the
+# snapshot. Worst-case staleness is TTL + poll ~ 3.5 s.
 ACTIVE_TASK_CACHE_TTL_S = 1.5
 
-# A robot does one thing at a time in practice, so this is a ceiling rather than
-# a page size worth tuning: it stops a pathological state (someone dispatching
-# twenty tasks) from paging the iterator forever inside a request a browser
-# polls twice a second.
+# A ceiling, not a page size: stops a pathological state from paging forever inside
+# a request polled every 2 s.
 ACTIVE_TASK_LIST_LIMIT = 10
 
-# Explicit, because the single-flight lock serialises callers: a wedged Temporal
-# frontend must not be able to hold that lock for the gRPC default timeout.
+# Explicit: the single-flight lock serialises callers, and a wedged frontend must not
+# hold it for the gRPC default timeout.
 ACTIVE_TASK_RPC_TIMEOUT_S = 3.0
 
 
 # --- "What has run" (GET /api/v1/task_history) ------------------------------
 #
-# One visibility page per request, uncached: a history page is opened and paged
-# by hand, not polled, so there is nothing for a cache to coalesce. How far back
-# it reaches is not decided here at all -- it is the namespace's retention.
+# One visibility page per request, uncached (paged by hand, not polled). How far back
+# it reaches is the namespace's retention.
 TASK_HISTORY_PAGE_SIZE_DEFAULT = 20
 TASK_HISTORY_PAGE_SIZE_MAX = 100
 
-# No lock is held, so this only bounds how long an operator stares at a spinner
-# when Temporal is wedged. Longer than the active-task one: a closed-execution
-# page is a bigger scan than the handful of Running rows.
+# No lock held; this only bounds the spinner. Longer than the active-task one: a
+# closed-execution page is a bigger scan.
 TASK_HISTORY_RPC_TIMEOUT_S = 5.0
 
 
 # --- "How did they end" (GET /api/v1/task_history/stats) --------------------
 #
-# One `count_workflows` with `GROUP BY ExecutionStatus` per call -- the one
-# GROUP BY the server allows. Uncached, like the history page it sits above:
-# the dashboard is opened and refined by hand, not polled.
+# One `count_workflows ... GROUP BY ExecutionStatus` (the one GROUP BY the server
+# allows) per call, uncached like the history page.
 TASK_STATS_RPC_TIMEOUT_S = 5.0

@@ -22,33 +22,23 @@ from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 
-# How often _wait_for_nav_goal reads the goal and heartbeats. A cancel reaches
-# this thread in two hops, and this is the second: the worker learns of it from
-# the server's reply to a heartbeat (at most every HEARTBEAT_THROTTLE_MAX, see
-# worker.py), then throws CancelledError into the thread -- which only takes
-# effect once the thread is back in Python, i.e. after the current sleep. Kept
-# at or below the throttle so a heartbeat is always waiting when the next one
-# may go out. get_move_status is an in-memory read, so polling this often is
-# free.
+# How often _wait_for_nav_goal reads the goal and heartbeats. A cancel arrives on a
+# heartbeat reply (at most every HEARTBEAT_THROTTLE_MAX, worker.py) and lands in this
+# thread only after the current sleep, so keep this at or under the throttle
+# (test_activities.py pins it). get_move_status is an in-memory read.
 NAV_POLL_INTERVAL_S = 0.25
 
-# How long _report_started waits for its signal to be accepted. Temporal is
-# local and answers a signal in milliseconds; this only bounds a wedged
-# frontend, and it has to fit inside MOVE_HEARTBEAT_TIMEOUT beside the
-# heartbeat execute_move sends just before it (test_activities.py checks).
+# Bounds _report_started against a wedged frontend; must fit inside
+# MOVE_HEARTBEAT_TIMEOUT beside the heartbeat sent just before it (test_activities.py).
 STARTED_REPORT_TIMEOUT_S = 1.0
 
 
 def _move_failure(status: dict) -> str:
     """The step's error_msg for a MOVE that did not succeed.
 
-    The robot's own sentence when it gave one: NavigateToGoal's error_msg says
-    whether planning or path following failed, which is the whole reason the
-    backend moved off nav2's NavigateToPose (whose Humble result is empty). An
-    abort with error_code NONE is, by the action's contract, a goal that was
-    superseded or never started -- another navigation held the robot, or the
-    behavior tree failed to load -- not a navigation failure, and it is said
-    so rather than left as a bare "aborted".
+    The robot's own sentence when it gave one (why the backend uses NavigateToGoal,
+    not NavigateToPose). An abort with error_code NONE is a goal that was superseded
+    or never started, not a navigation failure, and is said so.
     """
     state = status["state"]
     if state != "aborted":
@@ -81,15 +71,12 @@ class RobotActivities:
         self._logger = logger
         self._robot_gw = robot_gw
         self._tts_gw = tts_gw
-        # Read-only here: which map is loaded and whether its floor plan is
-        # being rebuilt, for the check at the top of execute_move. The worker
-        # shares this process with the REST server, so it is the same
-        # conversion registry the map routes write -- one answer, not two.
+        # Read-only, for execute_move's check; the same conversion registry the map
+        # routes write (shared process).
         self._map_catalog_repo = map_catalog_repo
         self._conversion_svc = conversion_svc
-        # The worker's client and the loop it runs on, for _report_started.
-        # Bound by run_worker once it has connected; a sync activity cannot
-        # reach either through activity.client(), which is async-only.
+        # Bound by run_worker, for _report_started: a sync activity cannot use the
+        # async-only activity.client().
         self._client: Optional[Client] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -100,16 +87,13 @@ class RobotActivities:
     def _report_started(self, beat: tuple = ()) -> None:
         """Tell the run this group member has started (STEP_STARTED_SIGNAL).
 
-        Only a group member reports -- its run starts the next member on it
-        (RobotWorkflow._run_group) -- and it knows it is one by the id it was
-        scheduled under. The signal goes out on the worker's loop, from this
-        thread. Never fatal: a report that cannot be sent leaves the next
-        member waiting for this one to end rather than to start, which keeps
-        the order and only loses the overlap. A cancel thrown in while it is
-        out is the caller's to clean up after, so it is let through.
+        Only ids from group_activity_id report. Sent on the worker's loop from this
+        thread. Never fatal: a lost report makes the next member wait for this one
+        to end, keeping the order and losing only the overlap. A cancel is let
+        through for the caller to clean up.
 
-        ``beat``, when given, is heartbeated before the signal goes out, for
-        a caller whose heartbeat window the wait could otherwise run out.
+        ``beat``, when given, is heartbeated first, for a caller whose heartbeat
+        window the wait could otherwise run out.
         """
         info = activity.info()
         if not reports_start(info.activity_id) or self._client is None:
@@ -155,22 +139,15 @@ class RobotActivities:
     ) -> ActivityResult:
         """Send a NavigateToGoal goal and supervise it to a terminal state.
 
-        ``expected_map`` is the run's ``TaskMap``, handed over by the workflow
-        when the run carries one. Before anything is sent the goal is checked
-        against the loaded map (helpers/move_guard.py, the same rule
-        POST /api/v1/tasks applies): coordinates from another map are a real
-        place on this one, just the wrong place, and a floor plan being
-        rebuilt is about to be replaced under the planner. Both refusals are
-        non-retryable, because three attempts five seconds apart fix neither
-        -- and a schedule that fired after a map switch is exactly the run
-        no dispatch-time check ever saw.
+        ``expected_map`` is the run's ``TaskMap``. The goal is first checked against
+        the loaded map (helpers/move_guard.py, as POST /api/v1/tasks does): another
+        map's coordinates, or a floor plan being rebuilt. Both refusals are
+        non-retryable; this is the check that catches a schedule firing after a map
+        switch.
 
-        This runs in a synchronous (threaded) activity. On cancellation Temporal
-        *throws* CancelledError into this thread wherever it happens to be --
-        in the poll loop, or inside move() while nav2 is still deciding -- so
-        cleanup lives in the except clause below, not in an is_cancelled() poll.
-        (A blocking C call such as time.sleep is not interrupted: the exception
-        lands when it returns, which is why NAV_POLL_INTERVAL_S is short.)
+        Cancellation is *thrown* into this thread as CancelledError (in the poll
+        loop or inside move()), so cleanup lives in the except clause. A blocking
+        call like time.sleep is not interrupted, hence the short NAV_POLL_INTERVAL_S.
         """
         active_map = self._map_catalog_repo.active_name()
         refusal = move_refusal(
@@ -185,10 +162,8 @@ class RobotActivities:
 
         yaw = math.radians(params.theta)
 
-        # The heartbeat_timeout clock starts when the activity starts, not at
-        # the first heartbeat, and move() blocks with no loop to heartbeat from
-        # for up to NAV_GOAL_SEND_BUDGET_S. Beating first is what keeps a slow
-        # nav2 from failing the attempt before the poll loop below ever runs.
+        # The heartbeat_timeout clock starts with the activity, and move() can block
+        # up to NAV_GOAL_SEND_BUDGET_S; beat first so a slow nav2 does not fail it.
         activity.heartbeat("sending")
 
         try:
@@ -204,12 +179,8 @@ class RobotActivities:
             state = status["state"]
 
         except CancelledError:
-            # Cancel whatever is executing rather than a remembered goal_id:
-            # if the cancel landed inside move() there is no id yet, and the
-            # gateway disowns a goal nav2 accepts after its wait was
-            # interrupted. Between the two, nothing is left driving. Shielded
-            # so the cancel RPC finishes before the CancelledError propagates
-            # and marks the activity cancelled.
+            # Cancel whatever is executing, not a remembered goal_id: a cancel inside
+            # move() has no id yet. Shielded so the cancel RPC finishes first.
             with activity.shield_thread_cancel_exception():
                 self._robot_gw.cancel_active_moves()
 
@@ -224,21 +195,12 @@ class RobotActivities:
     def _set_motion_key(self, key: MotionKey, label: str) -> ActivityResult:
         """Send a motion key. Fire-and-forget: this does NOT wait for the pose.
 
-        MODE is a one-way UDP command, so a successful service call only means
-        the datagram was sent -- the step completes while the robot is still
-        moving its legs. A step queued right behind this one (e.g. a MOVE) will
-        therefore start against a robot that has not finished standing up.
+        MODE is a one-way UDP command, so the step completes while the legs are
+        still moving and a following MOVE starts against a robot not yet standing.
+        Deliberately no fixed sleep: the fix is to poll the `mode` topic's motion
+        state (data[1]), pending its value mapping from the gait controller side.
 
-        We deliberately do not paper over that with a fixed sleep: the driver
-        manager already republishes the controller's MODE_STATE telemetry on
-        the `mode` topic (data[0] = policy state, data[1] = motion state), so
-        the real fix is to subscribe to it and poll the actual motion state
-        here. That is pending the value mapping for data[1], which is defined
-        on the gait controller side, not in this workspace.
-
-        A False from the service means the driver manager rejected the key
-        (unknown key, or the safety lock is engaged) -- retrying will not fix
-        either on its own, hence non_retryable.
+        A rejected key (unknown, or safety lock engaged) is non_retryable.
         """
         accepted, msg = self._robot_gw.set_motion_key(key=key)
         if not accepted:
@@ -260,43 +222,27 @@ class RobotActivities:
     def execute_speak(self, params: SpeakParams) -> ActivityResult:
         """Speak on the robot speaker, heartbeating until playback finishes.
 
-        The speech service's playback is a job: POST queues the utterance and
-        answers with an id, GET reports its state, DELETE stops it. So this
-        queues, then polls the job and heartbeats on every read -- the shape
-        `_wait_for_nav_goal` has for MOVE -- and a cancel of the run (a task
-        cancel, or a sibling in its group failing) reaches it on a heartbeat's
-        reply and lands in ``except CancelledError``, which stops the job: the
-        speaker goes quiet mid-sentence instead of finishing it.
+        Playback is a job (POST queues, GET polls, DELETE stops): this queues, then
+        polls and heartbeats like MOVE does, so a run cancel (task cancel, or a
+        failed group sibling) lands in ``except CancelledError`` and stops it
+        mid-sentence. A pause lets it finish (RobotWorkflow._run_step).
 
-        A pause never cancels a SPEAK; the workflow lets it finish (see
-        RobotWorkflow._run_step).
+        The POST waits for synthesis with no heartbeat, so SPEAK_HEARTBEAT_TIMEOUT
+        outlasts the gateway's timeout on it (pinned in test_activities.py).
 
-        The one stretch with no heartbeat is the POST, which waits for
-        synthesis (and, on a cold service, the model load). SPEAK's
-        heartbeat_timeout outlasts the gateway's timeout on that request
-        (SPEAK_HEARTBEAT_TIMEOUT, pinned in test_activities.py).
+        ``params.repeat`` utterances play back to back; the count said rides in the
+        heartbeat, so a retry says only the rest (an old heartbeat without it reads
+        as none said).
 
-        ``params.repeat`` utterances are said back to back in one attempt. The
-        count already said rides in the heartbeat beside the job's status, so
-        a retry after the third of five fails says the remaining two rather
-        than starting over; a heartbeat from before the field carries no count
-        and reads as none said.
-
-        Only Failure.UNKNOWN_VOICE is the request's fault and non-retryable;
-        everything else (the service unreachable, its model missing, device
-        trouble) is treated as possibly transient, same philosophy as the move
-        rejections — the workflow's maximum_attempts=3 bounds the ones that are
-        not. Note that a full speech queue is retryable on purpose: three
-        attempts five seconds apart is exactly the right response to a backlog.
+        Only Failure.UNKNOWN_VOICE is non-retryable; everything else, including a
+        full speech queue, may be transient and is bounded by maximum_attempts=3.
         """
         details = activity.info().heartbeat_details
         start = details[1] if len(details) > 1 and isinstance(details[1], int) else 0
         duration = 0.0
         for said in range(start, params.repeat):
             duration += self._speak_once(params, said, first=said == start)
-            # Counted the moment it ends, not on the next utterance's first
-            # poll: a retry after a failed POST would otherwise say this one
-            # again.
+            # Counted when it ends, or a retry after a failed POST says it again.
             activity.heartbeat("done", said + 1)
 
         self._logger.info(
@@ -308,18 +254,16 @@ class RobotActivities:
     def _speak_once(self, params: SpeakParams, said: int, first: bool = False) -> float:
         """One utterance of ``params``, heartbeating ``said`` beside its status.
 
-        The ``first`` of an attempt reports the step started once it is
-        queued: the service plays in the order it accepts, so a SPEAK grouped
-        behind this one is queued behind it too.
+        The ``first`` of an attempt reports the step started once queued: the
+        service plays in acceptance order, so a grouped SPEAK queues behind it.
 
         Returns how long it played; raises as execute_speak documents.
         """
         job_id = None
         try:
-            # Shielded so a cancel that lands while the POST is out is raised
-            # only once the job's id is known: the utterance is queued the
-            # moment the service answers, whether or not this thread has read
-            # the answer, and the except below needs the id to stop it.
+            # Shielded so a cancel during the POST is raised only once the job id is
+            # known: the utterance is queued as soon as the service answers, and the
+            # except below needs the id to stop it.
             with activity.shield_thread_cancel_exception():
                 success, message, job = self._tts_gw.start_speak(
                     text=params.text, voice=params.voice, speed=params.speed
@@ -337,8 +281,7 @@ class RobotActivities:
 
         except CancelledError:
             if job_id is not None:
-                # Shielded for the same reason execute_move shields its
-                # cleanup: the DELETE has to finish before the cancel does.
+                # Shielded: the DELETE has to finish before the cancel does.
                 with activity.shield_thread_cancel_exception():
                     stopped, why = self._tts_gw.cancel_speak(job_id)
                 if not stopped:
@@ -357,9 +300,7 @@ class RobotActivities:
         if not success:
             raise ApplicationError(
                 f"Speak failed: {message}",
-                # The gateway's code, not its prose. The tts router decides 400
-                # vs 502 from the same one, so the two answers to "whose fault
-                # is this?" cannot drift apart when the sentence is reworded.
+                # The code, not the prose: the tts router decides 400 vs 502 from it.
                 non_retryable=failure_code(message) is Failure.UNKNOWN_VOICE,
             )
 

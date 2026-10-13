@@ -1,8 +1,8 @@
 """Launch the syncai_backend REST API node.
 
-robot_id is read from the system config INI at launch time (same convention
-as planner_server.launch.py) and is used as the node namespace, so all the
-node's relative topics/actions get the /<robot_id> prefix.
+robot_id is read from the system INI (same convention as
+planner_server.launch.py) and used as the node namespace, so every relative
+topic/action gets the /<robot_id> prefix.
 """
 
 import configparser
@@ -14,11 +14,8 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-# Absolute path so the INI resolves no matter what cwd the launch is started
-# from — the old relative path only worked because every entrypoint happened
-# to run from the workspace root. ~/robot_ws is the workspace inside the robot
-# container, where docker-compose bind-mounts the per-robot instance INI over
-# config/system.ini.
+# Absolute so the INI resolves from any cwd. docker-compose bind-mounts the
+# per-robot instance INI over this path.
 DEFAULT_SYSTEM_INI = os.path.expanduser("~/robot_ws/config/system.ini")
 FALLBACK_ROBOT_ID = "default_robot"
 
@@ -46,8 +43,7 @@ def read_robot_id(config_path: str) -> str:
 
 
 def launch_setup(context, *args, **kwargs):
-    # LaunchConfiguration values only resolve inside an OpaqueFunction, and we
-    # need the resolved robot_id here to namespace the node.
+    # LaunchConfiguration only resolves inside an OpaqueFunction.
     config_path = LaunchConfiguration("system_config").perform(context)
     robot_id = read_robot_id(config_path)
 

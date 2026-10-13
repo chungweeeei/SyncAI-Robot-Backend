@@ -20,9 +20,8 @@ from syncai_backend.helpers.pointcloud import cap_points, pack_xyz_f32, read_pcd
 class MapCloudNotice:
     """One ``pgo/map_cloud_file`` message, parsed.
 
-    ``seq`` is pgo's own counter and is informational only: it restarts at 1
-    with every pgo process, so a lower seq is not stale, it is a new run.
-    ``path`` is ``""`` and ``points`` is ``0`` when the map is empty.
+    ``seq`` is informational: it restarts with every pgo process. ``path`` is
+    ``""`` and ``points`` is ``0`` when the map is empty.
     """
 
     seq: int
@@ -34,9 +33,8 @@ class MapCloudNotice:
 def parse_map_cloud_notice(data: str) -> MapCloudNotice:
     """Parse the JSON pgo publishes on ``pgo/map_cloud_file``.
 
-    Raises ``ValueError`` for anything that is not the five-field object pgo
-    writes (see ``mapCloudNoticeJson`` in pgo_node.cpp) -- bad JSON, a missing
-    key, or a wrong type. Kept free of ROS so it is unit-testable as-is.
+    Raises ``ValueError`` for anything but the object pgo writes (see
+    ``mapCloudNoticeJson`` in pgo_node.cpp). ROS-free, for unit tests.
     """
     try:
         obj = json.loads(data)
@@ -66,62 +64,31 @@ def parse_map_cloud_notice(data: str) -> MapCloudNotice:
 class MapCloudSubscriber:
     """Feed the console's "map so far" layer from pgo's merged keyframe cloud.
 
-    pgo re-merges every keyframe with its *current* loop-closure-corrected pose
-    while a mapping (MANUAL) session is up, at most every few seconds and
-    subscriber-gated -- this subscription is what un-gates it. The merge itself
-    arrives as a **file**, not as a topic payload:
+    The merge arrives as a **file**, not a topic payload: pgo writes a binary
+    PCD to ``/dev/shm/syncai_pgo/<robot_id>/map_cloud_<seq>.pcd`` (tmp +
+    rename, newest two kept) and publishes a ~200 B JSON notice naming it on
+    ``pgo/map_cloud_file``. This subscription is what un-gates pgo's merge.
 
-    * pgo writes the voxelised merge as a binary PCD to
-      ``/dev/shm/syncai_pgo/<robot_id>/map_cloud_<seq>.pcd`` (tmp + rename, so
-      the file is whole or absent, never partial; the newest two are kept), and
-    * publishes a ~200 B JSON notice naming it on ``pgo/map_cloud_file``
-      (relative, so ``/<robot_id>/pgo/map_cloud_file``).
+    Do not go back to the ``PointCloud2`` on ``pgo/map_cloud`` (kept for rviz):
+    16-45 MB samples overflow the kernel's default UDP receive buffer over
+    CycloneDDS, and raising ``net.core.rmem_max`` only moves the cliff. Both
+    containers need ``ipc: host`` to share ``/dev/shm``; without it notices
+    arrive and every read is ENOENT.
 
-    Why not the ``PointCloud2`` pgo still publishes on ``pgo/map_cloud`` (it is
-    kept for rviz): a large floor at pgo's 0.2 m voxel is ~16 MB per merge and
-    44.7 MB at full resolution (2.79 M points, 2026-09). CycloneDDS sends that
-    over UDP on ``lo`` as tens of thousands of datagrams in one burst, into a
-    receive buffer capped by the kernel's default ``net.core.rmem_max`` of
-    208 KB. Fragments drop, and a BEST_EFFORT reader loses the whole sample, so
-    the preview simply stopped once the map grew past a size cliff. Raising the
-    sysctl is host state on every robot and only moves the cliff; a tmpfs write
-    has no cliff at all. The directory is the host's ``/dev/shm``, which both
-    containers see because both compose services run with ``ipc: host`` --
-    without that the notices still arrive and every read here is ENOENT.
+    The notice is RELIABLE + **TRANSIENT_LOCAL** depth 1 so a (re)started
+    backend draws the current map at once; durability must match pgo's
+    publisher exactly, or nothing is replayed.
 
-    Why the notice still rides a topic rather than the backend polling the
-    directory: it keeps pgo's subscriber gating (no merge when nobody is
-    looking), the namespace scoping, and the reset semantics below, all for
-    free. And it is RELIABLE + **TRANSIENT_LOCAL** depth 1: latching a notice
-    costs nothing, and it means a backend (re)started mid-mapping draws the
-    current map at once instead of waiting for the next keyframe. The
-    durability has to match pgo's publisher exactly, or nothing is replayed.
+    Unlike PointCloudSubscriber: no TF (already in ``map``) and no voxel
+    downsample (pgo voxelised); ``cap_points`` is the one wire-size guard.
+    Each notice replaces the whole map (a loop closure moves all of it).
 
-    Deliberately NOT a copy of PointCloudSubscriber's pipeline:
-
-    * **No TF.** The cloud is already in the ``map`` frame -- every point was
-      placed with the keyframes' corrected global poses at merge time.
-    * **No voxel_downsample.** pgo already voxelised at its publish resolution
-      (``map_cloud_resolution``). ``cap_points`` (a stride) stays as the one
-      wire-size guard.
-
-    The single-slot repo semantics fit exactly: each notice is a complete
-    replacement -- a loop closure moves the *whole* map, so deltas are
-    impossible.
-
-    An **empty** notice (``points: 0``, ``path: ""``) is a message, not a
-    non-event: pgo publishes one from ``reset_mapping`` to say the map has been
-    discarded, and it is the only thing that tells a browser to stop drawing a
-    map that no longer exists, so it clears the slot rather than being skipped.
-    Being latched, it also replaces the notice that named the files the reset
-    deleted, so a late joiner never sees a path that is gone.
+    An **empty** notice (``points: 0``, ``path: ""``) is pgo's reset signal and
+    clears the slot.
 
     Every failure in the callback is a warning that leaves the slot untouched,
-    never an exception: this runs on the node's executor, and an exception out
-    of a callback ends ``spin()`` and with it the process (``main.py``). A
-    missing file is the expected shape of "stale": the notice we are acting on
-    can be one behind pgo's newest, pgo keeps two, and a reset or a pgo restart
-    in between simply means there is nothing to draw yet.
+    never an exception: one out of a callback ends ``spin()`` and the process.
+    A missing file is the normal "stale" case (pgo pruned or reset).
     """
 
     def __init__(
@@ -132,31 +99,19 @@ class MapCloudSubscriber:
     ):
         self._logger = logger
         self._map_cloud_repo = map_cloud_repo
-        # The only place a file named by a topic may come from. A foot-gun
-        # guard, not a security boundary -- anyone who can publish on this
-        # lo-only DDS domain can drive the robot -- so it is one check: the
-        # path must sit under the shared tmpfs (which implies absolute). Tests
-        # point it at a tmp dir.
+        # A file named by a topic must sit under this root. A foot-gun guard,
+        # not a security boundary. Tests point it at a tmp dir.
         self._allowed_root = PurePosixPath(allowed_root)
-        # ~6 MB per frame at the cap, and real sites reach it: a large floor
-        # at pgo's 0.2 m voxel came out at 2.79 M points (44.7 MB on the
-        # topic, 2026-09), so the stride keeps every ~6th point. This is the
-        # browser's wire/GPU budget, not a guard against a misconfigured
-        # resolution -- lower the ceiling here if the viewer struggles, and
-        # do not expect the cap to be a no-op on anything bigger than a room.
+        # The browser's wire/GPU budget (~6 MB per frame). Real sites exceed it
+        # (2.79 M points on a large floor), so expect the stride to apply.
         self._max_points = 500000
 
-        # Edge-triggered: log once when the first merge lands (the "mapping is
-        # visibly producing a map" moment), not per multi-MB frame.
+        # Edge-triggered: log once when the first merge lands, not per frame.
         self._streaming = False
 
     def register(self, node: Node):
-        # Own MutuallyExclusive group for the same reason as the live-cloud
-        # subscriber: reading and parsing a multi-MB PCD must not starve the
-        # 10 Hz body_cloud callback or the state/TF callbacks on the executor.
-        #
-        # Depth 1 where the live cloud uses 5: each notice replaces the map
-        # wholesale, so a queued older merge is never worth delivering.
+        # Own MutuallyExclusive group: parsing a multi-MB PCD must not starve
+        # the other callbacks. Depth 1: an older merge is never worth delivering.
         node.create_subscription(
             msg_type=String,
             topic="pgo/map_cloud_file",
@@ -201,9 +156,7 @@ class MapCloudSubscriber:
         try:
             points = read_pcd_xyz(notice.path)
         except OSError as exc:
-            # ENOENT is the ordinary case: pgo pruned or reset between publishing
-            # and our open, or pgo is gone. Keep whatever the slot holds -- the
-            # next notice (or the reset's empty one) is the correction.
+            # ENOENT is ordinary (pgo pruned or reset); the next notice corrects.
             self._logger.warning(
                 "map cloud file unreadable; keeping the current map",
                 path=notice.path,
@@ -223,10 +176,7 @@ class MapCloudSubscriber:
             return
 
         if points.shape[0] == 0:
-            # read_pcd_xyz drops non-finite rows, so a NaN-only file lands here
-            # too. Same call as the live-topic days: both mean "nothing to
-            # draw", and a second signal pgo does not send would be needed to
-            # tell them apart.
+            # read_pcd_xyz drops non-finite rows, so a NaN-only file lands here.
             self._clear(notice, reason="no finite points")
             return
 
