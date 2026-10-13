@@ -232,7 +232,8 @@ class RobotActivities:
 
         ``params.repeat`` utterances play back to back; the count said rides in the
         heartbeat, so a retry says only the rest (an old heartbeat without it reads
-        as none said).
+        as none said). The speech service caches rendered audio, so only the first
+        one synthesises.
 
         Only Failure.UNKNOWN_VOICE is non-retryable; everything else, including a
         full speech queue, may be transient and is bounded by maximum_attempts=3.
