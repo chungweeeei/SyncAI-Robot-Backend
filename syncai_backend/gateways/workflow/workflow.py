@@ -67,6 +67,7 @@ from syncai_backend.gateways.workflow.config import (
     TASK_HISTORY_RPC_TIMEOUT_S,
     TASK_STATS_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
+    task_queue,
 )
 
 
@@ -533,7 +534,7 @@ class WorkflowGateway:
         # worker's queue name in temporal/worker.py) so its own Temporal
         # worker — not another robot's — executes them.
         self._robot_id = robot_id
-        self._task_queue = f"{robot_id}.ROBOT_TASK_QUEUE"
+        self._task_queue = task_queue(robot_id)
         self._client: Client | None = None
 
         # Ownership verdicts for schedules whose memo predates the robot_id

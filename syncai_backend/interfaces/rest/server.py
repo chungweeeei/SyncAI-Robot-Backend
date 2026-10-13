@@ -63,7 +63,13 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(BadRequestError)
     async def _bad_request(_: Request, exc: BadRequestError) -> JSONResponse:
-        return _json(status.HTTP_400_BAD_REQUEST, str(exc))
+        # Both keys only when set, so every pre-existing 400 is the body it was.
+        content: dict = {"detail": str(exc)}
+        if getattr(exc, "code", None):
+            content["code"] = exc.code
+        if getattr(exc, "step_id", None):
+            content["step_id"] = exc.step_id
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=content)
 
     @app.exception_handler(ConflictError)
     async def _conflict(_: Request, exc: ConflictError) -> JSONResponse:

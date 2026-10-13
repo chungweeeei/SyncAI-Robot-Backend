@@ -148,6 +148,27 @@ def test_create_passes_the_map_label_through(client, workflow_gw):
     assert workflow_gw.created[-1].map_name == "full"
 
 
+def test_create_carries_groups_and_refuses_a_bad_one(client, workflow_gw):
+    def _post(steps):
+        return client.post(
+            "/api/v1/schedules",
+            json={"id": "sched-3", "trigger": {"interval_seconds": 900}, "steps": steps},
+        )
+
+    speak = {"id": "2-speak", "type": "SPEAK", "params": {"text": "hi"}, "group": "a"}
+    res = _post([{"id": "1-standup", "type": "STANDUP", "group": "a"}, speak])
+    assert res.status_code == 200
+    assert [s.group for s in workflow_gw.created[-1].definition.steps] == ["a", "a"]
+
+    created = len(workflow_gw.created)
+    res = _post([{"id": "1-standup", "type": "STANDUP", "group": "a"},
+                 {"id": "2-liedown", "type": "LIEDOWN", "group": "a"}])
+    assert res.status_code == 400
+    assert "more than one" in res.json()["detail"]
+    assert res.json()["step_id"] == "2-liedown"
+    assert len(workflow_gw.created) == created
+
+
 def test_patch_passes_the_new_trigger_through(client, workflow_gw):
     res = client.patch(
         "/api/v1/schedules/sched-1",

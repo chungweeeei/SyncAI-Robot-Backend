@@ -276,6 +276,59 @@ class TestTriggerTask:
         assert client.post("/api/v1/tasks", json=task).status_code == 422
         assert workflow_gw.started == []
 
+    def test_a_group_is_carried_onto_the_workflow_steps(self, client, workflow_gw):
+        task = _move_task()
+        task["steps"][0]["group"] = "a"
+        task["steps"].append(
+            {"id": "step2", "type": "SPEAK", "params": {"text": "hi"}, "group": "a"}
+        )
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        steps = workflow_gw.started[0][0].definition.steps
+        assert [step.group for step in steps] == ["a", "a"]
+
+    @pytest.mark.parametrize(
+        "steps, phrase, step_id",
+        [
+            # Two body steps in one group would queue on the one body slot.
+            (
+                [
+                    {
+                        "id": "m1",
+                        "type": "MOVE",
+                        "params": {"x": 0, "y": 0, "theta": 0},
+                        "group": "a",
+                    },
+                    {"id": "s1", "type": "STANDUP", "group": "a"},
+                ],
+                "more than one",
+                # The later body step, the one the console marks.
+                "s1",
+            ),
+            # A group is one place in the sequence.
+            (
+                [
+                    {"id": "w1", "type": "WAIT", "params": {"seconds": 1}, "group": "a"},
+                    {"id": "s1", "type": "STANDUP"},
+                    {"id": "w2", "type": "WAIT", "params": {"seconds": 1}, "group": "a"},
+                ],
+                "adjacent",
+                "w2",
+            ),
+        ],
+    )
+    def test_a_bad_grouping_is_a_400_naming_the_step(
+        self, client, workflow_gw, steps, phrase, step_id
+    ):
+        response = client.post("/api/v1/tasks", json={**_move_task(), "steps": steps})
+
+        assert response.status_code == 400
+        body = response.json()
+        assert phrase in body["detail"]
+        assert body["code"] == "invalid_step_group"
+        assert body["step_id"] == step_id
+        assert workflow_gw.started == []
+
     def test_a_duplicate_id_surfaces_as_400(self, client, workflow_gw):
         async def _raise(request, provenance=None):
             raise BadRequestError(f"Task {request.id} already exists")
@@ -364,10 +417,17 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-task-001").json()
 
         assert body["status"] == "IN_PROGRESS"
-        # StepState is status/error/message only — the definition (params)
-        # stays out. No feedback from the robot yet reads as an empty message.
+        # StepState is status/error/message (and the group it ran in) — the
+        # definition (params) stays out. No feedback from the robot yet reads
+        # as an empty message; an ungrouped step reads group null.
         assert body["steps"] == [
-            {"id": "step1", "status": "IN_PROGRESS", "error_msg": "", "message": ""}
+            {
+                "id": "step1",
+                "status": "IN_PROGRESS",
+                "error_msg": "",
+                "message": "",
+                "group": None,
+            }
         ]
 
     def test_a_running_move_carries_the_robots_status(self, client, robot_gw):

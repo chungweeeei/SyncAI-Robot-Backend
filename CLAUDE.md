@@ -107,8 +107,9 @@ ament linters (`test_copyright`, `test_flake8`, `test_pep257`) are part of the s
 `SyncAIBackend(Node)` is constructed once; its constructor wires everything and starts
 two daemon threads. Main thread: `MultiThreadedExecutor.spin()` (all ROS callbacks, TF,
 service/action clients). uvicorn thread: FastAPI on `0.0.0.0:3000`. Temporal worker
-thread: polls `<robot_id>.ROBOT_TASK_QUEUE`, runs `RobotWorkflow` + activities in a
-single-worker `ThreadPoolExecutor`.
+thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotWorkflow`
++ the body activities (MOVE, postures) in a single-worker `ThreadPoolExecutor`,
+`max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time.
 
 Consequences:
 - **Blocking REST handlers are plain `def`, not `async def`** (ROS service calls up to
@@ -168,7 +169,8 @@ That is why `ruff.toml` excludes isort — do not "organize imports".
 ### Errors
 
 Routers raise from `exceptions.py`; `server.py:register_exception_handlers` maps them:
-`NotFoundError`→404, `BadRequestError`→400, `ConflictError`→409 (optional
+`NotFoundError`→404, `BadRequestError`→400 (optional `code` and `step_id` beside
+`detail`, for a refusal about one step of a task body), `ConflictError`→409 (optional
 machine-readable `code` beside `detail`, e.g. `conversion_running`, `map_active`),
 `UnauthorizedError`→401, `UpstreamError`→502 (a downstream — Temporal or a ROS service —
 failed). Cross-field validation errors answer 400 with a sentence, not 422.
@@ -250,11 +252,28 @@ the only caller that passes anything else.
 
 ### Temporal specifics
 
+**Steps run one at a time unless adjacent steps share a `group`** (`Step.group`, an
+optional key — no migration): a group's members start together, the next step waits
+for all of them, and the first failure cancels the rest and fails the run
+(`RobotWorkflow._run_group`). At most one MOVE/STANDUP/LIEDOWN per group, members
+adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
+router that also names the offending step (`code: invalid_step_group`, `step_id`: the
+step rejoining a closed group, or the second body step), so the console marks that row.
+Raise it with `problem.refusal()`; wrapping it in a `ValueError` drops the step. That only works because activities are split by what they occupy: the body
+queue keeps its one slot (two runs never drive at once, nothing queues with its
+timeouts ticking), and SPEAK goes to the IO queue (behind the `speak-on-io-queue`
+patch; the body worker still registers `execute_speak` for runs from before it). A new
+activity that drives the robot belongs on the body queue; one that only talks to
+another service, on the IO queue. Coordination that must react at tick rate
+(stop when X) belongs in the BT (`syncai_task_runner`), not in a group.
+
 Activities are synchronous; cancellation arrives as `CancelledError` thrown into the
 thread — cleanup goes in `except CancelledError`, not an `is_cancelled()` poll. `SPEAK`
-does not heartbeat (one blocking HTTP call to the speech service, held open for the
-utterance) so it runs on `start_to_close` alone; that service's playback is a pollable,
-cancellable job, so this is now a choice rather than a constraint. Per-step state
+drives the speech service's playback as a job (queue, poll + heartbeat, `DELETE` on
+cancel), so a task cancel or a failed group sibling stops it mid-sentence; a pause lets
+it finish. Its POST cannot heartbeat (synthesis is inline), so `SPEAK_HEARTBEAT_TIMEOUT`
+must outlast the gateway's `SPEAK_START_TIMEOUT_S`, and a cancel only arrives promptly
+because the worker caps the heartbeat throttle. Per-step state
 is a workflow **query**, not a table — and the task-level `PAUSED` is derived from it,
 because **Temporal has no paused status**: `pause`/`resume` are two idempotent workflow
 **signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `gateways/workflow/config.py`, shared by

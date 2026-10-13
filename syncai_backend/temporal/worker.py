@@ -13,6 +13,7 @@ from temporalio.worker import Worker
 from syncai_backend.temporal.shared import temporal_server_url
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
+from syncai_backend.gateways.workflow.config import io_task_queue, task_queue
 from syncai_backend.gateways.workflow.search_attributes import (
     ensure_search_attributes,
 )
@@ -44,6 +45,12 @@ RETRY_INTERVAL = 5
 # timeout the server enforces is unchanged -- and two small RPCs a second
 # from one robot are nothing to the server.
 HEARTBEAT_THROTTLE_MAX = timedelta(milliseconds=500)
+
+# How many IO activities (SPEAK) run at once. More than one so a SPEAK from a
+# second run, or a group with two of them, is not left ticking its
+# start_to_close behind the first; a handful because each is one held-open
+# HTTP request and the speaker plays one utterance at a time anyway.
+IO_ACTIVITY_SLOTS = 4
 
 
 class TemporalWorkerHandle:
@@ -127,40 +134,56 @@ async def run_worker(
 
     worker = Worker(
         client,
-        task_queue=f"{robot_id}.ROBOT_TASK_QUEUE",
+        task_queue=task_queue(robot_id),
         workflows=[RobotWorkflow],
         activities=[
             activities.execute_move,
             activities.execute_stand,
             activities.execute_lie_down,
+            # Still here for runs started before SPEAK moved to the IO queue:
+            # their histories keep it on this one (SPEAK_ON_IO_QUEUE_PATCH).
             activities.execute_speak,
         ],
-        # One activity at a time, stated twice because the two settings mean
-        # different things. The executor is the thread that runs activities;
-        # max_concurrent_activities is how many the worker *accepts* from the
-        # server. Left at its default (100) the worker would take a second
-        # activity while the first held the only thread, and that activity's
-        # heartbeat_timeout and start_to_close would tick while it queued
-        # behind the thread -- so the one realistic overlap, a schedule firing
-        # during a direct task (see _require_idle's docstring), failed its
-        # MOVE by heartbeat timeout instead of waiting. Capped to 1, Temporal
-        # holds the second task server-side until this worker asks for it.
+        # One body activity at a time, stated twice because the two settings
+        # mean different things. The executor is the thread that runs
+        # activities; max_concurrent_activities is how many the worker
+        # *accepts* from the server. Left at its default (100) the worker
+        # would take a second activity while the first held the only thread,
+        # and that activity's heartbeat_timeout and start_to_close would tick
+        # while it queued behind the thread -- so the one realistic overlap, a
+        # schedule firing during a direct task (see _require_idle's
+        # docstring), failed its MOVE by heartbeat timeout instead of waiting.
+        # Capped to 1, Temporal holds the second task server-side until this
+        # worker asks for it. It is also what keeps two runs from driving the
+        # robot at once.
         activity_executor=ThreadPoolExecutor(max_workers=1),
         max_concurrent_activities=1,
+        max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
+    )
+    # The activities that only talk to another service (SPEAK), on their own
+    # queue so a run can speak while its MOVE holds the body slot (Step.group).
+    # Executor and cap kept equal for the same reason as above.
+    io_worker = Worker(
+        client,
+        task_queue=io_task_queue(robot_id),
+        activities=[activities.execute_speak],
+        activity_executor=ThreadPoolExecutor(max_workers=IO_ACTIVITY_SLOTS),
+        max_concurrent_activities=IO_ACTIVITY_SLOTS,
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
     )
 
     logger.info(
         "Temporal worker started",
         server=server,
-        task_queue=f"{robot_id}.ROBOT_TASK_QUEUE",
+        task_queue=task_queue(robot_id),
+        io_task_queue=io_task_queue(robot_id),
     )
 
     handle.mark_running()
     if ready is not None:
         ready.set()
 
-    await worker.run()
+    await asyncio.gather(worker.run(), io_worker.run())
 
 
 def start_temporal_worker(

@@ -203,27 +203,23 @@ class RobotActivities:
 
     @activity.defn
     def execute_speak(self, params: SpeakParams) -> ActivityResult:
-        """Speak on the robot speaker, blocking until playback finishes.
+        """Speak on the robot speaker, heartbeating until playback finishes.
 
-        This never heartbeats: TtsGateway.speak() sits in one blocking call —
-        now a single HTTP request to the syncai_tts service, held open for the
-        utterance by `wait=true` — so there is no loop to heartbeat from. The
-        workflow therefore drops the heartbeat_timeout for SPEAK steps and
-        relies on a short start_to_close instead; see the per-step options in
-        workflows.py. Same reason it is effectively not cancellable
-        mid-utterance: without heartbeats the worker never learns of a cancel,
-        so a canceled task finishes the sentence it is on before the workflow's
-        CancelledError lands. An utterance is bounded (text is capped at 1000
-        chars, and the gateway gives up at 240 s), so that is a few seconds of
-        latency, not a hang.
+        The speech service's playback is a job: POST queues the utterance and
+        answers with an id, GET reports its state, DELETE stops it. So this
+        queues, then polls the job and heartbeats on every read -- the shape
+        `_wait_for_nav_goal` has for MOVE -- and a cancel of the run (a task
+        cancel, or a sibling in its group failing) reaches it on a heartbeat's
+        reply and lands in ``except CancelledError``, which stops the job: the
+        speaker goes quiet mid-sentence instead of finishing it.
 
-        **That is now a choice rather than a constraint.** The speech service's
-        playback is a job: POST returns an id, GET reports its state and DELETE
-        stops it. Rewriting this to enqueue and then poll once a second would
-        make the heartbeat real and let `except CancelledError` cut the
-        utterance, the way `_wait_for_nav_goal` already does for MOVE. It is
-        left blocking here so that moving speech out of this process changed
-        nothing about the task path; do that next, not at the same time.
+        A pause never cancels a SPEAK; the workflow lets it finish (see
+        RobotWorkflow._run_step).
+
+        The one stretch with no heartbeat is the POST, which waits for
+        synthesis (and, on a cold service, the model load). SPEAK's
+        heartbeat_timeout outlasts the gateway's timeout on that request
+        (SPEAK_HEARTBEAT_TIMEOUT, pinned in test_activities.py).
 
         Only Failure.UNKNOWN_VOICE is the request's fault and non-retryable;
         everything else (the service unreachable, its model missing, device
@@ -232,9 +228,43 @@ class RobotActivities:
         not. Note that a full speech queue is retryable on purpose: three
         attempts five seconds apart is exactly the right response to a backlog.
         """
-        success, message, duration = self._tts_gw.speak(
-            text=params.text, voice=params.voice, speed=params.speed
-        )
+        job_id = None
+        try:
+            # Shielded so a cancel that lands while the POST is out is raised
+            # only once the job's id is known: the utterance is queued the
+            # moment the service answers, whether or not this thread has read
+            # the answer, and the except below needs the id to stop it.
+            with activity.shield_thread_cancel_exception():
+                success, message, job = self._tts_gw.start_speak(
+                    text=params.text, voice=params.voice, speed=params.speed
+                )
+                if success:
+                    job_id = job.get("id")
+
+            if success:
+                success, message, job = self._tts_gw.await_speak(
+                    job, on_poll=activity.heartbeat
+                )
+
+        except CancelledError:
+            if job_id is not None:
+                # Shielded for the same reason execute_move shields its
+                # cleanup: the DELETE has to finish before the cancel does.
+                with activity.shield_thread_cancel_exception():
+                    stopped, why = self._tts_gw.cancel_speak(job_id)
+                if not stopped:
+                    self._logger.warning(
+                        "[RobotActivity] Could not stop the utterance",
+                        job_id=job_id,
+                        error=why,
+                    )
+
+            self._logger.warning("[RobotActivity] Speak activity has been cancelled")
+            raise
+
+        if success:
+            success, message, duration = TtsGateway.speak_outcome(job)
+
         if not success:
             raise ApplicationError(
                 f"Speak failed: {message}",

@@ -9,6 +9,7 @@ from syncai_backend.gateways.workflow.schema import (
     ScheduleTask,
     ScheduleTrigger,
     WorkflowTaskDefinition,
+    step_group_problem,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.interfaces.rest.routers.task import StepRequest
@@ -127,6 +128,9 @@ def init_schedule_router(
 
     @schedule_router.post("/api/v1/schedules", response_model=ScheduleResponse)
     async def create_schedule(req: ScheduleRequest):
+        problem = step_group_problem(req.steps)
+        if problem is not None:
+            raise problem.refusal()
         schedule_task = ScheduleTask(
             id=req.id,
             trigger=ScheduleTrigger(
@@ -136,7 +140,7 @@ def init_schedule_router(
             ),
             definition=WorkflowTaskDefinition(
                 steps=[
-                    Step(id=step.id, type=step.type, params=step.params)
+                    Step(id=step.id, type=step.type, params=step.params, group=step.group)
                     for step in req.steps
                 ],
             ),
@@ -200,7 +204,9 @@ def init_schedule_router(
             task_template_id=view.task_template_id,
             task_template_name=view.task_template_name,
             steps=[
-                StepRequest(id=step.id, type=step.type, params=step.params)
+                StepRequest(
+                    id=step.id, type=step.type, params=step.params, group=step.group
+                )
                 for step in view.steps
             ],
         )

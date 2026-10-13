@@ -2,6 +2,31 @@
 # and WorkflowGateway).
 WORKFLOW_TYPE_NAME = "RobotWorkflow"
 
+# Two queues per robot, split by what an activity occupies. The body queue
+# carries the workflow and every activity that moves the robot (MOVE, the
+# posture steps): its worker takes one activity at a time, so two runs can
+# never drive at once and an activity never ticks its timeouts queued behind
+# another (see run_worker). The IO queue carries the activities that only talk
+# to another service (SPEAK), several at a time, which is what lets a run
+# speak while it drives (Step.group). The workflow finds the IO queue from its
+# own, so neither side spells the suffix itself.
+TASK_QUEUE_SUFFIX = ".ROBOT_TASK_QUEUE"
+IO_TASK_QUEUE_SUFFIX = ".ROBOT_IO_QUEUE"
+
+
+def task_queue(robot_id: str) -> str:
+    return f"{robot_id}{TASK_QUEUE_SUFFIX}"
+
+
+def io_task_queue(robot_id: str) -> str:
+    return f"{robot_id}{IO_TASK_QUEUE_SUFFIX}"
+
+
+def io_task_queue_for(body_queue: str) -> str:
+    """The IO queue beside ``body_queue``, the queue a run itself is on."""
+    return io_task_queue(body_queue.removesuffix(TASK_QUEUE_SUFFIX))
+
+
 # The two signals RobotWorkflow accepts, by the names that cross the wire. The
 # workflow declares its handlers under these and the gateway sends them, so
 # a rename has to land in both places -- which is why neither side spells
