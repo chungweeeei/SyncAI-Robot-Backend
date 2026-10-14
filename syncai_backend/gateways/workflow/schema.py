@@ -55,7 +55,7 @@ class MoveParams(BaseSchema):
 
 # Constraints mirror routers/tts.py's SynthesizeRequest: both drive the same
 # TtsGateway. Single-word field names, so camelCase aliasing is a no-op here.
-SPEAK_REPEAT_MAX = 10
+SPEAK_REPEAT_MAX = 50
 
 
 class SpeakParams(BaseSchema):
@@ -80,7 +80,7 @@ class SpeakParams(BaseSchema):
         ge=1,
         le=SPEAK_REPEAT_MAX,
         description=(
-            "How many times to say the text, back to back (1–10). Omitted: once, "
+            "How many times to say the text, back to back (1–50). Omitted: once, "
             "so a step stored before this field speaks as it always did."
         ),
     )
