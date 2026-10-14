@@ -256,7 +256,7 @@ class TestTriggerTask:
         assert client.post("/api/v1/tasks", json=task).status_code == 422
         assert workflow_gw.started == []
 
-    @pytest.mark.parametrize("repeat, expected", [(None, 1), (3, 3), (10, 10)])
+    @pytest.mark.parametrize("repeat, expected", [(None, 1), (3, 3), (50, 50)])
     def test_a_speak_step_carries_its_repeat_through(
         self, client, workflow_gw, repeat, expected
     ):
@@ -269,7 +269,7 @@ class TestTriggerTask:
         started, _ = workflow_gw.started[0]
         assert started.definition.steps[0].params.repeat == expected
 
-    @pytest.mark.parametrize("repeat", [0, 11])
+    @pytest.mark.parametrize("repeat", [0, 51])
     def test_a_speak_repeat_out_of_range_is_a_422(self, client, workflow_gw, repeat):
         task = _move_task()
         task["steps"] = [
