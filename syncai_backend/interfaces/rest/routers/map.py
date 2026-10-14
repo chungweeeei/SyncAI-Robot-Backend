@@ -25,6 +25,7 @@ from syncai_backend.database.models import MapPoint
 from syncai_backend.gateways.map.map import MapGateway
 from syncai_backend.gateways.workflow.schema import ActiveTask
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
+from syncai_backend.helpers.floors import detect_floor_levels, floor_name
 from syncai_backend.helpers.pgm import render_png, render_thumbnail
 from syncai_backend.helpers.system_config import (
     set_active_map,
@@ -50,6 +51,7 @@ from syncai_backend.repositories.map.catalog import (
     GridRecordStatus,
     KeepoutZone,
     MapCatalogRepo,
+    MapFloor,
     StoredMap,
 )
 from syncai_backend.repositories.map.map import MapRepo
@@ -85,6 +87,13 @@ OCTOMAP_STALE_AFTER_S = 30 * 60.0
 # Ground patches a save may carry. A whole floor at 0.1 m is a few hundred
 # thousand columns; this is a bound on the body, not a budget.
 OCTOMAP_EDITS_MAX = 1_000_000
+
+# Floors a save may name, the longest name, and how close two levels may sit.
+# The console draws one band per floor between neighbouring levels, so two
+# levels closer than a body height would leave a band with nothing in it.
+FLOORS_MAX = 16
+FLOOR_NAME_MAX = 16
+FLOOR_MIN_SEPARATION_M = 1.0
 
 
 # --- Schemas ----------------------------------------------------------------
@@ -325,6 +334,53 @@ class SaveOctomapEditsRequest(BaseModel):
 class SaveOctomapEditsResponse(BaseModel):
     name: str
     count: int = Field(..., description="Patches recorded.")
+    message: str = Field(..., description="Human-readable result.")
+
+
+class MapFloorModel(BaseModel):
+    name: str = Field(..., description="What the floor is called, e.g. `1F` or `B1`.")
+    level: float = Field(
+        ...,
+        description=(
+            "Body height the robot stands at on this floor, metres in the map "
+            "frame (the z of poses.txt, about half a metre above the ground)."
+        ),
+    )
+
+
+class MapFloorsResponse(BaseModel):
+    """The storeys a map spans, for showing one at a time."""
+
+    name: str
+    floors: List[MapFloorModel] = Field(
+        ...,
+        description=(
+            "The floors to show, lowest first: the saved ones, else the "
+            "detected ones. `[]` is one storey."
+        ),
+    )
+    detected: List[MapFloorModel] = Field(
+        ...,
+        description=(
+            "The floors found from the heights the robot walked at while "
+            "mapping, lowest first; `[]` without a trajectory or for one storey."
+        ),
+    )
+    saved: bool = Field(
+        ..., description="Whether `floors` is a saved list rather than the detected one."
+    )
+
+
+class SaveMapFloorsRequest(BaseModel):
+    floors: List[MapFloorModel] = Field(
+        ...,
+        description="The **whole** list of floors, in any order. `[]` saves one storey.",
+    )
+
+
+class SaveMapFloorsResponse(BaseModel):
+    name: str
+    floors: List[MapFloorModel] = Field(..., description="The floors saved, lowest first.")
     message: str = Field(..., description="Human-readable result.")
 
 
@@ -2592,5 +2648,79 @@ def init_map_router(
                 f"'{name}'. They take effect once applied to the robot's 3D map."
             )
         return SaveOctomapEditsResponse(name=name, count=count, message=message)
+
+    def _floor_models(floors: List[MapFloor]) -> List[MapFloorModel]:
+        return [MapFloorModel(name=floor.name, level=floor.level) for floor in floors]
+
+    def _detected_floors(name: str) -> List[MapFloor]:
+        heights = map_catalog_repo.read_pose_heights(name)
+        levels = detect_floor_levels(heights) if heights else []
+        # One level is one storey, which needs no split.
+        if len(levels) < 2:
+            return []
+        return [MapFloor(name=floor_name(i), level=level) for i, level in enumerate(levels)]
+
+    @map_router.get("/api/v1/maps/{name}/floors", response_model=MapFloorsResponse)
+    def get_map_floors(name: str):
+        """The floors of a map that spans storeys: saved, else detected.
+
+        Detected on every read from poses.txt (a few thousand lines), so a
+        map that has never been looked at needs no step to have floors.
+        """
+        _require(name)
+        detected = _detected_floors(name)
+        saved = map_catalog_repo.read_floors(name)
+        return MapFloorsResponse(
+            name=name,
+            floors=_floor_models(saved if saved is not None else detected),
+            detected=_floor_models(detected),
+            saved=saved is not None,
+        )
+
+    def _validate_floors(entries: List[MapFloorModel]) -> List[MapFloor]:
+        """400 with a sentence for a list the console could not draw bands from."""
+        if len(entries) > FLOORS_MAX:
+            raise BadRequestError(f"Too many floors ({len(entries)}); at most {FLOORS_MAX}.")
+        floors: List[MapFloor] = []
+        names = set()
+        for entry in entries:
+            label = entry.name.strip()
+            if not label:
+                raise BadRequestError("Every floor needs a name.")
+            if len(label) > FLOOR_NAME_MAX:
+                raise BadRequestError(
+                    f"Floor name '{label}' is too long; at most {FLOOR_NAME_MAX} characters."
+                )
+            if label.casefold() in names:
+                raise BadRequestError(f"Two floors are called '{label}'.")
+            if not math.isfinite(entry.level):
+                raise BadRequestError(f"Floor '{label}' has no height.")
+            names.add(label.casefold())
+            floors.append(MapFloor(name=label, level=float(entry.level)))
+        floors.sort(key=lambda floor: floor.level)
+        for lower, upper in zip(floors, floors[1:]):
+            if upper.level - lower.level < FLOOR_MIN_SEPARATION_M:
+                raise BadRequestError(
+                    f"Floors '{lower.name}' and '{upper.name}' are less than "
+                    f"{FLOOR_MIN_SEPARATION_M:g} m apart."
+                )
+        return floors
+
+    @map_router.put("/api/v1/maps/{name}/floors", response_model=SaveMapFloorsResponse)
+    def save_map_floors(name: str, request: SaveMapFloorsRequest):
+        """Replace the map's floors with the body's whole list.
+
+        Not held by a running job: the floors only decide what the console
+        shows, and nothing on the robot reads them.
+        """
+        _require(name)
+        floors = map_catalog_repo.write_floors(name, _validate_floors(request.floors))
+        count = len(floors)
+        message = (
+            f"Saved {count} floor{'' if count == 1 else 's'} for '{name}'."
+            if count
+            else f"Saved '{name}' as one floor."
+        )
+        return SaveMapFloorsResponse(name=name, floors=_floor_models(floors), message=message)
 
     return map_router
