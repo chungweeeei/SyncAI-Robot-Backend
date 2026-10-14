@@ -14,6 +14,7 @@ import builtins
 import hashlib
 import io
 import json
+from datetime import datetime, timedelta, timezone
 import os
 import shutil
 import struct
@@ -1025,6 +1026,411 @@ def test_pointcloud_is_recached_when_the_file_changes(client, maps_dir, make_pcd
 
     assert struct.unpack("<I", first[:4])[0] == 3
     assert struct.unpack("<I", second[:4])[0] == 2
+
+
+# --- octomap_status -----------------------------------------------------------
+#
+# The 3D map's status surface, grid_status's twin, read off disk alone: the
+# tree is the robot's clean_map's to write, a detached process this backend
+# never sees, so there is no registry to reconcile with.
+
+
+def _plant_clean(directory, payload):
+    """Write a map cleaning record, as pgo_node and clean_map would."""
+    path = directory / "map_clean.recipe.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _iso(moment):
+    return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _now_iso():
+    return _iso(datetime.now(timezone.utc))
+
+
+def _old_iso():
+    """Older than the stale threshold: a clean that was killed hard."""
+    return _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+
+
+def _clean_payload(
+    status,
+    *,
+    octomap=True,
+    written=None,
+    octomap_error=None,
+    started_at=None,
+    error=None,
+):
+    payload = {
+        "status": status,
+        "started_at": _now_iso() if started_at is None else started_at,
+        "params": {"voxel_size": 0.1, "octomap": octomap},
+    }
+    if status == "ok":
+        measurements = {"octomap_written": bool(written)}
+        if octomap_error is not None:
+            measurements["octomap_error"] = octomap_error
+        payload["measurements"] = measurements
+    if error is not None:
+        payload["error"] = error
+    return payload
+
+
+def _entry(client, name="full"):
+    return _by_name(client.get("/api/v1/maps").json())[name]
+
+
+def test_list_reports_no_3d_map_for_a_map_without_one(client):
+    entry = _entry(client)
+
+    assert entry["octomap_status"] == "none"
+    assert entry["octomap_error"] is None
+    assert entry["octomap_version"] is None
+    assert entry["octomap_resolution"] is None
+
+
+def test_list_reports_ok_with_the_version_and_resolution_of_a_tree_on_disk(
+    client, maps_dir, make_bt
+):
+    tree = make_bt(maps_dir / "full" / "octomap.bt", res=0.1)
+
+    entry = _entry(client)
+
+    assert entry["octomap_status"] == "ok"
+    assert entry["octomap_error"] is None
+    assert entry["octomap_version"] == f"{tree.stat().st_size}-{tree.stat().st_mtime_ns}"
+    assert entry["octomap_resolution"] == pytest.approx(0.1)
+
+
+def test_a_tree_on_disk_is_ok_whatever_the_sidecar_says(client, maps_dir, make_bt):
+    """A re-clean leaves the old tree in place until the new one lands."""
+    make_bt(maps_dir / "full" / "octomap.bt")
+    _plant_clean(maps_dir / "full", _clean_payload("converting"))
+
+    assert _entry(client)["octomap_status"] == "ok"
+
+
+def test_list_reports_converting_while_the_clean_runs(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("converting"))
+
+    entry = _entry(client)
+
+    assert entry["octomap_status"] == "converting"
+    assert entry["octomap_version"] is None
+
+
+def test_list_reports_converting_for_a_clean_with_no_start_time(client, maps_dir):
+    """Nothing to age it by; the timeout is the conversion's problem, not this field's."""
+    payload = _clean_payload("converting")
+    del payload["started_at"]
+    _plant_clean(maps_dir / "full", payload)
+
+    assert _entry(client)["octomap_status"] == "converting"
+
+
+def test_list_reports_interrupted_for_a_clean_that_never_finished(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("converting", started_at=_old_iso()))
+
+    assert _entry(client)["octomap_status"] == "interrupted"
+
+
+def test_list_reports_failed_with_the_reason_when_the_tree_was_dropped(client, maps_dir):
+    """map.pcd was cleaned; the tree ran out of memory and was not written."""
+    _plant_clean(
+        maps_dir / "full",
+        _clean_payload("ok", written=False, octomap_error="out of memory"),
+    )
+
+    entry = _entry(client)
+
+    assert entry["octomap_status"] == "failed"
+    assert entry["octomap_error"] == "out of memory"
+
+
+def test_list_reports_failed_with_a_sentence_when_the_sidecar_has_none(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("ok", written=False))
+
+    entry = _entry(client)
+
+    assert entry["octomap_status"] == "failed"
+    assert entry["octomap_error"]
+
+
+def test_list_reports_failed_with_the_cleans_reason_when_the_clean_failed(
+    client, maps_dir
+):
+    _plant_clean(maps_dir / "full", _clean_payload("failed", error="no readable patch"))
+
+    entry = _entry(client)
+
+    assert entry["octomap_status"] == "failed"
+    assert entry["octomap_error"] == "no readable patch"
+
+
+def test_list_reports_none_when_the_clean_never_asked_for_a_tree(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("failed", octomap=False, error="x"))
+    assert _entry(client)["octomap_status"] == "none"
+
+    _plant_clean(maps_dir / "full", _clean_payload("converting", octomap=False))
+    assert _entry(client)["octomap_status"] == "none"
+
+
+def test_list_reports_none_for_a_written_tree_that_is_gone(client, maps_dir):
+    """A save into the same directory deletes the previous tree first."""
+    _plant_clean(maps_dir / "full", _clean_payload("ok", written=True))
+
+    assert _entry(client)["octomap_status"] == "none"
+
+
+def test_list_survives_a_torn_clean_sidecar(client, maps_dir):
+    (maps_dir / "full" / "map_clean.recipe.json").write_text('{"status": "conv')
+
+    assert _entry(client)["octomap_status"] == "none"
+
+
+# --- GET /api/v1/maps/{name}/octomap ------------------------------------------
+
+
+def test_octomap_serves_the_tree_byte_for_byte(client, maps_dir, make_bt):
+    tree = make_bt(maps_dir / "full" / "octomap.bt")
+
+    response = client.get("/api/v1/maps/full/octomap")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.content == tree.read_bytes()
+
+
+def test_octomap_etag_is_the_catalogues_version(client, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    version = _entry(client)["octomap_version"]
+
+    response = client.get("/api/v1/maps/full/octomap")
+
+    assert response.headers["etag"] == f'"{version}"'
+    assert response.headers["cache-control"] == "no-cache"
+
+
+def test_octomap_revalidates_to_304(client, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    tag = client.get("/api/v1/maps/full/octomap").headers["etag"]
+
+    response = client.get("/api/v1/maps/full/octomap", headers={"If-None-Match": tag})
+
+    assert response.status_code == 304
+    assert response.content == b""
+
+
+def test_octomap_etag_follows_a_replaced_file(client, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt", body=b"\x02\x00")
+    first = client.get("/api/v1/maps/full/octomap").headers["etag"]
+
+    make_bt(maps_dir / "full" / "octomap.bt", body=b"\x02\x00\x02\x00")
+    response = client.get("/api/v1/maps/full/octomap", headers={"If-None-Match": first})
+
+    assert response.status_code == 200
+    assert response.headers["etag"] != first
+    assert response.content == (maps_dir / "full" / "octomap.bt").read_bytes()
+
+
+def test_octomap_404_for_a_map_without_one(client):
+    response = client.get("/api/v1/maps/full/octomap")
+
+    assert response.status_code == 404
+    assert "no 3D map" in response.json()["detail"]
+
+
+def test_octomap_404_for_a_missing_map(client):
+    assert client.get("/api/v1/maps/nosuchmap/octomap").status_code == 404
+
+
+def test_octomap_409_while_the_clean_builds_it(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("converting"))
+
+    response = client.get("/api/v1/maps/full/octomap")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_converting"
+
+
+def test_octomap_404_carries_the_cleans_reason(client, maps_dir):
+    _plant_clean(
+        maps_dir / "full",
+        _clean_payload("ok", written=False, octomap_error="out of memory"),
+    )
+
+    response = client.get("/api/v1/maps/full/octomap")
+
+    assert response.status_code == 404
+    assert "out of memory" in response.json()["detail"]
+
+
+def test_octomap_404_for_an_interrupted_build(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("converting", started_at=_old_iso()))
+
+    response = client.get("/api/v1/maps/full/octomap")
+
+    assert response.status_code == 404
+    assert "never finished" in response.json()["detail"]
+
+
+# --- /api/v1/maps/{name}/octomap/edits ----------------------------------------
+#
+# The ground patches. A record beside the tree, applied to it on the robot;
+# the backend writes the file and nothing else.
+
+
+def _put_edits(client, name, keys):
+    return client.put(f"/api/v1/maps/{name}/octomap/edits", json={"fill_key": keys})
+
+
+def test_octomap_edits_get_is_empty_for_a_map_never_patched(client):
+    response = client.get("/api/v1/maps/full/octomap/edits")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "name": "full",
+        "res": None,
+        "fill_key": [],
+        "created_at": None,
+    }
+
+
+def test_octomap_edits_get_404_for_a_missing_map(client):
+    assert client.get("/api/v1/maps/nosuchmap/octomap/edits").status_code == 404
+
+
+def test_octomap_edits_put_then_get_round_trips(client, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt", res=0.1)
+    keys = [[32770, 32768, 32763], [32771, 32768, 32763]]
+
+    response = _put_edits(client, "full", keys)
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 2
+    assert "2 ground patches" in response.json()["message"]
+    body = client.get("/api/v1/maps/full/octomap/edits").json()
+    assert body["fill_key"] == keys
+    assert body["res"] == pytest.approx(0.1)
+    assert body["created_at"].endswith("Z")
+
+
+def test_octomap_edits_put_writes_the_viewers_document(client, maps_dir, make_bt):
+    """The file is what the robot's apply tool reads; its shape is the contract."""
+    make_bt(maps_dir / "full" / "octomap.bt", res=0.1)
+
+    _put_edits(client, "full", [[32770, 32768, 32763]])
+
+    document = json.loads((maps_dir / "full" / "octomap_edits.json").read_text())
+    assert document["format"] == "syncai-octomap-edits"
+    assert document["version"] == 1
+    # The tree's resolution, read off its header -- the body carries none.
+    assert document["res"] == pytest.approx(0.1)
+    assert document["fill_key"] == [[32770, 32768, 32763]]
+    assert document["fill_xyz"] == [[0.25, 0.05, -0.45]]
+    assert not [p.name for p in (maps_dir / "full").iterdir() if p.name.endswith(".tmp")]
+
+
+def test_octomap_edits_put_empty_clears(client, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    _put_edits(client, "full", [[1, 2, 3]])
+
+    response = _put_edits(client, "full", [])
+
+    assert response.status_code == 200
+    assert response.json()["count"] == 0
+    assert "Cleared" in response.json()["message"]
+    assert client.get("/api/v1/maps/full/octomap/edits").json()["fill_key"] == []
+
+
+def test_octomap_edits_put_404_without_a_tree(client, maps_dir):
+    response = _put_edits(client, "full", [[1, 2, 3]])
+
+    assert response.status_code == 404
+    assert not (maps_dir / "full" / "octomap_edits.json").exists()
+
+
+def test_octomap_edits_put_409_while_the_tree_builds(client, maps_dir):
+    _plant_clean(maps_dir / "full", _clean_payload("converting"))
+
+    response = _put_edits(client, "full", [[1, 2, 3]])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_converting"
+
+
+def test_octomap_edits_put_409_for_a_tree_without_a_readable_header(client, maps_dir):
+    """The keys are meaningless without the tree's resolution."""
+    (maps_dir / "full" / "octomap.bt").write_bytes(b"not a tree")
+
+    response = _put_edits(client, "full", [[1, 2, 3]])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "octomap_unreadable"
+    assert not (maps_dir / "full" / "octomap_edits.json").exists()
+
+
+@pytest.mark.parametrize(
+    "keys, fragment",
+    [
+        ([[1, 2, 70000]], "outside the 3D map"),
+        ([[1, 2, 3], [1, 2, 9]], "same column"),
+    ],
+)
+def test_octomap_edits_put_400s_a_bad_key_with_a_sentence(
+    client, maps_dir, make_bt, keys, fragment
+):
+    make_bt(maps_dir / "full" / "octomap.bt")
+
+    response = _put_edits(client, "full", keys)
+
+    assert response.status_code == 400
+    assert fragment in response.json()["detail"]
+    assert not (maps_dir / "full" / "octomap_edits.json").exists()
+
+
+def test_octomap_edits_put_422s_a_key_that_is_not_three_ints(client, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt")
+
+    assert _put_edits(client, "full", [[1, 2]]).status_code == 422
+    assert _put_edits(client, "full", [[1, 2, "x"]]).status_code == 422
+
+
+def test_octomap_edits_put_refuses_while_a_job_drives_on_the_map(
+    client, maps_dir, make_bt, workflow_gw
+):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    workflow_gw.tasks = [types.SimpleNamespace(id="task-7", map_in_use=lambda active: "full")]
+
+    response = _put_edits(client, "full", [[1, 2, 3]])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "task_running"
+    assert not (maps_dir / "full" / "octomap_edits.json").exists()
+
+
+def test_octomap_edits_put_refuses_when_temporal_cannot_be_asked(
+    client, maps_dir, make_bt, workflow_gw
+):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    workflow_gw.error = RuntimeError("temporal down")
+
+    response = _put_edits(client, "full", [[1, 2, 3]])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "tasks_unknown"
+
+
+def test_octomap_edits_put_on_an_idle_map_does_not_ask_temporal(
+    client, maps_dir, make_bt, workflow_gw
+):
+    make_bt(maps_dir / "rawonly" / "octomap.bt")
+    workflow_gw.error = RuntimeError("temporal down")
+
+    assert _put_edits(client, "rawonly", [[1, 2, 3]]).status_code == 200
 
 
 # --- POST /api/v1/maps --------------------------------------------------------

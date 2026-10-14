@@ -18,6 +18,7 @@ from syncai_backend.helpers.system_config import (  # noqa: E402
     SYSTEM_INI_ENV,
 )
 from syncai_backend.repositories.map.catalog import (  # noqa: E402
+    GridRecordStatus,
     init_map_catalog_repo,
 )
 
@@ -488,6 +489,186 @@ def test_rename_map_dir_carries_the_keepout_along(catalog_repo, maps_dir):
     assert (maps_dir / "hall" / "keepout.yaml").read_bytes() == before
     assert catalog_repo.read_keepout_zones("hall") == zones
     assert catalog_repo.keepout_yaml_path("hall").endswith("hall/keepout.yaml")
+
+
+# --- octomap ----------------------------------------------------------------
+#
+# The robot's 3D map. The catalogue reads the tree's header and the cleaning
+# sidecar; it never parses the tree and never writes it.
+
+
+def _plant_clean(directory, payload):
+    (directory / "map_clean.recipe.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_octomap_is_none_without_a_tree(catalog_repo):
+    assert catalog_repo.get_map("full").octomap is None
+    assert catalog_repo.octomap_path("full") is None
+
+
+def test_octomap_reads_the_header_and_versions_the_file(catalog_repo, maps_dir, make_bt):
+    tree = make_bt(maps_dir / "full" / "octomap.bt", res=0.05)
+
+    info = catalog_repo.get_map("full").octomap
+
+    assert info is not None
+    assert info.resolution == pytest.approx(0.05)
+    assert info.size_bytes == tree.stat().st_size
+    assert info.version == f"{tree.stat().st_size}-{tree.stat().st_mtime_ns}"
+    assert catalog_repo.octomap_path("full") == str(tree)
+
+
+def test_octomap_resolution_is_none_for_a_header_this_build_cannot_read(
+    catalog_repo, maps_dir, make_bt
+):
+    """Present is still present (the file is served as-is); only ``res`` is unknown."""
+    (maps_dir / "full" / "octomap.bt").write_bytes(b"not a tree")
+    assert catalog_repo.get_map("full").octomap.resolution is None
+
+    make_bt(maps_dir / "full" / "octomap.bt", res=None)
+    assert catalog_repo.get_map("full").octomap.resolution is None
+
+
+def test_octomap_version_changes_when_the_file_is_replaced(catalog_repo, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt", body=b"\x02\x00")
+    before = catalog_repo.get_map("full").octomap.version
+
+    make_bt(maps_dir / "full" / "octomap.bt", body=b"\x02\x00\x02\x00")
+
+    assert catalog_repo.get_map("full").octomap.version != before
+
+
+def test_map_clean_record_is_none_without_a_sidecar(catalog_repo):
+    assert catalog_repo.get_map("full").map_clean_record is None
+
+
+def test_map_clean_record_reads_the_tree_fields(catalog_repo, maps_dir):
+    _plant_clean(
+        maps_dir / "full",
+        {
+            "status": "ok",
+            "started_at": "2026-10-13T02:49:28Z",
+            "params": {"voxel_size": 0.1, "octomap": True},
+            "measurements": {"octomap_written": False, "octomap_error": "out of memory"},
+        },
+    )
+
+    record = catalog_repo.get_map("full").map_clean_record
+
+    assert record.status is GridRecordStatus.OK
+    assert record.started_at == "2026-10-13T02:49:28Z"
+    assert record.octomap_requested is True
+    assert record.octomap_written is False
+    assert record.octomap_error == "out of memory"
+    assert record.error is None
+
+
+def test_map_clean_record_defaults_the_tree_fields(catalog_repo, maps_dir):
+    """A clean from before the tree existed, or one that never asked for it."""
+    _plant_clean(maps_dir / "full", {"status": "failed", "error": "no patches"})
+
+    record = catalog_repo.get_map("full").map_clean_record
+
+    assert record.status is GridRecordStatus.FAILED
+    assert record.octomap_requested is False
+    assert record.octomap_written is False
+    assert record.octomap_error is None
+    assert record.error == "no patches"
+
+
+@pytest.mark.parametrize("text", ['{"status": "ok"', "[]", '{"status": "sideways"}', ""])
+def test_map_clean_record_is_none_for_an_unusable_sidecar(catalog_repo, maps_dir, text):
+    (maps_dir / "full" / "map_clean.recipe.json").write_text(text)
+
+    assert catalog_repo.get_map("full").map_clean_record is None
+
+
+def test_read_octomap_edits_is_none_without_a_file(catalog_repo):
+    assert catalog_repo.read_octomap_edits("full") is None
+
+
+def test_write_octomap_edits_round_trips_in_the_viewer_shape(catalog_repo, maps_dir):
+    keys = [(32770, 32768, 32763), (32771, 32768, 32763)]
+
+    written = catalog_repo.write_octomap_edits("full", keys, 0.1)
+    document = json.loads((maps_dir / "full" / "octomap_edits.json").read_text())
+
+    assert written.fill_key == tuple(keys)
+    assert written.created_at.endswith("Z")
+    assert document["format"] == "syncai-octomap-edits"
+    assert document["version"] == 1
+    assert document["res"] == pytest.approx(0.1)
+    assert document["source"] == "octomap.bt"
+    assert document["fill_key"] == [list(key) for key in keys]
+    # The metric centres, for a reader without the key arithmetic.
+    assert document["fill_xyz"][0] == pytest.approx([0.25, 0.05, -0.45])
+    assert catalog_repo.read_octomap_edits("full") == written
+
+
+def test_write_octomap_edits_with_no_keys_clears_them(catalog_repo, maps_dir):
+    catalog_repo.write_octomap_edits("full", [(1, 2, 3)], 0.1)
+
+    catalog_repo.write_octomap_edits("full", [], 0.1)
+
+    assert catalog_repo.read_octomap_edits("full").fill_key == ()
+    assert (maps_dir / "full" / "octomap_edits.json").exists()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{",
+        "[]",
+        '{"format": "other", "version": 1, "res": 0.1, "fill_key": []}',
+        '{"format": "syncai-octomap-edits", "version": 2, "res": 0.1, "fill_key": []}',
+        '{"format": "syncai-octomap-edits", "version": 1, "res": "0.1", "fill_key": []}',
+        '{"format": "syncai-octomap-edits", "version": 1, "res": 0.1, "fill_key": {}}',
+    ],
+)
+def test_read_octomap_edits_reports_none_for_an_unusable_file(catalog_repo, maps_dir, text):
+    (maps_dir / "full" / "octomap_edits.json").write_text(text)
+
+    assert catalog_repo.read_octomap_edits("full") is None
+
+
+def test_read_octomap_edits_skips_malformed_keys_one_at_a_time(catalog_repo, maps_dir):
+    (maps_dir / "full" / "octomap_edits.json").write_text(
+        json.dumps(
+            {
+                "format": "syncai-octomap-edits",
+                "version": 1,
+                "res": 0.1,
+                "fill_key": [
+                    [1, 2],
+                    [1, 2, 70000],
+                    [1, 2, "3"],
+                    [1, 2, 3.0],
+                    [True, 2, 3],
+                    [4, 5, 6],
+                ],
+            }
+        )
+    )
+
+    assert catalog_repo.read_octomap_edits("full").fill_key == ((4, 5, 6),)
+
+
+def test_write_octomap_edits_rejects_an_unsafe_name(catalog_repo):
+    with pytest.raises(BadRequestError):
+        catalog_repo.write_octomap_edits("../full", [], 0.1)
+
+
+def test_rename_map_dir_carries_the_tree_and_its_patches_along(catalog_repo, maps_dir, make_bt):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    catalog_repo.write_octomap_edits("full", [(1, 2, 3)], 0.1)
+    before = (maps_dir / "full" / "octomap_edits.json").read_bytes()
+
+    catalog_repo.rename_map_dir("full", "hall")
+
+    # Neither file names the map, so neither was rewritten.
+    assert catalog_repo.octomap_path("hall").endswith("hall/octomap.bt")
+    assert (maps_dir / "hall" / "octomap_edits.json").read_bytes() == before
+    assert catalog_repo.read_octomap_edits("hall").fill_key == ((1, 2, 3),)
 
 
 # --- import staging ---------------------------------------------------------

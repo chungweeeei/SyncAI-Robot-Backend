@@ -141,6 +141,33 @@ def make_pcd():
 
 
 @pytest.fixture
+def make_bt():
+    """Factory writing a minimal OcTree ``.bt``: the text header, then a tree.
+
+    The default tree is one root record whose first child is an occupied
+    leaf — two bytes, what a console's decoder needs to accept it. The
+    backend never parses past the header (it reads ``res`` and serves the
+    file byte for byte), so ``body`` is only ever compared, not decoded.
+    ``banner=False`` builds a file that is not a tree at all.
+    """
+    def _make(path, res=0.1, banner=True, body=b"\x02\x00"):
+        header = b""
+        if banner:
+            header += (
+                b"# Octomap OcTree binary file\n"
+                b"# (feel free to add / change comments, but leave the first line as it is!)\n"
+            )
+        header += b"id OcTree\nsize 2\n"
+        if res is not None:
+            header += f"res {res}\n".encode("ascii")
+        header += b"data\n"
+        path.write_bytes(header + body)
+        return path
+
+    return _make
+
+
+@pytest.fixture
 def maps_dir(tmp_path, make_pgm, make_gridmap_yaml, make_pcd):
     """A maps root laid out the way the robot's ``map/`` directory is.
 
