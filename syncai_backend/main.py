@@ -169,6 +169,7 @@ class SyncAIBackend(Node):
             tts_gw=tts_gw,
             map_catalog_repo=map_catalog_repo,
             conversion_svc=conversion_svc,
+            robot_repo=robot_repo,
         )
         start_rest_server(
             logger=logger,
