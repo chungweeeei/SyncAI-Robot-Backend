@@ -467,11 +467,13 @@ class RobotGateway:
             return False, "The restart did not report back."
         return bool(response.success), response.message
 
-    def _make_pose_stamped(self, x: float, y: float, yaw: float) -> PoseStamped:
+    def _make_pose_stamped(
+        self, x: float, y: float, yaw: float, z: float = 0.0
+    ) -> PoseStamped:
         return PoseStamped(
             header=Header(frame_id="map", stamp=self._node.get_clock().now().to_msg()),
             pose=Pose(
-                position=Point(x=x, y=y, z=0.0),
+                position=Point(x=x, y=y, z=z),
                 orientation=Quaternion(
                     x=0.0, y=0.0, z=math.sin(yaw / 2.0), w=math.cos(yaw / 2.0)
                 ),
@@ -641,18 +643,25 @@ class RobotGateway:
             excess -= 1
 
     def move(
-        self, x: float, y: float, yaw: float, behavior_tree: str = ""
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        z: float = 0.0,
+        behavior_tree: str = "",
     ) -> Tuple[bool, str, Optional[str]]:
+        """Send a navigation goal; ``z`` is the ground height of its storey."""
         self._logger.info(
             "[RobotGateway] Sending navigation goal ",
             x=x,
             y=y,
+            z=z,
             yaw=yaw,
             behavior_tree=behavior_tree,
         )
 
         goal_msg = NavigateToGoal.Goal(
-            pose=self._make_pose_stamped(x=x, y=y, yaw=yaw),
+            pose=self._make_pose_stamped(x=x, y=y, yaw=yaw, z=z),
             behavior_tree=behavior_tree,
         )
 

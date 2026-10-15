@@ -300,6 +300,7 @@ class RobotActivities:
             move_kwargs = {
                 "x": params.x,
                 "y": params.y,
+                "z": params.z,
                 "yaw": math.radians(params.theta),
             }
         else:

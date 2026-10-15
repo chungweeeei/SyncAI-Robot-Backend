@@ -106,6 +106,17 @@ def _send_goal(robot_gw, move_client, result_future=None):
     return goal_id, result_future
 
 
+def test_a_goal_carries_the_height_of_its_storey(robot_gw, move_client):
+    handle = _goal_handle()
+    handle.get_result_async.return_value = _Future(completed=False)
+    move_client.send_goal_async.return_value = _Future(result=handle)
+
+    robot_gw.move(x=1.0, y=2.0, yaw=0.0, z=5.02)
+
+    goal = move_client.send_goal_async.call_args.kwargs["goal"]
+    assert goal.pose.pose.position.z == 5.02
+
+
 class TestMoveGoalStateMachine:
     def test_accepted_goal_starts_executing(self, robot_gw, move_client):
         goal_id, _ = _send_goal(robot_gw, move_client)
