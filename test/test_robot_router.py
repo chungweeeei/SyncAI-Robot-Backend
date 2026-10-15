@@ -71,6 +71,7 @@ class _StubRobotGateway:
         self.restart_done = None
         self.safety_locks = []
         self.safety_lock_result = (True, "Safety lock engaged. Remote control blocked.")
+        self.initial_poses = []
 
     def set_motion_key(self, key):
         self.motion_keys.append(key)
@@ -87,6 +88,10 @@ class _StubRobotGateway:
     def set_safety_lock(self, locked):
         self.safety_locks.append(locked)
         return self.safety_lock_result
+
+    def set_initial_pose(self, x, y, yaw, z=None):
+        self.initial_poses.append({"x": x, "y": y, "yaw": yaw, "z": z})
+        return True, ""
 
     def restart_mode(self, on_done=None):
         self.restarts += 1
@@ -668,3 +673,34 @@ def test_a_restart_answered_in_the_window_reads_back_as_succeeded(client, robot_
     _post_restart(client)
 
     assert _get_restart(client).json()["status"] == "succeeded"
+
+
+# --- POST /api/v1/robot/set_initial_pose -------------------------------------
+
+
+def _post_initial_pose(client, payload):
+    return client.post("/api/v1/robot/set_initial_pose", json=payload)
+
+
+def test_an_initial_pose_without_z_keeps_the_localizers_storey(client, robot_gw):
+    """No z reaches the gateway as None, never as 0.
+
+    0 is a height (the ground floor); None is "keep the storey you are on",
+    which is all a client from before z could have meant.
+    """
+    response = _post_initial_pose(client, {"x": 1.0, "y": -2.0, "theta": 90.0})
+
+    assert response.status_code == 200
+    assert robot_gw.initial_poses == [
+        {"x": 1.0, "y": -2.0, "yaw": pytest.approx(math.pi / 2), "z": None}
+    ]
+
+
+def test_an_initial_pose_on_another_storey_carries_its_z(client, robot_gw):
+    response = _post_initial_pose(
+        client, {"x": 1.0, "y": -2.0, "theta": 0.0, "z": 3.2}
+    )
+
+    assert response.status_code == 200
+    assert robot_gw.initial_poses[0]["z"] == 3.2
+    assert "z=3.2" in response.json()["message"]

@@ -32,6 +32,7 @@ from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
 from syncai_backend.gateways.robot.robot import (  # noqa: E402
     DOCK_BEHAVIOR_TREE,
+    INITIAL_POSE_Z_VARIANCE_INDEX,
     MAX_TRACKED_GOALS,
     MotionKey,
     MoveState,
@@ -590,6 +591,43 @@ class TestCommandServices:
         assert published.header.frame_id == "map"
         assert published.pose.pose.position.x == 1.0
         assert published.pose.pose.orientation.z == pytest.approx(math.sin(math.pi / 2))
+
+    def test_set_initial_pose_without_z_leaves_the_covariance_zero(self, robot_gw):
+        """No z: the localizer keeps its own height, as for RViz's pose.
+
+        An all-zero covariance is what RViz's 2D Pose Estimate leaves in the z
+        cell, and what every sender from before z sent.
+        """
+        publisher = robot_gw._publishers["initial_pose"]
+
+        robot_gw.set_initial_pose(x=1.0, y=-2.0, yaw=0.0)
+
+        published = publisher.publish.call_args[0][0]
+        assert published.pose.pose.position.z == 0.0
+        assert list(published.pose.covariance) == [0.0] * 36
+
+    def test_set_initial_pose_with_z_marks_it_in_the_z_variance(self, robot_gw):
+        publisher = robot_gw._publishers["initial_pose"]
+
+        robot_gw.set_initial_pose(x=1.0, y=-2.0, yaw=0.0, z=3.2)
+
+        published = publisher.publish.call_args[0][0]
+        assert published.pose.pose.position.z == 3.2
+        covariance = list(published.pose.covariance)
+        # Row 2, column 2 of the row-major 6x6: var(z), and only that cell.
+        assert covariance[INITIAL_POSE_Z_VARIANCE_INDEX] > 0.0
+        assert INITIAL_POSE_Z_VARIANCE_INDEX == 2 * 6 + 2
+        covariance[INITIAL_POSE_Z_VARIANCE_INDEX] = 0.0
+        assert covariance == [0.0] * 36
+
+    def test_set_initial_pose_at_ground_zero_is_still_marked(self, robot_gw):
+        # z = 0 given is the ground floor on purpose, not "no z".
+        publisher = robot_gw._publishers["initial_pose"]
+
+        robot_gw.set_initial_pose(x=0.0, y=0.0, yaw=0.0, z=0.0)
+
+        published = publisher.publish.call_args[0][0]
+        assert published.pose.covariance[INITIAL_POSE_Z_VARIANCE_INDEX] > 0.0
 
 
 class TestSwitchMode:

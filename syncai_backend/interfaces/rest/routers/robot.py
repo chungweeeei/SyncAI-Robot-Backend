@@ -298,6 +298,16 @@ class SetInitialPoseRequest(BaseModel):
     theta: float = Field(
         ..., description="The yaw angle of the pose, in degrees (map frame)."
     )
+    z: Optional[float] = Field(
+        None,
+        allow_inf_nan=False,
+        description=(
+            "Height of the ground the pose stands on (metres, map frame), as a "
+            "vertex's `z`: which storey to look for the robot on. Omitted, the "
+            "localizer keeps the storey it is on, so a pose on another storey "
+            "needs it."
+        ),
+    )
 
 
 class SetInitialPoseResponse(BaseModel):
@@ -549,21 +559,23 @@ def init_robot_router(
         #
         # REST is degrees everywhere, ROS radians; this is the conversion.
         success, message = robot_gw.set_initial_pose(
-            x=request.x, y=request.y, yaw=math.radians(request.theta)
+            x=request.x, y=request.y, yaw=math.radians(request.theta), z=request.z
         )
         if not success:
             logger.error(
                 "Failed to set initial pose",
                 x=request.x,
                 y=request.y,
+                z=request.z,
                 theta=request.theta,
                 message=message,
             )
             raise UpstreamError(message)
 
+        height = "" if request.z is None else f", z={request.z}"
         return SetInitialPoseResponse(
             message=(
-                f"Published initial pose x={request.x}, y={request.y}, "
+                f"Published initial pose x={request.x}, y={request.y}{height}, "
                 f"theta={request.theta}"
             )
         )

@@ -105,6 +105,14 @@ NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 DOCK_BEHAVIOR_TREE = "dock.xml"
 UNDOCK_BEHAVIOR_TREE = "undock.xml"
 
+# What tells syncai_localizer that an initialpose's z is meant: the z variance
+# (cell 14 of the row-major 6x6 covariance) above zero. RViz's 2D Pose Estimate
+# and every sender from before leave it 0, and the localizer then keeps the
+# height of its own estimate, so z = 0 from them never pulls the guess to 1F.
+# The value itself is not read; this one says "a few centimetres".
+INITIAL_POSE_Z_VARIANCE_INDEX = 14
+INITIAL_POSE_Z_VARIANCE = 0.01
+
 
 def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
     event = threading.Event()
@@ -480,8 +488,15 @@ class RobotGateway:
             ),
         )
 
-    def set_initial_pose(self, x: float, y: float, yaw: float) -> Tuple[bool, str]:
+    def set_initial_pose(
+        self, x: float, y: float, yaw: float, z: Optional[float] = None
+    ) -> Tuple[bool, str]:
         """Seed localization with an operator-supplied map-frame pose.
+
+        ``z`` is the height of the ground the pose stands on, as a vertex's z,
+        which picks the storey; the localizer adds its lidar height. None keeps
+        the storey the localizer is already on: the guess then takes its height
+        from the current estimate, as RViz's does.
 
         Fire-and-forget on a volatile topic: no ack, and only already-discovered
         subscribers see it. Hence the warning when nobody is subscribed — an
@@ -495,13 +510,19 @@ class RobotGateway:
                 "is the localizer running?"
             )
 
-        self._logger.info("[RobotGateway] Publishing initial pose", x=x, y=y, yaw=yaw)
+        self._logger.info(
+            "[RobotGateway] Publishing initial pose", x=x, y=y, z=z, yaw=yaw
+        )
 
-        pose_stamped = self._make_pose_stamped(x=x, y=y, yaw=yaw)
-        # Covariance stays zero: the localizer reads x/y/yaw only (see
-        # applyPlanarGuess).
+        pose_stamped = self._make_pose_stamped(
+            x=x, y=y, yaw=yaw, z=0.0 if z is None else z
+        )
         msg = PoseWithCovarianceStamped(header=pose_stamped.header)
         msg.pose.pose = pose_stamped.pose
+        # The rest of the covariance stays zero: the localizer reads x / y /
+        # yaw, and z only when marked (see applyPlanarGuess).
+        if z is not None:
+            msg.pose.covariance[INITIAL_POSE_Z_VARIANCE_INDEX] = INITIAL_POSE_Z_VARIANCE
         initial_pose_pub.publish(msg)
 
         return True, ""
