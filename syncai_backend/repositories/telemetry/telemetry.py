@@ -6,11 +6,17 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 
-# How long a planned route stays live without being republished. Nothing ever
-# publishes an empty plan (arrive, cancel and abort all just stop the plans), so
-# expiry is the only clear. 2x the BT's replan period (RateController
-# hz="0.333" in syncai_task_runner/behavior_trees/move.xml): tighter blinks the
-# route out mid-run, looser leaves a finished route on the map.
+# How long a planned route stays live without being republished. A fallback,
+# not the clear: since 2026-10-14 the planner re-sends its last plan on `plan`
+# at plan_republish_rate (1 Hz), and a cancelled navigation empties it with an
+# explicit empty Path (task_runner -> planner's clear_plan, sent three times),
+# which PathSubscriber turns into the empty sample itself. Arrival needs no
+# clear either: the re-send is trimmed to a stub inside xy_goal_tolerance. A
+# failure deliberately keeps the route up, so the operator can see where it
+# failed. What expiry still catches is a planner that stopped re-sending
+# (restarted, plan_republish_rate 0, clear_plan unreachable at cancel).
+# 6 s is several republish periods, so a dropped BEST_EFFORT sample or two
+# never blinks a live route out.
 _PATH_TTL_S = 6.0
 
 

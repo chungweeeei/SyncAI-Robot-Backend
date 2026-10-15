@@ -10,7 +10,7 @@ from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 
 
 # The global costmap's frame. Deliberately un-namespaced (see
-# syncai_planner/launch/planner_server.launch.py).
+# syncai_global_planner/launch/planner_server.launch.py).
 _MAP_FRAME = "map"
 
 # Upper bound on points forwarded to the viewport (NavFn emits one per 0.05 m
@@ -26,13 +26,17 @@ class PathSubscriber:
     """Feeds TelemetryRepo's path slot, and therefore the telemetry WebSocket,
     from the planner's ``plan`` topic.
 
-    Apart from TelemetrySubscriber: a route arrives ~every 3 s in the map frame
-    (no TF) and wants different QoS. Not the controller's
+    Apart from TelemetrySubscriber: a route arrives once a second in the map
+    frame (no TF) and wants different QoS. Not the controller's
     ``received_global_plan``, which is a pruned slice in base_link.
 
-    The publisher (syncai_planner/src/planner_server.cpp) is VOLATILE and
-    publishes only on success, so a restarted backend shows no route until the
-    next replan, and clearing the route is TTL-based in the repo.
+    The publisher (syncai_global_planner/src/planner_server.cpp) is VOLATILE
+    but re-sends its last plan at plan_republish_rate (1 Hz), trimmed to start
+    at the robot, so a restarted backend shows the route within a second. A
+    cancelled navigation is cleared by an **empty** Path in the ``map`` frame
+    (task_runner calls the planner's clear_plan; sent three times, one per
+    republish tick, because this subscription is BEST_EFFORT). The repo's TTL
+    is only the fallback for a planner that stopped re-sending.
     """
 
     def __init__(self, logger: structlog.stdlib.BoundLogger, telemetry_repo: TelemetryRepo):
@@ -44,8 +48,9 @@ class PathSubscriber:
         self._frame_ok = None
 
     def register(self, node: Node):
-        # BEST_EFFORT still matches the RELIABLE publisher. Costlier here than on
-        # 20 Hz feeds: a dropped plan shows a stale route until the next replan.
+        # BEST_EFFORT still matches the RELIABLE publisher. A dropped plan costs
+        # one republish period (1 s) of stale route; a dropped clear is covered
+        # by the planner sending it three times.
         node.create_subscription(
             msg_type=Path,
             topic="plan",  # relative, so it inherits the robot_id namespace
@@ -78,7 +83,9 @@ class PathSubscriber:
 
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        # Defensive (the planner never sends one today): an empty plan clears.
+        # An empty plan is the planner's clear on cancel (clear_plan). Its frame
+        # is `map`, so it passes the check above; one in any other frame would
+        # be dropped there and leave the old route up.
         if not msg.poses:
             self._repo.update_path(points=(), stamp=stamp)
             return

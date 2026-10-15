@@ -34,8 +34,10 @@ def init_telemetry_router(
         joint name. Each type is sent only when newer, at its own rate.
 
         ``path`` is the planner's remaining global route in map-frame metres,
-        thinned, once per replan (~0.333 Hz). An **empty** ``points`` means
-        "no route": the frame that tells a client to erase what it draws.
+        thinned, each time the planner re-sends it (1 Hz). An **empty** ``points`` means "no route": the frame
+        that tells a client to erase what it draws -- sent when a navigation
+        is cancelled (the planner publishes an empty plan) or when the repo's
+        TTL expires a route that stopped arriving.
         """
         await ws.accept()
         last_pose_seq = 0
@@ -68,8 +70,8 @@ def init_telemetry_router(
                         }
                     )
 
-                # Polling also runs the repo's TTL check, so a finished route
-                # clears itself with no further ROS traffic.
+                # Polling also runs the repo's TTL check, so a route the
+                # planner stopped re-sending clears with no further ROS traffic.
                 path = telemetry_repo.get_path(after_seq=last_path_seq)
                 if path is not None:
                     last_path_seq = path.seq
