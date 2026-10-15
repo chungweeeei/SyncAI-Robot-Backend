@@ -467,11 +467,11 @@ def test_list_survives_a_half_written_sidecar(client, maps_dir):
 
 def test_list_counts_vertices_of_that_map_only(client, map_repo):
     map_repo.create_vertices(map="full", vertices=[
-        {"name": "a", "type": "GENERAL", "x": 1.0, "y": 2.0, "theta": 0.0},
-        {"name": "b", "type": "CHARGER", "x": 3.0, "y": 4.0, "theta": 90.0},
+        {"name": "a", "type": "MOVE", "x": 1.0, "y": 2.0, "theta": 0.0},
+        {"name": "b", "type": "CHARGE", "x": 3.0, "y": 4.0, "theta": 90.0},
     ])
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "c", "type": "GENERAL", "x": 5.0, "y": 6.0, "theta": 0.0},
+        {"name": "c", "type": "MOVE", "x": 5.0, "y": 6.0, "theta": 0.0},
     ])
 
     body = _by_name(client.get("/api/v1/maps").json())
@@ -1340,8 +1340,8 @@ def test_rename_moves_the_directory_and_lists_under_the_new_name(
     client, maps_dir, map_repo, task_template_repo
 ):
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
-        {"name": "home", "type": "HOME", "x": 1.0, "y": 0.0, "theta": 0.0},
+        {"name": "dock", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "home", "type": "MOVE", "x": 1.0, "y": 0.0, "theta": 0.0},
     ])
     task_template_repo.create_task_template(
         name="patrol", description="", map_name="rawonly", steps=[]
@@ -1490,12 +1490,12 @@ def _delete(client, name):
 
 def test_delete_removes_the_directory_and_its_vertices(client, maps_dir, map_repo):
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
-        {"name": "home", "type": "HOME", "x": 1.0, "y": 0.0, "theta": 0.0},
+        {"name": "dock", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "home", "type": "MOVE", "x": 1.0, "y": 0.0, "theta": 0.0},
     ])
     # A vertex on another map must survive: the DELETE is filtered by map.
     map_repo.create_vertices(map="full", vertices=[
-        {"name": "charger", "type": "CHARGER", "x": 2.0, "y": 0.0, "theta": 0.0},
+        {"name": "charger", "type": "CHARGE", "x": 2.0, "y": 0.0, "theta": 0.0},
     ])
 
     response = _delete(client, "rawonly")
@@ -1540,7 +1540,7 @@ def test_delete_refuses_while_a_task_template_is_bound(
 ):
     """The one refusal that asks for work rather than a restart."""
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "dock", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
     ])
     task_template_repo.create_task_template(
         name="patrol", description="", map_name="rawonly", steps=[]
@@ -3181,8 +3181,8 @@ def exportable(maps_dir, map_repo, make_pcd):
     (maps_dir / "full" / "traversable_debug").mkdir()
     (maps_dir / "full" / "traversable_debug" / "step1.pcd").write_bytes(b"debug")
     map_repo.create_vertices(map="full", vertices=[
-        {"name": "dock", "type": "CHARGER", "x": 1.5, "y": -2.0, "theta": 90.0},
-        {"name": "home", "type": "HOME", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "dock", "type": "CHARGE", "x": 1.5, "y": -2.0, "theta": 90.0},
+        {"name": "home", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
     ])
     return maps_dir / "full"
 
@@ -3412,7 +3412,7 @@ def test_import_refuses_when_the_disk_is_too_full(client, maps_dir, catalog_repo
 
 def test_import_without_a_name_uses_the_manifest_name(client, maps_dir, map_repo):
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "dock", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
     ])
     payload = _export(client, "rawonly").content
     before = _tree(maps_dir / "rawonly")
@@ -3439,9 +3439,9 @@ def test_import_with_no_vertices_creates_none(client, maps_dir, map_repo):
 
 def test_import_sweeps_orphaned_vertex_rows_of_a_deleted_directory(client, map_repo):
     map_repo.create_vertices(map="ghost", vertices=[
-        {"name": "stale", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "stale", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
     ])
-    vertices = [{"name": "fresh", "type": "HOME", "x": 1.0, "y": 1.0, "theta": 0.0}]
+    vertices = [{"name": "fresh", "type": "MOVE", "x": 1.0, "y": 1.0, "theta": 0.0}]
 
     response = _import(client, _handmade(name="ghost", vertices=vertices))
 
@@ -3457,9 +3457,9 @@ def test_import_sweeps_orphaned_vertex_rows_of_a_deleted_directory(client, map_r
 
 def test_import_replaces_an_existing_map(client, maps_dir, map_repo, exportable):
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "old1", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
-        {"name": "old2", "type": "GENERAL", "x": 1.0, "y": 0.0, "theta": 0.0},
-        {"name": "old3", "type": "GENERAL", "x": 2.0, "y": 0.0, "theta": 0.0},
+        {"name": "old1", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "old2", "type": "MOVE", "x": 1.0, "y": 0.0, "theta": 0.0},
+        {"name": "old3", "type": "MOVE", "x": 2.0, "y": 0.0, "theta": 0.0},
     ])
     (maps_dir / "rawonly" / "poses.txt").write_text("stale\n")
     payload = _export(client, "full").content
@@ -3528,7 +3528,7 @@ def test_import_rolls_a_new_map_back_when_the_vertex_insert_fails(
         raise RuntimeError("database away")
 
     monkeypatch.setattr(map_repo, "create_vertices", _boom)
-    vertices = [{"name": "v", "type": "GENERAL", "x": 0, "y": 0, "theta": 0}]
+    vertices = [{"name": "v", "type": "MOVE", "x": 0, "y": 0, "theta": 0}]
 
     response = _import(client, _handmade(name="copy", vertices=vertices))
 
@@ -3542,7 +3542,7 @@ def test_import_puts_the_previous_map_back_when_the_vertex_insert_fails(
     client, maps_dir, map_repo, monkeypatch
 ):
     map_repo.create_vertices(map="rawonly", vertices=[
-        {"name": "keep", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "keep", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
     ])
     before = _tree(maps_dir / "rawonly")
 
@@ -3550,7 +3550,7 @@ def test_import_puts_the_previous_map_back_when_the_vertex_insert_fails(
         raise RuntimeError("database away")
 
     monkeypatch.setattr(map_repo, "create_vertices", _boom)
-    vertices = [{"name": "v", "type": "GENERAL", "x": 0, "y": 0, "theta": 0}]
+    vertices = [{"name": "v", "type": "MOVE", "x": 0, "y": 0, "theta": 0}]
 
     response = _import(client, _handmade(name="rawonly", vertices=vertices))
 

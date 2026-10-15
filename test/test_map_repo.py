@@ -13,7 +13,7 @@ from syncai_backend.exceptions import ConflictError
 _MISSING_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
 
-def _create(repo, name="v", type="GENERAL", map="warehouse", x=1.0, y=2.0,
+def _create(repo, name="v", type="MOVE", map="warehouse", x=1.0, y=2.0,
             theta=0.0):
     """Create a single vertex through the batch API and return it."""
     return repo.create_vertices(map=map, vertices=[{
@@ -26,7 +26,7 @@ def test_create_returns_persisted_vertex(map_repo):
 
     assert vertex.id is not None
     assert vertex.name == "dock"
-    assert vertex.type == "GENERAL"
+    assert vertex.type == "MOVE"
     assert vertex.map == "warehouse"
     assert (vertex.x, vertex.y, vertex.theta) == (3.0, -1.5, 90.0)
     assert vertex.created_at is not None
@@ -35,8 +35,8 @@ def test_create_returns_persisted_vertex(map_repo):
 
 def test_create_vertices_batch_persists_all_in_order(map_repo):
     created = map_repo.create_vertices(map="warehouse", vertices=[
-        {"name": "a", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
-        {"name": "b", "type": "ARTIFACT", "x": 1.0, "y": 1.0, "theta": 0.0},
+        {"name": "a", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+        {"name": "b", "type": "CHARGE", "x": 1.0, "y": 1.0, "theta": 0.0},
     ])
 
     assert [v.name for v in created] == ["a", "b"]
@@ -68,8 +68,8 @@ def test_create_allows_the_same_name_on_a_different_map(map_repo):
 def test_create_batch_rejects_a_name_repeated_within_the_request(map_repo):
     with pytest.raises(ConflictError) as caught:
         map_repo.create_vertices(map="warehouse", vertices=[
-            {"name": "a", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
-            {"name": "a", "type": "GENERAL", "x": 1.0, "y": 1.0, "theta": 0.0},
+            {"name": "a", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+            {"name": "a", "type": "MOVE", "x": 1.0, "y": 1.0, "theta": 0.0},
         ])
 
     assert caught.value.code == "vertex_name_taken"
@@ -82,8 +82,8 @@ def test_create_batch_inserts_nothing_when_one_name_collides(map_repo):
 
     with pytest.raises(ConflictError):
         map_repo.create_vertices(map="warehouse", vertices=[
-            {"name": "fresh", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
-            {"name": "taken", "type": "GENERAL", "x": 1.0, "y": 1.0, "theta": 0.0},
+            {"name": "fresh", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+            {"name": "taken", "type": "MOVE", "x": 1.0, "y": 1.0, "theta": 0.0},
         ])
 
     assert [v.name for v in map_repo.list_vertices()] == ["taken"]
@@ -108,28 +108,28 @@ def test_list_vertices_orders_by_creation_time(map_repo):
 
 
 def test_list_vertices_filters_by_map_and_type(map_repo):
-    _create(map_repo, name="g1", type="GENERAL", map="warehouse")
-    _create(map_repo, name="a1", type="ARTIFACT", map="warehouse")
-    _create(map_repo, name="g2", type="GENERAL", map="office")
+    _create(map_repo, name="g1", type="MOVE", map="warehouse")
+    _create(map_repo, name="a1", type="CHARGE", map="warehouse")
+    _create(map_repo, name="g2", type="MOVE", map="office")
 
     assert len(map_repo.list_vertices(map="warehouse")) == 2
     assert len(map_repo.list_vertices(map="office")) == 1
-    assert len(map_repo.list_vertices(type="GENERAL")) == 2
-    assert len(map_repo.list_vertices(map="warehouse", type="ARTIFACT")) == 1
+    assert len(map_repo.list_vertices(type="MOVE")) == 2
+    assert len(map_repo.list_vertices(map="warehouse", type="CHARGE")) == 1
     assert map_repo.list_vertices(map="does-not-exist") == []
 
 
 def test_count_vertices_matches_list_under_the_same_filters(map_repo):
-    _create(map_repo, name="g1", type="GENERAL", map="warehouse")
-    _create(map_repo, name="a1", type="ARTIFACT", map="warehouse")
-    _create(map_repo, name="g2", type="GENERAL", map="office")
+    _create(map_repo, name="g1", type="MOVE", map="warehouse")
+    _create(map_repo, name="a1", type="CHARGE", map="warehouse")
+    _create(map_repo, name="g2", type="MOVE", map="office")
 
     for filters in (
         {},
         {"map": "warehouse"},
         {"map": "office"},
-        {"type": "GENERAL"},
-        {"map": "warehouse", "type": "ARTIFACT"},
+        {"type": "MOVE"},
+        {"map": "warehouse", "type": "CHARGE"},
         {"map": "does-not-exist"},
     ):
         assert map_repo.count_vertices(**filters) == len(
@@ -316,7 +316,7 @@ def test_create_vertices_in_a_failed_transaction_is_rolled_back(map_repo):
     with pytest.raises(RuntimeError):
         with map_repo.transaction(op="test") as session:
             rows = map_repo.create_vertices(map="new", vertices=[
-                {"name": "a", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+                {"name": "a", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
             ], session=session)
             assert len(rows) == 1
             raise RuntimeError("the step after the insert failed")
@@ -331,7 +331,7 @@ def test_replace_vertices_in_one_transaction(map_repo):
     with map_repo.transaction(op="test") as session:
         assert map_repo.delete_vertices("m", session=session) == 1
         map_repo.create_vertices(map="m", vertices=[
-            {"name": "new", "type": "HOME", "x": 1.0, "y": 1.0, "theta": 0.0},
+            {"name": "new", "type": "MOVE", "x": 1.0, "y": 1.0, "theta": 0.0},
         ], session=session)
 
     assert map_repo.get_vertex(old.id) is None
@@ -344,7 +344,7 @@ def test_create_vertices_with_a_session_reports_a_duplicate_as_conflict(map_repo
     with pytest.raises(ConflictError) as caught:
         with map_repo.transaction(op="test") as session:
             map_repo.create_vertices(map="m", vertices=[
-                {"name": "dock", "type": "GENERAL", "x": 0.0, "y": 0.0, "theta": 0.0},
+                {"name": "dock", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
             ], session=session)
 
     assert caught.value.code == "vertex_name_taken"
