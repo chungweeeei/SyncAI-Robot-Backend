@@ -258,9 +258,7 @@ the only caller that passes anything else.
   (`PUT …/octomap/edits`, the viewer's document shape, one key per column) as a **record
   only**: applying them to the tree is the robot's `apply_octomap_edits` (which keeps
   `octomap.raw.bt`), and the planner reads the tree at session start. Nothing written
-  names the map. `GET/PUT …/floors` splits a multi-storey map for the console:
-  detected from `poses.txt` heights (`helpers/floors.py`) unless `floors.json` is
-  saved; display-only, so not behind the job lock.
+  names the map.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this

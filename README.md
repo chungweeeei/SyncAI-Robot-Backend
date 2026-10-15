@@ -201,15 +201,6 @@ original as `octomap.raw.bt`); the 3D planner then needs its session restarted
 to load the result. Like `keepout.json`, nothing in the file names the map, and
 the keys hold for exactly that save's map frame.
 
-**Floors.** A map that spans storeys is one tree in one frame; the console
-shows one storey at a time. `GET /api/v1/maps/{name}/floors` detects them from
-`poses.txt` on every read — a height the robot spent at least 5 % of its walk at
-is a floor, a stair or landing it passed through is not, levels under 2 m apart
-are one — and `PUT` saves an operator's list (names, body heights) to
-`floors.json`, which then wins. The trajectory rather than the ceiling, because
-the robot stood on every floor it mapped and a ceiling is a different height on
-every site. Only the console reads the file.
-
 **Maps travel as archives.** Since 2026-10 a map can leave as one `.zip` /
 `.tar.gz` (`GET /api/v1/maps/{name}/export`) and arrive on another robot (
 `POST /api/v1/maps/import`). `helpers/map_archive.py` owns the format: the directory's
@@ -524,8 +515,6 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/maps/{name}/pointcloud` | The saved `map.pcd`, packed binary |
 | GET | `/api/v1/maps/{name}/octomap` | The saved `octomap.bt` byte for byte (`application/octet-stream`), ETag = `"<octomap_version>"`, 304 on `If-None-Match`. 409 `octomap_converting` while the map cleaning is still building it; 404 with the reason otherwise (never built, `failed` with the cleaning's sentence, `interrupted`) |
 | GET | `/api/v1/maps/{name}/octomap/edits` | The ground patches saved for the 3D map: `{name, res, fill_key: [[kx, ky, kz], …], created_at}`, absolute OcTree keys of the voxels to mark as floor. `fill_key: []` (and null `res` / `created_at`) when none are saved |
-| GET | `/api/v1/maps/{name}/floors` | The storeys the map spans, lowest first: `{name, floors: [{name, level}], detected: [...], saved}`. `level` is the body height walked on that floor (the z of `poses.txt`), metres. `floors` is the saved list if there is one, else `detected`; `[]` is one storey |
-| PUT | `/api/v1/maps/{name}/floors` | Replace the floors with the **whole** body list (`{floors: [{name, level}, …]}`); `[]` saves one storey. Writes `floors.json`, sorted by level. 400 with a sentence for an empty or over-long name (16), a repeated name, more than 16 floors, or two levels under 1 m apart. Not held by a running job: nothing on the robot reads it |
 | PUT | `/api/v1/maps/{name}/octomap/edits` | Replace the patches with the **whole** body list (`{fill_key: [[kx, ky, kz], …]}`, 0–65535 each, one per `[kx, ky]` column); `[]` clears. Writes `octomap_edits.json` (tmp + rename, `res` from the tree's header) and **nothing else** — the tree is patched on the robot by `apply_octomap_edits`, the message says so. 400 with a sentence for an out-of-range key or a column named twice; 404 with no tree; 409 `octomap_converting`, `octomap_unreadable` (a tree without a readable header), `task_running` / `tasks_unknown` (held by a running job like every map write) |
 | POST · GET | `/api/v1/maps/{name}/vertices` | Batch-create (one transaction) / list with optional `?type=`. Create is held by a running job (below) |
 | GET · PUT · DELETE | `/api/v1/maps/{name}/vertices/{id}` | Read / partial update / delete; update and delete held by a running job |
