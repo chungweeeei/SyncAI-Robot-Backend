@@ -62,6 +62,7 @@ is cheaper than sharing one event loop across tests would be worth.
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from typing import Optional
 
 import pytest
 
@@ -122,13 +123,12 @@ def _task(task_id: str, *step_types: StepType) -> WorkflowTask:
         Step(
             id=f"step-{i}",
             type=step_type,
-            # Schema contract: MOVE, DOCK, UNDOCK and WAIT carry params, the posture steps
-            # carry none (Step validation enforces it, the workflow relies on
-            # it for its empty-args special case).
+            # Schema contract: MOVE, DOCK and WAIT carry params, the posture steps
+            # and UNDOCK carry none (Step validation enforces it, the workflow
+            # relies on it for its empty-args special case).
             params={
                 StepType.MOVE: MoveParams(x=1.5, y=-2.5, theta=90.0),
                 StepType.DOCK: MoveParams(x=3.0, y=1.0, theta=180.0),
-                StepType.UNDOCK: MoveParams(x=3.0, y=1.0, theta=180.0),
                 StepType.WAIT: WaitParams(seconds=WAIT_SECONDS),
             }.get(step_type),
         )
@@ -314,9 +314,10 @@ def test_a_runs_map_is_handed_to_every_move():
     ]
 
 
-def test_a_runs_map_is_handed_to_dock_and_undock():
-    """DOCK / UNDOCK coordinates are a pose on the map too, so they get MOVE's
-    second argument and execute_dock / execute_undock the same check."""
+def test_a_runs_map_is_handed_to_dock_but_not_undock():
+    """DOCK coordinates are a pose on the map too, so they get MOVE's second
+    argument and execute_dock the same check. UNDOCK backs out from wherever the
+    robot stands: no pose, so no argument at all."""
 
     async def scenario():
         calls: list = []
@@ -327,10 +328,8 @@ def test_a_runs_map_is_handed_to_dock_and_undock():
             return ActivityResult(success=True, state="succeeded")
 
         @activity.defn(name="execute_undock")
-        async def execute_undock(
-            params: MoveParams, expected_map=None
-        ) -> ActivityResult:
-            calls.append(("execute_undock", params.x, expected_map))
+        async def execute_undock() -> ActivityResult:
+            calls.append(("execute_undock", None, None))
             return ActivityResult(success=True, state="succeeded")
 
         task = _task("task-dock-map", StepType.DOCK, StepType.UNDOCK)
@@ -358,7 +357,7 @@ def test_a_runs_map_is_handed_to_dock_and_undock():
 
     assert asyncio.run(scenario()) == [
         ("execute_dock", 3.0, "lab"),
-        ("execute_undock", 3.0, "lab"),
+        ("execute_undock", None, None),
     ]
 
 
@@ -568,11 +567,12 @@ def _recording_move(
 
     ``dispatches`` collects ``activity.info().attempt`` so a test can tell a
     *re-sent* MOVE (two activities, each attempt 1) from a *retried* one.
-    ``name`` stands it in for DOCK / UNDOCK, which the hold treats the same.
+    ``name`` stands it in for DOCK / UNDOCK, which the hold treats the same;
+    ``params`` defaults because an UNDOCK is dispatched with none.
     """
 
     @activity.defn(name=name)
-    async def execute_move(params: MoveParams) -> ActivityResult:
+    async def execute_move(params: Optional[MoveParams] = None) -> ActivityResult:
         dispatches.append(activity.info().attempt)
         await _report_started()
         started.set()
@@ -665,17 +665,20 @@ def test_pause_interrupts_a_move_and_resume_re_sends_it():
     assert calls == [("execute_stand", None)]
 
 
-def test_pause_interrupts_a_dock_and_resume_re_sends_it():
-    # A dock is a NavigateToGoal like a MOVE: the pause cancels it (in production,
-    # execute_dock's cancel path also puts RL back) and resume starts the tree over.
+@pytest.mark.parametrize(
+    "step_type, name",
+    [(StepType.DOCK, "execute_dock"), (StepType.UNDOCK, "execute_undock")],
+)
+def test_pause_interrupts_a_dock_and_resume_re_sends_it(step_type, name):
+    # A dock or an undock is a NavigateToGoal like a MOVE, pose or not: the pause
+    # cancels it (in production, the cancel path also puts RL back) and resume
+    # starts the tree over.
     async def scenario():
         started, release = asyncio.Event(), asyncio.Event()
         dispatches: list = []
         cancels: list = []
-        activities = [
-            _recording_move(started, release, dispatches, cancels, "execute_dock")
-        ]
-        task = _task("task-pause-dock", StepType.DOCK)
+        activities = [_recording_move(started, release, dispatches, cancels, name)]
+        task = _task(f"task-pause-{name}", step_type)
 
         async with _worker(activities) as client:
             handle = await _start(client, task)

@@ -235,27 +235,49 @@ class TestExecuteMove:
 
 
 class TestExecuteDock:
-    """DOCK / UNDOCK are execute_move on the dock trees: same send, poll, map
-    check and cancel, plus putting RL back when a tree is cut short."""
+    """DOCK / UNDOCK are execute_move on the dock trees: same send, poll and
+    cancel, plus putting RL back when a tree is cut short. Only DOCK has a pose,
+    so only DOCK meets the map check."""
 
-    @pytest.mark.parametrize(
-        "name, tree", [("execute_dock", "dock.xml"), ("execute_undock", "undock.xml")]
-    )
-    def test_sends_the_dock_pose_on_its_tree(
-        self, env, activities, robot_gw, name, tree
-    ):
+    def test_sends_the_dock_pose_on_its_tree(self, env, activities, robot_gw):
         robot_gw.move.return_value = (True, "", "goal-1")
         robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
 
         result = env.run(
-            getattr(activities, name), MoveParams(x=1.0, y=2.0, theta=90.0), "lab"
+            activities.execute_dock, MoveParams(x=1.0, y=2.0, theta=90.0), "lab"
         )
 
         assert result.success is True
         kwargs = robot_gw.move.call_args[1]
-        assert kwargs["behavior_tree"] == tree
+        assert kwargs["behavior_tree"] == "dock.xml"
         assert (kwargs["x"], kwargs["y"]) == (1.0, 2.0)
         assert kwargs["yaw"] == pytest.approx(1.5707963)
+
+    def test_an_undock_sends_an_empty_pose_on_its_tree(
+        self, env, activities, robot_gw
+    ):
+        # undock.xml backs out 1 m from where the robot stands and reads no pose.
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(activities.execute_undock)
+
+        assert result.success is True
+        kwargs = robot_gw.move.call_args[1]
+        assert kwargs == {"x": 0.0, "y": 0.0, "yaw": 0.0, "behavior_tree": "undock.xml"}
+
+    def test_an_undock_drives_whatever_map_is_loaded(
+        self, env, activities, robot_gw, map_catalog_repo, conversion_svc
+    ):
+        # No coordinates, so neither a map switch nor a rebuild can make them wrong.
+        conversion_svc.is_converting.return_value = True
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(activities.execute_undock)
+
+        assert result.success is True
+        map_catalog_repo.active_name.assert_not_called()
 
     def test_a_failed_dock_carries_the_robots_reason(self, env, activities, robot_gw):
         robot_gw.move.return_value = (True, "", "goal-1")
@@ -279,7 +301,7 @@ class TestExecuteDock:
         robot_gw.move.return_value = (False, "server not available", None)
 
         with pytest.raises(ApplicationError, match="Undock rejected") as exc_info:
-            env.run(activities.execute_undock, MoveParams(x=0.0, y=0.0, theta=0.0))
+            env.run(activities.execute_undock)
 
         assert exc_info.value.non_retryable is False
 
@@ -322,7 +344,7 @@ class TestExecuteDock:
         robot_gw.set_motion_key.side_effect = RuntimeError("safety lock")
 
         with pytest.raises(CancelledError):
-            env.run(activities.execute_undock, MoveParams(x=0.0, y=0.0, theta=0.0))
+            env.run(activities.execute_undock)
 
         robot_gw.cancel_active_moves.assert_called_once()
 

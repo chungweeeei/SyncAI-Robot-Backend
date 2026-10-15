@@ -35,8 +35,9 @@ class StepType(str, Enum):
     LIEDOWN = "LIEDOWN"
     SPEAK = "SPEAK"
     WAIT = "WAIT"
-    # A NavigateToGoal on the dock trees (gateways/robot DOCK_BEHAVIOR_TREE): x/y/theta
-    # is the dock pose, the same for both; the trees derive the staging pose from it.
+    # A NavigateToGoal on the dock trees (gateways/robot DOCK_BEHAVIOR_TREE). DOCK's
+    # x/y/theta is the dock pose, which dock.xml derives the staging pose from; UNDOCK
+    # takes none, since undock.xml backs out 1 m from wherever the robot stands.
     DOCK = "DOCK"
     UNDOCK = "UNDOCK"
 
@@ -116,13 +117,18 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.SPEAK: SpeakParams,
     StepType.WAIT: WaitParams,
     StepType.DOCK: MoveParams,
-    StepType.UNDOCK: MoveParams,
+    StepType.UNDOCK: None,
 }
 
 
-# Steps that send a NavigateToGoal: their params are a pose on the loaded map, so they
-# share MOVE's map stamping / check, its pause interrupt and its template vertex refs.
-NAV_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK, StepType.UNDOCK})
+# Steps whose params are a pose on the loaded map: they share MOVE's map stamping /
+# check and its template vertex refs. UNDOCK is not one -- its goal carries no pose,
+# so a job that only backs off the dock holds no map.
+POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK})
+
+# Steps that send a NavigateToGoal: they share MOVE's pause interrupt and its live
+# status sentence, pose or not.
+NAV_STEP_TYPES = POSE_STEP_TYPES | {StepType.UNDOCK}
 
 
 # Steps on the one-slot body queue (config.TASK_QUEUE_SUFFIX). Two in one group would
@@ -223,7 +229,7 @@ class Step(BaseSchema):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE, DOCK, UNDOCK (x/y/theta: "
+            "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK (x/y/theta: "
             "the dock pose), SPEAK and WAIT"
         ),
     )

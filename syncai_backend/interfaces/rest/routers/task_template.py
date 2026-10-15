@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from syncai_backend.database.models import MapPoint, TaskTemplate
 from syncai_backend.exceptions import BadRequestError, NotFoundError
 from syncai_backend.gateways.workflow.schema import (
-    NAV_STEP_TYPES,
+    POSE_STEP_TYPES,
     MoveParams,
     ScheduleTask,
     ScheduleTrigger,
@@ -64,7 +64,7 @@ class TemplateStepRequest(StepRequest):
     vertex_id: Optional[uuid.UUID] = Field(
         default=None,
         description=(
-            "The map vertex this MOVE / DOCK / UNDOCK step's coordinates were "
+            "The map vertex this MOVE / DOCK step's coordinates were "
             "taken from (for a dock, typically a CHARGE vertex). "
             "`params` is kept as a snapshot either way: a dispatch prefers the "
             "vertex's current pose and falls back to the snapshot once the "
@@ -76,7 +76,7 @@ class TemplateStepRequest(StepRequest):
     # silently drop the params check.
     @model_validator(mode="after")
     def _check_vertex_ref(self) -> "TemplateStepRequest":
-        if self.vertex_id is not None and self.type not in NAV_STEP_TYPES:
+        if self.vertex_id is not None and self.type not in POSE_STEP_TYPES:
             raise ValueError(f"{self.type.value} step cannot reference a vertex")
         return self
 
@@ -99,7 +99,7 @@ class TaskTemplateRequest(BaseModel):
     map_name: Optional[str] = Field(
         default=None,
         description=(
-            "The map whose frame the MOVE / DOCK / UNDOCK coordinates are in. "
+            "The map whose frame the MOVE / DOCK coordinates are in. "
             "Required when the template has any such step; must be omitted when "
             "it has none."
         ),
@@ -246,21 +246,21 @@ def _check_step_groups(steps: List[TemplateStepRequest]) -> None:
 
 
 def _check_map_scope(map_name: Optional[str], steps: List[TemplateStepRequest]) -> None:
-    """Any MOVE / DOCK / UNDOCK step means a map name is required; none means it
-    is forbidden.
+    """Any MOVE / DOCK step means a map name is required; none means it is
+    forbidden.
 
     Any such step, not just a vertex reference: hand-typed coordinates are in a
-    map's frame too.
+    map's frame too. An UNDOCK has no coordinates, so it does not count.
     """
-    has_move = any(step.type in NAV_STEP_TYPES for step in steps)
+    has_move = any(step.type in POSE_STEP_TYPES for step in steps)
     if has_move and not map_name:
         raise ValueError(
-            "a template with MOVE/DOCK/UNDOCK steps must name the map its "
+            "a template with MOVE/DOCK steps must name the map its "
             "coordinates are in"
         )
     if not has_move and map_name:
         raise ValueError(
-            "a template with no MOVE/DOCK/UNDOCK step is map-independent; "
+            "a template with no MOVE/DOCK step is map-independent; "
             "omit map_name"
         )
 

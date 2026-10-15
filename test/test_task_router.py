@@ -207,13 +207,17 @@ def _move_task(task_id="robot01-task-001"):
     }
 
 
-def _dock_task(task_id="robot01-dock-001", step_type="DOCK"):
+def _dock_task(task_id="robot01-dock-001"):
     return {
         "id": task_id,
         "steps": [
-            {"id": "s1", "type": step_type, "params": {"x": 3.0, "y": 1.0, "theta": 180.0}}
+            {"id": "s1", "type": "DOCK", "params": {"x": 3.0, "y": 1.0, "theta": 180.0}}
         ],
     }
+
+
+def _undock_task(task_id="robot01-undock-001"):
+    return {"id": task_id, "steps": [{"id": "s1", "type": "UNDOCK"}]}
 
 
 class TestTriggerTask:
@@ -396,12 +400,27 @@ class TestJobMap:
         _, provenance = workflow_gw.started[0]
         assert provenance.map_name == "lab"
 
-    @pytest.mark.parametrize("step_type", ["DOCK", "UNDOCK"])
-    def test_a_dock_job_is_stamped_like_a_move(self, client, workflow_gw, step_type):
-        task = _dock_task(step_type=step_type)
+    def test_a_dock_job_is_stamped_like_a_move(self, client, workflow_gw):
+        assert client.post("/api/v1/tasks", json=_dock_task()).status_code == 200
+        assert workflow_gw.started[0][1].map_name == "lab"
+
+    def test_an_undock_job_holds_no_map(self, client, workflow_gw):
+        # It backs out from wherever the robot stands: no coordinates to be on a map.
+        task = {**_undock_task(), "map_name": "warehouse"}
 
         assert client.post("/api/v1/tasks", json=task).status_code == 200
-        assert workflow_gw.started[0][1].map_name == "lab"
+        assert workflow_gw.started[0][1].map_name is None
+
+    def test_an_undock_with_a_pose_is_refused(self, client, workflow_gw):
+        task = {
+            "id": "robot01-undock-001",
+            "steps": [
+                {"id": "s1", "type": "UNDOCK", "params": {"x": 3.0, "y": 1.0, "theta": 0}}
+            ],
+        }
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
 
     def test_a_dock_from_another_map_is_refused(self, client, workflow_gw):
         task = {**_dock_task(), "map_name": "warehouse"}

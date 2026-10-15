@@ -16,6 +16,7 @@ from syncai_backend.gateways.workflow.config import (
 from syncai_backend.gateways.workflow.schema import (
     GROUP_DESCRIPTION,
     NAV_STEP_TYPES,
+    POSE_STEP_TYPES,
     Step,
     StepType,
     StepStatus,
@@ -62,7 +63,7 @@ class StepRequest(BaseModel):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE, DOCK, UNDOCK "
+            "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK "
             "(x/y/theta: the dock pose), SPEAK and WAIT"
         ),
     )
@@ -346,11 +347,12 @@ def init_task_router(
         if problem is not None:
             raise problem.refusal()
 
-        # A job that drives is stamped with the loaded map (what the map
-        # routes lock on and the history shows). One that does not drive holds
-        # no map and is neither stamped nor refused.
+        # A job that drives to a pose is stamped with the loaded map (what the
+        # map routes lock on and the history shows). One that does not -- an
+        # UNDOCK backs off blind, from wherever the robot stands -- holds no map
+        # and is neither stamped nor refused.
         map_name: Optional[str] = None
-        if any(step.type in NAV_STEP_TYPES for step in req.steps):
+        if any(step.type in POSE_STEP_TYPES for step in req.steps):
             active = map_catalog_repo.active_name()
             refusal = move_refusal(
                 req.map_name,

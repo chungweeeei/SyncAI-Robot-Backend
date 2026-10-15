@@ -15,7 +15,8 @@ standalone. It imports generated interfaces from one other colcon package —
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
 map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `AutoLocalize`, and the
 `NavigateToGoal` action the MOVE step sends — and the DOCK / UNDOCK steps, on its
-`behavior_tree` `dock.xml` / `undock.xml`; this package never calls `DockToPose`) — plus `rclpy`,
+`behavior_tree` `dock.xml` / `undock.xml`, the UNDOCK with an empty pose; this package never
+calls `DockToPose`) — plus `rclpy`,
 `nav2_msgs`, `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
 those imports as they are. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `AutoLocalize` (behind `POST /api/v1/localization/auto`)

@@ -53,7 +53,7 @@ class ScheduleRequest(BaseModel):
     map_name: Optional[str] = Field(
         default=None,
         description=(
-            "Map whose frame the MOVE / DOCK / UNDOCK coordinates are in, carried "
+            "Map whose frame the MOVE / DOCK coordinates are in, carried "
             "through to the schedule memo so a client can tell whether this schedule still "
             "belongs to the loaded map. A display label only, and deliberately "
             "unvalidated: this router has no MapCatalogRepo, and threading one in "
@@ -95,7 +95,7 @@ class ScheduleStateResponse(BaseModel):
     map_name: Optional[str] = Field(
         default=None,
         description=(
-            "Map whose frame this schedule's MOVE / DOCK / UNDOCK coordinates "
+            "Map whose frame this schedule's MOVE / DOCK coordinates "
             "are in."
         ),
     )

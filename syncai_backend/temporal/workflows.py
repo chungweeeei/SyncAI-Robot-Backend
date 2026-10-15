@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from syncai_backend.gateways.workflow.schema import (
         NAV_STEP_TYPES,
+        POSE_STEP_TYPES,
         Step,
         StepStatus,
         StepType,
@@ -223,10 +224,10 @@ class RobotWorkflow:
 
         # Postures take no argument; passing None would fail the arg-count check.
         args = [] if step.params is None else [step.params]
-        # MOVE / DOCK / UNDOCK get the map as a second argument only when there is
-        # one, so old one-argument histories and runs without the attribute look the
-        # same.
-        if step.type in NAV_STEP_TYPES and own_map is not None:
+        # MOVE / DOCK get the map as a second argument only when there is one, so old
+        # one-argument histories and runs without the attribute look the same. UNDOCK
+        # has no pose to check against it and takes no argument at all.
+        if step.type in POSE_STEP_TYPES and own_map is not None:
             args.append(own_map)
 
         # SPEAK: wider heartbeat window (SPEAK_HEARTBEAT_TIMEOUT) and a much shorter
@@ -317,7 +318,8 @@ class RobotWorkflow:
         self, step: Step, activity_fn, activity_options: dict, new_activity_id=None
     ) -> ActivityResult:
         """Run a MOVE / DOCK / UNDOCK, letting a pause interrupt it and a resume
-        re-send it (a dock from its staging leg).
+        re-send it (a dock from its staging leg; an undock backs out a further
+        metre from wherever the pause stopped it, since its goal has no pose).
 
         Never ``await handle`` directly: that lets a run cancel be swallowed into
         ActivityError(cause=CancelledError), indistinguishable from the pause's own.

@@ -97,9 +97,11 @@ NAV_ACCEPT_WAIT_S = 1.5
 NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 
 # NavigateToGoal.behavior_tree for the DOCK / UNDOCK steps: bare file names the task
-# runner resolves in its own behavior_trees/ (syncai_common >= bbcc958). Both take the
-# dock pose; the trees work out the staging pose and drive DockToPose themselves, so
-# this process never calls that action. "" is the task runner's default, move.xml.
+# runner resolves in its own behavior_trees/ (syncai_common >= bbcc958). dock.xml takes
+# the dock pose and works out the staging pose from it; undock.xml ignores the pose
+# (task runner e027dbe) and backs out 1 m from where the robot stands. Both drive
+# DockToPose themselves, so this process never calls that action. "" is the task
+# runner's default, move.xml.
 DOCK_BEHAVIOR_TREE = "dock.xml"
 UNDOCK_BEHAVIOR_TREE = "undock.xml"
 

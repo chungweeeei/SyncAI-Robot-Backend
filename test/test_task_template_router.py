@@ -229,17 +229,32 @@ def test_vertex_from_another_map_names_both_maps(client, map_repo):
     assert "rawonly" in res.json()["detail"] and "full" in res.json()["detail"]
 
 
-@pytest.mark.parametrize("step_type", ["DOCK", "UNDOCK"])
-def test_a_dock_step_resolves_its_vertex_like_a_move(client, dock, step_type):
-    step = dict(_move(dock.id, step_id="1-dock"), type=step_type)
+def test_a_dock_step_resolves_its_vertex_like_a_move(client, dock):
+    step = dict(_move(dock.id, step_id="1-dock"), type="DOCK")
 
     created = _create(client, steps=[step])
 
     assert created.status_code == 200
     stored = created.json()["steps"][0]
-    assert stored["type"] == step_type
+    assert stored["type"] == "DOCK"
     assert stored["vertex_status"] == "CURRENT"
     assert stored["resolved_params"] == {"x": 3.0, "y": -1.5, "theta": 90.0}
+
+
+def test_an_undock_only_template_is_map_independent(client):
+    # An UNDOCK has no coordinates, so it puts no map in scope.
+    undock = {"id": "1-undock", "type": "UNDOCK"}
+
+    assert _create(client, map_name=None, steps=[undock]).status_code == 200
+    res = _create(client, name="undock-on-a-map", steps=[undock])
+    assert res.status_code == 400
+    assert "map-independent" in res.json()["detail"]
+
+
+def test_an_undock_cannot_reference_a_vertex(client, dock):
+    undock = {"id": "1-undock", "type": "UNDOCK", "vertex_id": str(dock.id)}
+
+    assert _create(client, map_name=None, steps=[undock]).status_code == 422
 
 
 def test_dock_steps_require_a_map_name(client):

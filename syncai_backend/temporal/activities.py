@@ -160,47 +160,53 @@ class RobotActivities:
         )
 
     @activity.defn
-    def execute_undock(
-        self, params: MoveParams, expected_map: Optional[str] = None
-    ) -> ActivityResult:
-        """Back out of the dock at the pose in ``params``: a NavigateToGoal on
-        undock.xml (stand, MPC, back out to the staging pose, RL)."""
+    def execute_undock(self) -> ActivityResult:
+        """Back off the dock: a NavigateToGoal on undock.xml (stand, MPC, back out
+        1 m from where the robot stands, RL). The tree reads no pose, so the goal's
+        is left empty and there is no map to check it against."""
         return self._navigate(
-            params, expected_map, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock"
+            None, None, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock"
         )
 
     def _navigate(
         self,
-        params: MoveParams,
+        params: Optional[MoveParams],
         expected_map: Optional[str],
         behavior_tree: str,
         label: str,
     ) -> ActivityResult:
         """Send a NavigateToGoal goal on ``behavior_tree`` and supervise it.
 
-        ``expected_map`` is the run's ``TaskMap``. The goal is first checked against
-        the loaded map (helpers/move_guard.py, as POST /api/v1/tasks does): another
-        map's coordinates, or a floor plan being rebuilt. Both refusals are
-        non-retryable; this is the check that catches a schedule firing after a map
-        switch.
+        ``expected_map`` is the run's ``TaskMap``. A goal with a pose is first
+        checked against the loaded map (helpers/move_guard.py, as POST
+        /api/v1/tasks does): another map's coordinates, or a floor plan being
+        rebuilt. Both refusals are non-retryable; this is the check that catches a
+        schedule firing after a map switch. ``params`` None (an UNDOCK) skips it and
+        sends an empty pose: the tree works from the robot's own frame.
 
         Cancellation is *thrown* into this thread as CancelledError (in the poll
         loop or inside move()), so cleanup lives in the except clause. A blocking
         call like time.sleep is not interrupted, hence the short NAV_POLL_INTERVAL_S.
         """
-        active_map = self._map_catalog_repo.active_name()
-        refusal = move_refusal(
-            expected_map,
-            active_map,
-            active_map is not None and self._conversion_svc.is_converting(active_map),
-        )
-        if refusal is not None:
-            raise ApplicationError(
-                refusal.message, type=refusal.code, non_retryable=True
+        if params is not None:
+            active_map = self._map_catalog_repo.active_name()
+            refusal = move_refusal(
+                expected_map,
+                active_map,
+                active_map is not None
+                and self._conversion_svc.is_converting(active_map),
             )
-
-        yaw = math.radians(params.theta)
-        move_kwargs = {"x": params.x, "y": params.y, "yaw": yaw}
+            if refusal is not None:
+                raise ApplicationError(
+                    refusal.message, type=refusal.code, non_retryable=True
+                )
+            move_kwargs = {
+                "x": params.x,
+                "y": params.y,
+                "yaw": math.radians(params.theta),
+            }
+        else:
+            move_kwargs = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         if behavior_tree:
             move_kwargs["behavior_tree"] = behavior_tree
 
