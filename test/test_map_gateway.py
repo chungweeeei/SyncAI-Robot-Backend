@@ -29,7 +29,7 @@ pytest.importorskip("syncai_common")
 from builtin_interfaces.msg import Time  # noqa: E402
 from nav2_msgs.srv import LoadMap  # noqa: E402
 from syncai_common.srv import (  # noqa: E402
-    AutoLocalize, ResetMapping, SaveMaps, StartMapping,
+    ResetMapping, ResetOdometry, SaveMaps, StartMapping,
 )
 
 from syncai_backend.gateways.map import map as map_module  # noqa: E402
@@ -77,7 +77,7 @@ def map_gw(logger) -> MapGateway:
         "pgo/start_mapping": MagicMock(),
         "relocalize": MagicMock(),
         "relocalize_check": MagicMock(),
-        "auto_localize": MagicMock(),
+        "reset_odometry": MagicMock(),
     }
     node.create_client.side_effect = lambda srv_type, srv_name: clients[srv_name]
     # Header asserts its stamp is a builtin_interfaces/Time — a bare MagicMock
@@ -659,19 +659,22 @@ class TestAutoLocalize:
     def _found(self, success=True, message="matched", **fields):
         values = dict(
             x=1.5, y=-2.0, z=0.1, yaw=0.5, fitness=0.02,
-            inlier_ratio=0.8, candidates=480,
+            inlier_ratio=0.8, candidates=480, method="global",
         )
         values.update(fields)
         return SimpleNamespace(success=success, message=message, **values)
 
     def test_success_returns_the_localizers_answer(self, map_gw):
         found = self._found()
-        client = _arm(map_gw, "auto_localize", found)
+        client = _arm(map_gw, "reset_odometry", found)
 
         ok, message, response = map_gw.auto_localize()
 
         assert (ok, message, response) == (True, "matched", found)
-        assert isinstance(client.call_async.call_args[0][0], AutoLocalize.Request)
+        request = client.call_async.call_args[0][0]
+        assert isinstance(request, ResetOdometry.Request)
+        # Kidnap: no seed, straight to the search on a freshly reset LIO.
+        assert request.skip_seed is True
 
     def test_a_refusal_passes_through_with_the_diagnostic_pose(self, map_gw):
         # A convergence failure still carries the candidate that did not
@@ -679,14 +682,14 @@ class TestAutoLocalize:
         found = self._found(
             success=False, message="ambiguous, a distinct pose scores alike"
         )
-        _arm(map_gw, "auto_localize", found)
+        _arm(map_gw, "reset_odometry", found)
 
         assert map_gw.auto_localize() == (
             False, "ambiguous, a distinct pose scores alike", found,
         )
 
     def test_service_unavailable_blames_the_mode(self, map_gw):
-        client = _arm(map_gw, "auto_localize", available=False)
+        client = _arm(map_gw, "reset_odometry", available=False)
 
         ok, message, response = map_gw.auto_localize()
 
@@ -699,24 +702,25 @@ class TestAutoLocalize:
     def test_timeout_outlasts_the_localizers_own_deadlines(
         self, map_gw, monkeypatch
     ):
-        # The localizer gives up after 10 s search + 5 s convergence; the
-        # client must wait longer, or its verdict is never heard.
+        # The localizer gives up after 2 s LIO reset + 10 s new-run scans +
+        # 10 s search + 5 s convergence; the client must wait longer, or its
+        # verdict is never heard.
         seen = {}
 
         def _wait(future, timeout):
             seen["timeout"] = timeout
             return False
 
-        _arm(map_gw, "auto_localize", completed=False)
+        _arm(map_gw, "reset_odometry", completed=False)
         monkeypatch.setattr(map_module, "_wait_for_future", _wait)
 
         assert map_gw.auto_localize() == (
-            False, "Timeout waiting for auto_localize response", None,
+            False, "Timeout waiting for reset_odometry response", None,
         )
-        assert seen["timeout"] > 15.0
+        assert seen["timeout"] > 27.0
 
     def test_finding_the_robot_swaps_no_map(self, map_gw):
-        _arm(map_gw, "auto_localize", self._found())
+        _arm(map_gw, "reset_odometry", self._found())
         relocalize = map_gw._service_clients["relocalize"]
 
         map_gw.auto_localize()

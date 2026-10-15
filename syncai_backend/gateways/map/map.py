@@ -6,7 +6,7 @@ the robot thinks it is; a second publisher on RobotGateway's topic is fine.
 
 The clients split by session: ``map_server/load_map``,
 ``filter_mask_server/load_map``, ``relocalize``, ``relocalize_check`` and
-``auto_localize`` exist only in the nav (AUTO) session; ``pgo/start_mapping``,
+``reset_odometry`` exist only in the nav (AUTO) session; ``pgo/start_mapping``,
 ``pgo/save_maps`` and ``pgo/reset_mapping`` only in the mapping (MANUAL) one.
 "Service is not available" usually means "wrong mode", which activate turns
 into ``stack_not_ready``. The nav launch writes a blank keepout mask for a map
@@ -26,7 +26,7 @@ from geometry_msgs.msg import Point, Pose, PoseWithCovarianceStamped, Quaternion
 from std_msgs.msg import Header
 from nav2_msgs.srv import LoadMap
 from syncai_common.srv import (
-    AutoLocalize, IsValid, Relocalize, ResetMapping, SaveMaps, StartMapping,
+    IsValid, Relocalize, ResetMapping, ResetOdometry, SaveMaps, StartMapping,
 )
 
 
@@ -119,10 +119,11 @@ class MapGateway:
         )
 
         # Bare like relocalize and in its mutually exclusive callback group, so
-        # calls queue behind a running search.
-        auto_localize_client = self._node.create_client(
-            srv_type=AutoLocalize,
-            srv_name="auto_localize",
+        # calls queue behind a running search. Finding the robot goes through
+        # reset_odometry (skip_seed), not auto_localize: see auto_localize().
+        reset_odometry_client = self._node.create_client(
+            srv_type=ResetOdometry,
+            srv_name="reset_odometry",
         )
 
         self._service_clients.update(
@@ -134,7 +135,7 @@ class MapGateway:
                 "start_mapping": start_mapping_client,
                 "relocalize": relocalize_client,
                 "relocalize_check": relocalize_check_client,
-                "auto_localize": auto_localize_client,
+                "reset_odometry": reset_odometry_client,
             }
         )
 
@@ -247,34 +248,46 @@ class MapGateway:
 
     def auto_localize(
         self,
-    ) -> tuple[bool, str, Optional[AutoLocalize.Response]]:
+    ) -> tuple[bool, str, Optional[ResetOdometry.Response]]:
         """Find the robot on the loaded map with no hint: kidnap recovery.
 
-        Unlike ``relocalize``, ``success`` is a result: true means localized.
-        False leaves localization as it was; the response still carries the
-        pose that did not converge, for diagnosis.
+        Calls the localizer's ``reset_odometry`` with ``skip_seed``, not
+        ``auto_localize``: Point-LIO is reset first, then the same hint-free
+        search runs on scans of the new run. A carry often diverges Point-LIO
+        too, and ``auto_localize`` alone cannot recover from that (its scan
+        window is posed by the diverged odometry); a bare ``pointlio/reset``
+        would leave the localizer's offset on the old origin. ``skip_seed``
+        tries no seed, because after a kidnap the last good pose is wrong.
 
-        The 30 s deadline outlasts the localizer's own (10 s search + 5 s
-        convergence), so a slow answer is its verdict, not ours.
+        Unlike ``relocalize``, ``success`` is a result: true means localized.
+        The odometry has been reset either way — that step is not undone — and
+        on failure the map pose stays where it was before the call; the
+        response carries the candidate that did not converge, for diagnosis.
+        The robot must be standing still (nothing here can check it).
+
+        The 40 s deadline outlasts the localizer's own (2 s LIO reset + 10 s
+        new-run scans + 10 s search + 5 s convergence), so a slow answer is
+        its verdict, not ours.
         """
-        client = self._service_clients["auto_localize"]
+        client = self._service_clients["reset_odometry"]
         if not client.wait_for_service(timeout_sec=5.0):
             return False, (
-                "auto_localize is not available — finding the robot needs it "
+                "reset_odometry is not available — finding the robot needs it "
                 "in AUTO (navigation) mode."
             ), None
 
-        self._logger.info("[MapGateway] Auto-localizing")
+        self._logger.info("[MapGateway] Auto-localizing (reset odometry + search)")
 
-        future = client.call_async(AutoLocalize.Request())
-        if not _wait_for_future(future, timeout=30.0):
-            return False, "Timeout waiting for auto_localize response", None
+        future = client.call_async(ResetOdometry.Request(skip_seed=True))
+        if not _wait_for_future(future, timeout=40.0):
+            return False, "Timeout waiting for reset_odometry response", None
 
         response = future.result()
         self._logger.info(
             "[MapGateway] Auto-localize answered",
             success=response.success,
             message=response.message,
+            method=response.method,
             fitness=response.fitness,
             inlier_ratio=response.inlier_ratio,
             candidates=response.candidates,
