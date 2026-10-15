@@ -216,6 +216,26 @@ class StoredMap:
     map_clean_record: Optional[MapCleanRecord] = None
 
 
+def _octomap_edits_text(document: dict) -> str:
+    """``document`` indented, but each ``[x, y, z]`` triple on one line.
+
+    Plain ``indent=2`` spends five lines on every triple, and a map's worth of
+    patches is tens of thousands of them; this keeps the file readable at one
+    line per cell.
+    """
+    lines = ["{"]
+    items = list(document.items())
+    for index, (key, value) in enumerate(items):
+        comma = "," if index < len(items) - 1 else ""
+        if isinstance(value, list) and value:
+            rows = ",\n".join(f"    {json.dumps(row)}" for row in value)
+            lines.append(f"  {json.dumps(key)}: [\n{rows}\n  ]{comma}")
+        else:
+            lines.append(f"  {json.dumps(key)}: {json.dumps(value)}{comma}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
 class MapCatalogRepo:
     def __init__(self, logger: structlog.stdlib.BoundLogger):
         self.logger = logger
@@ -419,10 +439,8 @@ class MapCatalogRepo:
                 for key in keys
             ],
         }
-        # Compact on purpose: a map's worth of patches is tens of thousands of
-        # triples, three lines each when indented.
         write_text_atomic(
-            os.path.join(directory, OCTOMAP_EDITS_JSON), json.dumps(document) + "\n"
+            os.path.join(directory, OCTOMAP_EDITS_JSON), _octomap_edits_text(document)
         )
         self.logger.info("[MapCatalogRepo] Wrote ground patches", map=name, cells=len(keys))
         return OctomapEdits(res=res, fill_key=tuple(keys), created_at=created_at)

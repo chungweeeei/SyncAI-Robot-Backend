@@ -605,6 +605,17 @@ def test_write_octomap_edits_round_trips_in_the_viewer_shape(catalog_repo, maps_
     assert catalog_repo.read_octomap_edits("full") == written
 
 
+def test_write_octomap_edits_puts_one_cell_per_line(catalog_repo, maps_dir):
+    catalog_repo.write_octomap_edits("full", [(1, 2, 3), (4, 5, 6)], 0.1)
+
+    lines = (maps_dir / "full" / "octomap_edits.json").read_text().splitlines()
+
+    assert lines[0] == "{"
+    assert '  "format": "syncai-octomap-edits",' in lines
+    assert "    [1, 2, 3]," in lines
+    assert "    [4, 5, 6]" in lines
+
+
 def test_write_octomap_edits_with_no_keys_clears_them(catalog_repo, maps_dir):
     catalog_repo.write_octomap_edits("full", [(1, 2, 3)], 0.1)
 
