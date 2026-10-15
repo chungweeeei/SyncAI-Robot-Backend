@@ -75,7 +75,13 @@ def _parse_wifi_info(wifi_info: str) -> "RobotNetworkStatus":
 class RobotPose(BaseModel):
     x: float = Field(..., description="The x-coordinate of the robot's position.")
     y: float = Field(..., description="The y-coordinate of the robot's position.")
-    z: float = Field(..., description="The z-coordinate of the robot's position.")
+    z: float = Field(
+        ...,
+        description=(
+            "Height of base_link in the map frame, metres: which storey the "
+            "robot is on (the ground is about 0.43 m below it, standing)."
+        ),
+    )
     theta: float = Field(..., description="The yaw angle of the robot, in degrees.")
 
 

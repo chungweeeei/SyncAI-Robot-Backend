@@ -258,7 +258,8 @@ frame from the message header and only pins the target frame (`map`).
 | Topic | Type | QoS | Goes to |
 |---|---|---|---|
 | `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state`; `low_level_mode.safety_state` → `SafetyLockService` (rising edge cancels every task) |
-| `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS |
+| `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS (x, y, yaw; z from `pointlio/lio_odom`, see *Telemetry*) |
+| `pointlio/lio_odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed through `map→pointlio_odom` and the lidar mount → telemetry WS: the whole pose while mapping, base_link's height in AUTO |
 | `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
 | `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
@@ -566,7 +567,11 @@ It is its own socket so a 360 kB cloud frame cannot head-of-line block pose;
 `path` rides it because a thinned route is ~8 kB every 3 s. Its `points` are
 `[x, y, z]` in map metres, z the ground each one stands on (OctomapPlanner3D's
 floor surface, 0 from a 2D planner) — a waypoint's z — so a route that climbs a
-stair can be drawn storey by storey. An **empty**
+stair can be drawn storey by storey. `pose.z` is base_link's height, not the
+ground: in AUTO x, y and yaw are lio_bridge's, but its chain is projected onto
+the plane (z = 0 on every storey), so the height is taken from the
+`pointlio/lio_odom` chain while one is under a second old — the same number a
+mapping run reports. An **empty**
 `path.points` means "no route": the planner never publishes an empty plan, so
 `TelemetryRepo` clears a route by TTL (arrival, cancel and abort are the same
 silence from here).
