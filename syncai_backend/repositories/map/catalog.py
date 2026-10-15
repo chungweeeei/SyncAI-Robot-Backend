@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ import structlog
 import yaml
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, NotFoundError
+from syncai_backend.helpers.floors import read_pose_heights
 from syncai_backend.helpers.keepout import keepout_yaml_text, rasterize_zones
 from syncai_backend.helpers.pgm import read_pgm_size, write_pgm, write_text_atomic
 from syncai_backend.helpers.system_config import active_map_name
@@ -75,6 +77,18 @@ OCTOMAP_EDITS_VERSION = 1
 # centre is ``(key - OCTOMAP_KEY_ORIGIN + 0.5) * res``.
 OCTOMAP_KEY_ORIGIN = 32768
 OCTOMAP_KEY_MAX = 65535
+
+# pgo's keyframe trajectory, ``<N>.pcd x y z qw qx qy qz`` per line, written
+# by every save. Read here for the heights the robot walked at, which is what
+# the floors are detected from (helpers/floors.py).
+POSES_TXT = "poses.txt"
+# The floors an operator named for a map that spans storeys: a name and the
+# body height the robot stands at on it, in the map frame. Only the console
+# reads it, to show one storey of the 3D map at a time; absent means the
+# floors are the ones detected from poses.txt.
+FLOORS_JSON = "floors.json"
+FLOORS_JSON_FORMAT = "syncai-map-floors"
+FLOORS_JSON_VERSION = 1
 
 # Map import staging: ``map/.import-<token>/`` (unpacked + verified) and
 # ``map/.import-old-<token>/`` (the replaced map, until the DB agrees). Inside
@@ -189,6 +203,14 @@ class MapCleanRecord:
     octomap_written: bool
     octomap_error: Optional[str]
     error: Optional[str]
+
+
+@dataclass(frozen=True)
+class MapFloor:
+    """One storey: what it is called and the body height walked on it, metres."""
+
+    name: str
+    level: float
 
 
 @dataclass(frozen=True)
@@ -444,6 +466,88 @@ class MapCatalogRepo:
         )
         self.logger.info("[MapCatalogRepo] Wrote ground patches", map=name, cells=len(keys))
         return OctomapEdits(res=res, fill_key=tuple(keys), created_at=created_at)
+
+    def read_pose_heights(self, name: str) -> Optional[List[float]]:
+        """The z of every keyframe in the map's ``poses.txt``, or None without one."""
+        path = os.path.join(self.resolve_dir(name), POSES_TXT)
+        try:
+            return read_pose_heights(path)
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            self.logger.warning(
+                "[MapCatalogRepo] Unreadable poses.txt; detecting no floors",
+                map=name,
+                error=str(exc),
+            )
+            return None
+
+    def read_floors(self, name: str) -> Optional[List[MapFloor]]:
+        """The floors saved in ``floors.json``, lowest first, or None.
+
+        None for no file and (logged) for one this build cannot read, for
+        ``read_keepout_zones``'s reason. Malformed entries are skipped.
+        """
+        path = os.path.join(self.resolve_dir(name), FLOORS_JSON)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            self.logger.warning(
+                "[MapCatalogRepo] Unreadable floors.json; using the detected floors",
+                map=name,
+                error=str(exc),
+            )
+            return None
+
+        if (
+            not isinstance(document, dict)
+            or document.get("format") != FLOORS_JSON_FORMAT
+            or document.get("version") != FLOORS_JSON_VERSION
+            or not isinstance(document.get("floors"), list)
+        ):
+            self.logger.warning(
+                "[MapCatalogRepo] floors.json has an unexpected shape; "
+                "using the detected floors",
+                map=name,
+            )
+            return None
+
+        floors: List[MapFloor] = []
+        for entry in document["floors"]:
+            floor = _parse_floor(entry)
+            if floor is None:
+                self.logger.warning(
+                    "[MapCatalogRepo] Skipping a malformed floor in floors.json", map=name
+                )
+                continue
+            floors.append(floor)
+        return sorted(floors, key=lambda floor: floor.level)
+
+    def write_floors(self, name: str, floors: List[MapFloor]) -> List[MapFloor]:
+        """Replace the map's floors, lowest first; ``[]`` saves "one storey".
+
+        A temp file + rename, like every write here. The levels are body
+        heights in this map's frame, the same quantity poses.txt holds, so a
+        saved floor and a detected one compare directly.
+        """
+        ordered = sorted(floors, key=lambda floor: floor.level)
+        document = {
+            "format": FLOORS_JSON_FORMAT,
+            "version": FLOORS_JSON_VERSION,
+            "floors": [
+                {"name": floor.name, "level": round(float(floor.level), 3)}
+                for floor in ordered
+            ],
+        }
+        write_text_atomic(
+            os.path.join(self.resolve_dir(name), FLOORS_JSON),
+            json.dumps(document, indent=2) + "\n",
+        )
+        self.logger.info("[MapCatalogRepo] Wrote floors", map=name, floors=len(ordered))
+        return ordered
 
     # --- Listing ------------------------------------------------------------
 
@@ -1040,6 +1144,21 @@ def _parse_octomap_key(entry: object) -> Optional[Tuple[int, int, int]]:
         if value < 0 or value > OCTOMAP_KEY_MAX:
             return None
     return (entry[0], entry[1], entry[2])
+
+
+def _parse_floor(entry: object) -> Optional[MapFloor]:
+    """One ``floors`` entry as a named, finite level, or None."""
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    level = entry.get("level")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        return None
+    if not math.isfinite(level):
+        return None
+    return MapFloor(name=name.strip(), level=float(level))
 
 
 def _walk_stats(path: str) -> Tuple[int, float]:
