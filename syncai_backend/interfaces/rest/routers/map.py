@@ -375,8 +375,9 @@ class AutoLocalizeResponse(BaseModel):
         description=(
             "True on any 200: the search found a pose and the localizer has "
             "registered against a fresh scan from it, so there is nothing left "
-            "to poll. A failure is a 502 (or a 409), never a 200 with false, "
-            "and leaves localization as it was."
+            "to poll. A failure is a 502 (or a 409), never a 200 with false; "
+            "the odometry has been reset either way, and the map pose is left "
+            "where it was before the call."
         ),
     )
     message: str = Field(..., description="The localizer's summary of the match.")
@@ -1721,10 +1722,13 @@ def init_map_router(
         "/api/v1/localization/auto", response_model=AutoLocalizeResponse
     )
     async def auto_localize():
-        """Find the robot on the loaded map with no hint — the localizer's
-        ``auto_localize``, the recovery for a kidnapped robot.
+        """Find the robot on the loaded map with no hint — the recovery for a
+        kidnapped robot. The localizer's ``reset_odometry`` with ``skip_seed``:
+        Point-LIO is reset first (a carry often diverges it), then the
+        hint-free search runs on the new run's scans. The robot must be
+        standing still; ``odom → base_link`` jumps back to the origin once.
 
-        No body. Blocks up to ~15 s; a 200 means localized, nothing to poll.
+        No body. Blocks up to ~30 s; a 200 means localized, nothing to poll.
         Writes nothing (not the INI's ``[initial_pose]``).
 
         409 ``task_running`` while any job runs (it moves the map frame under
