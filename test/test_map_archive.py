@@ -35,8 +35,8 @@ _FILES = {
     "patches/000001.pcd": b"patch one",
 }
 _VERTICES = [
-    {"name": "dock", "type": "CHARGER", "x": 1.5, "y": -2.0, "theta": 90.0},
-    {"name": "home", "type": "HOME", "x": 0.0, "y": 0.0, "theta": 0.0},
+    {"name": "dock", "type": "CHARGE", "x": 1.5, "y": -2.0, "theta": 90.0},
+    {"name": "home", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
 ]
 
 
@@ -172,12 +172,12 @@ def test_build_without_exclusions_keeps_debug_clouds(map_dir):
 def test_build_coerces_vertex_numbers_to_float(map_dir):
     payload = build_archive(
         str(map_dir), "full",
-        [{"name": "a", "type": "GENERAL", "x": 1, "y": 2, "theta": 3}],
+        [{"name": "a", "type": "MOVE", "x": 1, "y": 2, "theta": 3}],
         ArchiveFormat.ZIP, exported_at="t",
     )
 
     vertex = inspect_archive(payload).manifest.vertices[0]
-    assert vertex == {"name": "a", "type": "GENERAL", "x": 1.0, "y": 2.0, "theta": 3.0}
+    assert vertex == {"name": "a", "type": "MOVE", "x": 1.0, "y": 2.0, "theta": 3.0}
 
 
 def test_extract_does_not_apply_archive_modes(tmp_path):
@@ -311,11 +311,11 @@ def test_vertices_must_be_present():
 @pytest.mark.parametrize(
     "vertex, fragment",
     [
-        ({"name": "", "type": "GENERAL", "x": 0, "y": 0, "theta": 0}, "has no name"),
+        ({"name": "", "type": "MOVE", "x": 0, "y": 0, "theta": 0}, "has no name"),
         ({"name": "a", "type": "", "x": 0, "y": 0, "theta": 0}, "has no type"),
-        ({"name": "a", "type": "GENERAL", "x": 0, "y": 0}, "finite theta"),
-        ({"name": "a", "type": "GENERAL", "x": "1", "y": 0, "theta": 0}, "finite x"),
-        ({"name": "a", "type": "GENERAL", "x": True, "y": 0, "theta": 0}, "finite x"),
+        ({"name": "a", "type": "MOVE", "x": 0, "y": 0}, "finite theta"),
+        ({"name": "a", "type": "MOVE", "x": "1", "y": 0, "theta": 0}, "finite x"),
+        ({"name": "a", "type": "MOVE", "x": True, "y": 0, "theta": 0}, "finite x"),
         ("not an object", "not an object"),
     ],
 )
@@ -327,7 +327,7 @@ def test_malformed_vertices_are_refused(vertex, fragment):
 def test_nan_coordinates_are_refused():
     # json.dumps writes NaN as a bare token Python's loader accepts, so a
     # manifest can carry one; the check has to be explicit.
-    manifest = _manifest(vertices=[{"name": "a", "type": "GENERAL",
+    manifest = _manifest(vertices=[{"name": "a", "type": "MOVE",
                                     "x": float("nan"), "y": 0, "theta": 0}])
 
     with pytest.raises(MapArchiveError, match="finite x"):

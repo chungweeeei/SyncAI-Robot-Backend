@@ -74,7 +74,7 @@ def dock(map_repo):
     """A vertex on the active map, at a pose no snapshot in this file uses."""
     return map_repo.create_vertices(
         map="full",
-        vertices=[{"name": "dock", "type": "GENERAL",
+        vertices=[{"name": "dock", "type": "MOVE",
                    "x": 3.0, "y": -1.5, "theta": 90.0}],
     )[0]
 
@@ -220,7 +220,7 @@ def test_vertex_from_another_map_names_both_maps(client, map_repo):
     probed, and at save time the distinction is the whole diagnosis."""
     elsewhere = map_repo.create_vertices(
         map="rawonly",
-        vertices=[{"name": "other", "type": "GENERAL",
+        vertices=[{"name": "other", "type": "MOVE",
                    "x": 0.0, "y": 0.0, "theta": 0.0}],
     )[0]
 

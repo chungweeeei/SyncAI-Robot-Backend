@@ -565,8 +565,8 @@ streams carries none of it.
 
 ### Vertex vs. MapPoint
 
-REST says **"vertex"** with a `VertexType` enum (`GENERAL` / `ARTIFACT` /
-`CHARGER` / `HOME` / `WAITING`); the ORM and repository say `MapPoint` (table
+REST says **"vertex"** with a `VertexType` enum (`MOVE` /
+`CHARGE`); the ORM and repository say `MapPoint` (table
 `map_vertices`). Intentional — no migration was done. `type` is validated at the
 REST boundary and stored as a plain string.
 

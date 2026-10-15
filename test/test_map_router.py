@@ -44,7 +44,7 @@ from syncai_backend.services.gridmap_conversion import (  # noqa: E402
 # No map_name: the owning map is the URL's path segment now.
 _VERTEX = {
     "name": "dock",
-    "type": "GENERAL",
+    "type": "MOVE",
     "x": 3.0,
     "y": -1.5,
     "theta": 90.0,
@@ -139,7 +139,7 @@ def test_create_single_and_get_vertex(client):
 def test_create_batch_returns_all_in_order(client):
     created = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[
         {**_VERTEX, "name": "a"},
-        {**_VERTEX, "name": "b", "type": "ARTIFACT"},
+        {**_VERTEX, "name": "b", "type": "CHARGE"},
         {**_VERTEX, "name": "c"},
     ])
     assert created.status_code == 200
@@ -232,17 +232,17 @@ def test_create_batch_is_atomic_on_invalid_item(client):
 
 def test_list_vertices_scoped_to_the_map_in_the_path(client):
     client.post(f"/api/v1/maps/{_MAP}/vertices", json=[
-        {**_VERTEX, "name": "w", "type": "GENERAL"},
-        {**_VERTEX, "name": "p", "type": "ARTIFACT"},
+        {**_VERTEX, "name": "w", "type": "MOVE"},
+        {**_VERTEX, "name": "p", "type": "CHARGE"},
     ])
     client.post(f"/api/v1/maps/{_OTHER_MAP}/vertices", json=[
-        {**_VERTEX, "name": "o", "type": "GENERAL"},
+        {**_VERTEX, "name": "o", "type": "MOVE"},
     ])
 
     assert len(client.get(f"/api/v1/maps/{_MAP}/vertices").json()) == 2
     assert len(client.get(f"/api/v1/maps/{_OTHER_MAP}/vertices").json()) == 1
     assert len(client.get(f"/api/v1/maps/{_MAP}/vertices",
-                          params={"type": "ARTIFACT"}).json()) == 1
+                          params={"type": "CHARGE"}).json()) == 1
 
 
 def test_created_vertex_takes_map_name_from_the_path(client):

@@ -81,19 +81,16 @@ class VertexType(str, Enum):
     """Semantic role of a map vertex: what the robot does when it visits.
 
     Stored as a plain string in ``map_vertices``; validated at REST only.
+
+    Narrowed to two in 2026-10 (from GENERAL / ARTIFACT / CHARGER / HOME /
+    WAITING). There are no migrations, and a stored row with a retired value
+    fails ``MapVertexResponse``, so clear or rewrite those rows before deploying.
     """
 
     # A plain navigation stop.
-    GENERAL = "GENERAL"
-    # An IoT device station. Outlived ``StepType.ARTIFACT`` (removed 2026-08):
-    # existing rows carry it and the frontend renders it.
-    ARTIFACT = "ARTIFACT"
+    MOVE = "MOVE"
     # A charging dock.
-    CHARGER = "CHARGER"
-    # An idle/park base the robot returns to.
-    HOME = "HOME"
-    # A hold spot for queueing / yielding / waiting on a station to free up.
-    WAITING = "WAITING"
+    CHARGE = "CHARGE"
 
 
 class MapVertexRequest(BaseModel):
