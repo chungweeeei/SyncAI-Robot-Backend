@@ -349,16 +349,48 @@ status and cancel, and the latest feedback per goal for that read.
 behavior_tree=...)` sets the goal's `behavior_tree` to `dock.xml` / `undock.xml`
 (`DOCK_BEHAVIOR_TREE` / `UNDOCK_BEHAVIOR_TREE`; `""` is the task runner's default
 `move.xml`). A DOCK's `pose` is the **dock pose**: dock.xml computes the staging
-pose from it, drives there, switches to MPC, calls the controller's `DockToPose`
-action and lies the robot down. An UNDOCK's `pose` is **empty** (zeros):
-undock.xml ignores it since task runner `e027dbe` and backs out 1 m from where
-the robot stands, standing it up first and switching back to RL at the end. This
-process never calls `DockToPose`. Sharing the client is what puts docks in the goal table, so the
+pose from it, drives there, switches to MPC and calls the controller's `DockToPose`
+action; it ends **standing on the dock in MPC** (the task runner stopped lying it
+down on 2026-10-15 — a LIEDOWN step after the DOCK does that). An UNDOCK's `pose`
+is **empty** (zeros): undock.xml ignores it since task runner `e027dbe` and backs
+out 1 m from where the robot stands, switching back to RL at the end; it has no
+stand-up step, so a robot lying on the dock is stood up first (see *Auto-undock*
+below). This process never calls `DockToPose`. Sharing the client is what puts docks in the goal table, so the
 status poll, `status_msg`, `cancel_active_moves` (safety lock included) and the
 teleop refusal cover them with no extra code. A docking-branch failure ends the
 goal `DOCK_FAILED` (300) with the failing node's reason in `error_msg`; an
 unreachable staging pose is `PLAN_FAILED` / `FOLLOW_PATH_FAILED` as for a MOVE.
 Needs `syncai_common` at or after SyncAI-Robot-Interface `bbcc958`.
+
+**Auto-undock (2026-10-15).** A MOVE after a DOCK gets the robot off the dock
+by itself: a MOVE straight off one starts with the footprint on the dock's
+lethal cells and fails. `execute_dock`'s success records the dock's target pose
+and map (`services/dock_state.py`, `DockStateService`); `execute_move`, after
+its map check, asks whether the robot is still on it — same map, a localized
+pose within 0.2 m / 0.3 rad of the record (unmeasured) — and if so sends
+`MotionKey.STAND` and waits up to 15 s (unmeasured) for `motion_state` STAND
+when it lies there (a LIEDOWN after the DOCK), runs undock.xml, forgets the
+dock, and then drives. The state is here and not in the task runner on purpose
+(SyncAI-Robot-Workspace, 2026-10-15): only this process sees the LIEDOWN, and
+the robot side keeps its trees stateless. Consequences:
+
+- A record the robot is provably not at (another map loaded, or a localized
+  pose outside the window — teleop drove it away, a cancelled undock moved it)
+  is dropped, never acted on: a blind 1 m back-out from a stale record is the
+  failure this guards against. No robot_state yet or an unlocalized pose
+  proves nothing; the MOVE just drives and the record stays.
+- **It is in memory.** A backend restart forgets the dock, and the next MOVE
+  fails on the dock's lethal cells as it did before this existed; an UNDOCK
+  step through `POST /api/v1/tasks` still gets the robot off.
+- The auto-undock runs inside the MOVE's attempt, so the MOVE's retry, pause
+  and cancel cover it. A cancel or pause during the back-out cancels the goal
+  and restores RL (as for an UNDOCK); the next attempt, or the resumed step,
+  asks again, and a robot stopped within the window backs out again from
+  there. A failed back-out fails the attempt with `undock ended in …` and keeps
+  the record. In a group, the undock goal's acceptance reports the MOVE
+  started, so a grouped SPEAK starts with the back-out.
+- The UNDOCK step stays (API, stored templates and schedules), and its success
+  forgets the dock too; the console no longer offers it.
 
 **Service clients.**
 
@@ -625,8 +657,8 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 
 | StepType | Activity | What it does |
 |---|---|---|
-| `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg` |
-| `DOCK` / `UNDOCK` | `execute_dock` / `execute_undock` | `execute_move` on the dock trees (`behavior_tree` `dock.xml` / `undock.xml`, see *Action client*). DOCK's `MoveParams` is the dock pose and gets MOVE's map check; UNDOCK takes no params, sends an empty pose and is checked against no map, since it backs out 1 m from wherever the robot stands. Same poll, heartbeat and pause interrupt as MOVE; a cancel (or pause) also sends `MotionKey.LOCOMOTION`, best effort, because a halted dock tree stays in MPC |
+| `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg`. A robot still on the dock the last DOCK ended on is stood up (if lying) and undocked first — *Auto-undock* under *Action client* |
+| `DOCK` / `UNDOCK` | `execute_dock` / `execute_undock` | `execute_move` on the dock trees (`behavior_tree` `dock.xml` / `undock.xml`, see *Action client*). DOCK's `MoveParams` is the dock pose and gets MOVE's map check; UNDOCK takes no params, sends an empty pose and is checked against no map, since it backs out 1 m from wherever the robot stands. DOCK's success records the dock for the next MOVE's auto-undock, UNDOCK's forgets it; the console no longer offers UNDOCK, since a MOVE undocks by itself. Same poll, heartbeat and pause interrupt as MOVE; a cancel (or pause) also sends `MotionKey.LOCOMOTION`, best effort, because a halted dock tree stays in MPC |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.start_speak()` then `await_speak()` — queue the utterance on the speech service, then poll its job and heartbeat until it has played; a cancel `DELETE`s the job mid-sentence. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
 | `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the body queue's one-thread executor, no heartbeat, and it survives a backend restart with the time already served |

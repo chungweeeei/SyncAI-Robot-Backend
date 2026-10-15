@@ -172,6 +172,7 @@ def test_worker_run_dying_marks_dead():
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
         conversion_svc=MagicMock(),
+        robot_repo=MagicMock(),
     )
     handle.thread.join(timeout=10)
 

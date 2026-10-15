@@ -24,6 +24,8 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.helpers.move_guard import move_refusal
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
+from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 
@@ -36,6 +38,17 @@ NAV_POLL_INTERVAL_S = 0.25
 # Bounds _report_started against a wedged frontend; must fit inside
 # MOVE_HEARTBEAT_TIMEOUT beside the heartbeat sent just before it (test_activities.py).
 STARTED_REPORT_TIMEOUT_S = 1.0
+
+# RobotState.low_level_mode.motion_state values the auto-undock reads (the
+# console's table is routers/robot.py's _MOTION_STATE_TO_STR).
+MOTION_STATE_STAND = 0
+MOTION_STATE_LIE_DOWN = 2
+
+# How long a MOVE's auto-undock waits for a robot lying on the dock to report
+# STAND after the STANDUP key, before the attempt fails (retryably). Unmeasured:
+# a stand-up has been seen to take a few seconds, and robot_state publishes at
+# 1 Hz, so this leaves room for both with margin.
+STAND_UP_TIMEOUT_S = 15.0
 
 
 def _move_failure(status: dict, label: str = "move") -> str:
@@ -73,6 +86,8 @@ class RobotActivities:
         tts_gw: TtsGateway,
         map_catalog_repo: MapCatalogRepo,
         conversion_svc: GridmapConversionService,
+        robot_repo: RobotRepo,
+        dock_state: Optional[DockStateService] = None,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
@@ -81,6 +96,11 @@ class RobotActivities:
         # routes write (shared process).
         self._map_catalog_repo = map_catalog_repo
         self._conversion_svc = conversion_svc
+        # The latest RobotState (pose, motion state), for the auto-undock's checks.
+        self._robot_repo = robot_repo
+        # Where the last DOCK ended; see services/dock_state.py. One per process,
+        # and only the activities touch it.
+        self._dock_state = dock_state if dock_state is not None else DockStateService()
         # Bound by run_worker, for _report_started: a sync activity cannot use the
         # async-only activity.client().
         self._client: Optional[Client] = None
@@ -143,7 +163,15 @@ class RobotActivities:
     def execute_move(
         self, params: MoveParams, expected_map: Optional[str] = None
     ) -> ActivityResult:
-        """Send a NavigateToGoal goal and supervise it to a terminal state."""
+        """Send a NavigateToGoal goal and supervise it to a terminal state.
+
+        A robot still standing (or lying) on the dock the last DOCK ended on is
+        taken off it first (_undock_if_docked): a MOVE straight off a dock starts
+        with the footprint on its lethal cells and fails. The map check runs
+        before that, so a MOVE refused for its map never backs the robot out.
+        """
+        self._refuse_wrong_map(expected_map)
+        self._undock_if_docked()
         return self._navigate(params, expected_map, behavior_tree="", label="move")
 
     @activity.defn
@@ -152,21 +180,100 @@ class RobotActivities:
     ) -> ActivityResult:
         """Dock at the pose in ``params``: a NavigateToGoal on dock.xml.
 
-        The tree drives to the staging pose, switches to MPC, approaches with
-        DockToPose and lies the robot down.
+        The tree drives to the staging pose, switches to MPC and approaches with
+        DockToPose; it ends standing on the dock in MPC (the task runner stopped
+        lying it down on 2026-10-15 -- a LIEDOWN step after the DOCK does that).
+        Success records the dock for the next MOVE's auto-undock, under the
+        run's map, or the loaded one for a run that carries none.
         """
-        return self._navigate(
+        result = self._navigate(
             params, expected_map, behavior_tree=DOCK_BEHAVIOR_TREE, label="dock"
         )
+        self._dock_state.record(
+            expected_map if expected_map is not None
+            else self._map_catalog_repo.active_name(),
+            params.x,
+            params.y,
+            params.theta,
+        )
+        return result
 
     @activity.defn
     def execute_undock(self) -> ActivityResult:
-        """Back off the dock: a NavigateToGoal on undock.xml (stand, MPC, back out
-        1 m from where the robot stands, RL). The tree reads no pose, so the goal's
-        is left empty and there is no map to check it against."""
-        return self._navigate(
+        """Back off the dock: a NavigateToGoal on undock.xml (MPC, back out 1 m
+        from where the robot stands, RL). The tree reads no pose, so the goal's
+        is left empty and there is no map to check it against.
+
+        Kept for the API and for stored templates / schedules: a MOVE after a
+        DOCK undocks by itself now, so the console no longer offers the step.
+        Success forgets the dock, so the next MOVE does not back out again.
+        """
+        result = self._navigate(
             None, None, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock"
         )
+        self._dock_state.clear()
+        return result
+
+    def _undock_if_docked(self) -> None:
+        """Get the robot off the recorded dock, if it is still on it.
+
+        Lying (a LIEDOWN after the DOCK): STANDUP first, and wait until the
+        controller reports STAND, because undock.xml starts from standing and
+        what its MPC switch does from lying is unmeasured. Then undock.xml, then
+        forget the dock.
+
+        Runs inside the MOVE's attempt, so the MOVE's retry, pause and cancel
+        cover it: a cancel or pause during the back-out lands in _navigate's
+        cleanup (goal cancelled, RL restored), and the next attempt (or the
+        resumed step) asks again. A robot stopped within the on-dock tolerance
+        backs out again from there; one stopped outside it is not on the dock
+        any more and just drives. In a group, the undock goal's acceptance is
+        what reports the MOVE started, so a grouped SPEAK starts with the
+        back-out rather than after it.
+        """
+        state = self._robot_repo.get_robot_state()
+        if not self._dock_state.is_on_dock(state, self._map_catalog_repo.active_name()):
+            return
+
+        self._logger.info("[RobotActivity] Robot is on the dock; undocking before the move")
+        if state.low_level_mode.motion_state == MOTION_STATE_LIE_DOWN:
+            self._set_motion_key(key=MotionKey.STAND, label="Stand")
+            self._wait_for_motion_state(MOTION_STATE_STAND, STAND_UP_TIMEOUT_S, "standing")
+
+        self._navigate(None, None, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock")
+        self._dock_state.clear()
+
+    def _wait_for_motion_state(self, motion_state: int, timeout_s: float, label: str) -> None:
+        """Poll RobotState until the controller reports ``motion_state``,
+        heartbeating each round. Retryable on timeout: the next attempt sends
+        the key again from whatever the robot is doing by then."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            state = self._robot_repo.get_robot_state()
+            reported = None if state is None else state.low_level_mode.motion_state
+            activity.heartbeat(label, reported)
+            if reported == motion_state:
+                return
+            if time.monotonic() >= deadline:
+                raise ApplicationError(
+                    f"Auto-undock: the robot did not report {label} within "
+                    f"{timeout_s:.0f} s (motion state {reported})",
+                    non_retryable=False,
+                )
+            time.sleep(NAV_POLL_INTERVAL_S)
+
+    def _refuse_wrong_map(self, expected_map: Optional[str]) -> None:
+        """Raise move_guard's refusal (non-retryable) for a goal planned on
+        ``expected_map`` when another map is loaded or its floor plan is being
+        rebuilt."""
+        active_map = self._map_catalog_repo.active_name()
+        refusal = move_refusal(
+            expected_map,
+            active_map,
+            active_map is not None and self._conversion_svc.is_converting(active_map),
+        )
+        if refusal is not None:
+            raise ApplicationError(refusal.message, type=refusal.code, non_retryable=True)
 
     def _navigate(
         self,
@@ -189,17 +296,7 @@ class RobotActivities:
         call like time.sleep is not interrupted, hence the short NAV_POLL_INTERVAL_S.
         """
         if params is not None:
-            active_map = self._map_catalog_repo.active_name()
-            refusal = move_refusal(
-                expected_map,
-                active_map,
-                active_map is not None
-                and self._conversion_svc.is_converting(active_map),
-            )
-            if refusal is not None:
-                raise ApplicationError(
-                    refusal.message, type=refusal.code, non_retryable=True
-                )
+            self._refuse_wrong_map(expected_map)
             move_kwargs = {
                 "x": params.x,
                 "y": params.y,
