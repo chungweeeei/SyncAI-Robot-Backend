@@ -56,13 +56,13 @@ class JointsSample:
 class PathSample:
     """The planner's global route, map-frame metres, downsampled for the wire.
 
-    ``points`` is (x, y) pairs; heading is dropped (the route is drawn as a
-    band). An empty ``points`` is the explicit "no route" sample (see
-    ``TelemetryRepo.get_path``).
+    ``points`` is (x, y, z) triples, z the ground the route stands on; heading
+    is dropped (the route is drawn as a band). An empty ``points`` is the
+    explicit "no route" sample (see ``TelemetryRepo.get_path``).
     """
 
     seq: int
-    points: Tuple[Tuple[float, float], ...]
+    points: Tuple[Tuple[float, float, float], ...]
     stamp: float
 
 
@@ -77,7 +77,7 @@ class _PathSlot:
         # Monotonic, not the message stamp: the TTL is about when we heard it.
         self._recv_at = 0.0
 
-    def update(self, points: Tuple[Tuple[float, float], ...], stamp: float):
+    def update(self, points: Tuple[Tuple[float, float, float], ...], stamp: float):
         self._seq += 1
         self._sample = PathSample(seq=self._seq, points=points, stamp=stamp)
         self._recv_at = time.monotonic()
@@ -127,12 +127,12 @@ class TelemetryRepo:
                 seq=self._joints_seq, joints=joints, stamp=stamp
             )
 
-    def update_path(self, points: Tuple[Tuple[float, float], ...], stamp: float):
+    def update_path(self, points: Tuple[Tuple[float, float, float], ...], stamp: float):
         with self._lock:
             self._path.update(points=points, stamp=stamp)
 
     def update_docking_plan(
-        self, points: Tuple[Tuple[float, float], ...], stamp: float
+        self, points: Tuple[Tuple[float, float, float], ...], stamp: float
     ):
         with self._lock:
             self._docking_plan.update(points=points, stamp=stamp)

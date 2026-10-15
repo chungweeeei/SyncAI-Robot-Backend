@@ -73,15 +73,16 @@ def test_joints_arrive_keyed_by_urdf_joint_name(client, telemetry_repo):
         }
 
 
-def test_a_path_arrives_as_xy_pairs(client, telemetry_repo):
+def test_a_path_arrives_as_xyz_triples(client, telemetry_repo):
     # The repo stores tuples; JSON has no tuple, so the wire shape is nested
-    # lists — which is what the frontend indexes into.
-    telemetry_repo.update_path(points=((0.0, 0.0), (1.0, 2.0)), stamp=12.0)
+    # lists — which is what the frontend indexes into. z is the third item, so
+    # a client that reads only x and y still reads them where it always did.
+    telemetry_repo.update_path(points=((0.0, 0.0, 0.0), (1.0, 2.0, 3.0)), stamp=12.0)
 
     with client.websocket_connect(STREAM_PATH) as ws:
         assert ws.receive_json() == {
             "type": "path",
-            "points": [[0.0, 0.0], [1.0, 2.0]],
+            "points": [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
             "stamp": 12.0,
         }
 
@@ -99,12 +100,12 @@ def test_an_empty_path_is_a_real_frame(client, telemetry_repo):
 def test_a_docking_plan_arrives_as_its_own_type(client, telemetry_repo):
     # Not a `path` frame: the console draws the dock's last metre apart from
     # the route, and a dock's clear must not erase the route.
-    telemetry_repo.update_docking_plan(points=((1.0, 1.0), (1.5, 1.2)), stamp=20.0)
+    telemetry_repo.update_docking_plan(points=((1.0, 1.0, 0.0), (1.5, 1.2, 0.0)), stamp=20.0)
 
     with client.websocket_connect(STREAM_PATH) as ws:
         assert ws.receive_json() == {
             "type": "dock_path",
-            "points": [[1.0, 1.0], [1.5, 1.2]],
+            "points": [[1.0, 1.0, 0.0], [1.5, 1.2, 0.0]],
             "stamp": 20.0,
         }
 
@@ -122,7 +123,7 @@ def test_all_three_types_multiplex_over_one_socket(client, telemetry_repo):
     # observable wire behavior, so it is pinned rather than sorted away.
     telemetry_repo.update_pose(x=1.0, y=2.0, z=0.0, yaw_deg=0.0, stamp=1.0)
     telemetry_repo.update_joints(joints={"FL_HipX_joint": 0.1}, stamp=2.0)
-    telemetry_repo.update_path(points=((0.0, 0.0),), stamp=3.0)
+    telemetry_repo.update_path(points=((0.0, 0.0, 0.0),), stamp=3.0)
 
     with client.websocket_connect(STREAM_PATH) as ws:
         assert [ws.receive_json()["type"] for _ in range(3)] == [

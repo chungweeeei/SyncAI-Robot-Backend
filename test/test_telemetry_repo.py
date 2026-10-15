@@ -59,14 +59,14 @@ class TestSeqGating:
 class TestPathTtl:
     def test_a_fresh_path_replays_until_consumed(self, repo):
         with patch(MONOTONIC, return_value=100.0):
-            repo.update_path(points=((0.0, 0.0), (1.0, 1.0)), stamp=10.0)
+            repo.update_path(points=((0.0, 0.0, 0.0), (1.0, 1.0, 0.0)), stamp=10.0)
             sample = repo.get_path(after_seq=0)
-            assert sample.points == ((0.0, 0.0), (1.0, 1.0))
+            assert sample.points == ((0.0, 0.0, 0.0), (1.0, 1.0, 0.0))
             assert repo.get_path(after_seq=sample.seq) is None
 
     def test_a_stale_path_expires_into_one_empty_sample(self, repo):
         with patch(MONOTONIC, return_value=100.0):
-            repo.update_path(points=((0.0, 0.0),), stamp=10.0)
+            repo.update_path(points=((0.0, 0.0, 0.0),), stamp=10.0)
             seq = repo.get_path(after_seq=0).seq
 
         # Past the TTL the silence is turned into an explicit "no route":
@@ -82,7 +82,7 @@ class TestPathTtl:
         # Once empty, the branch must not keep bumping seq on every poll —
         # that would re-send "no route" to every client at 20 Hz forever.
         with patch(MONOTONIC, return_value=100.0):
-            repo.update_path(points=((0.0, 0.0),), stamp=10.0)
+            repo.update_path(points=((0.0, 0.0, 0.0),), stamp=10.0)
 
         with patch(MONOTONIC, return_value=200.0):
             expired = repo.get_path(after_seq=0)
@@ -92,7 +92,7 @@ class TestPathTtl:
 
     def test_a_replan_revives_the_route(self, repo):
         with patch(MONOTONIC, return_value=100.0):
-            repo.update_path(points=((0.0, 0.0),), stamp=10.0)
+            repo.update_path(points=((0.0, 0.0, 0.0),), stamp=10.0)
             first = repo.get_path(after_seq=0)
 
         with patch(MONOTONIC, return_value=200.0):
@@ -100,16 +100,16 @@ class TestPathTtl:
             assert expired.points == ()
 
             # The planner replans: the fresh route supersedes the expiry.
-            repo.update_path(points=((5.0, 5.0),), stamp=110.0)
+            repo.update_path(points=((5.0, 5.0, 0.0),), stamp=110.0)
             revived = repo.get_path(after_seq=expired.seq)
-            assert revived.points == ((5.0, 5.0),)
+            assert revived.points == ((5.0, 5.0, 0.0),)
 
 
 class TestDockingPlan:
     def test_the_docking_plan_is_its_own_slot(self, repo):
         # A dock's clear must not erase the route, nor the reverse.
         with patch(MONOTONIC, return_value=100.0):
-            repo.update_path(points=((0.0, 0.0), (1.0, 1.0)), stamp=10.0)
+            repo.update_path(points=((0.0, 0.0, 0.0), (1.0, 1.0, 0.0)), stamp=10.0)
             path_seq = repo.get_path().seq
 
             repo.update_docking_plan(points=(), stamp=11.0)
@@ -119,7 +119,7 @@ class TestDockingPlan:
 
     def test_a_docking_plan_expires_on_its_own_ttl(self, repo):
         with patch(MONOTONIC, return_value=100.0):
-            repo.update_docking_plan(points=((0.0, 0.0),), stamp=10.0)
+            repo.update_docking_plan(points=((0.0, 0.0, 0.0),), stamp=10.0)
             seq = repo.get_docking_plan().seq
 
         # Shorter than the route's: the plan comes at 2 Hz, not 1 Hz.

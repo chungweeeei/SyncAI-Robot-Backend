@@ -24,8 +24,8 @@ _MAX_PATH_POINTS = 512
 _MIN_POINT_SPACING_M = 1e-3
 
 
-# What a subscriber hands its repo slot: thinned (x, y) pairs and the stamp.
-PathSink = Callable[[Tuple[Tuple[float, float], ...], float], None]
+# What a subscriber hands its repo slot: thinned (x, y, z) triples and the stamp.
+PathSink = Callable[[Tuple[Tuple[float, float, float], ...], float], None]
 
 
 class PathSubscriber:
@@ -47,6 +47,11 @@ class PathSubscriber:
     (task_runner calls the planner's clear_plan; sent three times, one per
     republish tick, because this subscription is BEST_EFFORT). The repo's TTL
     is only the fallback for a planner that stopped re-sending.
+
+    Each point keeps its z: the ground the route stands on (OctomapPlanner3D's
+    floor surface; 0 from a 2D planner), the same height a waypoint's z is. A
+    route that climbs a stair is on two storeys, and the console draws each
+    part on its own.
     """
 
     def __init__(
@@ -110,7 +115,7 @@ class PathSubscriber:
         self._sink(self._thin(msg), stamp)
 
     def _thin(self, msg: Path) -> tuple:
-        """Reduce a plan to at most _MAX_PATH_POINTS deduplicated (x, y) pairs."""
+        """Reduce a plan to at most _MAX_PATH_POINTS deduplicated (x, y, z) triples."""
         # Stride sampling suffices: NavFn's output is uniformly spaced.
         stride = max(1, -(-len(msg.poses) // _MAX_PATH_POINTS))  # ceil division
 
@@ -118,14 +123,14 @@ class PathSubscriber:
         for i in range(0, len(msg.poses), stride):
             p = msg.poses[i].pose.position
             # Millimetres keep the JSON small; far finer than the costmap.
-            xy = (round(p.x, 3), round(p.y, 3))
-            if points and self._too_close(points[-1], xy):
+            xyz = (round(p.x, 3), round(p.y, 3), round(p.z, 3))
+            if points and self._too_close(points[-1], xyz):
                 continue
-            points.append(xy)
+            points.append(xyz)
 
         # Always keep the goal, which an uneven stride would drop.
         last = msg.poses[-1].pose.position
-        goal = (round(last.x, 3), round(last.y, 3))
+        goal = (round(last.x, 3), round(last.y, 3), round(last.z, 3))
         if not points or not self._too_close(points[-1], goal):
             points.append(goal)
 
@@ -133,10 +138,9 @@ class PathSubscriber:
 
     @staticmethod
     def _too_close(a: tuple, b: tuple) -> bool:
-        return (
-            abs(a[0] - b[0]) < _MIN_POINT_SPACING_M
-            and abs(a[1] - b[1]) < _MIN_POINT_SPACING_M
-        )
+        # All three axes: a point straight over the last one is a step up a
+        # stair, not a duplicate.
+        return all(abs(p - q) < _MIN_POINT_SPACING_M for p, q in zip(a, b))
 
 
 def init_path_subscriber(

@@ -563,7 +563,10 @@ delete and import-replace already refuse the loaded map (`map_active`).
 **Telemetry** is the internal visualization channel and shares no models with
 `GET /api/v1/robot/state` — that payload is frozen, this one may change freely.
 It is its own socket so a 360 kB cloud frame cannot head-of-line block pose;
-`path` rides it because a thinned route is ~8 kB every 3 s. An **empty**
+`path` rides it because a thinned route is ~8 kB every 3 s. Its `points` are
+`[x, y, z]` in map metres, z the ground each one stands on (OctomapPlanner3D's
+floor surface, 0 from a 2D planner) — a waypoint's z — so a route that climbs a
+stair can be drawn storey by storey. An **empty**
 `path.points` means "no route": the planner never publishes an empty plan, so
 `TelemetryRepo` clears a route by TTL (arrival, cancel and abort are the same
 silence from here).
