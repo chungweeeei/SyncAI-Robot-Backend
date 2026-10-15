@@ -238,7 +238,7 @@ def test_a_dock_step_resolves_its_vertex_like_a_move(client, dock):
     stored = created.json()["steps"][0]
     assert stored["type"] == "DOCK"
     assert stored["vertex_status"] == "CURRENT"
-    assert stored["resolved_params"] == {"x": 3.0, "y": -1.5, "theta": 90.0}
+    assert stored["resolved_params"] == {"x": 3.0, "y": -1.5, "theta": 90.0, "z": 0.0}
 
 
 def test_an_undock_only_template_is_map_independent(client):
