@@ -14,11 +14,13 @@ standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
 map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `AutoLocalize`, and the
-`NavigateToGoal` action the MOVE step sends) — plus `rclpy`,
+`NavigateToGoal` action the MOVE step sends — and the DOCK / UNDOCK steps, on its
+`behavior_tree` `dock.xml` / `undock.xml`, the UNDOCK with an empty pose; this package never
+calls `DockToPose`) — plus `rclpy`,
 `nav2_msgs`, `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
 those imports as they are. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `AutoLocalize` (behind `POST /api/v1/localization/auto`)
-at or after `ebe9bca`. It is named in
+at or after `ebe9bca`; the dock trees and `DOCK_FAILED` at or after `bbcc958`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
 colcon workspace root materialises it into `src/` beside this package, over
 HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.

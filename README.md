@@ -345,6 +345,21 @@ which `GET /api/v1/tasks/{id}` returns as a running MOVE step's `message`.
 `RobotGateway` keeps a goal-id → `MoveGoal` table so an activity can poll
 status and cancel, and the latest feedback per goal for that read.
 
+`DOCK` / `UNDOCK` steps are goals on the **same** client: `move(...,
+behavior_tree=...)` sets the goal's `behavior_tree` to `dock.xml` / `undock.xml`
+(`DOCK_BEHAVIOR_TREE` / `UNDOCK_BEHAVIOR_TREE`; `""` is the task runner's default
+`move.xml`). A DOCK's `pose` is the **dock pose**: dock.xml computes the staging
+pose from it, drives there, switches to MPC, calls the controller's `DockToPose`
+action and lies the robot down. An UNDOCK's `pose` is **empty** (zeros):
+undock.xml ignores it since task runner `e027dbe` and backs out 1 m from where
+the robot stands, standing it up first and switching back to RL at the end. This
+process never calls `DockToPose`. Sharing the client is what puts docks in the goal table, so the
+status poll, `status_msg`, `cancel_active_moves` (safety lock included) and the
+teleop refusal cover them with no extra code. A docking-branch failure ends the
+goal `DOCK_FAILED` (300) with the failing node's reason in `error_msg`; an
+unreachable staging pose is `PLAN_FAILED` / `FOLLOW_PATH_FAILED` as for a MOVE.
+Needs `syncai_common` at or after SyncAI-Robot-Interface `bbcc958`.
+
 **Service clients.**
 
 - `RobotGateway`: `scan_wifi`, `connect_wifi`, `switch_mode`, `restart_mode`
@@ -390,10 +405,10 @@ Interactive docs: `http://<robot>:3000/docs`.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
-| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE is checked against the loaded map — 409 `map_mismatch` / `conversion_running`, see *A job's map is checked twice*; stand / lie down never are. 409 `task_running` while any task runs — one task at a time |
-| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), empty otherwise. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
+| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / DOCK is checked against the loaded map — 409 `map_mismatch` / `conversion_running`, see *A job's map is checked twice*; stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time |
+| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), empty otherwise. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
 | DELETE | `/api/v1/tasks/{id}` | Request cancellation; answers `CANCELING` — the final state (possibly still `COMPLETED`) comes from GET |
-| POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` is interrupted at once and re-sent on resume, a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see *Task orchestration*. 409 `task_not_running` once closed; 404 for another robot's id |
+| POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` / `DOCK` / `UNDOCK` is interrupted at once and re-sent on resume, a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see *Task orchestration*. 409 `task_not_running` once closed; 404 for another robot's id |
 | GET | `/api/v1/active_tasks` | What runs on this robot's queue now, *whoever* started it, with `source` / `schedule_id` / `kind` / `name` / `map_name` (the run's `TaskMap`; for a run older than the attribute, the loaded map unless it is a stand / lie down; `null` for a run that drives nowhere). A held run is still listed as `IN_PROGRESS`. Not `/tasks/active`, which would shadow `/tasks/{id}` |
 | GET | `/api/v1/task_history` | **Finished** runs, newest close first, one visibility page per call. Query: `page_size` (1–100, default 20), `page_token` (previous `next_page_token`), `status` (`COMPLETED` / `FAILED` / `CANCELED`), `since` / `until` (close time; naive is UTC; `until` before `since` is 400), `kind` (`goal` / `standup` / `liedown` / `task` / `schedule`), `name` (exact template name). `kind` / `name` / `map_name` are `null` for runs dispatched without them or predating the attribute — no fallback. Bounded by namespace retention |
 | GET | `/api/v1/task_history/stats` | The same runs counted: `total`, `by_status`, `success_rate` (`COMPLETED` / `total`, `null` when nothing finished). Same filters as `task_history`; one count RPC |
@@ -585,14 +600,17 @@ the include-order note in `server.py`).
   step *order*, and a child table would be rewritten whole on every edit anyway.
   **Forward-compat rule: only add optional keys to a stored step; never rename,
   retype or repurpose one.**
-- **A MOVE step keeps both a `vertex_id` and a `params` snapshot**; every read
+- **A MOVE / DOCK step keeps both a `vertex_id` and a `params` snapshot**
+  (a DOCK typically references a `CHARGE` vertex; an UNDOCK has no params and
+  cannot reference one); every read
   reports `resolved_params` — the vertex's *current* pose if it exists
   (`vertex_status: CURRENT`), else the snapshot (`MISSING`). Moving a dock
   updates every template using it. Resolution is server-side (one
   implementation); the client dispatches by sending `resolved_params` through
   `POST /api/v1/tasks`.
-- **Map scoping keys off "contains a MOVE", not "references a vertex"** — a
-  hand-typed `(x, y, theta)` is in a map's frame too. Any MOVE ⇒ `map_name`
+- **Map scoping keys off "contains a MOVE / DOCK", not "references a
+  vertex"** — a hand-typed `(x, y, theta)` is in a map's frame too. Any such step ⇒
+  `map_name`
   required; none ⇒ `map_name` absent, runs anywhere. A template for a map that is
   not active still saves (authoring ahead is legitimate), reported with
   `map_matches_active: false` for the client to gate on.
@@ -608,6 +626,7 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 | StepType | Activity | What it does |
 |---|---|---|
 | `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg` |
+| `DOCK` / `UNDOCK` | `execute_dock` / `execute_undock` | `execute_move` on the dock trees (`behavior_tree` `dock.xml` / `undock.xml`, see *Action client*). DOCK's `MoveParams` is the dock pose and gets MOVE's map check; UNDOCK takes no params, sends an empty pose and is checked against no map, since it backs out 1 m from wherever the robot stands. Same poll, heartbeat and pause interrupt as MOVE; a cancel (or pause) also sends `MotionKey.LOCOMOTION`, best effort, because a halted dock tree stays in MPC |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.start_speak()` then `await_speak()` — queue the utterance on the speech service, then poll its job and heartbeat until it has played; a cancel `DELETE`s the job mid-sentence. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
 | `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the body queue's one-thread executor, no heartbeat, and it survives a backend restart with the time already served |
@@ -626,7 +645,7 @@ rejoining a closed group, or a group's second body step):
 
 - a group's members must be **adjacent** — the same name again after another
   step is refused, not read as a second group;
-- **at most one `MOVE` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
+- **at most one `MOVE` / `DOCK` / `UNDOCK` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
   slot, so two would only run one after the other.
 
 **Start order**: a group's members start **in list order**, each once the one
@@ -634,7 +653,7 @@ before it has *started* — not finished — and from then on they overlap:
 
 | Member | Started when |
 |---|---|
-| `MOVE` | nav2 accepted the goal |
+| `MOVE` / `DOCK` / `UNDOCK` | nav2 accepted the goal |
 | `SPEAK` | its first utterance is queued (the speech service plays in accepted order) |
 | `STANDUP` / `LIEDOWN` | the motion key is sent (the activity ends right there) |
 | `WAIT` | its timer runs |
@@ -667,8 +686,8 @@ issues the same commands it always did, so pre-existing histories replay.
 Details that matter when editing this path:
 
 - **Two queues, split by what an activity occupies.** The body queue
-  (`<robot_id>.ROBOT_TASK_QUEUE`, which also carries the workflow) runs `MOVE`
-  and the posture steps in a single-worker `ThreadPoolExecutor` with
+  (`<robot_id>.ROBOT_TASK_QUEUE`, which also carries the workflow) runs `MOVE`,
+  `DOCK` / `UNDOCK` and the posture steps in a single-worker `ThreadPoolExecutor` with
   `max_concurrent_activities=1` — one thing at a time, like the robot — so
   Temporal holds a second body activity server-side instead of handing it over
   to queue with its timeouts ticking, and two runs can never drive at once. The
@@ -739,7 +758,13 @@ Details that matter when editing this path:
   canceled". Only a `MOVE` is cut short: `pause` cancels the in-flight activity
   handle, landing in `execute_move`'s `except CancelledError` and cancelling the
   nav2 goal exactly as a task cancel would; resume re-dispatches the step from
-  scratch (same target, fresh attempts, from wherever the robot is). Consequences:
+  scratch (same target, fresh attempts, from wherever the robot is). `DOCK` /
+  `UNDOCK` are interrupted the same way (`_run_move` serves all three): the dock
+  tree is halted mid-approach, `execute_dock` puts the walking gait back
+  (`MotionKey.LOCOMOTION` — the halted tree leaves the robot in MPC), and resume
+  starts the tree over: a DOCK from its staging leg, an UNDOCK with a fresh 1 m
+  back-out from wherever the pause stopped it — so a paused undock ends up to
+  2 m off the dock, not at a fixed staging pose. Consequences:
   - **Temporal has no paused status.** A held run is `RUNNING` to the server;
     the gateway derives task-level `PAUSED` from the step list the existing
     query returns — one query per console poll, and a failed query honestly
@@ -799,14 +824,15 @@ Details that matter when editing this path:
     would be one count per value.
   - The page token is Temporal's, base64url'd, valid only for the same `status` /
     `since` / `until` / `kind` / `name`. A rejected or malformed token is 400.
-- **A job's map is checked twice.** MOVE coordinates are a place in one map's
+- **A job's map is checked twice.** MOVE / DOCK coordinates are a place in one map's
   frame; on another map they are a real place, just the wrong one. The rule is
   `helpers/move_guard.py`: refuse positions planned on another map
   (`map_mismatch`) or while the loaded map's floor plan is rebuilt
   (`conversion_running`); an unknown map is never refused. `POST /api/v1/tasks`
-  asks before starting a run, and `execute_move` asks again before every goal
-  with the run's own `TaskMap` (read off `workflow.info()`, passed as MOVE's
-  optional second argument). The second check is the one a schedule meets — it
+  asks before starting a run, and `execute_move` (and `execute_dock`) asks
+  again before every goal with the run's own `TaskMap` (read off
+  `workflow.info()`, passed as their optional second argument). An UNDOCK has
+  no coordinates and is checked by neither. The second check is the one a schedule meets — it
   never passes the first — and its refusal is a non-retryable step failure, so
   the history row says why. A schedule registered before `TaskMap` drives as it
   always did.

@@ -222,6 +222,132 @@ class TestExecuteMove:
 
         robot_gw.cancel_active_moves.assert_called_once()
 
+    def test_a_cancelled_move_leaves_the_gait_alone(self, env, activities, robot_gw):
+        # move.xml never leaves RL; only the dock trees need it put back.
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.side_effect = CancelledError()
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        robot_gw.set_motion_key.assert_not_called()
+        assert "behavior_tree" not in robot_gw.move.call_args[1]
+
+
+class TestExecuteDock:
+    """DOCK / UNDOCK are execute_move on the dock trees: same send, poll and
+    cancel, plus putting RL back when a tree is cut short. Only DOCK has a pose,
+    so only DOCK meets the map check."""
+
+    def test_sends_the_dock_pose_on_its_tree(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(
+            activities.execute_dock, MoveParams(x=1.0, y=2.0, theta=90.0), "lab"
+        )
+
+        assert result.success is True
+        kwargs = robot_gw.move.call_args[1]
+        assert kwargs["behavior_tree"] == "dock.xml"
+        assert (kwargs["x"], kwargs["y"]) == (1.0, 2.0)
+        assert kwargs["yaw"] == pytest.approx(1.5707963)
+
+    def test_an_undock_sends_an_empty_pose_on_its_tree(
+        self, env, activities, robot_gw
+    ):
+        # undock.xml backs out 1 m from where the robot stands and reads no pose.
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(activities.execute_undock)
+
+        assert result.success is True
+        kwargs = robot_gw.move.call_args[1]
+        assert kwargs == {"x": 0.0, "y": 0.0, "yaw": 0.0, "behavior_tree": "undock.xml"}
+
+    def test_an_undock_drives_whatever_map_is_loaded(
+        self, env, activities, robot_gw, map_catalog_repo, conversion_svc
+    ):
+        # No coordinates, so neither a map switch nor a rebuild can make them wrong.
+        conversion_svc.is_converting.return_value = True
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(activities.execute_undock)
+
+        assert result.success is True
+        map_catalog_repo.active_name.assert_not_called()
+
+    def test_a_failed_dock_carries_the_robots_reason(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {
+            "goal_id": "goal-1",
+            "state": "aborted",
+            "error_code": 300,
+            "error_msg": "controller dock_to_pose aborted the goal (error_code 304)",
+        }
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_dock, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert str(exc_info.value) == (
+            "dock ended in aborted: "
+            "controller dock_to_pose aborted the goal (error_code 304)"
+        )
+        assert exc_info.value.non_retryable is False
+
+    def test_a_rejected_undock_is_retryable(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (False, "server not available", None)
+
+        with pytest.raises(ApplicationError, match="Undock rejected") as exc_info:
+            env.run(activities.execute_undock)
+
+        assert exc_info.value.non_retryable is False
+
+    def test_a_dock_from_another_map_never_sends_a_goal(
+        self, env, activities, robot_gw
+    ):
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(
+                activities.execute_dock,
+                MoveParams(x=0.0, y=0.0, theta=0.0),
+                "warehouse",
+            )
+
+        assert exc_info.value.non_retryable is True
+        assert exc_info.value.type == "map_mismatch"
+        robot_gw.move.assert_not_called()
+
+    def test_a_cancel_cancels_the_goal_then_restores_locomotion(
+        self, env, activities, robot_gw
+    ):
+        # A halted dock tree stays in MPC; the next MOVE needs RL.
+        order = []
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.side_effect = CancelledError()
+        robot_gw.cancel_active_moves.side_effect = lambda: order.append("cancel")
+        robot_gw.set_motion_key.side_effect = lambda key: (
+            order.append(key) or (True, "")
+        )
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_dock, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert order == ["cancel", MotionKey.LOCOMOTION]
+
+    def test_a_refused_restore_does_not_mask_the_cancel(
+        self, env, activities, robot_gw
+    ):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.side_effect = CancelledError()
+        robot_gw.set_motion_key.side_effect = RuntimeError("safety lock")
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_undock)
+
+        robot_gw.cancel_active_moves.assert_called_once()
+
 
 class TestMoveMapCheck:
     """The same rule POST /api/v1/tasks applies, asked again before driving --

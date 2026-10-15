@@ -90,7 +90,7 @@ def _stub_temporal(monkeypatch):
 
 
 def _activities():
-    # run_worker only forwards the four activity methods into Worker, which is
+    # run_worker only forwards the six activity methods into Worker, which is
     # stubbed here, so a MagicMock quacks well enough.
     return MagicMock()
 
@@ -130,6 +130,8 @@ def test_body_and_io_activities_poll_separate_queues():
     assert body["workflows"]
     assert body["max_concurrent_activities"] == 1
     assert activities.execute_move in body["activities"]
+    assert activities.execute_dock in body["activities"]
+    assert activities.execute_undock in body["activities"]
     assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
     assert "workflows" not in io
     assert io["activities"] == [activities.execute_speak]

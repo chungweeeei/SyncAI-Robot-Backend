@@ -207,6 +207,19 @@ def _move_task(task_id="robot01-task-001"):
     }
 
 
+def _dock_task(task_id="robot01-dock-001"):
+    return {
+        "id": task_id,
+        "steps": [
+            {"id": "s1", "type": "DOCK", "params": {"x": 3.0, "y": 1.0, "theta": 180.0}}
+        ],
+    }
+
+
+def _undock_task(task_id="robot01-undock-001"):
+    return {"id": task_id, "steps": [{"id": "s1", "type": "UNDOCK"}]}
+
+
 class TestTriggerTask:
     def test_post_builds_the_workflow_task(self, client, workflow_gw):
         body = client.post("/api/v1/tasks", json=_move_task()).json()
@@ -387,6 +400,43 @@ class TestJobMap:
         _, provenance = workflow_gw.started[0]
         assert provenance.map_name == "lab"
 
+    def test_a_dock_job_is_stamped_like_a_move(self, client, workflow_gw):
+        assert client.post("/api/v1/tasks", json=_dock_task()).status_code == 200
+        assert workflow_gw.started[0][1].map_name == "lab"
+
+    def test_an_undock_job_holds_no_map(self, client, workflow_gw):
+        # It backs out from wherever the robot stands: no coordinates to be on a map.
+        task = {**_undock_task(), "map_name": "warehouse"}
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        assert workflow_gw.started[0][1].map_name is None
+
+    def test_an_undock_with_a_pose_is_refused(self, client, workflow_gw):
+        task = {
+            "id": "robot01-undock-001",
+            "steps": [
+                {"id": "s1", "type": "UNDOCK", "params": {"x": 3.0, "y": 1.0, "theta": 0}}
+            ],
+        }
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
+    def test_a_dock_from_another_map_is_refused(self, client, workflow_gw):
+        task = {**_dock_task(), "map_name": "warehouse"}
+
+        response = client.post("/api/v1/tasks", json=task)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "map_mismatch"
+        assert workflow_gw.started == []
+
+    def test_a_dock_without_a_pose_is_refused(self, client, workflow_gw):
+        task = {"id": "robot01-dock-001", "steps": [{"id": "s1", "type": "DOCK"}]}
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
     def test_a_posture_job_holds_no_map(self, client, workflow_gw):
         assert client.post("/api/v1/tasks", json=_stand_task()).status_code == 200
 
@@ -459,6 +509,27 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-task-001").json()
 
         assert body["steps"][0]["message"] == "Path blocked; replanning"
+
+    def test_a_running_dock_carries_the_robots_status(
+        self, client, workflow_gw, robot_gw
+    ):
+        robot_gw.message = "Docking: 0.42 m from the dock"
+        workflow_gw.state = TaskState(
+            id="robot01-dock-001",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="s1",
+                    type=StepType.DOCK,
+                    params=MoveParams(x=3.0, y=1.0, theta=180.0),
+                    status=StepStatus.IN_PROGRESS,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-dock-001").json()
+
+        assert body["steps"][0]["message"] == "Docking: 0.42 m from the dock"
 
     def test_only_a_running_move_asks_the_robot(self, client, workflow_gw, robot_gw):
         # A paused MOVE has cancelled its goal, and a STANDUP never had one:
