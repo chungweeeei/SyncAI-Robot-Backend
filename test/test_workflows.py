@@ -122,11 +122,13 @@ def _task(task_id: str, *step_types: StepType) -> WorkflowTask:
         Step(
             id=f"step-{i}",
             type=step_type,
-            # Schema contract: MOVE and WAIT carry params, the posture steps
+            # Schema contract: MOVE, DOCK, UNDOCK and WAIT carry params, the posture steps
             # carry none (Step validation enforces it, the workflow relies on
             # it for its empty-args special case).
             params={
                 StepType.MOVE: MoveParams(x=1.5, y=-2.5, theta=90.0),
+                StepType.DOCK: MoveParams(x=3.0, y=1.0, theta=180.0),
+                StepType.UNDOCK: MoveParams(x=3.0, y=1.0, theta=180.0),
                 StepType.WAIT: WaitParams(seconds=WAIT_SECONDS),
             }.get(step_type),
         )
@@ -309,6 +311,54 @@ def test_a_runs_map_is_handed_to_every_move():
         ("execute_move", "lab"),
         ("execute_stand", None),
         ("execute_move", "lab"),
+    ]
+
+
+def test_a_runs_map_is_handed_to_dock_and_undock():
+    """DOCK / UNDOCK coordinates are a pose on the map too, so they get MOVE's
+    second argument and execute_dock / execute_undock the same check."""
+
+    async def scenario():
+        calls: list = []
+
+        @activity.defn(name="execute_dock")
+        async def execute_dock(params: MoveParams, expected_map=None) -> ActivityResult:
+            calls.append(("execute_dock", params.x, expected_map))
+            return ActivityResult(success=True, state="succeeded")
+
+        @activity.defn(name="execute_undock")
+        async def execute_undock(
+            params: MoveParams, expected_map=None
+        ) -> ActivityResult:
+            calls.append(("execute_undock", params.x, expected_map))
+            return ActivityResult(success=True, state="succeeded")
+
+        task = _task("task-dock-map", StepType.DOCK, StepType.UNDOCK)
+
+        async with _worker([execute_dock, execute_undock]) as client:
+            await client.operator_service.add_search_attributes(
+                AddSearchAttributesRequest(
+                    namespace=client.namespace,
+                    search_attributes={
+                        TASK_MAP_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD
+                    },
+                )
+            )
+            handle = await client.start_workflow(
+                RobotWorkflow.run,
+                task,
+                id=task.id,
+                task_queue=TASK_QUEUE,
+                search_attributes=TypedSearchAttributes(
+                    [SearchAttributePair(TASK_MAP_KEY, "lab")]
+                ),
+            )
+            await handle.result()
+        return calls
+
+    assert asyncio.run(scenario()) == [
+        ("execute_dock", 3.0, "lab"),
+        ("execute_undock", 3.0, "lab"),
     ]
 
 
@@ -508,15 +558,20 @@ def test_cancellation_mid_posture_ends_the_step_canceled_too():
 
 
 def _recording_move(
-    started: asyncio.Event, release: asyncio.Event, dispatches: list, cancels: list
+    started: asyncio.Event,
+    release: asyncio.Event,
+    dispatches: list,
+    cancels: list,
+    name: str = "execute_move",
 ):
     """``_gated_move`` that also records each dispatch and each cancel it receives.
 
     ``dispatches`` collects ``activity.info().attempt`` so a test can tell a
     *re-sent* MOVE (two activities, each attempt 1) from a *retried* one.
+    ``name`` stands it in for DOCK / UNDOCK, which the hold treats the same.
     """
 
-    @activity.defn(name="execute_move")
+    @activity.defn(name=name)
     async def execute_move(params: MoveParams) -> ActivityResult:
         dispatches.append(activity.info().attempt)
         await _report_started()
@@ -608,6 +663,39 @@ def test_pause_interrupts_a_move_and_resume_re_sends_it():
     assert [step.status for step in resumed] == [StepStatus.IN_PROGRESS, StepStatus.PENDING]
     # Then the run went on to the end.
     assert calls == [("execute_stand", None)]
+
+
+def test_pause_interrupts_a_dock_and_resume_re_sends_it():
+    # A dock is a NavigateToGoal like a MOVE: the pause cancels it (in production,
+    # execute_dock's cancel path also puts RL back) and resume starts the tree over.
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        dispatches: list = []
+        cancels: list = []
+        activities = [
+            _recording_move(started, release, dispatches, cancels, "execute_dock")
+        ]
+        task = _task("task-pause-dock", StepType.DOCK)
+
+        async with _worker(activities) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            started.clear()
+
+            await handle.signal(RobotWorkflow.pause)
+            held = await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            release.set()
+            await handle.result()
+            return dispatches, cancels, held
+
+    dispatches, cancels, held = asyncio.run(scenario())
+
+    assert cancels == [True]
+    assert held == [StepStatus.PAUSED]
+    assert dispatches == [1, 1]
 
 
 def test_pause_during_an_uninterruptible_step_holds_before_the_next():

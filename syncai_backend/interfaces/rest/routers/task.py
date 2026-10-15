@@ -15,6 +15,7 @@ from syncai_backend.gateways.workflow.config import (
 )
 from syncai_backend.gateways.workflow.schema import (
     GROUP_DESCRIPTION,
+    NAV_STEP_TYPES,
     Step,
     StepType,
     StepStatus,
@@ -61,7 +62,8 @@ class StepRequest(BaseModel):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE, SPEAK and WAIT"
+            "Omitted for STANDUP/LIEDOWN, required for MOVE, DOCK, UNDOCK "
+            "(x/y/theta: the dock pose), SPEAK and WAIT"
         ),
     )
     group: Optional[str] = Field(default=None, description=GROUP_DESCRIPTION)
@@ -348,7 +350,7 @@ def init_task_router(
         # routes lock on and the history shows). One that does not drive holds
         # no map and is neither stamped nor refused.
         map_name: Optional[str] = None
-        if any(step.type is StepType.MOVE for step in req.steps):
+        if any(step.type in NAV_STEP_TYPES for step in req.steps):
             active = map_catalog_repo.active_name()
             refusal = move_refusal(
                 req.map_name,
@@ -536,9 +538,9 @@ def init_task_router(
 
     def _step_message(step: Step) -> str:
         # Read live from the gateway: the workflow cannot see an activity's
-        # progress. Only a running MOVE has a goal; between retry attempts the
-        # gateway answers "".
-        if step.type is StepType.MOVE and step.status is StepStatus.IN_PROGRESS:
+        # progress. Only a running MOVE / DOCK / UNDOCK has a goal; between retry
+        # attempts the gateway answers "".
+        if step.type in NAV_STEP_TYPES and step.status is StepStatus.IN_PROGRESS:
             return robot_gw.get_move_message()
         return ""
 

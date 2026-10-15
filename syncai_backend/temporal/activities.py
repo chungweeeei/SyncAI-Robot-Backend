@@ -14,7 +14,12 @@ from temporalio.exceptions import ApplicationError, CancelledError
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.workflow.config import STEP_STARTED_SIGNAL, reports_start
 from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams
-from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
+from syncai_backend.gateways.robot.robot import (
+    DOCK_BEHAVIOR_TREE,
+    UNDOCK_BEHAVIOR_TREE,
+    MotionKey,
+    RobotGateway,
+)
 from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.helpers.move_guard import move_refusal
@@ -33,24 +38,25 @@ NAV_POLL_INTERVAL_S = 0.25
 STARTED_REPORT_TIMEOUT_S = 1.0
 
 
-def _move_failure(status: dict) -> str:
-    """The step's error_msg for a MOVE that did not succeed.
+def _move_failure(status: dict, label: str = "move") -> str:
+    """The step's error_msg for a MOVE / DOCK / UNDOCK that did not succeed.
 
     The robot's own sentence when it gave one (why the backend uses NavigateToGoal,
-    not NavigateToPose). An abort with error_code NONE is a goal that was superseded
-    or never started, not a navigation failure, and is said so.
+    not NavigateToPose; a dock tree's DOCK_FAILED names the node that failed). An
+    abort with error_code NONE is a goal that was superseded or never started, not a
+    navigation failure, and is said so.
     """
     state = status["state"]
     if state != "aborted":
-        return f"move ended in {state}"
+        return f"{label} ended in {state}"
     if status.get("error_msg"):
-        return f"move ended in aborted: {status['error_msg']}"
+        return f"{label} ended in aborted: {status['error_msg']}"
     if status.get("error_code") == 0:
         return (
-            "move ended in aborted: navigation did not start "
+            f"{label} ended in aborted: navigation did not start "
             "(another navigation is running, or the behavior tree failed to load)"
         )
-    return "move ended in aborted"
+    return f"{label} ended in aborted"
 
 
 class ActivityResult(BaseModel):
@@ -137,7 +143,40 @@ class RobotActivities:
     def execute_move(
         self, params: MoveParams, expected_map: Optional[str] = None
     ) -> ActivityResult:
-        """Send a NavigateToGoal goal and supervise it to a terminal state.
+        """Send a NavigateToGoal goal and supervise it to a terminal state."""
+        return self._navigate(params, expected_map, behavior_tree="", label="move")
+
+    @activity.defn
+    def execute_dock(
+        self, params: MoveParams, expected_map: Optional[str] = None
+    ) -> ActivityResult:
+        """Dock at the pose in ``params``: a NavigateToGoal on dock.xml.
+
+        The tree drives to the staging pose, switches to MPC, approaches with
+        DockToPose and lies the robot down.
+        """
+        return self._navigate(
+            params, expected_map, behavior_tree=DOCK_BEHAVIOR_TREE, label="dock"
+        )
+
+    @activity.defn
+    def execute_undock(
+        self, params: MoveParams, expected_map: Optional[str] = None
+    ) -> ActivityResult:
+        """Back out of the dock at the pose in ``params``: a NavigateToGoal on
+        undock.xml (stand, MPC, back out to the staging pose, RL)."""
+        return self._navigate(
+            params, expected_map, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock"
+        )
+
+    def _navigate(
+        self,
+        params: MoveParams,
+        expected_map: Optional[str],
+        behavior_tree: str,
+        label: str,
+    ) -> ActivityResult:
+        """Send a NavigateToGoal goal on ``behavior_tree`` and supervise it.
 
         ``expected_map`` is the run's ``TaskMap``. The goal is first checked against
         the loaded map (helpers/move_guard.py, as POST /api/v1/tasks does): another
@@ -161,17 +200,24 @@ class RobotActivities:
             )
 
         yaw = math.radians(params.theta)
+        move_kwargs = {"x": params.x, "y": params.y, "yaw": yaw}
+        if behavior_tree:
+            move_kwargs["behavior_tree"] = behavior_tree
 
         # The heartbeat_timeout clock starts with the activity, and move() can block
         # up to NAV_GOAL_SEND_BUDGET_S; beat first so a slow nav2 does not fail it.
         activity.heartbeat("sending")
 
         try:
-            accepted, msg, goal_id = self._robot_gw.move(x=params.x, y=params.y, yaw=yaw)
+            accepted, msg, goal_id = self._robot_gw.move(**move_kwargs)
             if not accepted:
-                raise ApplicationError(f"Move rejected: {msg}", non_retryable=False)
+                raise ApplicationError(
+                    f"{label.capitalize()} rejected: {msg}", non_retryable=False
+                )
 
-            self._logger.info("[RobotActivity] Move accepted", goal_id=goal_id)
+            self._logger.info(
+                f"[RobotActivity] {label.capitalize()} accepted", goal_id=goal_id
+            )
             # Beat first: move() may have used most of the heartbeat window.
             self._report_started(beat=("accepted",))
 
@@ -183,14 +229,35 @@ class RobotActivities:
             # move() has no id yet. Shielded so the cancel RPC finishes first.
             with activity.shield_thread_cancel_exception():
                 self._robot_gw.cancel_active_moves()
+                if behavior_tree:
+                    self._restore_locomotion(label)
 
-            self._logger.warning("[RobotActivity] Move activity has been cancelled")
+            self._logger.warning(
+                f"[RobotActivity] {label.capitalize()} activity has been cancelled"
+            )
             raise
 
         if state != "succeeded":
-            raise ApplicationError(_move_failure(status), non_retryable=False)
+            raise ApplicationError(_move_failure(status, label), non_retryable=False)
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
+
+    def _restore_locomotion(self, label: str) -> None:
+        """Put the walking gait back after a dock tree was cut short.
+
+        A halted dock.xml / undock.xml does not switch back from MPC itself (its
+        fallback only runs on a failure), and the next MOVE needs RL. Best effort:
+        a refusal (safety lock) is logged, never raised over the cancel.
+        """
+        try:
+            accepted, msg = self._robot_gw.set_motion_key(key=MotionKey.LOCOMOTION)
+        except Exception as err:
+            accepted, msg = False, str(err)
+        if not accepted:
+            self._logger.warning(
+                f"[RobotActivity] Could not restore locomotion after {label}",
+                error=msg,
+            )
 
     def _set_motion_key(self, key: MotionKey, label: str) -> ActivityResult:
         """Send a motion key. Fire-and-forget: this does NOT wait for the pose.

@@ -53,8 +53,8 @@ class ScheduleRequest(BaseModel):
     map_name: Optional[str] = Field(
         default=None,
         description=(
-            "Map whose frame the MOVE coordinates are in, carried through to the "
-            "schedule memo so a client can tell whether this schedule still "
+            "Map whose frame the MOVE / DOCK / UNDOCK coordinates are in, carried "
+            "through to the schedule memo so a client can tell whether this schedule still "
             "belongs to the loaded map. A display label only, and deliberately "
             "unvalidated: this router has no MapCatalogRepo, and threading one in "
             "for a label is not worth it. POST /api/v1/task_templates/{id}/schedule "
@@ -94,7 +94,10 @@ class ScheduleStateResponse(BaseModel):
     )
     map_name: Optional[str] = Field(
         default=None,
-        description="Map whose frame this schedule's MOVE coordinates are in.",
+        description=(
+            "Map whose frame this schedule's MOVE / DOCK / UNDOCK coordinates "
+            "are in."
+        ),
     )
     task_template_id: Optional[str] = Field(
         default=None,

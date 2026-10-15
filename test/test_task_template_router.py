@@ -229,6 +229,28 @@ def test_vertex_from_another_map_names_both_maps(client, map_repo):
     assert "rawonly" in res.json()["detail"] and "full" in res.json()["detail"]
 
 
+@pytest.mark.parametrize("step_type", ["DOCK", "UNDOCK"])
+def test_a_dock_step_resolves_its_vertex_like_a_move(client, dock, step_type):
+    step = dict(_move(dock.id, step_id="1-dock"), type=step_type)
+
+    created = _create(client, steps=[step])
+
+    assert created.status_code == 200
+    stored = created.json()["steps"][0]
+    assert stored["type"] == step_type
+    assert stored["vertex_status"] == "CURRENT"
+    assert stored["resolved_params"] == {"x": 3.0, "y": -1.5, "theta": 90.0}
+
+
+def test_dock_steps_require_a_map_name(client):
+    step = dict(_move(step_id="1-dock"), type="DOCK")
+
+    res = _create(client, map_name=None, steps=[step])
+
+    assert res.status_code == 400
+    assert "must name the map" in res.json()["detail"]
+
+
 def test_posture_step_cannot_reference_a_vertex(client, dock):
     res = _create(client, map_name=None,
                   steps=[dict(STANDUP, vertex_id=str(dock.id))])

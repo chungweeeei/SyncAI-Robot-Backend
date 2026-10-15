@@ -35,6 +35,10 @@ class StepType(str, Enum):
     LIEDOWN = "LIEDOWN"
     SPEAK = "SPEAK"
     WAIT = "WAIT"
+    # A NavigateToGoal on the dock trees (gateways/robot DOCK_BEHAVIOR_TREE): x/y/theta
+    # is the dock pose, the same for both; the trees derive the staging pose from it.
+    DOCK = "DOCK"
+    UNDOCK = "UNDOCK"
 
 
 class MoveParams(BaseSchema):
@@ -111,12 +115,19 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.LIEDOWN: None,
     StepType.SPEAK: SpeakParams,
     StepType.WAIT: WaitParams,
+    StepType.DOCK: MoveParams,
+    StepType.UNDOCK: MoveParams,
 }
+
+
+# Steps that send a NavigateToGoal: their params are a pose on the loaded map, so they
+# share MOVE's map stamping / check, its pause interrupt and its template vertex refs.
+NAV_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK, StepType.UNDOCK})
 
 
 # Steps on the one-slot body queue (config.TASK_QUEUE_SUFFIX). Two in one group would
 # just run one after the other, so a group may hold at most one.
-BODY_STEP_TYPES = frozenset({StepType.MOVE, StepType.STANDUP, StepType.LIEDOWN})
+BODY_STEP_TYPES = NAV_STEP_TYPES | {StepType.STANDUP, StepType.LIEDOWN}
 
 
 # The one ``code`` for both step_group_problem rules: a client just marks ``step_id``.
@@ -146,7 +157,7 @@ def step_group_problem(steps) -> Optional[StepGroupProblem]:
     """Why ``steps``' groups cannot run, as a sentence; None when they can.
 
     ``step_id`` names the step that rejoins a closed group, or the second
-    MOVE/STANDUP/LIEDOWN of one. A group must be *adjacent* steps (RobotWorkflow.
+    body step (BODY_STEP_TYPES) of one. A group must be *adjacent* steps (RobotWorkflow.
     _run_group): the same name after another step would be a second group the
     operator takes for the first. Duck-typed on ``.id`` / ``.type`` / ``.group``
     so the request models and Step share it.
@@ -170,7 +181,7 @@ def step_group_problem(steps) -> Optional[StepGroupProblem]:
             body.append(step.id)
             if len(body) > 1:
                 return StepGroupProblem(
-                    f"Group '{group}' has more than one MOVE/STANDUP/LIEDOWN step "
+                    f"Group '{group}' has more than one MOVE/DOCK/UNDOCK/STANDUP/LIEDOWN step "
                     f"({', '.join(body)}); the robot can do only one at a time",
                     step.id,
                 )
@@ -198,7 +209,7 @@ GROUP_DESCRIPTION = (
     "Adjacent steps with the same group run at the same time, started in "
     "list order (each once the one before it has started), and the next "
     "step starts once all of them have finished; if one fails the others are "
-    "canceled. At most one MOVE/STANDUP/LIEDOWN per group. Omitted: the step "
+    "canceled. At most one MOVE/DOCK/UNDOCK/STANDUP/LIEDOWN per group. Omitted: the step "
     "runs on its own, after the one before it"
 )
 
@@ -212,7 +223,8 @@ class Step(BaseSchema):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN, required for MOVE, SPEAK and WAIT"
+            "Omitted for STANDUP/LIEDOWN, required for MOVE, DOCK, UNDOCK (x/y/theta: "
+            "the dock pose), SPEAK and WAIT"
         ),
     )
     status: StepStatus = Field(

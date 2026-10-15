@@ -14,6 +14,7 @@ with workflow.unsafe.imports_passed_through():
         io_task_queue_for,
     )
     from syncai_backend.gateways.workflow.schema import (
+        NAV_STEP_TYPES,
         Step,
         StepStatus,
         StepType,
@@ -45,6 +46,8 @@ ACTIVITY_MAP = {
     StepType.STANDUP: RobotActivities.execute_stand,
     StepType.LIEDOWN: RobotActivities.execute_lie_down,
     StepType.SPEAK: RobotActivities.execute_speak,
+    StepType.DOCK: RobotActivities.execute_dock,
+    StepType.UNDOCK: RobotActivities.execute_undock,
 }
 
 
@@ -220,9 +223,10 @@ class RobotWorkflow:
 
         # Postures take no argument; passing None would fail the arg-count check.
         args = [] if step.params is None else [step.params]
-        # MOVE gets the map as a second argument only when there is one, so old
-        # one-argument histories and runs without the attribute look the same.
-        if step.type is StepType.MOVE and own_map is not None:
+        # MOVE / DOCK / UNDOCK get the map as a second argument only when there is
+        # one, so old one-argument histories and runs without the attribute look the
+        # same.
+        if step.type in NAV_STEP_TYPES and own_map is not None:
             args.append(own_map)
 
         # SPEAK: wider heartbeat window (SPEAK_HEARTBEAT_TIMEOUT) and a much shorter
@@ -264,7 +268,8 @@ class RobotWorkflow:
         new_activity_id = (lambda: self._new_dispatch_id(step)) if report_start else None
 
         # A pause that landed before this step holds here, before dispatch. That is
-        # the whole hold for SPEAK and postures; MOVE and WAIT are interrupted below.
+        # the whole hold for SPEAK and postures; MOVE / DOCK / UNDOCK and WAIT are
+        # interrupted below.
         try:
             await self._hold(step)
         except asyncio.CancelledError:
@@ -277,7 +282,7 @@ class RobotWorkflow:
             if step.type is StepType.WAIT:
                 await self._run_wait(step, step.params)
                 result = None
-            elif step.type is StepType.MOVE:
+            elif step.type in NAV_STEP_TYPES:
                 result = await self._run_move(
                     step, activity_fn, activity_options, new_activity_id
                 )
@@ -311,7 +316,8 @@ class RobotWorkflow:
     async def _run_move(
         self, step: Step, activity_fn, activity_options: dict, new_activity_id=None
     ) -> ActivityResult:
-        """Run a MOVE, letting a pause interrupt it and a resume re-send it.
+        """Run a MOVE / DOCK / UNDOCK, letting a pause interrupt it and a resume
+        re-send it (a dock from its staging leg).
 
         Never ``await handle`` directly: that lets a run cancel be swallowed into
         ActivityError(cause=CancelledError), indistinguishable from the pause's own.

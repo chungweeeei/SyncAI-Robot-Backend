@@ -31,6 +31,7 @@ from syncai_common.action import NavigateToGoal  # noqa: E402
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
 from syncai_backend.gateways.robot.robot import (  # noqa: E402
+    DOCK_BEHAVIOR_TREE,
     MAX_TRACKED_GOALS,
     MotionKey,
     MoveState,
@@ -118,6 +119,26 @@ class TestMoveGoalStateMachine:
         assert goal_msg.pose.header.frame_id == "map"
         assert goal_msg.pose.pose.position.x == 1.0
         assert goal_msg.pose.pose.orientation.z == pytest.approx(math.sin(math.pi / 4))
+        # move.xml: the task runner's default tree.
+        assert goal_msg.behavior_tree == ""
+
+    def test_a_dock_goal_names_its_tree(self, robot_gw, move_client):
+        """DOCK / UNDOCK go out on the same client, so the goal book, cancel and
+        teleop gate cover them too; only the tree differs."""
+        handle = _goal_handle()
+        handle.get_result_async.return_value = _Future(completed=False)
+        move_client.send_goal_async.return_value = _Future(result=handle)
+
+        accepted, _, goal_id = robot_gw.move(
+            x=1.0, y=2.0, yaw=0.0, behavior_tree=DOCK_BEHAVIOR_TREE
+        )
+
+        assert accepted is True
+        goal_msg = move_client.send_goal_async.call_args[1]["goal"]
+        assert goal_msg.behavior_tree == "dock.xml"
+        assert robot_gw.get_move_status(goal_id=goal_id)["state"] == (
+            MoveState.EXECUTING.value
+        )
 
     @pytest.mark.parametrize(
         "ros_status,expected",
