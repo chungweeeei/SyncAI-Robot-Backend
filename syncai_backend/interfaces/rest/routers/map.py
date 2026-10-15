@@ -126,6 +126,12 @@ class MapVertexRequest(BaseModel):
     x: float = Field(..., description="World x-coordinate (metres, map frame).")
     y: float = Field(..., description="World y-coordinate (metres, map frame).")
     theta: float = Field(..., description="Yaw angle in degrees (map frame).")
+    z: float = Field(
+        0.0,
+        allow_inf_nan=False,
+        description="Height of the ground the vertex stands on (metres, map frame): "
+        "which storey it is on. 0 is the ground floor.",
+    )
 
 
 class MapVertexUpdateRequest(BaseModel):
@@ -139,6 +145,11 @@ class MapVertexUpdateRequest(BaseModel):
     x: Optional[float] = Field(None, description="New world x-coordinate (metres).")
     y: Optional[float] = Field(None, description="New world y-coordinate (metres).")
     theta: Optional[float] = Field(None, description="New yaw angle in degrees.")
+    z: Optional[float] = Field(
+        None,
+        allow_inf_nan=False,
+        description="New ground height (metres): a move to another storey.",
+    )
 
 
 class MapVertexResponse(BaseModel):
@@ -149,6 +160,7 @@ class MapVertexResponse(BaseModel):
     x: float = Field(..., description="World x-coordinate (metres, map frame).")
     y: float = Field(..., description="World y-coordinate (metres, map frame).")
     theta: float = Field(..., description="Yaw angle in degrees (map frame).")
+    z: float = Field(..., description="Height of the ground the vertex stands on (metres).")
 
 
 class DeleteResponse(BaseModel):
@@ -860,6 +872,7 @@ def _vertex_response(vertex: MapPoint) -> MapVertexResponse:
         x=vertex.x,
         y=vertex.y,
         theta=vertex.theta,
+        z=vertex.z,
     )
 
 
@@ -1238,7 +1251,7 @@ def init_map_router(
             )
 
         vertices = [
-            {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta}
+            {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta, "z": v.z}
             for v in map_repo.list_vertices(map=name)
         ]
         started = time.perf_counter()
@@ -1344,6 +1357,7 @@ def init_map_router(
                 "x": float(v["x"]),
                 "y": float(v["y"]),
                 "theta": float(v["theta"]),
+                "z": float(v.get("z", 0.0)),
             }
             for v in manifest.vertices
         ]
@@ -2166,6 +2180,7 @@ def init_map_router(
                     "x": req.x,
                     "y": req.y,
                     "theta": req.theta,
+                    "z": req.z,
                 }
                 for req in reqs
             ],

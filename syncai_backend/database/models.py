@@ -21,6 +21,10 @@ class MapPoint(Base):
     """A named point placed on a map, stored in world (map-frame) coordinates.
 
     ``x``/``y`` in metres, ``theta`` in degrees, map frame: a MOVE goal as-is.
+    ``z`` is the height of the ground the point stands on, in metres: which
+    storey of a multi-floor map it is on, and what the 3D planner snaps the
+    goal to. 0 is the ground floor, and what every point saved before the
+    column existed reads as.
     """
 
     __tablename__ = "map_vertices"
@@ -37,6 +41,7 @@ class MapPoint(Base):
     x: Mapped[float] = mapped_column(Float, nullable=False)
     y: Mapped[float] = mapped_column(Float, nullable=False)
     theta: Mapped[float] = mapped_column(Float, nullable=False)
+    z: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

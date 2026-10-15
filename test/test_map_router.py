@@ -268,6 +268,26 @@ def test_update_vertex(client):
     assert body["y"] == -1.5  # untouched
 
 
+def test_a_vertex_without_a_height_is_on_the_ground_floor(client):
+    body = client.post(f"/api/v1/maps/{_MAP}/vertices", json=[_VERTEX]).json()[0]
+
+    assert body["z"] == 0.0
+
+
+def test_a_vertex_keeps_the_storey_it_was_placed_on(client):
+    body = client.post(f"/api/v1/maps/{_MAP}/vertices",
+                       json=[dict(_VERTEX, z=5.02)]).json()[0]
+
+    assert client.get(f"/api/v1/maps/{_MAP}/vertices/{body['id']}").json()["z"] == 5.02
+
+    # A rename sends no z, and must not drop the point back to the ground floor.
+    renamed = client.put(f"/api/v1/maps/{_MAP}/vertices/{body['id']}", json={"name": "up"})
+    assert renamed.json()["z"] == 5.02
+
+    moved = client.put(f"/api/v1/maps/{_MAP}/vertices/{body['id']}", json={"z": 0.0})
+    assert moved.json()["z"] == 0.0
+
+
 def test_update_missing_vertex_returns_404(client):
     response = client.put(f"/api/v1/maps/{_MAP}/vertices/{_MISSING_ID}", json={"name": "x"})
     assert response.status_code == 404

@@ -147,6 +147,7 @@ def _manifest_bytes(
                 "x": float(vertex["x"]),
                 "y": float(vertex["y"]),
                 "theta": float(vertex["theta"]),
+                "z": float(vertex.get("z", 0.0)),
             }
             for vertex in vertices
         ],
@@ -420,6 +421,12 @@ def _parse_manifest(raw: bytes) -> ArchiveManifest:
                     f"Vertex {vertex_name!r} in {MANIFEST_NAME} has no finite {key}."
                 )
             row[key] = float(value)
+        # Optional: an archive exported before storeys has no z, and every
+        # one of its waypoints was on the ground floor.
+        z = vertex.get("z", 0.0)
+        if not (isinstance(z, (int, float)) and not isinstance(z, bool) and math.isfinite(z)):
+            raise MapArchiveError(f"Vertex {vertex_name!r} in {MANIFEST_NAME} has no finite z.")
+        row["z"] = float(z)
         normalised.append(row)
 
     return ArchiveManifest(
