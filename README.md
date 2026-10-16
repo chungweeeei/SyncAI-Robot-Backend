@@ -923,7 +923,7 @@ Details that matter when editing this path:
 | `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads, e.g. `[map]`) |
 | `TTS_SERVICE_URL` | `http://syncai_tts:8080` | `gateways/tts` — the syncai_tts container by compose service name; `http://127.0.0.1:8080` with the backend on the host (the compose service uses `http://127.0.0.1:9090`, the port syncai_tts publishes) |
 | `SYNCAI_WEBRTC_LIB` | `~/robot_ws/lib/libsyncai_worker.so` | `gateways/webrtc` — the Go worker to dlopen. A nonexistent path is the only way to disable WebRTC: a loaded c-shared library cannot be unloaded |
-| `VIDEO_RTP_PORT` · `VIDEO_AUDIO_RTP_PORT` · `AUDIO_RTP_PORT` · `STUN_SERVERS` | `5006` · `5007` · `5004` · `stun:stun.l.google.com:19302` | Read by the **worker**, not Python; `gateways/webrtc` only `setdefault`s them right before `InitWorker`, which freezes them for the process. The compose service sets `STUN_SERVERS=""` (LAN robot) and `VIDEO_FORMAT=rtpjpeg`, so video comes from the camera feeder's RTP/JPEG on `127.0.0.1:5008` instead of each session opening `/dev/syncai/camera0` itself (which fails "busy" while the feeder holds it). `TURN_SERVERS` / `TURN_USERNAME` / `TURN_PASSWORD` have no default on purpose — `.env` is their only source |
+| `VIDEO_RTP_PORT` · `VIDEO_AUDIO_RTP_PORT` · `AUDIO_RTP_PORT` · `STUN_SERVERS` | `5006` · `5007` · `5004` · `stun:stun.l.google.com:19302` | Read by the **worker**, not Python; `gateways/webrtc` only `setdefault`s them right before `InitWorker`, which freezes them for the process. The compose service sets `STUN_SERVERS=""` (LAN robot), `VIDEO_FORMAT=rtpjpeg`, so video comes from the camera feeder's RTP/JPEG on `127.0.0.1:5008` instead of each session opening `/dev/syncai/camera0` itself (which fails "busy" while the feeder holds it), and `VIDEO_FRAMERATE=30`, the feeder's rate with stabilization on, which under `rtpjpeg` only sets the half-second IDR interval. `TURN_SERVERS` / `TURN_USERNAME` / `TURN_PASSWORD` have no default on purpose — `.env` is their only source |
 
 `.env` in the workspace root is loaded via `python-dotenv` at import time.
 
@@ -1097,7 +1097,7 @@ docker run -d --name syncai_backend --restart unless-stopped \
     -e POSTGRES_HOST=127.0.0.1 -e POSTGRES_PORT=5432 \
     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
     -e TEMPORAL_ADDRESS=127.0.0.1:7233 -e TTS_SERVICE_URL=http://127.0.0.1:9090 \
-    -e STUN_SERVERS= -e VIDEO_FORMAT=rtpjpeg \
+    -e STUN_SERVERS= -e VIDEO_FORMAT=rtpjpeg -e VIDEO_FRAMERATE=30 \
     -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all \
     --device /dev/video0 --device /dev/video1 --device /dev/video2 --device /dev/video3 \
     -v /dev/syncai:/dev/syncai:ro \
