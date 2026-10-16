@@ -43,6 +43,7 @@ from syncai_backend.repositories.telemetry.telemetry import (  # noqa: E402
 )
 from syncai_backend.subscribers.path_subscriber import (  # noqa: E402
     _MAX_PATH_POINTS,
+    init_docking_plan_subscriber,
     init_path_subscriber,
 )
 
@@ -153,6 +154,50 @@ def test_an_empty_plan_is_forwarded_as_the_explicit_clear(subscription, repo):
     cleared = repo.get_path(after_seq=seq)
     assert cleared.points == ()
     assert cleared.stamp == pytest.approx(101.0)
+
+
+def test_an_empty_plan_clears_whatever_its_frame(subscription, repo):
+    # A clear carries no coordinates to misplace; dropping one for its frame
+    # would leave the old route up until the TTL.
+    subscription.callback(_path([(0.0, 0.0), (1.0, 1.0)]))
+    seq = repo.get_path().seq
+
+    subscription.callback(_path([], frame_id=""))
+
+    assert repo.get_path(after_seq=seq).points == ()
+
+
+# --- the docking plan ---------------------------------------------------------
+
+
+@pytest.fixture
+def docking_subscription(logger, node, repo):
+    init_docking_plan_subscriber(logger=logger, node=node, telemetry_repo=repo)
+    (sub,) = node.subscriptions
+    return sub
+
+
+def test_the_docking_plan_is_the_relative_docking_plan_topic(docking_subscription):
+    assert docking_subscription.topic == "docking_plan"
+    assert docking_subscription.msg_type is Path
+    assert (
+        docking_subscription.qos_profile.reliability
+        == rclpy.qos.ReliabilityPolicy.BEST_EFFORT
+    )
+
+
+def test_the_docking_plan_fills_its_own_slot(docking_subscription, repo):
+    docking_subscription.callback(_path([(1.0, 1.0), (1.5, 1.2)]))
+
+    assert repo.get_docking_plan().points == ((1.0, 1.0), (1.5, 1.2))
+    assert repo.get_path() is None
+
+
+def test_the_docking_plan_has_the_same_frame_gate(docking_subscription, repo):
+    # The controller integrates in odom; only the map-frame copy may land.
+    docking_subscription.callback(_path([(1.0, 1.0)], frame_id="robot01/odom"))
+
+    assert repo.get_docking_plan() is None
 
 
 # --- thinning -----------------------------------------------------------------

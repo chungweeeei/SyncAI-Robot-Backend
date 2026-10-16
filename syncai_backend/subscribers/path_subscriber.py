@@ -1,3 +1,5 @@
+from typing import Callable, Tuple
+
 import structlog
 
 import rclpy
@@ -22,9 +24,17 @@ _MAX_PATH_POINTS = 512
 _MIN_POINT_SPACING_M = 1e-3
 
 
+# What a subscriber hands its repo slot: thinned (x, y) pairs and the stamp.
+PathSink = Callable[[Tuple[Tuple[float, float], ...], float], None]
+
+
 class PathSubscriber:
-    """Feeds TelemetryRepo's path slot, and therefore the telemetry WebSocket,
-    from the planner's ``plan`` topic.
+    """Feeds one of TelemetryRepo's path slots, and therefore the telemetry
+    WebSocket, from a map-frame ``nav_msgs/Path`` topic: the planner's
+    ``plan`` (``init_path_subscriber``) or the docking controller's
+    ``docking_plan`` (``init_docking_plan_subscriber``). The two share the
+    frame gate, the thinning and the empty-means-clear rule, which is why
+    they are one class with the topic and the slot as arguments.
 
     Apart from TelemetrySubscriber: a route arrives once a second in the map
     frame (no TF) and wants different QoS. Not the controller's
@@ -39,9 +49,15 @@ class PathSubscriber:
     is only the fallback for a planner that stopped re-sending.
     """
 
-    def __init__(self, logger: structlog.stdlib.BoundLogger, telemetry_repo: TelemetryRepo):
-        self._logger = logger
-        self._repo = telemetry_repo
+    def __init__(
+        self,
+        logger: structlog.stdlib.BoundLogger,
+        topic: str,
+        sink: PathSink,
+    ):
+        self._logger = logger.bind(topic=topic)
+        self._topic = topic
+        self._sink = sink
 
         # Edge-triggered logging for the frame check (tri-state, as in
         # TelemetrySubscriber._tf_available).
@@ -53,7 +69,7 @@ class PathSubscriber:
         # by the planner sending it three times.
         node.create_subscription(
             msg_type=Path,
-            topic="plan",  # relative, so it inherits the robot_id namespace
+            topic=self._topic,  # relative, so it inherits the robot_id namespace
             callback=self._plan_cb,
             qos_profile=QoSProfile(
                 depth=1,
@@ -64,6 +80,16 @@ class PathSubscriber:
         )
 
     def _plan_cb(self, msg: Path):
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+        # An empty path is a clear (the planner's clear_plan, controller_server
+        # at the end of every dock goal), and it is honoured in any frame: it
+        # carries no coordinates to misplace, and dropping one would leave the
+        # old route up until the TTL.
+        if not msg.poses:
+            self._sink((), stamp)
+            return
+
         frame = msg.header.frame_id
         if frame != _MAP_FRAME:
             # Dropped, not reprojected: everything downstream assumes map metres.
@@ -81,16 +107,7 @@ class PathSubscriber:
             self._logger.info("planned path streaming", frame=frame)
             self._frame_ok = True
 
-        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-
-        # An empty plan is the planner's clear on cancel (clear_plan). Its frame
-        # is `map`, so it passes the check above; one in any other frame would
-        # be dropped there and leave the old route up.
-        if not msg.poses:
-            self._repo.update_path(points=(), stamp=stamp)
-            return
-
-        self._repo.update_path(points=self._thin(msg), stamp=stamp)
+        self._sink(self._thin(msg), stamp)
 
     def _thin(self, msg: Path) -> tuple:
         """Reduce a plan to at most _MAX_PATH_POINTS deduplicated (x, y) pairs."""
@@ -125,6 +142,34 @@ class PathSubscriber:
 def init_path_subscriber(
     logger: structlog.stdlib.BoundLogger, node: Node, telemetry_repo: TelemetryRepo
 ) -> PathSubscriber:
-    subscriber = PathSubscriber(logger=logger, telemetry_repo=telemetry_repo)
+    subscriber = PathSubscriber(
+        logger=logger,
+        topic="plan",
+        sink=lambda points, stamp: telemetry_repo.update_path(points=points, stamp=stamp),
+    )
+    subscriber.register(node=node)
+    return subscriber
+
+
+def init_docking_plan_subscriber(
+    logger: structlog.stdlib.BoundLogger, node: Node, telemetry_repo: TelemetryRepo
+) -> PathSubscriber:
+    """The DockingController's predicted approach onto the dock (2 Hz, map
+    frame), which the planner's ``plan`` does not cover: the final metre is
+    driven by a control law with no planner involved. The staging leg before
+    it is an ordinary plan and arrives on ``plan``.
+
+    Its own slot rather than the route's, so the console can draw the two
+    differently and a dock's clear never erases a route (or the reverse).
+    controller_server publishes the empty Path when the dock goal ends,
+    however it ends; the repo's TTL covers a controller that died mid-dock.
+    """
+    subscriber = PathSubscriber(
+        logger=logger,
+        topic="docking_plan",
+        sink=lambda points, stamp: telemetry_repo.update_docking_plan(
+            points=points, stamp=stamp
+        ),
+    )
     subscriber.register(node=node)
     return subscriber

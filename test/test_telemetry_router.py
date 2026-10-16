@@ -96,6 +96,26 @@ def test_an_empty_path_is_a_real_frame(client, telemetry_repo):
         assert ws.receive_json() == {"type": "path", "points": [], "stamp": 13.0}
 
 
+def test_a_docking_plan_arrives_as_its_own_type(client, telemetry_repo):
+    # Not a `path` frame: the console draws the dock's last metre apart from
+    # the route, and a dock's clear must not erase the route.
+    telemetry_repo.update_docking_plan(points=((1.0, 1.0), (1.5, 1.2)), stamp=20.0)
+
+    with client.websocket_connect(STREAM_PATH) as ws:
+        assert ws.receive_json() == {
+            "type": "dock_path",
+            "points": [[1.0, 1.0], [1.5, 1.2]],
+            "stamp": 20.0,
+        }
+
+
+def test_an_empty_docking_plan_is_a_real_frame(client, telemetry_repo):
+    telemetry_repo.update_docking_plan(points=(), stamp=21.0)
+
+    with client.websocket_connect(STREAM_PATH) as ws:
+        assert ws.receive_json() == {"type": "dock_path", "points": [], "stamp": 21.0}
+
+
 def test_all_three_types_multiplex_over_one_socket(client, telemetry_repo):
     # Seeded before connect, so the pump's very first tick drains all three
     # slots. The pose → joints → path order is the loop's own and therefore
