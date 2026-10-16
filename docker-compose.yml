@@ -140,6 +140,14 @@ services:
       #    default, every video session opens /dev/syncai/camera0 itself and
       #    dies on "Device '/dev/syncai/camera0' is busy" / not-negotiated.
       VIDEO_FORMAT: rtpjpeg
+      #    The rate the feeder sends at. With its gyro stabilization on
+      #    (`stabilize: true`), the RTP branch drops to its ros_framerate, 30,
+      #    instead of the camera's 60. Under rtpjpeg this sets nothing but the
+      #    encoder's IDR interval (VIDEO_FRAMERATE / 2 frames): left at the
+      #    worker's 60, a keyframe comes every second instead of every half
+      #    second, and the worker never answers a PLI, so a browser joining
+      #    mid-stream sits on a black view that much longer.
+      VIDEO_FRAMERATE: "30"
       #    These two are what the `runtime: nvidia` above reads to decide what
       #    to inject; `all` rather than `video` because the CSV is consumed
       #    wholesale and trimming it brings the missing elements back without
