@@ -491,8 +491,9 @@ class TestTaskState:
 
         assert body["status"] == "IN_PROGRESS"
         # StepState is status/error/message (and the group it ran in) — the
-        # definition (params) stays out. No feedback from the robot yet reads
-        # as an empty message; an ungrouped step reads group null.
+        # definition (params) stays out, but for a DOCK's pose. No feedback
+        # from the robot yet reads as an empty message; an ungrouped step
+        # reads group null, and a step that is not a DOCK reads dock null.
         assert body["steps"] == [
             {
                 "id": "step1",
@@ -500,6 +501,7 @@ class TestTaskState:
                 "error_msg": "",
                 "message": "",
                 "group": None,
+                "dock": None,
             }
         ]
 
@@ -530,6 +532,36 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-dock-001").json()
 
         assert body["steps"][0]["message"] == "Docking: 0.42 m from the dock"
+
+    def test_a_dock_step_carries_its_dock_pose(self, client, workflow_gw):
+        # The console derives the staging pose from it to draw the approach,
+        # so it is there in every state, not only while running -- and only
+        # on the DOCK: a MOVE's goal is the route's end, which `plan` draws.
+        workflow_gw.state = TaskState(
+            id="robot01-task-002",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="1-move",
+                    type=StepType.MOVE,
+                    params=MoveParams(x=1.0, y=2.0, theta=90.0),
+                    status=StepStatus.COMPLETED,
+                ),
+                Step(
+                    id="2-dock",
+                    type=StepType.DOCK,
+                    params=MoveParams(x=3.0, y=-1.5, theta=180.0),
+                    status=StepStatus.PENDING,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-task-002").json()
+
+        assert [step["dock"] for step in body["steps"]] == [
+            None,
+            {"x": 3.0, "y": -1.5, "theta": 180.0},
+        ]
 
     def test_only_a_running_move_asks_the_robot(self, client, workflow_gw, robot_gw):
         # A paused MOVE has cancelled its goal, and a STANDUP never had one:
