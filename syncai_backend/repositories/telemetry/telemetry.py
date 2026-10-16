@@ -19,6 +19,12 @@ from typing import Dict, Optional, Tuple
 # never blinks a live route out.
 _PATH_TTL_S = 6.0
 
+# The docking plan's fallback, by the same rule at its own rate: the
+# DockingController sends it at 2 Hz and controller_server clears it when the
+# dock goal ends, so expiry only catches a controller that died mid-dock. 3 s
+# is six periods.
+_DOCKING_PLAN_TTL_S = 3.0
+
 
 @dataclass(frozen=True)
 class PoseSample:
@@ -60,12 +66,40 @@ class PathSample:
     stamp: float
 
 
+class _PathSlot:
+    """One seq-gated path cache with a TTL. Not locked itself: TelemetryRepo
+    holds its own lock around every call."""
+
+    def __init__(self, ttl_s: float):
+        self._ttl_s = ttl_s
+        self._seq = 0
+        self._sample: Optional[PathSample] = None
+        # Monotonic, not the message stamp: the TTL is about when we heard it.
+        self._recv_at = 0.0
+
+    def update(self, points: Tuple[Tuple[float, float], ...], stamp: float):
+        self._seq += 1
+        self._sample = PathSample(seq=self._seq, points=points, stamp=stamp)
+        self._recv_at = time.monotonic()
+
+    def get(self, after_seq: int) -> Optional[PathSample]:
+        if self._sample is None:
+            return None
+        if self._sample.points and time.monotonic() - self._recv_at > self._ttl_s:
+            # Bump seq so each client gets exactly one empty sample.
+            self._seq += 1
+            self._sample = PathSample(seq=self._seq, points=(), stamp=self._sample.stamp)
+        if self._sample.seq <= after_seq:
+            return None
+        return self._sample
+
+
 class TelemetryRepo:
     """In-process single-slot caches for the internal telemetry stream.
 
-    Pose, joints and path are sequenced independently because they arrive at
-    very different rates. Newest sample only, under a lock (ROS thread writes,
-    asyncio reads), as in PointCloudRepo.
+    Pose, joints, the route and the docking plan are sequenced independently
+    because they arrive at very different rates. Newest sample only, under a
+    lock (ROS thread writes, asyncio reads), as in PointCloudRepo.
     """
 
     def __init__(self, logger: structlog.stdlib.BoundLogger):
@@ -76,10 +110,8 @@ class TelemetryRepo:
         self._pose: Optional[PoseSample] = None
         self._joints_seq = 0
         self._joints: Optional[JointsSample] = None
-        self._path_seq = 0
-        self._path: Optional[PathSample] = None
-        # Monotonic, not the message stamp: the TTL is about when we heard it.
-        self._path_recv_at = 0.0
+        self._path = _PathSlot(ttl_s=_PATH_TTL_S)
+        self._docking_plan = _PathSlot(ttl_s=_DOCKING_PLAN_TTL_S)
 
     def update_pose(self, x: float, y: float, z: float, yaw_deg: float, stamp: float):
         with self._lock:
@@ -97,9 +129,13 @@ class TelemetryRepo:
 
     def update_path(self, points: Tuple[Tuple[float, float], ...], stamp: float):
         with self._lock:
-            self._path_seq += 1
-            self._path = PathSample(seq=self._path_seq, points=points, stamp=stamp)
-            self._path_recv_at = time.monotonic()
+            self._path.update(points=points, stamp=stamp)
+
+    def update_docking_plan(
+        self, points: Tuple[Tuple[float, float], ...], stamp: float
+    ):
+        with self._lock:
+            self._docking_plan.update(points=points, stamp=stamp)
 
     def get_pose(self, after_seq: int = 0) -> Optional[PoseSample]:
         """Return the cached pose if newer than ``after_seq``, else None."""
@@ -126,20 +162,13 @@ class TelemetryRepo:
         so the rule lives here rather than in every WebSocket client.
         """
         with self._lock:
-            if self._path is None:
-                return None
-            if (
-                self._path.points
-                and time.monotonic() - self._path_recv_at > _PATH_TTL_S
-            ):
-                # Bump seq so each client gets exactly one empty sample.
-                self._path_seq += 1
-                self._path = PathSample(
-                    seq=self._path_seq, points=(), stamp=self._path.stamp
-                )
-            if self._path.seq <= after_seq:
-                return None
-            return self._path
+            return self._path.get(after_seq)
+
+    def get_docking_plan(self, after_seq: int = 0) -> Optional[PathSample]:
+        """The docking controller's predicted approach, by get_path's rules
+        with _DOCKING_PLAN_TTL_S."""
+        with self._lock:
+            return self._docking_plan.get(after_seq)
 
 
 def init_telemetry_repo(logger: structlog.stdlib.BoundLogger) -> TelemetryRepo:

@@ -50,6 +50,7 @@ from syncai_backend.subscribers.telemetry_subscriber import (
     init_telemetry_subscriber,
 )
 from syncai_backend.subscribers.path_subscriber import (
+    init_docking_plan_subscriber,
     init_path_subscriber,
 )
 from syncai_backend.subscribers.tf import init_tf_listener
@@ -161,6 +162,10 @@ class SyncAIBackend(Node):
         )
         # The planner's route, onto the telemetry socket; already in the map frame.
         init_path_subscriber(logger=logger, node=self, telemetry_repo=telemetry_repo)
+        # The dock's last metre, which no planner draws; also map frame.
+        init_docking_plan_subscriber(
+            logger=logger, node=self, telemetry_repo=telemetry_repo
+        )
 
         worker_handle = start_temporal_worker(
             logger=logger,

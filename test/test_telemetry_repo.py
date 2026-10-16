@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from syncai_backend.repositories.telemetry.telemetry import (
+    _DOCKING_PLAN_TTL_S,
     _PATH_TTL_S,
     TelemetryRepo,
 )
@@ -102,3 +103,28 @@ class TestPathTtl:
             repo.update_path(points=((5.0, 5.0),), stamp=110.0)
             revived = repo.get_path(after_seq=expired.seq)
             assert revived.points == ((5.0, 5.0),)
+
+
+class TestDockingPlan:
+    def test_the_docking_plan_is_its_own_slot(self, repo):
+        # A dock's clear must not erase the route, nor the reverse.
+        with patch(MONOTONIC, return_value=100.0):
+            repo.update_path(points=((0.0, 0.0), (1.0, 1.0)), stamp=10.0)
+            path_seq = repo.get_path().seq
+
+            repo.update_docking_plan(points=(), stamp=11.0)
+
+            assert repo.get_path(after_seq=path_seq) is None
+            assert repo.get_docking_plan().points == ()
+
+    def test_a_docking_plan_expires_on_its_own_ttl(self, repo):
+        with patch(MONOTONIC, return_value=100.0):
+            repo.update_docking_plan(points=((0.0, 0.0),), stamp=10.0)
+            seq = repo.get_docking_plan().seq
+
+        # Shorter than the route's: the plan comes at 2 Hz, not 1 Hz.
+        assert _DOCKING_PLAN_TTL_S < _PATH_TTL_S
+        with patch(MONOTONIC, return_value=100.0 + _DOCKING_PLAN_TTL_S + 0.1):
+            expired = repo.get_docking_plan(after_seq=seq)
+            assert expired.points == ()
+            assert repo.get_docking_plan(after_seq=expired.seq) is None

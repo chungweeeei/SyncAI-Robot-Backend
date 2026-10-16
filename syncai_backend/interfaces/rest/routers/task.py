@@ -15,6 +15,7 @@ from syncai_backend.gateways.workflow.config import (
 )
 from syncai_backend.gateways.workflow.schema import (
     GROUP_DESCRIPTION,
+    MoveParams,
     NAV_STEP_TYPES,
     POSE_STEP_TYPES,
     Step,
@@ -136,6 +137,16 @@ class TaskResponse(BaseModel):
     )
 
 
+class DockPose(BaseModel):
+    x: float = Field(..., description="Dock x in the map frame, metres", examples=[1.0])
+    y: float = Field(..., description="Dock y in the map frame, metres", examples=[2.0])
+    theta: float = Field(
+        ...,
+        description="Dock heading in degrees, CCW from +x, the way the robot faces on it",
+        examples=[90.0],
+    )
+
+
 class StepState(BaseModel):
     id: str = Field(
         ..., description="Unique identifier of the step", examples=["step1"]
@@ -159,6 +170,14 @@ class StepState(BaseModel):
     group: Optional[str] = Field(
         default=None,
         description="The step's group, as dispatched: steps sharing one ran side by side",
+    )
+    dock: Optional[DockPose] = Field(
+        default=None,
+        description=(
+            "The dock pose a DOCK step drives onto, as dispatched (map frame); "
+            "null for every other step. A console derives the staging pose "
+            "from it to draw the approach of a running dock"
+        ),
     )
 
 
@@ -546,6 +565,14 @@ def init_task_router(
             return robot_gw.get_move_message()
         return ""
 
+    def _step_dock(step: Step) -> Optional[DockPose]:
+        # The params as dispatched, which a template already resolved from its
+        # vertex: the pose the robot is driving to, not the vertex as it may
+        # have been edited since.
+        if step.type is StepType.DOCK and isinstance(step.params, MoveParams):
+            return DockPose(x=step.params.x, y=step.params.y, theta=step.params.theta)
+        return None
+
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)
     async def get_task_state(id: str):
         state = await workflow_gw.get_task_state(task_id=id)
@@ -560,6 +587,7 @@ def init_task_router(
                     error_msg=step.error_msg or "",
                     message=_step_message(step),
                     group=step.group,
+                    dock=_step_dock(step),
                 )
                 for step in state.steps
             ],
