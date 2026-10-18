@@ -22,6 +22,10 @@ from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 # How long one `odom` sample keeps ownership of the pose: well above a 20 Hz
 # period, so the mapping fallback stays inert in AUTO through a hiccup.
 PRIMARY_POSE_HOLD_S = 1.0
+# How long one `lio_odom` height stands in for the odom feed's flat z: well
+# above its ~10 Hz (one per scan), so a late scan does not drop the robot a
+# storey for a frame.
+LIO_HEIGHT_HOLD_S = 1.0
 
 # The URDF frames the mapping fallback composes through (fixed by
 # description/G23.urdf), under the LIO body frame's namespace prefix.
@@ -57,7 +61,9 @@ class TelemetrySubscriber:
          ``_lio_odom_cb``); the mapping session has no ``odom`` or map->odom.
 
        ``odom`` wins whenever it is live (``PRIMARY_POSE_HOLD_S``): it is what
-       the stack navigates by.
+       the stack navigates by. Except for z: the projection makes the planar
+       chain's z 0 on every storey, so in AUTO the height is the LIO chain's
+       (``LIO_HEIGHT_HOLD_S``), the same number MANUAL reports.
 
     2. Joints: ``motor_states`` reduced to {URDF joint name: position}, the
        names the frontend looks GLB nodes up by.
@@ -82,6 +88,10 @@ class TelemetrySubscriber:
         # When the primary feed last delivered (monotonic). -inf so the
         # fallback is live at once in a session with no primary feed.
         self._primary_seen_s = float("-inf")
+        # base_link's map-frame z from the LIO chain and when (monotonic), for
+        # the primary feed. One tuple, so a reader never pairs a z with
+        # another sample's time.
+        self._lio_height = (0.0, float("-inf"))
 
     def register(self, node: Node):
         # Best-effort keep-last: only the newest sample matters. Matches odom
@@ -148,11 +158,19 @@ class TelemetrySubscriber:
         oq = msg.pose.pose.orientation
         odom_yaw = _yaw_from_quat(oq.x, oq.y, oq.z, oq.w)
 
+        # lio_bridge projects both onto the plane, so t.z + p.z is 0 upstairs
+        # too; the LIO chain's height stands in while it is fresh.
+        lio_z, lio_z_s = self._lio_height
+        if time.monotonic() - lio_z_s < LIO_HEIGHT_HOLD_S:
+            z = lio_z
+        else:
+            z = t.z + p.z
+
         cos_y, sin_y = math.cos(tf_yaw), math.sin(tf_yaw)
         self._repo.update_pose(
             x=t.x + cos_y * p.x - sin_y * p.y,
             y=t.y + sin_y * p.x + cos_y * p.y,
-            z=t.z + p.z,
+            z=z,
             yaw_deg=math.degrees(tf_yaw + odom_yaw),
             stamp=msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
         )
@@ -169,10 +187,11 @@ class TelemetrySubscriber:
         closes the tree. Full 3x3 algebra, not planar: the mount is tilted and
         the LIO solution is 6-DOF, so composing yaws would bake the tilt into
         the heading. z is kept, or the robot would float above its map.
-        """
-        if time.monotonic() - self._primary_seen_s < PRIMARY_POSE_HOLD_S:
-            return
 
+        In AUTO the same chain exists (the localizer broadcasts
+        map->pointlio_odom), but ``odom`` owns the pose; this then only hands
+        it the height, which is the one thing the planar chain cannot carry.
+        """
         body_frame = msg.child_frame_id
         # The namespace prefix is taken from the frame id, so an upstream rename
         # needs no edit here.
@@ -188,8 +207,9 @@ class TelemetrySubscriber:
         except TransformException as exc:
             if self._lio_tf_available is not False:
                 self._logger.warning(
-                    "telemetry pose dropping: mapping TF unavailable (is pgo "
-                    "broadcasting map->pointlio_odom, and bringup the URDF?)",
+                    "telemetry LIO pose dropping: TF unavailable (map->"
+                    "pointlio_odom comes from pgo while mapping, from the "
+                    "localizer in AUTO; is bringup up for the URDF?)",
                     body_frame=body_frame,
                     error=str(exc),
                 )
@@ -211,6 +231,10 @@ class TelemetrySubscriber:
 
         rot = map_r @ odom_r @ lidar_base_r
         pos = map_t + map_r @ (odom_t + odom_r @ lidar_base_t)
+
+        self._lio_height = (float(pos[2]), time.monotonic())
+        if time.monotonic() - self._primary_seen_s < PRIMARY_POSE_HOLD_S:
+            return
 
         self._repo.update_pose(
             x=float(pos[0]),

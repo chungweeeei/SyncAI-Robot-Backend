@@ -234,7 +234,7 @@ the only caller that passes anything else.
   `_refuse_if_in_use`).
 - **A running job locks the map it is on.** Every route that edits what the planner,
   the costmaps or a job's waypoints read — vertex create/update/delete, `PUT …/grid`,
-  `PUT …/keepout`, `POST …/grid/convert` — sits behind `_refuse_while_a_job_holds`
+  `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `_refuse_while_a_job_holds`
   (an **async** dependency in front of plain `def` routes, so the Temporal call runs on
   the event loop and the route still runs in the threadpool): 409 `task_running` while a
   run's `TaskMap` is the loaded map, 409 `tasks_unknown` when Temporal cannot be asked —
@@ -247,6 +247,20 @@ the only caller that passes anything else.
   unknown costmap cells. Written pgm → yaml → json. The nav session writes a blank pair
   (no json) at boot for a map that has none and never overwrites an existing one; a map
   switch must reload the mask itself (`filter_mask_server/load_map`), which `activate` does.
+- **The 3D map (`map/<name>/octomap.bt`) is read, never parsed, never written.** The
+  robot's `clean_map` writes it (with `map_clean_octomap`) and reports it in
+  `map_clean.recipe.json`'s `params.octomap` / `measurements.octomap_written` /
+  `octomap_error`; `MapCatalogRepo` reads that sidecar (`MapCleanRecord`) and the tree's
+  text header (`OctomapInfo`: `res`, plus `size-mtime_ns` as `version`), and the router's
+  `_octomap_status` derives `octomap_status` from disk alone — a present tree is `ok`
+  whatever the sidecar says (tmp + rename). `GET …/octomap` is a `FileResponse` of the
+  `.bt`, ETag'd on `version`. The console's ground patches land in `octomap_edits.json`
+  (`PUT …/octomap/edits`, the viewer's document shape, one key per column) as a **record
+  only**: applying them to the tree is the robot's `apply_octomap_edits` (which keeps
+  `octomap.raw.bt`), and the planner reads the tree at session start. Nothing written
+  names the map. `GET/PUT …/floors` splits a multi-storey map for the console:
+  detected from `poses.txt` heights (`helpers/floors.py`) unless `floors.json` is
+  saved; display-only, so not behind the job lock.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this

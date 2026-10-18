@@ -178,6 +178,38 @@ carry them along. Not done yet: re-rasterising when `grid/convert` changes the
 gridmap's geometry — the filter looks cells up by world coordinate, so the old
 mask still applies where it has cells, and the next save rewrites it.
 
+**The 3D map is served as the robot wrote it.** With `map_clean_octomap` on,
+the same `clean_map` that rewrites `map.pcd` also writes `map/<name>/octomap.bt`
+— the `octomap::OcTree` (0.1 m, free *and* occupied) the 3D planner plans on —
+and says so in `map_clean.recipe.json` (`params.octomap`,
+`measurements.octomap_written` / `octomap_error`). The catalogue reads that
+sidecar and the tree's text header only, and reports `octomap_status` the way it
+reports `grid_status` (`none` / `converting` / `ok` / `failed` / `interrupted`,
+derived in `_octomap_status`; a tree on disk is `ok` whatever the sidecar says,
+since it is written by tmp + rename), with `octomap_version` — `size-mtime_ns`,
+the file's ETag unquoted — and `octomap_resolution`. `GET /api/v1/maps/{name}/octomap`
+is the `.bt` byte for byte, ETag'd on that version and revalidated to 304. Not
+decoded here on purpose: the file is a third the size of its voxel centres as
+floats, the console's decoder is a hundred lines, and the console's ground
+editor needs the tree's own keys, not metres. **Ground patches** are the one
+thing the console writes back: `PUT /api/v1/maps/{name}/octomap/edits` records
+the floor voxels an operator painted in — absolute OcTree keys, one per column —
+as `octomap_edits.json`, in the shape the standalone viewer exported, **the
+record and nothing else**: the tree is untouched, and the robot's
+`apply_octomap_edits` is what patches `octomap.bt` from it (setting aside the
+original as `octomap.raw.bt`); the 3D planner then needs its session restarted
+to load the result. Like `keepout.json`, nothing in the file names the map, and
+the keys hold for exactly that save's map frame.
+
+**Floors.** A map that spans storeys is one tree in one frame; the console
+shows one storey at a time. `GET /api/v1/maps/{name}/floors` detects them from
+`poses.txt` on every read — a height the robot spent at least 5 % of its walk at
+is a floor, a stair or landing it passed through is not, levels under 2 m apart
+are one — and `PUT` saves an operator's list (names, body heights) to
+`floors.json`, which then wins. The trajectory rather than the ceiling, because
+the robot stood on every floor it mapped and a ceiling is a different height on
+every site. Only the console reads the file.
+
 **Maps travel as archives.** Since 2026-10 a map can leave as one `.zip` /
 `.tar.gz` (`GET /api/v1/maps/{name}/export`) and arrive on another robot (
 `POST /api/v1/maps/import`). `helpers/map_archive.py` owns the format: the directory's
@@ -226,7 +258,8 @@ frame from the message header and only pins the target frame (`map`).
 | Topic | Type | QoS | Goes to |
 |---|---|---|---|
 | `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state`; `low_level_mode.safety_state` → `SafetyLockService` (rising edge cancels every task) |
-| `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS |
+| `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS (x, y, yaw; z from `pointlio/lio_odom`, see *Telemetry*) |
+| `pointlio/lio_odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed through `map→pointlio_odom` and the lidar mount → telemetry WS: the whole pose while mapping, base_link's height in AUTO |
 | `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
 | `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
@@ -467,13 +500,13 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/robot/restart` | How the latest restart this process dispatched went: `status` `idle` / `restarting` / `succeeded` / `failed`, `message`, `started_at` / `finished_at`. This, not `/robot/state` (which keeps serving the last frame through the rebuild), is how a console learns the outcome. Unanswered for 3 min reads `failed`; in memory, so a restarted backend says `idle` |
 | WS | `/api/v1/robot/teleop` | Inbound manual control: `{vx, vy, wz}` JSON frames at ~10 Hz, each axis clamped to [-1, 1] and published as-is (m/s / rad/s). Refused (`{"error": ...}` frame, socket stays open) while an autonomous MOVE runs. A 0.5 s stale-input watchdog and disconnect both publish zero velocity — driver_manager has no cmd_vel watchdog |
 | POST | `/api/v1/localization/auto` | Find the robot on the loaded map with **no hint** (`reset_odometry` with `skip_seed`: reset Point-LIO, then the global search — kidnap recovery) — the alternative to `set_initial_pose`. The robot must be standing still. No body; blocks up to ~30 s. 200 = localized, nothing to poll: `x` / `y` / `z`, `theta` (degrees), `fitness`, `inlier_ratio`, `candidates`. 409 `task_running` (any job — it moves the map frame), `tasks_unknown`, `localize_running` (one search at a time). Every localizer answer — not AUTO, no `poses.txt`, ambiguous, did not converge — is 502 with its sentence; the odometry has been reset by then, the map pose is left where it was. Writes nothing, not even `[initial_pose]` |
-| POST | `/api/v1/robot/set_initial_pose` | Seed localization with a map-frame pose (degrees in, radians out); fire-and-forget |
+| POST | `/api/v1/robot/set_initial_pose` | Seed localization with a map-frame pose (degrees in, radians out); fire-and-forget. Optional `z`, the ground the pose stands on (a vertex's `z`), picks the storey: it goes out as `position.z` with the z variance (covariance cell 14) set, which is what tells `syncai_localizer` to use it. Omitted, the localizer keeps the height of its current estimate (RViz's 2D Pose Estimate does the same), so a pose on another storey needs `z` |
 | POST | `/api/v1/robot/set_motion_key` | Gait key `"0"`–`"5"`; `"4"` (ESTOP) is accepted but **not** forwarded — 200 with `sent: false` |
 | POST | `/api/v1/robot/estop` | `{"locked": bool}` → `set_safety_lock` on `syncai_driver_manager`. `true` engages the lock and, on the `false → true` edge only, starts cancelling every running task and nav goal in the background (`cancel_requested: true`; started, not finished). `false` releases it, cancelling nothing. 502 if the driver is unreachable, nothing cancelled. Not the ESTOP motion key |
 | POST | `/api/v1/robot/set_policy_mode` | Gait-controller policy index; only `0` (PPO) and `1` (HIMLOCO) |
 | GET | `/api/v1/network/wifi/scan` | Scan networks (blocks up to 45 s) |
 | POST | `/api/v1/network/wifi/connect` | Connect via `nmcli` (blocks up to 70 s) |
-| GET | `/api/v1/maps` | Map directories on disk with geometry, vertex counts and `grid_status` — **the conversion-status surface**; there is no job resource. `none` / `converting` / `ok` / `failed` (reason in `grid_error`) / `interrupted` (backend restarted mid-conversion). `grid_converting` is the deprecated boolean it replaces |
+| GET | `/api/v1/maps` | Map directories on disk with geometry, vertex counts and `grid_status` — **the conversion-status surface**; there is no job resource. `none` / `converting` / `ok` / `failed` (reason in `grid_error`) / `interrupted` (backend restarted mid-conversion). `grid_converting` is the deprecated boolean it replaces. The 3D map's twin: `octomap_status` (same five words, off `octomap.bt` and the cleaning sidecar), `octomap_error`, `octomap_version` (changes when the file does) and `octomap_resolution` |
 | GET | `/api/v1/maps/{name}` | One map's summary |
 | POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, then z-band conversion in a background thread, after the robot's map cleaning (`grid_pending` only means started — poll `grid_status`, which stays `converting` through the cleaning too). On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
 | POST | `/api/v1/mapping/start` | Begin a run: `pgo/start_mapping`, idle → mapping (the drive to the start point is not part of any map). No body; always resets the LIO front end (map origin = odometry origin), so the robot must be **stationary** until it returns. 409 `mapping_running` / `mapping_busy`; 502 with pgo's sentence. Touches no file |
@@ -490,6 +523,11 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/maps/{name}/keepout` | Forbidden zones as saved through this API: `zones: [{id, points: [{x, y}, …]}]` in map-frame metres, plus `active`. Read from `keepout.json`, so a boot-time blank or hand-drawn mask answers `[]` |
 | PUT | `/api/v1/maps/{name}/keepout` | Replace the zones with the **whole** body list (`{zones: [{id?, points: [{x, y}, …]}]}`; ids kept when given, generated when not). Rasterises into `keepout.pgm` + `keepout.yaml`, records `keepout.json`, then (map active) `filter_mask_server/load_map` — `reloaded: true` means enforced now. `[]` **clears**: mask rewritten all-unknown and reloaded, files kept (deleting them changes nothing in the running filter). A failed reload is still **200** with `reloaded: false` and the reason — zones apply at the next boot of this map. 400 for a zone under three points, a non-finite coordinate, an empty or duplicate id; 404 with no gridmap; 409 `conversion_running` |
 | GET | `/api/v1/maps/{name}/pointcloud` | The saved `map.pcd`, packed binary |
+| GET | `/api/v1/maps/{name}/octomap` | The saved `octomap.bt` byte for byte (`application/octet-stream`), ETag = `"<octomap_version>"`, 304 on `If-None-Match`. 409 `octomap_converting` while the map cleaning is still building it; 404 with the reason otherwise (never built, `failed` with the cleaning's sentence, `interrupted`) |
+| GET | `/api/v1/maps/{name}/octomap/edits` | The ground patches saved for the 3D map: `{name, res, fill_key: [[kx, ky, kz], …], created_at}`, absolute OcTree keys of the voxels to mark as floor. `fill_key: []` (and null `res` / `created_at`) when none are saved |
+| GET | `/api/v1/maps/{name}/floors` | The storeys the map spans, lowest first: `{name, floors: [{name, level}], detected: [...], saved}`. `level` is the body height walked on that floor (the z of `poses.txt`), metres. `floors` is the saved list if there is one, else `detected`; `[]` is one storey |
+| PUT | `/api/v1/maps/{name}/floors` | Replace the floors with the **whole** body list (`{floors: [{name, level}, …]}`); `[]` saves one storey. Writes `floors.json`, sorted by level. 400 with a sentence for an empty or over-long name (16), a repeated name, more than 16 floors, or two levels under 1 m apart. Not held by a running job: nothing on the robot reads it |
+| PUT | `/api/v1/maps/{name}/octomap/edits` | Replace the patches with the **whole** body list (`{fill_key: [[kx, ky, kz], …]}`, 0–65535 each, one per `[kx, ky]` column); `[]` clears. Writes `octomap_edits.json` (tmp + rename, `res` from the tree's header) and **nothing else** — the tree is patched on the robot by `apply_octomap_edits`, the message says so. 400 with a sentence for an out-of-range key or a column named twice; 404 with no tree; 409 `octomap_converting`, `octomap_unreadable` (a tree without a readable header), `task_running` / `tasks_unknown` (held by a running job like every map write) |
 | POST · GET | `/api/v1/maps/{name}/vertices` | Batch-create (one transaction) / list with optional `?type=`. Create is held by a running job (below) |
 | GET · PUT · DELETE | `/api/v1/maps/{name}/vertices/{id}` | Read / partial update / delete; update and delete held by a running job |
 | GET | `/api/v1/tts/voices` | Voice ids the speech service's model carries |
@@ -510,7 +548,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (~0.333 Hz) |
 
 **A job's map is read-only while it runs.** Vertex create / update / delete,
-`PUT …/grid`, `PUT …/keepout` and `POST …/grid/convert` answer 409 `task_running`
+`PUT …/grid`, `PUT …/keepout`, `PUT …/octomap/edits` and `POST …/grid/convert` answer 409 `task_running`
 while a running job holds the map (its `map_name` in `GET /api/v1/active_tasks`;
 `ActiveTask.map_in_use`), and 409 `tasks_unknown` when running jobs cannot be
 listed — refuse rather than assume idle. Each of those reloads into the running
@@ -526,7 +564,14 @@ delete and import-replace already refuse the loaded map (`map_active`).
 **Telemetry** is the internal visualization channel and shares no models with
 `GET /api/v1/robot/state` — that payload is frozen, this one may change freely.
 It is its own socket so a 360 kB cloud frame cannot head-of-line block pose;
-`path` rides it because a thinned route is ~8 kB every 3 s. An **empty**
+`path` rides it because a thinned route is ~8 kB every 3 s. Its `points` are
+`[x, y, z]` in map metres, z the ground each one stands on (OctomapPlanner3D's
+floor surface, 0 from a 2D planner) — a waypoint's z — so a route that climbs a
+stair can be drawn storey by storey. `pose.z` is base_link's height, not the
+ground: in AUTO x, y and yaw are lio_bridge's, but its chain is projected onto
+the plane (z = 0 on every storey), so the height is taken from the
+`pointlio/lio_odom` chain while one is under a second old — the same number a
+mapping run reports. An **empty**
 `path.points` means "no route": the planner never publishes an empty plan, so
 `TelemetryRepo` clears a route by TTL (arrival, cancel and abort are the same
 silence from here).

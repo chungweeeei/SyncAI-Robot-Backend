@@ -20,6 +20,10 @@ What is pinned:
   pose always surviving — it is the one point whose exact position the
   operator reads, and a non-dividing stride is exactly what would drop it.
 
+* z survives: it is the ground the route stands on, which is how the console
+  tells a route's upstairs part from its downstairs one. A point over the last
+  one is a climb, not a duplicate.
+
 * An empty plan is FORWARDED as the explicit clear sample, even though today's
   planner never publishes one (route clearing is TTL-based in the repo — see
   test_telemetry_repo). A future producer that does publish one must get the
@@ -63,15 +67,18 @@ class _FakeNode:
 
 
 def _path(points, frame_id="map", sec=100, nanosec=0):
-    """A nav_msgs/Path the way NavFn emits one: positions only, shared header."""
+    """A nav_msgs/Path the way the planners emit one: positions only, shared
+    header. A point is (x, y), on the ground floor as a 2D planner's is, or
+    (x, y, z) as OctomapPlanner3D's."""
     msg = Path()
     msg.header.frame_id = frame_id
     msg.header.stamp.sec = sec
     msg.header.stamp.nanosec = nanosec
-    for x, y in points:
+    for x, y, *z in points:
         pose = PoseStamped()
         pose.pose.position.x = float(x)
         pose.pose.position.y = float(y)
+        pose.pose.position.z = float(z[0]) if z else 0.0
         msg.poses.append(pose)
     return msg
 
@@ -121,7 +128,7 @@ def test_a_map_frame_plan_lands_in_the_repo(subscription, repo):
     )
 
     sample = repo.get_path()
-    assert sample.points == ((0.0, 0.0), (0.5, 0.5), (1.0, 1.0))
+    assert sample.points == ((0.0, 0.0, 0.0), (0.5, 0.5, 0.0), (1.0, 1.0, 0.0))
     assert sample.stamp == pytest.approx(100.25)
 
 
@@ -141,7 +148,7 @@ def test_plans_resume_after_a_wrong_frame(subscription, repo):
     # the drop once a well-formed plan arrives.
     subscription.callback(_path([(1.0, 2.0)]))
 
-    assert repo.get_path().points == ((1.0, 2.0),)
+    assert repo.get_path().points == ((1.0, 2.0, 0.0),)
 
 
 def test_an_empty_plan_is_forwarded_as_the_explicit_clear(subscription, repo):
@@ -189,7 +196,7 @@ def test_the_docking_plan_is_the_relative_docking_plan_topic(docking_subscriptio
 def test_the_docking_plan_fills_its_own_slot(docking_subscription, repo):
     docking_subscription.callback(_path([(1.0, 1.0), (1.5, 1.2)]))
 
-    assert repo.get_docking_plan().points == ((1.0, 1.0), (1.5, 1.2))
+    assert repo.get_docking_plan().points == ((1.0, 1.0, 0.0), (1.5, 1.2, 0.0))
     assert repo.get_path() is None
 
 
@@ -204,11 +211,11 @@ def test_the_docking_plan_has_the_same_frame_gate(docking_subscription, repo):
 
 
 def test_points_are_rounded_to_millimetres(subscription, repo):
-    subscription.callback(_path([(1.23456, -0.00049), (2.0004, 3.0006)]))
+    subscription.callback(_path([(1.23456, -0.00049, 3.14159), (2.0004, 3.0006, 0.0)]))
 
     # round(), so -0.00049 goes to -0.0 and 3.0006 to 3.001 — finer than the
     # 0.05 m costmap resolution the poses came from, so nothing real is lost.
-    assert repo.get_path().points == ((1.235, -0.0), (2.0, 3.001))
+    assert repo.get_path().points == ((1.235, -0.0, 3.142), (2.0, 3.001, 0.0))
 
 
 def test_sub_millimetre_neighbours_collapse_to_one_point(subscription, repo):
@@ -216,7 +223,27 @@ def test_sub_millimetre_neighbours_collapse_to_one_point(subscription, repo):
     # survive (NaN normal blanks the mesh) — the filter here is its guarantee.
     subscription.callback(_path([(0.0, 0.0), (0.0, 0.0), (0.0004, 0.0002), (1.0, 1.0)]))
 
-    assert repo.get_path().points == ((0.0, 0.0), (1.0, 1.0))
+    assert repo.get_path().points == ((0.0, 0.0, 0.0), (1.0, 1.0, 0.0))
+
+
+def test_a_route_up_a_stair_keeps_its_heights(subscription, repo):
+    # A ground floor, a climb, the floor above: the heights are what put each
+    # part on its own storey in the console.
+    subscription.callback(
+        _path(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.5, 0.0, 1.5), (2.0, 0.0, 3.0), (3.0, 0.0, 3.0)]
+        )
+    )
+
+    assert [z for _, _, z in repo.get_path().points] == [0.0, 0.0, 1.5, 3.0, 3.0]
+
+
+def test_a_point_straight_over_the_last_is_kept(subscription, repo):
+    # Same x and y, a step higher: a climb, not the duplicate the spacing
+    # filter is for.
+    subscription.callback(_path([(1.0, 1.0, 0.0), (1.0, 1.0, 0.17), (2.0, 1.0, 0.17)]))
+
+    assert repo.get_path().points == ((1.0, 1.0, 0.0), (1.0, 1.0, 0.17), (2.0, 1.0, 0.17))
 
 
 def test_a_single_pose_plan_is_one_point_not_two(subscription, repo):
@@ -225,7 +252,7 @@ def test_a_single_pose_plan_is_one_point_not_two(subscription, repo):
     # spacing filter exists to remove.
     subscription.callback(_path([(2.5, -1.5)]))
 
-    assert repo.get_path().points == ((2.5, -1.5),)
+    assert repo.get_path().points == ((2.5, -1.5, 0.0),)
 
 
 def test_long_plans_are_thinned_by_stride_and_keep_the_goal(subscription, repo):
@@ -237,9 +264,9 @@ def test_long_plans_are_thinned_by_stride_and_keep_the_goal(subscription, repo):
 
     points = repo.get_path().points
     assert len(points) == 343
-    assert points[0] == (0.0, 0.0)
-    assert points[1] == (0.15, 0.0)  # every 3rd pose, not every pose
-    assert points[-1] == (51.2, 0.0)  # the goal, exactly, not the last stride hit
+    assert points[0] == (0.0, 0.0, 0.0)
+    assert points[1] == (0.15, 0.0, 0.0)  # every 3rd pose, not every pose
+    assert points[-1] == (51.2, 0.0, 0.0)  # the goal, exactly, not the last stride hit
 
 
 def test_the_goal_append_may_exceed_the_cap_by_one(subscription, repo):
@@ -252,4 +279,4 @@ def test_the_goal_append_may_exceed_the_cap_by_one(subscription, repo):
 
     points = repo.get_path().points
     assert len(points) == _MAX_PATH_POINTS + 1
-    assert points[-1] == (51.15, 0.0)
+    assert points[-1] == (51.15, 0.0, 0.0)

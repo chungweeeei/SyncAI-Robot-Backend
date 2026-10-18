@@ -419,7 +419,9 @@ def init_task_template_router(
             vertex_name=vertex.name,
             vertex_status=VertexRefStatus.CURRENT,
             # Moving a vertex moves every template that references it.
-            resolved_params=MoveParams(x=vertex.x, y=vertex.y, theta=vertex.theta),
+            resolved_params=MoveParams(
+                x=vertex.x, y=vertex.y, theta=vertex.theta, z=vertex.z
+            ),
         )
 
     def _response(

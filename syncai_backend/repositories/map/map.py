@@ -5,7 +5,7 @@ from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from typing import Optional, TypedDict
 
-from sqlalchemy import Engine, delete, func, select, update
+from sqlalchemy import Engine, delete, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -13,12 +13,18 @@ from syncai_backend.database.models import MapPoint, _utcnow
 from syncai_backend.exceptions import ConflictError
 
 
-class VertexFields(TypedDict):
+class _VertexFieldsRequired(TypedDict):
     name: str
     type: str
     x: float
     y: float
     theta: float
+
+
+class VertexFields(_VertexFieldsRequired, total=False):
+    # Optional so a caller that predates storeys (and every test) still
+    # inserts a ground-floor point; the column default fills it in.
+    z: float
 
 
 class MapRepo:
@@ -186,7 +192,7 @@ class MapRepo:
         same map (renaming to its own name does not).
         """
         # Only these columns may be updated through the API.
-        allowed = {"name", "type", "x", "y", "theta"}
+        allowed = {"name", "type", "x", "y", "theta", "z"}
         changes = {k: v for k, v in fields.items() if k in allowed and v is not None}
 
         with self._session(op="update_vertex") as session:
@@ -268,4 +274,23 @@ def init_map_repo(
     engine: Engine,
 ) -> MapRepo:
     MapPoint.metadata.create_all(engine)
+    _add_vertex_z(engine)
     return MapRepo(logger=logger, engine=engine)
+
+
+def _add_vertex_z(engine: Engine) -> None:
+    """Give a ``map_vertices`` table created before ``z`` existed its column.
+
+    There are no migrations and ``create_all`` never alters a table that is
+    already there, so a robot's existing waypoints would otherwise fail every
+    read. Checked by inspection rather than ``ADD COLUMN IF NOT EXISTS``,
+    which the SQLite test engine does not speak. The default puts every old
+    waypoint on the ground floor, which is where they all were.
+    """
+    columns = {column["name"] for column in inspect(engine).get_columns("map_vertices")}
+    if "z" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE map_vertices ADD COLUMN z FLOAT NOT NULL DEFAULT 0")
+        )

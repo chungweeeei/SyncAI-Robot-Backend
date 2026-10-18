@@ -211,8 +211,12 @@ MAP_CLEAN_TIMEOUT_S = 900.0
 MAP_CLEAN_POLL_S = 2.0
 
 
-def _parse_iso_utc(value: object) -> Optional[datetime]:
-    """``2026-10-12T05:47:05Z`` -> an aware datetime; None for anything else."""
+def parse_iso_utc(value: object) -> Optional[datetime]:
+    """``2026-10-12T05:47:05Z`` -> an aware datetime; None for anything else.
+
+    Public because the map router ages the same sidecar's ``started_at`` for
+    the 3D map's status, with the same reading of it.
+    """
     if not isinstance(value, str):
         return None
     try:
@@ -287,7 +291,7 @@ def wait_for_map_clean(
                     "waited_s": _waited(),
                     "error": record.get("error"),
                 }
-            clean_started = _parse_iso_utc(record.get("started_at"))
+            clean_started = parse_iso_utc(record.get("started_at"))
             if (
                 clean_started is not None
                 and (wall_now() - clean_started).total_seconds() > timeout_s

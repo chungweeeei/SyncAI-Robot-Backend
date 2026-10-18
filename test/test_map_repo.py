@@ -349,3 +349,28 @@ def test_create_vertices_with_a_session_reports_a_duplicate_as_conflict(map_repo
 
     assert caught.value.code == "vertex_name_taken"
     assert len(map_repo.list_vertices(map="m")) == 1
+
+
+def test_an_existing_table_gains_the_height_column(logger):
+    """A robot's table from before storeys gets ``z`` on start, its rows at 0."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import StaticPool
+
+    from syncai_backend.repositories.map.map import init_map_repo
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE map_vertices (id CHAR(32) PRIMARY KEY, name VARCHAR(255) NOT NULL,"
+            " type VARCHAR(64) NOT NULL, map VARCHAR(255) NOT NULL, x FLOAT NOT NULL,"
+            " y FLOAT NOT NULL, theta FLOAT NOT NULL, created_at DATETIME NOT NULL,"
+            " updated_at DATETIME NOT NULL)"))
+        connection.execute(text(
+            "INSERT INTO map_vertices VALUES ('0123456789abcdef0123456789abcdef', 'old',"
+            " 'GENERAL', 'm', 1, 2, 0, '2026-01-01', '2026-01-01')"))
+
+    repo = init_map_repo(logger=logger, engine=engine)
+    init_map_repo(logger=logger, engine=engine)  # a second start is a no-op
+
+    assert [v.z for v in repo.list_vertices(map="m")] == [0.0]

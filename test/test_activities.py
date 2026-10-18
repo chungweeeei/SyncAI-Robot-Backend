@@ -123,6 +123,15 @@ class TestExecuteMove:
         # Degrees on the wire, radians at the gateway — this boundary converts.
         kwargs = robot_gw.move.call_args[1]
         assert kwargs["yaw"] == pytest.approx(1.5707963)
+        assert kwargs["z"] == 0.0
+
+    def test_the_goal_keeps_its_storey(self, env, activities, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        env.run(activities.execute_move, MoveParams(x=1.0, y=2.0, theta=0.0, z=5.02))
+
+        assert robot_gw.move.call_args[1]["z"] == 5.02
 
     def test_rejection_is_retryable(self, env, activities, robot_gw):
         robot_gw.move.return_value = (False, "server not available", None)

@@ -56,6 +56,15 @@ class MoveParams(BaseSchema):
         description="Target orientation (in degrees) for the move step",
         examples=[90.0],
     )
+    # The ground height of the goal's storey. The 3D planner snaps the goal to
+    # the walkable surface nearest this height, so a fixed 0 would send every
+    # goal on an upper floor to the one below it. The 2D planners ignore it.
+    z: float = Field(
+        0.0,
+        allow_inf_nan=False,
+        description="Ground height (metres, map frame) of the storey the goal is on",
+        examples=[0.0],
+    )
 
 
 # Constraints mirror routers/tts.py's SynthesizeRequest: both drive the same

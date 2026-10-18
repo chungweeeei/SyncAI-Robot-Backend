@@ -35,8 +35,8 @@ _FILES = {
     "patches/000001.pcd": b"patch one",
 }
 _VERTICES = [
-    {"name": "dock", "type": "CHARGE", "x": 1.5, "y": -2.0, "theta": 90.0},
-    {"name": "home", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0},
+    {"name": "dock", "type": "CHARGE", "x": 1.5, "y": -2.0, "theta": 90.0, "z": 0.0},
+    {"name": "home", "type": "MOVE", "x": 0.0, "y": 0.0, "theta": 0.0, "z": 0.0},
 ]
 
 
@@ -177,7 +177,17 @@ def test_build_coerces_vertex_numbers_to_float(map_dir):
     )
 
     vertex = inspect_archive(payload).manifest.vertices[0]
-    assert vertex == {"name": "a", "type": "MOVE", "x": 1.0, "y": 2.0, "theta": 3.0}
+    assert vertex == {"name": "a", "type": "MOVE", "x": 1.0, "y": 2.0, "theta": 3.0, "z": 0.0}
+
+
+def test_a_vertex_keeps_its_storey_through_an_archive(map_dir):
+    payload = build_archive(
+        str(map_dir), "full",
+        [{"name": "up", "type": "MOVE", "x": 1, "y": 2, "theta": 3, "z": 5.5}],
+        ArchiveFormat.ZIP, exported_at="t",
+    )
+
+    assert inspect_archive(payload).manifest.vertices[0]["z"] == 5.5
 
 
 def test_extract_does_not_apply_archive_modes(tmp_path):

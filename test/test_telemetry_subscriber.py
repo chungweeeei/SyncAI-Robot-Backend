@@ -22,7 +22,8 @@ What is pinned:
 * The mapping-mode pose path (``pointlio/lio_odom``), which is the only pose
   the console gets during a mapping run: the full 3x3 composition through the
   tilted lidar mount, and the rule that a live ``odom`` feed silences it —
-  both topics are published in AUTO and the two must never take turns.
+  both topics are published in AUTO and the two must never take turns. In
+  AUTO it lends ``odom`` one number, the height the planar chain flattens.
 
 * All subscriptions use RELATIVE topic names (namespace inheritance —
   CLAUDE.md) and best-effort QoS: motor_states' publisher is SensorDataQoS and
@@ -54,7 +55,9 @@ from syncai_backend.helpers.pointcloud import (  # noqa: E402
 from syncai_backend.repositories.telemetry.telemetry import (  # noqa: E402
     init_telemetry_repo,
 )
+from syncai_backend.subscribers import telemetry_subscriber  # noqa: E402
 from syncai_backend.subscribers.telemetry_subscriber import (  # noqa: E402
+    LIO_HEIGHT_HOLD_S,
     init_telemetry_subscriber,
 )
 
@@ -409,14 +412,67 @@ def test_a_live_odom_feed_silences_the_lio_fallback(mapping_subs, repo, mapping_
     mapping_tf.transforms[("map", "robot01/odom")] = _tf(x=5.0)
     mapping_subs["odom"].callback(_odom(x=0.0, y=0.0))
     assert repo.get_pose().x == pytest.approx(5.0)
+    seq = repo.get_pose().seq
 
     mapping_subs["pointlio/lio_odom"].callback(_lio_odom(x=0.2, y=0.0, z=0.4))
 
-    # Unchanged, and the lookup was never even attempted.
+    # Not a sample of its own: the pose is the odom feed's, untouched.
+    assert repo.get_pose().seq == seq
     assert repo.get_pose().x == pytest.approx(5.0)
-    assert ("map", "robot01/pointlio_odom") not in [
-        (target, source) for target, source, _ in mapping_tf.lookups
-    ]
+
+
+# A robot standing upstairs in AUTO: base_link 3 m up. pointlio reports the
+# lidar, so the mount is added on top (0.2 m forward, 0.4 m up, pitched).
+UPSTAIRS_Z = 3.0
+
+
+def _upstairs_lio_odom():
+    return _lio_odom(x=0.2, y=0.0, z=UPSTAIRS_Z + 0.4, quat=_pitch_quat(MOUNT_PITCH))
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The subscriber's monotonic clock, advanced by hand."""
+    now = SimpleNamespace(s=1000.0)
+    monkeypatch.setattr(telemetry_subscriber.time, "monotonic", lambda: now.s)
+    return now
+
+
+def test_auto_takes_its_height_from_the_lio_chain(mapping_subs, repo, mapping_tf, clock):
+    """Upstairs, the odom feed still reads z = 0; the drawn robot must not.
+
+    lio_bridge projects odom->base_link and map->odom onto the plane, so their
+    z is 0 on every storey and the console drew a robot on 2F on the floor of
+    1F. x / y / yaw stay the odom feed's — what the stack navigates by.
+    """
+    mapping_tf.transforms[("map", "robot01/odom")] = _tf(x=5.0)
+    mapping_subs["odom"].callback(_odom(x=0.0, y=0.0))
+    assert repo.get_pose().z == pytest.approx(0.0)
+
+    mapping_subs["pointlio/lio_odom"].callback(_upstairs_lio_odom())
+    clock.s += 0.05
+    mapping_subs["odom"].callback(_odom(x=1.0, y=0.0))
+
+    pose = repo.get_pose()
+    assert (pose.x, pose.y) == pytest.approx((6.0, 0.0))
+    # base_link's height, mount taken back out: the same number MANUAL shows.
+    assert pose.z == pytest.approx(UPSTAIRS_Z)
+    assert pose.yaw_deg == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_stale_lio_height_falls_back_to_the_planar_z(
+    mapping_subs, repo, mapping_tf, clock
+):
+    # LIO has gone quiet (Point-LIO restarted, reset_odometry): a height that
+    # old says where the robot was, not where it is.
+    mapping_tf.transforms[("map", "robot01/odom")] = _tf(x=5.0)
+    mapping_subs["odom"].callback(_odom(x=0.0, y=0.0))
+    mapping_subs["pointlio/lio_odom"].callback(_upstairs_lio_odom())
+
+    clock.s += LIO_HEIGHT_HOLD_S + 0.01
+    mapping_subs["odom"].callback(_odom(x=0.0, y=0.0))
+
+    assert repo.get_pose().z == pytest.approx(0.0)
 
 
 # --- joints: motor_states reduced to {joint name: position} -------------------

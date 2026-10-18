@@ -28,24 +28,26 @@ def init_telemetry_router(
              "stamp": ..}
             {"type": "joints", "joints": {"FL_HipX_joint": .., ...},
              "stamp": ..}
-            {"type": "path",   "points": [[x, y], ...], "stamp": ..}
-            {"type": "dock_path", "points": [[x, y], ...], "stamp": ..}
+            {"type": "path",   "points": [[x, y, z], ...], "stamp": ..}
+            {"type": "dock_path", "points": [[x, y, z], ...], "stamp": ..}
 
         Pose is map-frame planar (yaw in degrees); joints are radians by URDF
         joint name. Each type is sent only when newer, at its own rate.
 
         ``path`` is the planner's remaining global route in map-frame metres,
-        thinned, each time the planner re-sends it (1 Hz). An **empty**
-        ``points`` means "no route": the frame that tells a client to erase
-        what it draws -- sent when a navigation is cancelled (the planner
-        publishes an empty plan) or when the repo's TTL expires a route that
-        stopped arriving.
+        thinned, each time the planner re-sends it (1 Hz). z is the ground
+        each point stands on, as a waypoint's z is. An **empty** ``points``
+        means "no route": the frame that tells a client to erase what it
+        draws -- sent when a navigation is cancelled (the planner publishes an
+        empty plan) or when the repo's TTL expires a route that stopped
+        arriving.
 
         ``dock_path`` is the last metre of a dock: the approach the docking
         controller predicts from the robot to the dock, map-frame metres,
-        thinned like ``path``, at 2 Hz while it drives. The staging leg before
-        it is an ordinary ``path``. Empty ``points`` clears it, sent when the
-        dock goal ends however it ends, or by its own (3 s) TTL.
+        thinned like ``path`` (z included), at 2 Hz while it drives. The
+        staging leg before it is an ordinary ``path``. Empty ``points`` clears
+        it, sent when the dock goal ends however it ends, or by its own (3 s)
+        TTL.
         """
         await ws.accept()
         last_pose_seq = 0

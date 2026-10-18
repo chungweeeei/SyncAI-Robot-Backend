@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ import structlog
 import yaml
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, NotFoundError
+from syncai_backend.helpers.floors import read_pose_heights
 from syncai_backend.helpers.keepout import keepout_yaml_text, rasterize_zones
 from syncai_backend.helpers.pgm import read_pgm_size, write_pgm, write_text_atomic
 from syncai_backend.helpers.system_config import active_map_name
@@ -52,6 +54,41 @@ KEEPOUT_PGM = "keepout.pgm"
 KEEPOUT_YAML = "keepout.yaml"
 KEEPOUT_JSON = "keepout.json"
 KEEPOUT_JSON_VERSION = 1
+
+# The robot's 3D map: the occupancy tree ``clean_map`` writes beside map.pcd
+# (``map_clean_octomap``), which the 3D planner plans on. Served to the
+# console byte for byte; only its text header is read here, for ``res``.
+# Whether a save got one is in MAP_CLEAN_SIDECAR's ``measurements``
+# (``octomap_written`` / ``octomap_error``), see ``_read_map_clean_record``.
+OCTOMAP_BT = "octomap.bt"
+# The tree as the mapping wrote it, set aside by the robot's
+# ``apply_octomap_edits`` the first time it patches ``octomap.bt`` from the
+# edits below. Named for the layout; nothing in this process touches it.
+OCTOMAP_RAW_BT = "octomap.raw.bt"
+# Hand-patched ground from the console's editor: the tree columns to mark as
+# floor and the height each gets, as absolute OcTree keys. Source of truth the
+# way keepout.json is, and applied to the tree on the robot, never here. The
+# document keeps the shape the standalone viewer exported, so one tool reads a
+# console save and a hand export alike.
+OCTOMAP_EDITS_JSON = "octomap_edits.json"
+OCTOMAP_EDITS_FORMAT = "syncai-octomap-edits"
+OCTOMAP_EDITS_VERSION = 1
+# An OcTree key is 16 bits with the map origin at its midpoint: a voxel's
+# centre is ``(key - OCTOMAP_KEY_ORIGIN + 0.5) * res``.
+OCTOMAP_KEY_ORIGIN = 32768
+OCTOMAP_KEY_MAX = 65535
+
+# pgo's keyframe trajectory, ``<N>.pcd x y z qw qx qy qz`` per line, written
+# by every save. Read here for the heights the robot walked at, which is what
+# the floors are detected from (helpers/floors.py).
+POSES_TXT = "poses.txt"
+# The floors an operator named for a map that spans storeys: a name and the
+# body height the robot stands at on it, in the map frame. Only the console
+# reads it, to show one storey of the 3D map at a time; absent means the
+# floors are the ones detected from poses.txt.
+FLOORS_JSON = "floors.json"
+FLOORS_JSON_FORMAT = "syncai-map-floors"
+FLOORS_JSON_VERSION = 1
 
 # Map import staging: ``map/.import-<token>/`` (unpacked + verified) and
 # ``map/.import-old-<token>/`` (the replaced map, until the DB agrees). Inside
@@ -127,6 +164,65 @@ class GridRecord:
 
 
 @dataclass(frozen=True)
+class OctomapInfo:
+    """``octomap.bt`` as it stands on disk: what versioning and serving it need.
+
+    No parse of the tree: ``resolution`` comes from the text header alone and
+    is None when that header is not one this build reads.
+    """
+
+    size_bytes: int
+    mtime_ns: int
+    resolution: Optional[float]
+
+    @property
+    def version(self) -> str:
+        """An opaque tag for the file's current bytes.
+
+        Size and mtime, not a content hash: the tree is only ever replaced
+        wholesale (tmp + rename, by the cleaning or the robot's edit tool),
+        never edited in place the way the gridmap is. The console keys its
+        cache on it and the GET route serves it as the ETag.
+        """
+        return f"{self.size_bytes}-{self.mtime_ns}"
+
+
+@dataclass(frozen=True)
+class MapCleanRecord:
+    """What the cleaning sidecar says, read for the tree's sake.
+
+    ``status`` is about map.pcd; the ``octomap_*`` fields are the sidecar's
+    ``params.octomap`` and ``measurements.octomap_written`` /
+    ``octomap_error``, which is where a tree that was asked for and not
+    written is reported. ``error`` is the clean's own, on ``failed``.
+    """
+
+    status: GridRecordStatus
+    started_at: Optional[str]
+    octomap_requested: bool
+    octomap_written: bool
+    octomap_error: Optional[str]
+    error: Optional[str]
+
+
+@dataclass(frozen=True)
+class MapFloor:
+    """One storey: what it is called and the body height walked on it, metres."""
+
+    name: str
+    level: float
+
+
+@dataclass(frozen=True)
+class OctomapEdits:
+    """The hand-patched ground recorded in ``octomap_edits.json``."""
+
+    res: float
+    fill_key: Tuple[Tuple[int, int, int], ...]
+    created_at: Optional[str]
+
+
+@dataclass(frozen=True)
 class StoredMap:
     name: str
     grid: Optional[GridInfo]
@@ -136,6 +232,30 @@ class StoredMap:
     # None without a usable sidecar; a grid with no record counts as converted
     # (see the REST layer's _grid_status).
     grid_record: Optional[GridRecord]
+    # The tree on disk, or None without one, and what the cleaning sidecar
+    # says about it (see the REST layer's _octomap_status).
+    octomap: Optional[OctomapInfo] = None
+    map_clean_record: Optional[MapCleanRecord] = None
+
+
+def _octomap_edits_text(document: dict) -> str:
+    """``document`` indented, but each ``[x, y, z]`` triple on one line.
+
+    Plain ``indent=2`` spends five lines on every triple, and a map's worth of
+    patches is tens of thousands of them; this keeps the file readable at one
+    line per cell.
+    """
+    lines = ["{"]
+    items = list(document.items())
+    for index, (key, value) in enumerate(items):
+        comma = "," if index < len(items) - 1 else ""
+        if isinstance(value, list) and value:
+            rows = ",\n".join(f"    {json.dumps(row)}" for row in value)
+            lines.append(f"  {json.dumps(key)}: [\n{rows}\n  ]{comma}")
+        else:
+            lines.append(f"  {json.dumps(key)}: {json.dumps(value)}{comma}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 class MapCatalogRepo:
@@ -198,6 +318,10 @@ class MapCatalogRepo:
         """
         return self._artifact_path(name, POINTCLOUD_PCD)
 
+    def octomap_path(self, name: str) -> Optional[str]:
+        """Return the path of the map's ``octomap.bt``, or None if absent."""
+        return self._artifact_path(name, OCTOMAP_BT)
+
     def keepout_yaml_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``keepout.yaml``, or None if unloadable.
 
@@ -252,6 +376,178 @@ class MapCatalogRepo:
                 continue
             zones.append(zone)
         return zones
+
+    def read_octomap_edits(self, name: str) -> Optional[OctomapEdits]:
+        """Return the ground patches recorded in ``octomap_edits.json``, or None.
+
+        None for no file and (logged) for one this build cannot read, for
+        ``read_keepout_zones``'s reason: an error here would lock the operator
+        out of the save that overwrites it. Malformed keys are skipped one at
+        a time.
+        """
+        path = os.path.join(self.resolve_dir(name), OCTOMAP_EDITS_JSON)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            self.logger.warning(
+                "[MapCatalogRepo] Unreadable octomap_edits.json; reporting no patches",
+                map=name,
+                error=str(exc),
+            )
+            return None
+
+        if (
+            not isinstance(document, dict)
+            or document.get("format") != OCTOMAP_EDITS_FORMAT
+            or document.get("version") != OCTOMAP_EDITS_VERSION
+            or isinstance(document.get("res"), bool)
+            or not isinstance(document.get("res"), (int, float))
+            or not isinstance(document.get("fill_key"), list)
+        ):
+            self.logger.warning(
+                "[MapCatalogRepo] octomap_edits.json has an unexpected shape; "
+                "reporting no patches",
+                map=name,
+            )
+            return None
+
+        keys: List[Tuple[int, int, int]] = []
+        for entry in document["fill_key"]:
+            key = _parse_octomap_key(entry)
+            if key is None:
+                self.logger.warning(
+                    "[MapCatalogRepo] Skipping a malformed key in octomap_edits.json",
+                    map=name,
+                )
+                continue
+            keys.append(key)
+        created_at = document.get("created_at")
+        return OctomapEdits(
+            res=float(document["res"]),
+            fill_key=tuple(keys),
+            created_at=created_at if isinstance(created_at, str) else None,
+        )
+
+    def write_octomap_edits(
+        self, name: str, fill_key: List[Tuple[int, int, int]], res: float
+    ) -> OctomapEdits:
+        """Replace the map's ground patches with ``fill_key``; ``[]`` clears.
+
+        One file through a temp file + rename. The document is the standalone
+        viewer's export, field for field (``fill_xyz`` included: derivable,
+        but what a reader without the key arithmetic looks at), so the robot's
+        ``apply_octomap_edits`` reads a console save and a hand export alike.
+        Nothing written names the map or holds a path, so the directory stays
+        renamable; the keys are the tree's own and hold for exactly this
+        save's map frame.
+        """
+        directory = self.resolve_dir(name)
+        created_at = (
+            datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+        keys = [(int(key[0]), int(key[1]), int(key[2])) for key in fill_key]
+        document = {
+            "format": OCTOMAP_EDITS_FORMAT,
+            "version": OCTOMAP_EDITS_VERSION,
+            "res": res,
+            "source": OCTOMAP_BT,
+            "created_at": created_at,
+            "fill_key": [list(key) for key in keys],
+            "fill_xyz": [
+                [round((value - OCTOMAP_KEY_ORIGIN + 0.5) * res, 3) for value in key]
+                for key in keys
+            ],
+        }
+        write_text_atomic(
+            os.path.join(directory, OCTOMAP_EDITS_JSON), _octomap_edits_text(document)
+        )
+        self.logger.info("[MapCatalogRepo] Wrote ground patches", map=name, cells=len(keys))
+        return OctomapEdits(res=res, fill_key=tuple(keys), created_at=created_at)
+
+    def read_pose_heights(self, name: str) -> Optional[List[float]]:
+        """The z of every keyframe in the map's ``poses.txt``, or None without one."""
+        path = os.path.join(self.resolve_dir(name), POSES_TXT)
+        try:
+            return read_pose_heights(path)
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            self.logger.warning(
+                "[MapCatalogRepo] Unreadable poses.txt; detecting no floors",
+                map=name,
+                error=str(exc),
+            )
+            return None
+
+    def read_floors(self, name: str) -> Optional[List[MapFloor]]:
+        """The floors saved in ``floors.json``, lowest first, or None.
+
+        None for no file and (logged) for one this build cannot read, for
+        ``read_keepout_zones``'s reason. Malformed entries are skipped.
+        """
+        path = os.path.join(self.resolve_dir(name), FLOORS_JSON)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            self.logger.warning(
+                "[MapCatalogRepo] Unreadable floors.json; using the detected floors",
+                map=name,
+                error=str(exc),
+            )
+            return None
+
+        if (
+            not isinstance(document, dict)
+            or document.get("format") != FLOORS_JSON_FORMAT
+            or document.get("version") != FLOORS_JSON_VERSION
+            or not isinstance(document.get("floors"), list)
+        ):
+            self.logger.warning(
+                "[MapCatalogRepo] floors.json has an unexpected shape; "
+                "using the detected floors",
+                map=name,
+            )
+            return None
+
+        floors: List[MapFloor] = []
+        for entry in document["floors"]:
+            floor = _parse_floor(entry)
+            if floor is None:
+                self.logger.warning(
+                    "[MapCatalogRepo] Skipping a malformed floor in floors.json", map=name
+                )
+                continue
+            floors.append(floor)
+        return sorted(floors, key=lambda floor: floor.level)
+
+    def write_floors(self, name: str, floors: List[MapFloor]) -> List[MapFloor]:
+        """Replace the map's floors, lowest first; ``[]`` saves "one storey".
+
+        A temp file + rename, like every write here. The levels are body
+        heights in this map's frame, the same quantity poses.txt holds, so a
+        saved floor and a detected one compare directly.
+        """
+        ordered = sorted(floors, key=lambda floor: floor.level)
+        document = {
+            "format": FLOORS_JSON_FORMAT,
+            "version": FLOORS_JSON_VERSION,
+            "floors": [
+                {"name": floor.name, "level": round(float(floor.level), 3)}
+                for floor in ordered
+            ],
+        }
+        write_text_atomic(
+            os.path.join(self.resolve_dir(name), FLOORS_JSON),
+            json.dumps(document, indent=2) + "\n",
+        )
+        self.logger.info("[MapCatalogRepo] Wrote floors", map=name, floors=len(ordered))
+        return ordered
 
     # --- Listing ------------------------------------------------------------
 
@@ -648,6 +944,73 @@ class MapCatalogRepo:
             size_bytes=size_bytes,
             modified_at=datetime.fromtimestamp(newest_mtime, tz=timezone.utc),
             grid_record=self._read_grid_record(name, path),
+            octomap=self._read_octomap(name, path),
+            map_clean_record=self._read_map_clean_record(name, path),
+        )
+
+    def _read_octomap(self, name: str, path: str) -> Optional[OctomapInfo]:
+        """Describe ``octomap.bt`` if the directory has one, else None.
+
+        A tree that vanishes between the listing and the stat (a save into
+        the same directory removes the old one first) is None, not an error,
+        like a patch gone mid-walk in ``_walk_stats``.
+        """
+        tree = os.path.join(path, OCTOMAP_BT)
+        try:
+            stats = os.stat(tree)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self.logger.debug(
+                "[MapCatalogRepo] Unreadable octomap.bt", map=name, error=str(exc)
+            )
+            return None
+        return OctomapInfo(
+            size_bytes=stats.st_size,
+            mtime_ns=stats.st_mtime_ns,
+            resolution=_read_octomap_resolution(tree),
+        )
+
+    def _read_map_clean_record(self, name: str, path: str) -> Optional[MapCleanRecord]:
+        """Read what the cleaning sidecar says, or None; never raises.
+
+        Tolerant for ``_read_grid_record``'s reason: pgo_node writes it
+        ``converting`` before the save answers, the clean rewrites it minutes
+        later, and the listing is polled meanwhile.
+        """
+        sidecar = os.path.join(path, MAP_CLEAN_SIDECAR)
+        try:
+            with open(sidecar, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            self.logger.debug(
+                "[MapCatalogRepo] Unreadable map clean sidecar", map=name, error=str(exc)
+            )
+            return None
+
+        if not isinstance(document, dict):
+            return None
+        status = GridRecordStatus.parse(document.get("status"))
+        if status is None:
+            return None
+        params = document.get("params")
+        measurements = document.get("measurements")
+        params = params if isinstance(params, dict) else {}
+        measurements = measurements if isinstance(measurements, dict) else {}
+        started_at = document.get("started_at")
+        error = document.get("error")
+        octomap_error = measurements.get("octomap_error")
+        return MapCleanRecord(
+            status=status,
+            started_at=started_at if isinstance(started_at, str) else None,
+            octomap_requested=params.get("octomap") is True,
+            octomap_written=measurements.get("octomap_written") is True,
+            octomap_error=(
+                octomap_error if isinstance(octomap_error, str) and octomap_error else None
+            ),
+            error=error if isinstance(error, str) and error else None,
         )
 
     def _read_grid_record(self, name: str, path: str) -> Optional[GridRecord]:
@@ -738,6 +1101,64 @@ def _parse_keepout_zone(entry: object) -> Optional[KeepoutZone]:
     if len(points) < 3:
         return None
     return KeepoutZone(id=zone_id, points=tuple(points))
+
+
+# The banner every ``.bt`` opens with; a few short text lines follow (``id``,
+# ``size``, ``res``), then ``data`` and the tree.
+_OCTOMAP_BANNER = b"# Octomap OcTree binary file"
+_OCTOMAP_HEADER_MAX_BYTES = 4096
+
+
+def _read_octomap_resolution(path: str) -> Optional[float]:
+    """The ``res`` line of a ``.bt``'s text header, or None.
+
+    Reads the first few KB only; the tree after ``data`` is never parsed
+    here. None for a file without the banner, or with no ``res`` before
+    ``data``.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(_OCTOMAP_HEADER_MAX_BYTES)
+    except OSError:
+        return None
+    if not head.startswith(_OCTOMAP_BANNER):
+        return None
+    for line in head.split(b"\n"):
+        if line == b"data":
+            return None
+        if line.startswith(b"res "):
+            try:
+                return float(line[4:].decode("ascii").strip())
+            except (UnicodeDecodeError, ValueError):
+                return None
+    return None
+
+
+def _parse_octomap_key(entry: object) -> Optional[Tuple[int, int, int]]:
+    """One ``fill_key`` triple as three in-range ints, or None."""
+    if not isinstance(entry, list) or len(entry) != 3:
+        return None
+    for value in entry:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if value < 0 or value > OCTOMAP_KEY_MAX:
+            return None
+    return (entry[0], entry[1], entry[2])
+
+
+def _parse_floor(entry: object) -> Optional[MapFloor]:
+    """One ``floors`` entry as a named, finite level, or None."""
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    level = entry.get("level")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        return None
+    if not math.isfinite(level):
+        return None
+    return MapFloor(name=name.strip(), level=float(level))
 
 
 def _walk_stats(path: str) -> Tuple[int, float]:
