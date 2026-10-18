@@ -214,6 +214,12 @@ the only caller that passes anything else.
 - **No migrations.** Schema is whatever `create_all` produced on a robot. Adding a column
   or constraint has no path to existing deployments; `TaskTemplate.steps` is a JSON column
   for this reason. Only ever *add optional keys* to a stored step — never rename/retype.
+  The one exception is `map_vertices.z` (2026-10): `init_map_repo` runs `_add_vertex_z`
+  after `create_all`, which inspects the table and `ALTER TABLE … ADD COLUMN z FLOAT NOT
+  NULL DEFAULT 0` when it is missing. Additive and defaulted, so an older backend still
+  reads the altered table. It is a one-column patch, not a migration framework — do not
+  grow it into one, and do not delete it while a robot may still carry a table from
+  before the column (every waypoint read would fail).
 - JSON columns are not mutation-tracked: assign a fresh list, never mutate in place.
 - `Base.metadata` is shared: adding a model changes what every `init_*_repo`'s
   `create_all` does.
