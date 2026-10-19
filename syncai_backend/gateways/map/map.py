@@ -11,6 +11,10 @@ The clients split by session: ``map_server/load_map``,
 "Service is not available" usually means "wrong mode", which activate turns
 into ``stack_not_ready``. The nav launch writes a blank keepout mask for a map
 without one, so ``filter_mask_server`` is up on every map.
+
+``planner_server/Octo3D/load_map`` (the 3D planner's map) exists only on a
+workspace that carries OctomapPlanner3D (``feature/octomap-planner-3d``); its
+absence is a capability answer, not a mode one — see ``planner_3d_available``.
 """
 
 import math
@@ -86,6 +90,14 @@ class MapGateway:
             srv_name="filter_mask_server/load_map",
         )
 
+        # OctomapPlanner3D's tree (2026-10). Under planner_server's node name
+        # plus the plugin id, the way map_server's carries its node name. Same
+        # LoadMap type: map_url is the octomap.bt, and an empty one unloads.
+        load_octomap_client = self._node.create_client(
+            srv_type=LoadMap,
+            srv_name="planner_server/Octo3D/load_map",
+        )
+
         save_maps_client = self._node.create_client(
             srv_type=SaveMaps,
             srv_name="pgo/save_maps",
@@ -130,6 +142,7 @@ class MapGateway:
             {
                 "load_map": load_map_client,
                 "load_keepout": load_keepout_client,
+                "load_octomap": load_octomap_client,
                 "save_maps": save_maps_client,
                 "reset_mapping": reset_mapping_client,
                 "start_mapping": start_mapping_client,
@@ -362,6 +375,57 @@ class MapGateway:
         if response.result != LoadMap.Response.RESULT_SUCCESS:
             return False, _load_map_failure(
                 response.result, "filter_mask_server", "keepout.pgm", "keepout.yaml"
+            )
+
+        return True, ""
+
+    def planner_3d_available(self, timeout_sec: float = 2.0) -> bool:
+        """Does the running nav stack have the 3D planner (Octo3D) at all?
+
+        Asked before a switch touches anything: a stack built without
+        OctomapPlanner3D cannot navigate a 3D map, and has no 3D map to unload
+        when switching to a 2D one. Discoverability, as ``nav_services_ready``.
+        """
+        return self._service_clients["load_octomap"].wait_for_service(
+            timeout_sec=timeout_sec
+        )
+
+    def reload_octomap(self, bt_path: str) -> tuple[bool, str]:
+        """Point Octo3D at a map's ``octomap.bt``, or unload it with ``""``.
+
+        The 3D counterpart of ``reload_map``, and what makes the robot's
+        task_runner pick the 3D trees: Octo3D latches whether it has a map,
+        and every goal runs move_3d.xml / dock_3d.xml while it does. So a
+        switch to a 2D map must unload (``bt_path=""``) — otherwise the 3D
+        trees keep planning on the previous site's octree.
+
+        Unlike ``relocalize``, success is a result: the call answers once the
+        surface map is built (seconds; the 120 s bound covers a large site).
+        A missing file is refused with the current map kept; any other failure
+        leaves Octo3D with no map at all, never the old one.
+        """
+        client = self._service_clients["load_octomap"]
+        if not client.wait_for_service(timeout_sec=5.0):
+            return False, (
+                "planner_server/Octo3D/load_map is not available — the nav stack "
+                "has no 3D planner, or it is not in AUTO mode."
+            )
+
+        map_url = os.path.abspath(os.path.expanduser(bt_path)) if bt_path else ""
+
+        self._logger.info(
+            "[MapGateway] Reloading the 3D planner's map",
+            map_url=map_url or "(unload)",
+        )
+
+        future = client.call_async(LoadMap.Request(map_url=map_url))
+        if not _wait_for_future(future, timeout=120.0):
+            return False, "Timeout waiting for planner_server/Octo3D/load_map response"
+
+        response = future.result()
+        if response.result != LoadMap.Response.RESULT_SUCCESS:
+            return False, _load_map_failure(
+                response.result, "the 3D planner", "octomap.bt", "the octomap path"
             )
 
         return True, ""

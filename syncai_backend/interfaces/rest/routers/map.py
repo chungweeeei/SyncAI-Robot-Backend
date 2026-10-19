@@ -574,6 +574,14 @@ class ActivateMapResponse(BaseModel):
     """POST /api/v1/maps/{name}/activate — the outcome of a live map switch."""
 
     name: str = Field(..., description="The map the robot is on now.")
+    map_kind: Optional[str] = Field(
+        None,
+        description=(
+            "'3d' when the map has an octomap.bt, so the robot's 3D planner "
+            "(Octo3D) navigates it and the robot runs its 3D trees; '2d' for a "
+            "gridmap-only map. Null on the no-op. Added 2026-10."
+        ),
+    )
     previous: Optional[str] = Field(
         None, description="The map it was on before, if there was one."
     )
@@ -1712,13 +1720,22 @@ def init_map_router(
     async def activate_map(name: str):
         """Switch the robot onto another map, live, without restarting the stack.
 
-        Three parts must agree: the localizer's cloud (`relocalize`),
-        map_server's grid (`load_map`) and `[map] name` in the INI (what
+        Four parts must agree: the localizer's cloud (`relocalize`),
+        map_server's grid (`load_map`), the 3D planner's tree
+        (`planner_server/Octo3D/load_map`) and `[map] name` in the INI (what
         `active_name()` reports and a restart reads). The localizer goes first
         because a refusal there mutates nothing; each later step compensates the
         earlier ones on failure. The INI is last and preflighted for
         writability, since an unrecorded swap would leave REST naming the wrong
         map.
+
+        A map is 2D (a usable gridmap) or 3D (an ``octomap.bt``; 2026-10). A 3D
+        map is loaded into Octo3D, which is what makes the robot run its 3D
+        trees, and needs a stack that has it (409 ``planner_3d_unavailable``);
+        a 2D map *unloads* Octo3D when the stack has one, or the robot would
+        keep planning on the previous map's octree. A 3D map has no keepout
+        zones, and map_server keeps the previous grid when the 3D map has none
+        (it cannot unload; nothing plans on it while Octo3D has a map).
 
         All refusals come first. `stack_not_ready` (e.g. mapping mode) is
         detected by service discoverability, not the cached RobotState, which
@@ -1748,14 +1765,22 @@ def init_map_router(
                 code="conversion_running",
             )
 
+        # 2D or 3D. The robot's own rule is "3D wins": its task_runner runs the
+        # 3D trees whenever Octo3D has a map, so a map with both is a 3D map
+        # here too (its grid is loaded as well, keeping map_server in step).
         status, grid_error = _grid_status(stored, False)
-        if status != GridStatus.OK:
+        has_grid = status == GridStatus.OK
+        octomap_path = map_catalog_repo.octomap_path(name)
+        is_3d = octomap_path is not None
+        if not has_grid and not is_3d:
             # Refuse up front, before the localizer is swapped (and an
             # unloadable yaml would crash map_server at the next launch).
             detail = f" ({grid_error})" if grid_error else ""
             raise ConflictError(
-                f"'{name}' has no usable gridmap{detail}. Build one from the "
-                "map's Rebuild-grid control before switching to it.",
+                f"'{name}' has no usable gridmap{detail} and no 3D map "
+                "(octomap.bt). Build a grid from the map's Rebuild-grid control, "
+                "or let the robot's map cleaning write its 3D map, before "
+                "switching to it.",
                 code="grid_missing",
             )
 
@@ -1768,12 +1793,15 @@ def init_map_router(
                 code="pointcloud_missing",
             )
 
-        yaml_path = map_catalog_repo.gridmap_yaml_path(name)
-        if yaml_path is None:
+        yaml_path = map_catalog_repo.gridmap_yaml_path(name) if has_grid else None
+        if yaml_path is None and not is_3d:
             raise ConflictError(
                 f"'{name}' has no gridmap.yaml to hand map_server.",
                 code="grid_missing",
             )
+        previous_is_3d = (
+            previous is not None and map_catalog_repo.octomap_path(previous) is not None
+        )
 
         ini_path = system_ini_path()
         if not os.access(ini_path, os.W_OK):
@@ -1809,6 +1837,16 @@ def init_map_router(
                     "running map to switch. The robot is in mapping mode, or the "
                     "nav stack is down.",
                     code="stack_not_ready",
+                )
+
+            # Asked before anything moves. Absent on a stack built without
+            # OctomapPlanner3D: fatal for a 3D map, nothing to unload for a 2D.
+            planner_3d = map_gw.planner_3d_available()
+            if is_3d and not planner_3d:
+                raise ConflictError(
+                    f"'{name}' is a 3D map, but the nav stack has no 3D planner "
+                    "(planner_server/Octo3D/load_map) to navigate it.",
+                    code="planner_3d_unavailable",
                 )
 
             previous_pcd = (
@@ -1853,24 +1891,11 @@ def init_map_router(
                     f"is still on '{previous}'."
                 )
 
-            reloaded, detail = map_gw.reload_map(yaml_path)
-            if not reloaded:
-                logger.error("Map switch failed at map_server", map=name, error=detail)
-                raise UpstreamError(
-                    f"The localizer moved to '{name}' but map_server would not load "
-                    f"its gridmap: {detail}." + _restore_localizer("load_map failed")
-                )
-
-            try:
-                set_active_map(name, logger)
-            except (OSError, ValueError) as exc:
-                logger.error(
-                    "Map switch failed at the INI write", map=name, error=str(exc)
-                )
-                # Undone in the order done, as statements: inside the message
-                # concatenation the order would follow the sentences.
-                restored_cloud = _restore_localizer("INI write failed")
-
+            def _restore_grid() -> str:
+                """Put map_server back on the old grid, if this switch moved it."""
+                if yaml_path is None:
+                    # A 3D map without a grid: map_server was never touched.
+                    return ""
                 previous_yaml = (
                     map_catalog_repo.gridmap_yaml_path(previous) if previous else None
                 )
@@ -1882,28 +1907,96 @@ def init_map_router(
                         if previous
                         else "the INI named no previous map"
                     )
-                    restored_grid = (
-                        f" map_server is still serving '{name}' — {where} to put back."
+                    return f" map_server is still serving '{name}' — {where} to put back."
+                back, back_detail = map_gw.reload_map(previous_yaml)
+                return "" if back else f" map_server is still serving '{name}' ({back_detail})."
+
+            def _restore_octomap() -> str:
+                """Put Octo3D back as the old map had it: its tree, or none."""
+                if not planner_3d:
+                    return ""
+                previous_bt = map_catalog_repo.octomap_path(previous) if previous else None
+                back, back_detail = map_gw.reload_octomap(previous_bt or "")
+                if back:
+                    return ""
+                logger.error(
+                    "Could not restore the 3D planner after a failed map switch",
+                    map=name,
+                    previous=previous,
+                    error=back_detail,
+                )
+                return (
+                    f" The 3D planner could not be put back on '{previous}' "
+                    f"({back_detail}) — restart the nav stack before navigating."
+                )
+
+            if yaml_path is not None:
+                reloaded, detail = map_gw.reload_map(yaml_path)
+                if not reloaded:
+                    logger.error("Map switch failed at map_server", map=name, error=detail)
+                    raise UpstreamError(
+                        f"The localizer moved to '{name}' but map_server would not load "
+                        f"its gridmap: {detail}." + _restore_localizer("load_map failed")
                     )
-                else:
-                    back, back_detail = map_gw.reload_map(previous_yaml)
-                    restored_grid = (
-                        ""
-                        if back
-                        else f" map_server is still serving '{name}' ({back_detail})."
+
+            # After the grid: a 3D map's tree takes seconds to build, and a
+            # refusal from map_server should not have paid for it. For a 2D map
+            # this unloads the previous 3D map, if the stack has a 3D planner.
+            if planner_3d:
+                octomap_loaded, detail = map_gw.reload_octomap(
+                    octomap_path if is_3d else ""
+                )
+                if not octomap_loaded:
+                    logger.error(
+                        "Map switch failed at the 3D planner", map=name, error=detail
                     )
+                    what = (
+                        "load its 3D map" if is_3d else "unload the previous 3D map"
+                    )
+                    # Undone in the order done, as statements (see below).
+                    restored_cloud = _restore_localizer("Octo3D load_map failed")
+                    restored_grid = _restore_grid()
+                    restored_octomap = _restore_octomap()
+                    raise UpstreamError(
+                        f"The localizer moved to '{name}' but the 3D planner would not "
+                        f"{what}: {detail}."
+                        + restored_cloud
+                        + restored_grid
+                        + restored_octomap
+                    )
+
+            try:
+                set_active_map(name, logger)
+            except (OSError, ValueError) as exc:
+                logger.error(
+                    "Map switch failed at the INI write", map=name, error=str(exc)
+                )
+                # Undone in the order done, as statements: inside the message
+                # concatenation the order would follow the sentences.
+                restored_cloud = _restore_localizer("INI write failed")
+                restored_grid = _restore_grid()
+                restored_octomap = _restore_octomap()
 
                 raise UpstreamError(
                     f"The robot moved to '{name}' but the switch could not be "
                     f"recorded in {ini_path}: {exc}."
                     + restored_cloud
                     + restored_grid
+                    + restored_octomap
                 )
 
             # The switch is recorded; nothing can fail it now. The keepout mask
             # (still the previous map's) is carried over best-effort after this
             # commit point: a mask problem goes in the message, not a failure.
-            keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
+            # A 3D map has no zones: the robot's 3D planner does not read the
+            # keepout (decided 2026-10-19), so there is no mask to carry.
+            if is_3d:
+                keepout_reloaded, keepout_note = None, (
+                    " It is a 3D map: the 3D planner navigates it, and it has no "
+                    "forbidden zones."
+                )
+            else:
+                keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
 
             # Renderings are keyed by map name, so nothing cached is stale.
             localized = map_gw.localization_converged()
@@ -1912,6 +2005,8 @@ def init_map_router(
                 "Switched the active map",
                 map=name,
                 previous=previous,
+                map_kind="3d" if is_3d else "2d",
+                previous_was_3d=previous_is_3d,
                 localized=localized,
                 keepout_reloaded=keepout_reloaded,
             )
@@ -1931,6 +2026,7 @@ def init_map_router(
             message += keepout_note
             return ActivateMapResponse(
                 name=name,
+                map_kind="3d" if is_3d else "2d",
                 previous=previous,
                 switched=True,
                 localized=localized,

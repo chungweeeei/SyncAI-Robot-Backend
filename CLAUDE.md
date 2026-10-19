@@ -267,6 +267,15 @@ the only caller that passes anything else.
   names the map. `GET/PUT …/floors` splits a multi-storey map for the console:
   detected from `poses.txt` heights (`helpers/floors.py`) unless `floors.json` is
   saved; display-only, so not behind the job lock.
+- **A map is 2D or 3D, and `activate` loads it where the robot looks for it** (2026-10).
+  An `octomap.bt` makes it 3D (with a grid too: the robot's rule, "3D wins"). The switch
+  calls the robot's `planner_server/Octo3D/load_map` (`MapGateway.reload_octomap`) with the
+  tree for a 3D map and with **`""` for a 2D one** — the unload is not optional: the robot
+  runs its 3D trees for as long as Octo3D has a map, so skipping it leaves a 2D map
+  navigated on the previous map's octree. The call blocks until the tree is built and
+  each later failure rolls Octo3D back to the previous map's state; 409
+  `planner_3d_unavailable` when the stack has no Octo3D and the map is 3D. A 3D map has
+  no keepout zones and its switch reloads no mask.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this

@@ -72,6 +72,7 @@ def map_gw(logger) -> MapGateway:
     clients = {
         "map_server/load_map": MagicMock(),
         "filter_mask_server/load_map": MagicMock(),
+        "planner_server/Octo3D/load_map": MagicMock(),
         "pgo/save_maps": MagicMock(),
         "pgo/reset_mapping": MagicMock(),
         "pgo/start_mapping": MagicMock(),
@@ -187,6 +188,65 @@ class TestReloadMap:
         success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
 
         assert (success, message) == (False, "map_server returned result 42")
+
+
+class TestReloadOctomap:
+    """The 3D planner's tree: the same LoadMap call, where "" means unload."""
+
+    def test_a_tree_is_sent_as_an_expanded_absolute_url(self, map_gw):
+        client = _arm(
+            map_gw,
+            "load_octomap",
+            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
+        )
+
+        success, message = map_gw.reload_octomap(bt_path="~/map/three/octomap.bt")
+
+        assert (success, message) == (True, "")
+        request = client.call_async.call_args[0][0]
+        assert request.map_url == os.path.join(
+            os.path.expanduser("~"), "map/three/octomap.bt"
+        )
+        # Neither map_server is touched: the grid and the mask are other calls.
+        map_gw._service_clients["load_map"].call_async.assert_not_called()
+        map_gw._service_clients["load_keepout"].call_async.assert_not_called()
+
+    def test_an_empty_path_unloads_rather_than_resolving_the_cwd(self, map_gw):
+        # os.path.abspath("") is the cwd; the robot would read that as a tree.
+        client = _arm(
+            map_gw,
+            "load_octomap",
+            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
+        )
+
+        assert map_gw.reload_octomap(bt_path="") == (True, "")
+        assert client.call_async.call_args[0][0].map_url == ""
+
+    def test_service_unavailable_names_the_missing_planner(self, map_gw):
+        client = _arm(map_gw, "load_octomap", available=False)
+
+        success, message = map_gw.reload_octomap(bt_path="/map/three/octomap.bt")
+
+        assert success is False
+        assert "no 3D planner" in message
+        client.call_async.assert_not_called()
+
+    def test_a_failed_build_gets_its_operator_message(self, map_gw):
+        _arm(
+            map_gw,
+            "load_octomap",
+            LoadMap.Response(result=LoadMap.Response.RESULT_INVALID_MAP_DATA),
+        )
+
+        success, message = map_gw.reload_octomap(bt_path="/map/three/octomap.bt")
+
+        assert (success, message) == (False, "the 3D planner could not read octomap.bt")
+
+    def test_planner_3d_available_is_discoverability(self, map_gw):
+        _arm(map_gw, "load_octomap", available=True)
+        assert map_gw.planner_3d_available() is True
+        _arm(map_gw, "load_octomap", available=False)
+        assert map_gw.planner_3d_available() is False
 
 
 class TestReloadKeepout:
