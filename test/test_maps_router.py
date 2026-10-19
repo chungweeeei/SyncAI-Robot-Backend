@@ -96,6 +96,13 @@ class _StubMapGateway:
         # to reload it *after* the INI write, the commit point.
         self.keepout_calls = []
         self.keepout_result = (True, "")
+        # The 3D planner (Octo3D). Off by default, as on a stack built without
+        # it -- which is why the 2D switch tests keep their exact call order.
+        # `octomap_results` queues one answer per call (default: success), so a
+        # test can fail the load and let the rollback succeed.
+        self.planner_3d = False
+        self.octomap_calls = []
+        self.octomap_results = []
         # The kidnap recovery. `auto_localize_gate`, when set, holds the call
         # until the test releases it -- how a second press is caught mid-search.
         self.auto_localize_calls = 0
@@ -119,6 +126,14 @@ class _StubMapGateway:
         self.keepout_calls.append(yaml_path)
         self.order.append(("reload_keepout", yaml_path))
         return self.keepout_result
+
+    def planner_3d_available(self, timeout_sec=2.0):
+        return self.planner_3d
+
+    def reload_octomap(self, bt_path):
+        self.octomap_calls.append(bt_path)
+        self.order.append(("reload_octomap", bt_path))
+        return self.octomap_results.pop(0) if self.octomap_results else (True, "")
 
     def save_map(self, directory):
         self.save_calls.append(directory)
@@ -3517,6 +3532,142 @@ def test_activate_noop_has_no_keepout_verdict(client, map_gw):
     assert body["switched"] is False
     assert body["keepout_reloaded"] is None
     assert map_gw.keepout_calls == []
+
+
+# --- 3D maps (octomap.bt) ---------------------------------------------------------
+#
+# A map is 2D (a usable gridmap) or 3D (an octomap.bt). A 3D map is loaded into the
+# robot's 3D planner, Octo3D, whose latched state is what makes the robot run its
+# 3D trees; a 2D map unloads it (empty map_url), or those trees keep planning on
+# the previous map's octree.
+
+
+@pytest.fixture
+def three_d(maps_dir, make_pcd, make_bt):
+    """A 3D-only map: map.pcd + octomap.bt, no gridmap."""
+    directory = maps_dir / "three"
+    directory.mkdir()
+    make_pcd(directory / "map.pcd")
+    make_bt(directory / "octomap.bt")
+    return directory
+
+
+def test_activate_loads_a_3d_map_into_the_3d_planner(
+    client, map_gw, three_d, monkeypatch, tmp_path
+):
+    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.planner_3d = True
+
+    response = _activate(client, "three")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["switched"] is True
+    assert body["map_kind"] == "3d"
+    # No grid to hand map_server, and no zones in 3D.
+    assert [step for step, _ in map_gw.order] == ["swap_localizer_map", "reload_octomap"]
+    assert map_gw.order[1][1] == str(three_d / "octomap.bt")
+    assert body["keepout_reloaded"] is None
+    assert "no forbidden zones" in body["message"]
+    assert "name: three" in ini.read_text()
+
+
+def test_activate_refuses_a_3d_map_on_a_stack_without_the_3d_planner(
+    client, map_gw, three_d, monkeypatch, tmp_path
+):
+    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+
+    response = _activate(client, "three")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "planner_3d_unavailable"
+    assert map_gw.order == []
+    assert "name: rawonly" in ini.read_text()
+
+
+def test_activate_unloads_the_3d_planner_for_a_2d_map(
+    client, map_gw, maps_dir, monkeypatch, tmp_path
+):
+    """The other half: a 3D map left loaded keeps the robot on its 3D trees."""
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.planner_3d = True
+
+    body = _activate(client, "full").json()
+
+    assert body["switched"] is True
+    assert body["map_kind"] == "2d"
+    assert [step for step, _ in map_gw.order] == [
+        "swap_localizer_map",
+        "reload_map",
+        "reload_octomap",
+        "reload_keepout",
+    ]
+    assert map_gw.octomap_calls == [""]
+
+
+def test_activate_rolls_back_when_the_3d_planner_will_not_load(
+    client, map_gw, maps_dir, three_d, make_bt, monkeypatch, tmp_path
+):
+    """Octo3D drops its map before building, so a failed load must put the old one back."""
+    make_bt(maps_dir / "rawonly" / "octomap.bt")
+    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.planner_3d = True
+    map_gw.octomap_results = [(False, "the 3D planner could not read octomap.bt")]
+
+    response = _activate(client, "three")
+
+    assert response.status_code == 502
+    assert "could not read octomap.bt" in response.json()["detail"]
+    assert [step for step, _ in map_gw.order] == [
+        "swap_localizer_map",
+        "reload_octomap",
+        "swap_localizer_map",
+        "reload_octomap",
+    ]
+    assert map_gw.order[2][1] == str(maps_dir / "rawonly" / "map.pcd")
+    # Back onto the previous map's own tree, not left without one.
+    assert map_gw.order[3][1] == str(maps_dir / "rawonly" / "octomap.bt")
+    assert "name: rawonly" in ini.read_text()
+
+
+def test_activate_rolls_the_3d_planner_back_to_none_for_a_previous_2d_map(
+    client, map_gw, three_d, monkeypatch, tmp_path
+):
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.planner_3d = True
+
+    def _boom(name, logger):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(map_router_module, "set_active_map", _boom)
+
+    response = _activate(client, "three")
+
+    assert response.status_code == 502
+    assert [step for step, _ in map_gw.order] == [
+        "swap_localizer_map",
+        "reload_octomap",
+        "swap_localizer_map",
+        "reload_octomap",
+    ]
+    # rawonly has no tree: the planner goes back to having none.
+    assert map_gw.octomap_calls == [str(three_d / "octomap.bt"), ""]
+
+
+def test_activate_says_so_when_the_3d_planner_cannot_be_put_back(
+    client, map_gw, three_d, monkeypatch, tmp_path
+):
+    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.planner_3d = True
+    map_gw.octomap_results = [
+        (False, "the 3D planner could not read octomap.bt"),
+        (False, "Timeout waiting for planner_server/Octo3D/load_map response"),
+    ]
+
+    response = _activate(client, "three")
+
+    assert response.status_code == 502
+    assert "3D planner could not be put back" in response.json()["detail"]
 
 
 # --- export / import ------------------------------------------------------------
