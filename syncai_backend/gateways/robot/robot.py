@@ -567,6 +567,19 @@ class RobotGateway:
                 goal.state is MoveState.EXECUTING for goal in self._goals.values()
             )
 
+    def navigation_active(self) -> bool:
+        """Whether a navigation this process sent (a MOVE, DOCK or UNDOCK goal)
+        is still executing.
+
+        The telemetry stream's gate for the local costmap and the controller's
+        local plan, which mean something only while the robot drives. Asked of
+        the goals rather than read off the route on ``plan``: the planner keeps
+        re-sending a route after a success (trimmed to a stub) and after a
+        failure (on purpose, for the operator), and clears it only on a cancel.
+        A goal sent from outside this process (rviz, the CLI) is not seen.
+        """
+        return self._autonomous_move_active()
+
     def _send_nav_goal(
         self, client_name: str, goal_msg
     ) -> Tuple[bool, str, Optional[str]]:
