@@ -262,6 +262,8 @@ frame from the message header and only pins the target frame (`map`).
 | `pointlio/lio_odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed through `map→pointlio_odom` and the lidar mount → telemetry WS: the whole pose while mapping, base_link's height in AUTO |
 | `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
 | `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
+| `local_costmap/costmap/raw` | `nav2_msgs/Costmap` | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | the controller's rolling costmap, origin into `map` by TF → telemetry WS `local_costmap`, while a navigation runs |
+| `local_plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | MPPI's optimal trajectory, into `map` by TF, kept at 5 Hz → telemetry WS `local_plan`, while a navigation runs |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
 | `pgo/map_cloud_file` | `std_msgs/String` (JSON notice) | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | names a PCD in the shared `/dev/shm`; read, stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only) |
 | `pgo/mapping_status` | `syncai_common/MappingStatus` | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | pgo's run state (`IDLE` / `MAPPING` / `RESETTING`, keyframe and loop counts) → `MappingStatusRepo` → `GET /api/v1/mapping`, and the 409s on the run routes. Aged out after 5 s of silence; `unknown` outside a mapping session |
@@ -545,7 +547,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/webrtc/status` | `library_loaded` plus the `video` / `audio` / `duplex` slots (`session_id`, `age_seconds`) as this backend believes them. No callback from the worker, so an abandoned session reads live until the next create preempts it. Deliberately not in `/health` |
 | WS | `/api/v1/robot/pointcloud/stream` | Live `body_cloud`, ~10 Hz |
 | WS | `/api/v1/robot/pointcloud/map/stream` | pgo's merged "map so far", every few seconds at most, mapping mode only; each frame replaces the whole layer |
-| WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (~0.333 Hz) |
+| WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (1 Hz), `dock_path` (2 Hz), and while a navigation runs `local_costmap` (2 Hz) and `local_plan` (5 Hz) |
 
 **A job's map is read-only while it runs.** Vertex create / update / delete,
 `PUT …/grid`, `PUT …/keepout`, `PUT …/octomap/edits` and `POST …/grid/convert` answer 409 `task_running`
@@ -575,6 +577,23 @@ mapping run reports. An **empty**
 `path.points` means "no route": the planner never publishes an empty plan, so
 `TelemetryRepo` clears a route by TTL (arrival, cancel and abort are the same
 silence from here).
+
+**The local picture rides the same socket, only while a navigation runs**
+(2026-10-20): `local_costmap`, the controller's 4 × 4 m rolling costmap (on a
+2D map the obstacle layer's, on a 3D map the terrain layer's, inflated), and
+`local_plan`, the 2 s trajectory MPPI is following. "Runs" is a MOVE, DOCK or
+UNDOCK goal this process sent that has not ended (`RobotGateway.navigation_active`)
+— not a route on `plan`, which the planner keeps re-sending after a success and
+a failure. When the goal ends, however it ends, each client gets one empty
+frame of each (`width` 0, `points` []), the clear; a goal sent from rviz or the
+CLI shows neither. The costmap is read off `costmap/raw`, not the
+OccupancyGrid: that one carries only incremental updates while the robot
+stands. Its cells go out as base64 bytes with the costmap's own values (0 free,
+1–252 inflation, 253 inscribed, 254 lethal, 255 unknown), row-major from
+`origin`, the grid turned by `origin.yaw` in the map frame. Both are planar —
+draw them on the ground the robot stands on. Each also expires by its own TTL
+(3 s, 1 s) when its source stops: MPPI publishes no local plan on a stair, in
+the final rotation or the direct approach onto the goal.
 
 **Errors.** Routers raise domain exceptions from `exceptions.py`; `server.py`
 maps them:

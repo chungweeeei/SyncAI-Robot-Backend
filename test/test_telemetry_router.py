@@ -34,11 +34,30 @@ def telemetry_repo(logger):
     return init_telemetry_repo(logger=logger)
 
 
+class _Navigation:
+    """RobotGateway.navigation_active, switchable from the test."""
+
+    def __init__(self):
+        self.active = False
+
+    def __call__(self) -> bool:
+        return self.active
+
+
 @pytest.fixture
-def client(logger, telemetry_repo):
+def navigation():
+    return _Navigation()
+
+
+@pytest.fixture
+def client(logger, telemetry_repo, navigation):
     app = FastAPI()
     app.include_router(
-        init_telemetry_router(logger=logger, telemetry_repo=telemetry_repo)
+        init_telemetry_router(
+            logger=logger,
+            telemetry_repo=telemetry_repo,
+            navigation_active=navigation,
+        )
     )
     return TestClient(app)
 
@@ -157,3 +176,75 @@ def test_the_type_cursors_are_independent(client, telemetry_repo):
         frame = ws.receive_json()
         assert frame["type"] == "joints"
         assert frame["joints"] == {"FL_HipX_joint": 0.5}
+
+
+# --- the local costmap and plan: only while a navigation runs -----------------
+
+
+def _seed_local(telemetry_repo):
+    telemetry_repo.update_local_costmap(
+        resolution=0.05,
+        width=2,
+        height=1,
+        origin=(1.0, 2.0, 0.5),
+        data=bytes([0, 254]),
+        stamp=30.0,
+    )
+    telemetry_repo.update_local_plan(points=((0.0, 0.0), (0.2, 0.1)), stamp=31.0)
+
+
+def test_the_local_picture_is_sent_while_navigating(client, telemetry_repo, navigation):
+    navigation.active = True
+    _seed_local(telemetry_repo)
+
+    with client.websocket_connect(STREAM_PATH) as ws:
+        assert ws.receive_json() == {
+            "type": "local_costmap",
+            "resolution": 0.05,
+            "width": 2,
+            "height": 1,
+            "origin": {"x": 1.0, "y": 2.0, "yaw": 0.5},
+            # base64 of the raw bytes 0, 254: the costmap's own values.
+            "data": "AP4=",
+            "stamp": 30.0,
+        }
+        assert ws.receive_json() == {
+            "type": "local_plan",
+            "points": [[0.0, 0.0], [0.2, 0.1]],
+            "stamp": 31.0,
+        }
+
+
+def test_the_local_picture_is_held_back_while_idle(client, telemetry_repo, navigation):
+    # Not navigating: the costmap is in the repo (the robot publishes it all
+    # the time) but must not reach the console. A pose update after it is the
+    # positive control -- the very next frame is the pose, nothing before it.
+    _seed_local(telemetry_repo)
+    telemetry_repo.update_pose(x=1.0, y=0.0, z=0.0, yaw_deg=0.0, stamp=1.0)
+
+    with client.websocket_connect(STREAM_PATH) as ws:
+        assert ws.receive_json()["type"] == "pose"
+        telemetry_repo.update_pose(x=2.0, y=0.0, z=0.0, yaw_deg=0.0, stamp=1.1)
+        assert ws.receive_json()["type"] == "pose"
+
+
+def test_the_end_of_a_navigation_sends_both_clears(client, telemetry_repo, navigation):
+    # The robot's costmap goes on publishing after a goal ends, so the clear
+    # cannot be left to the TTL: it is sent once, on the falling edge.
+    navigation.active = True
+    _seed_local(telemetry_repo)
+
+    with client.websocket_connect(STREAM_PATH) as ws:
+        assert ws.receive_json()["type"] == "local_costmap"
+        assert ws.receive_json()["type"] == "local_plan"
+
+        navigation.active = False
+        costmap_clear = ws.receive_json()
+        assert costmap_clear["type"] == "local_costmap"
+        assert costmap_clear["width"] == 0 and costmap_clear["data"] == ""
+        plan_clear = ws.receive_json()
+        assert plan_clear["type"] == "local_plan" and plan_clear["points"] == []
+
+        # Once, not every tick: the next frame is the pose that follows.
+        telemetry_repo.update_pose(x=1.0, y=0.0, z=0.0, yaw_deg=0.0, stamp=2.0)
+        assert ws.receive_json()["type"] == "pose"

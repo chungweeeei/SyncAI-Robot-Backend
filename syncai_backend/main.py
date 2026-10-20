@@ -53,6 +53,9 @@ from syncai_backend.subscribers.path_subscriber import (
     init_docking_plan_subscriber,
     init_path_subscriber,
 )
+from syncai_backend.subscribers.local_nav_subscriber import (
+    init_local_nav_subscriber,
+)
 from syncai_backend.subscribers.tf import init_tf_listener
 
 
@@ -165,6 +168,14 @@ class SyncAIBackend(Node):
         # The dock's last metre, which no planner draws; also map frame.
         init_docking_plan_subscriber(
             logger=logger, node=self, telemetry_repo=telemetry_repo
+        )
+        # The controller's local costmap and local plan, onto the same socket
+        # while a navigation runs; from odom into the map frame by TF.
+        init_local_nav_subscriber(
+            logger=logger,
+            node=self,
+            telemetry_repo=telemetry_repo,
+            tf_buffer=self._tf_listener.buffer,
         )
 
         worker_handle = start_temporal_worker(

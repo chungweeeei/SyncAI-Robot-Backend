@@ -170,6 +170,27 @@ class TestMoveGoalStateMachine:
         status = robot_gw.get_move_status(goal_id=goal_id)
         assert status["state"] == expected.value
 
+    @pytest.mark.parametrize(
+        "ros_status",
+        [
+            GoalStatus.STATUS_SUCCEEDED,
+            GoalStatus.STATUS_ABORTED,
+            GoalStatus.STATUS_CANCELED,
+        ],
+    )
+    def test_navigation_is_active_from_acceptance_to_the_result(
+        self, robot_gw, move_client, ros_status
+    ):
+        # The telemetry stream's gate for the local costmap and plan: it must
+        # close however the goal ends, or the console keeps drawing them.
+        assert robot_gw.navigation_active() is False
+
+        _, result_future = _send_goal(robot_gw, move_client)
+        assert robot_gw.navigation_active() is True
+
+        result_future.complete(SimpleNamespace(status=ros_status, result=None))
+        assert robot_gw.navigation_active() is False
+
     def test_rejected_goal_is_not_tracked(self, robot_gw, move_client):
         move_client.send_goal_async.return_value = _Future(
             result=_goal_handle(accepted=False)

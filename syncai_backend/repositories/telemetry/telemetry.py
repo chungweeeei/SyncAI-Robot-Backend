@@ -25,6 +25,18 @@ _PATH_TTL_S = 6.0
 # is six periods.
 _DOCKING_PLAN_TTL_S = 3.0
 
+# The local costmap's fallback: the controller's costmap publishes at 2 Hz
+# (publish_frequency) for as long as anything subscribes, so silence means the
+# controller is gone. Six periods, as the docking plan's.
+_LOCAL_COSTMAP_TTL_S = 3.0
+
+# The local plan's, shorter on purpose: MPPI publishes it only on the cycles
+# its optimizer runs, so it stops by itself on a stair climb, the final
+# rotation and the direct approach onto the goal, and the last one drawn would
+# otherwise point where the robot is no longer going. The subscriber keeps 5 Hz
+# of the 20 Hz, so 1 s is five periods.
+_LOCAL_PLAN_TTL_S = 1.0
+
 
 @dataclass(frozen=True)
 class PoseSample:
@@ -66,6 +78,28 @@ class PathSample:
     stamp: float
 
 
+@dataclass(frozen=True)
+class LocalCostmapSample:
+    """The controller's rolling local costmap, placed in the map frame.
+
+    ``data`` is the raw costmap, one byte per cell, row-major from the
+    ``origin`` corner (x along the rows): 0 free, 1-252 the inflation
+    gradient, 253 inscribed, 254 lethal, 255 unknown. ``origin`` is that
+    corner's map-frame (x, y) and the grid's yaw in the map frame, radians:
+    the costmap is axis-aligned in odom, and map->odom turns it. It is planar;
+    the console draws it on the ground the robot stands on. A ``width`` of 0 is
+    the explicit "no costmap" sample (see ``TelemetryRepo.get_local_costmap``).
+    """
+
+    seq: int
+    resolution: float
+    width: int
+    height: int
+    origin: Tuple[float, float, float]
+    data: bytes
+    stamp: float
+
+
 class _PathSlot:
     """One seq-gated path cache with a TTL. Not locked itself: TelemetryRepo
     holds its own lock around every call."""
@@ -77,7 +111,7 @@ class _PathSlot:
         # Monotonic, not the message stamp: the TTL is about when we heard it.
         self._recv_at = 0.0
 
-    def update(self, points: Tuple[Tuple[float, float, float], ...], stamp: float):
+    def update(self, points: Tuple[Tuple[float, ...], ...], stamp: float):
         self._seq += 1
         self._sample = PathSample(seq=self._seq, points=points, stamp=stamp)
         self._recv_at = time.monotonic()
@@ -94,11 +128,62 @@ class _PathSlot:
         return self._sample
 
 
+class _LocalCostmapSlot:
+    """_PathSlot's rules for the local costmap: seq-gated, and a costmap that
+    stopped arriving turns into one empty sample. Not locked itself."""
+
+    def __init__(self, ttl_s: float):
+        self._ttl_s = ttl_s
+        self._seq = 0
+        self._sample: Optional[LocalCostmapSample] = None
+        self._recv_at = 0.0
+
+    def update(
+        self,
+        resolution: float,
+        width: int,
+        height: int,
+        origin: Tuple[float, float, float],
+        data: bytes,
+        stamp: float,
+    ):
+        self._seq += 1
+        self._sample = LocalCostmapSample(
+            seq=self._seq,
+            resolution=resolution,
+            width=width,
+            height=height,
+            origin=origin,
+            data=data,
+            stamp=stamp,
+        )
+        self._recv_at = time.monotonic()
+
+    def get(self, after_seq: int) -> Optional[LocalCostmapSample]:
+        if self._sample is None:
+            return None
+        if self._sample.width and time.monotonic() - self._recv_at > self._ttl_s:
+            self._seq += 1
+            self._sample = LocalCostmapSample(
+                seq=self._seq,
+                resolution=0.0,
+                width=0,
+                height=0,
+                origin=(0.0, 0.0, 0.0),
+                data=b"",
+                stamp=self._sample.stamp,
+            )
+        if self._sample.seq <= after_seq:
+            return None
+        return self._sample
+
+
 class TelemetryRepo:
     """In-process single-slot caches for the internal telemetry stream.
 
-    Pose, joints, the route and the docking plan are sequenced independently
-    because they arrive at very different rates. Newest sample only, under a
+    Pose, joints, the route, the docking plan, the local costmap and the local
+    plan are sequenced independently because they arrive at very different
+    rates. Newest sample only, under a
     lock (ROS thread writes, asyncio reads), as in PointCloudRepo.
     """
 
@@ -112,6 +197,8 @@ class TelemetryRepo:
         self._joints: Optional[JointsSample] = None
         self._path = _PathSlot(ttl_s=_PATH_TTL_S)
         self._docking_plan = _PathSlot(ttl_s=_DOCKING_PLAN_TTL_S)
+        self._local_costmap = _LocalCostmapSlot(ttl_s=_LOCAL_COSTMAP_TTL_S)
+        self._local_plan = _PathSlot(ttl_s=_LOCAL_PLAN_TTL_S)
 
     def update_pose(self, x: float, y: float, z: float, yaw_deg: float, stamp: float):
         with self._lock:
@@ -136,6 +223,31 @@ class TelemetryRepo:
     ):
         with self._lock:
             self._docking_plan.update(points=points, stamp=stamp)
+
+    def update_local_costmap(
+        self,
+        resolution: float,
+        width: int,
+        height: int,
+        origin: Tuple[float, float, float],
+        data: bytes,
+        stamp: float,
+    ):
+        with self._lock:
+            self._local_costmap.update(
+                resolution=resolution,
+                width=width,
+                height=height,
+                origin=origin,
+                data=data,
+                stamp=stamp,
+            )
+
+    def update_local_plan(self, points: Tuple[Tuple[float, float], ...], stamp: float):
+        """The controller's optimal trajectory, map-frame (x, y) pairs: planar,
+        so the console draws it on the robot's ground. Kept in a PathSample."""
+        with self._lock:
+            self._local_plan.update(points=points, stamp=stamp)
 
     def get_pose(self, after_seq: int = 0) -> Optional[PoseSample]:
         """Return the cached pose if newer than ``after_seq``, else None."""
@@ -169,6 +281,19 @@ class TelemetryRepo:
         with _DOCKING_PLAN_TTL_S."""
         with self._lock:
             return self._docking_plan.get(after_seq)
+
+    def get_local_costmap(self, after_seq: int = 0) -> Optional[LocalCostmapSample]:
+        """The local costmap if newer than ``after_seq``, by get_path's rules
+        with _LOCAL_COSTMAP_TTL_S: one that stopped arriving expires into an
+        empty (``width`` 0) sample."""
+        with self._lock:
+            return self._local_costmap.get(after_seq)
+
+    def get_local_plan(self, after_seq: int = 0) -> Optional[PathSample]:
+        """The controller's local plan, by get_path's rules with
+        _LOCAL_PLAN_TTL_S."""
+        with self._lock:
+            return self._local_plan.get(after_seq)
 
 
 def init_telemetry_repo(logger: structlog.stdlib.BoundLogger) -> TelemetryRepo:

@@ -224,7 +224,13 @@ def init_rest_server(
         )
     )
     app.include_router(
-        init_telemetry_router(logger=logger, telemetry_repo=telemetry_repo)
+        init_telemetry_router(
+            logger=logger,
+            telemetry_repo=telemetry_repo,
+            # The gate for the local costmap and plan frames: a navigation this
+            # process sent is running.
+            navigation_active=robot_gw.navigation_active,
+        )
     )
     # Inbound WS: the console's manual-control velocity frames.
     app.include_router(init_teleop_router(logger=logger, robot_gw=robot_gw))
