@@ -7,8 +7,9 @@ asserting on the post-disconnect zero-stops deterministic.
 
 What is pinned: frame parsing (floats reach the gateway), the error-frame
 contract (refusals and malformed frames answer without killing the socket),
-the stop-on-disconnect repeats, and the stale-input watchdog (patched down
-from 0.5 s so the test doesn't sleep for real).
+the stop-on-disconnect repeats, the stale-input watchdog (patched down from
+0.5 s so the test doesn't sleep for real), and that a socket with no input
+publishes nothing — every stop is owed to a command this socket sent.
 """
 
 import time
@@ -99,10 +100,12 @@ def test_disconnect_repeats_the_zero_stop(client, robot_gw):
         ws.send_json({"vx": 0.5, "vy": 0.0, "wz": 0.0})
 
     # The driver->gait hop is fire-and-forget UDP; a single zero can be lost.
-    assert robot_gw.stops >= teleop_module._STOP_REPEATS
+    assert robot_gw.stops == teleop_module._STOP_REPEATS
 
 
-def test_watchdog_zeroes_while_the_client_is_quiet(client, robot_gw, monkeypatch):
+def test_watchdog_stops_a_drive_once_then_stays_quiet(
+    client, robot_gw, monkeypatch
+):
     monkeypatch.setattr(teleop_module, "_WATCHDOG_S", 0.05)
 
     with client.websocket_connect("/api/v1/robot/teleop") as ws:
@@ -111,6 +114,42 @@ def test_watchdog_zeroes_while_the_client_is_quiet(client, robot_gw, monkeypatch
         # real time passing here is real time for its watchdog.
         time.sleep(0.3)
 
-    # At least one watchdog stop beyond the disconnect repeats.
-    assert robot_gw.stops > teleop_module._STOP_REPEATS
+    # Several watchdog ticks passed, but only the first had a drive to stop,
+    # and the disconnect found the robot already stopped.
+    assert robot_gw.stops == teleop_module._STOP_REPEATS
     assert robot_gw.commands == [(0.5, 0.0, 0.0)]
+
+
+def test_a_socket_with_no_input_publishes_nothing(client, robot_gw, monkeypatch):
+    # An armed console nobody touches: no watchdog zeros, no disconnect stop.
+    monkeypatch.setattr(teleop_module, "_WATCHDOG_S", 0.05)
+
+    with client.websocket_connect("/api/v1/robot/teleop"):
+        time.sleep(0.3)
+
+    assert robot_gw.stops == 0
+    assert robot_gw.commands == []
+
+
+def test_a_release_zero_is_one_repeated_stop(client, robot_gw):
+    with client.websocket_connect("/api/v1/robot/teleop") as ws:
+        ws.send_json({"vx": 0.5, "vy": 0.0, "wz": 0.0})
+        ws.send_json({"vx": 0, "vy": 0, "wz": 0})
+        # Already stopped: an older console's stream of zeros is skipped.
+        ws.send_json({"vx": 0, "vy": 0, "wz": 0})
+        ws.send_json({"vx": 0, "vy": 0, "wz": 0})
+
+    assert robot_gw.commands == [(0.5, 0.0, 0.0)]
+    assert robot_gw.stops == teleop_module._STOP_REPEATS
+
+
+def test_a_refused_command_leaves_nothing_to_stop(client, robot_gw):
+    # Nothing was published, so nothing may be published to undo it — the
+    # zero would fight the controller that refused us.
+    robot_gw.refusal = "autonomous move in progress"
+
+    with client.websocket_connect("/api/v1/robot/teleop") as ws:
+        ws.send_json({"vx": 0.5, "vy": 0.0, "wz": 0.0})
+        assert ws.receive_json() == {"error": "autonomous move in progress"}
+
+    assert robot_gw.stops == 0
