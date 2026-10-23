@@ -10,7 +10,7 @@ from syncai_backend.logger import setup_log_handler
 from syncai_backend.database.postgres import connect_to_postgres
 from syncai_backend.temporal.worker import start_temporal_worker
 
-from syncai_backend.interfaces.rest.server import start_rest_server
+from syncai_backend.interfaces.rest.server import RestDeps, start_rest_server
 
 from syncai_backend.repositories.robot.robot import init_robot_repo
 from syncai_backend.repositories.map.map import init_map_repo
@@ -31,6 +31,10 @@ from syncai_backend.gateways.recording.recording import init_recording_gateway
 from syncai_backend.services.gridmap_conversion import (
     init_gridmap_conversion_service,
 )
+from syncai_backend.services.dock_state import init_dock_state_service
+from syncai_backend.services.map_import import init_map_import_service
+from syncai_backend.services.map_switch import init_map_switch_service
+from syncai_backend.services.map_usage import init_job_gate, init_map_usage_policy
 from syncai_backend.services.mode_restart import init_mode_restart_service
 from syncai_backend.services.safety_lock import init_safety_lock_service
 
@@ -126,6 +130,36 @@ class SyncAIBackend(Node):
         # it like any other collaborator.
         conversion_svc = init_gridmap_conversion_service(logger=logger)
 
+        # Whether a map may be edited, destroyed, switched to or driven on. The
+        # policy reads disk and the registries only, so the worker holds it too;
+        # the gate asks Temporal and stays on the REST loop (WorkflowGateway's).
+        map_usage = init_map_usage_policy(
+            map_catalog_repo=map_catalog_repo,
+            conversion_svc=conversion_svc,
+            task_template_repo=task_template_repo,
+        )
+        job_gate = init_job_gate(
+            logger=logger, map_catalog_repo=map_catalog_repo, workflow_gw=workflow_gw
+        )
+
+        # The live map switch: localizer, map_server, Octo3D and the INI moved
+        # together, each later failure undoing the earlier ones.
+        map_switch_svc = init_map_switch_service(
+            logger=logger,
+            map_catalog_repo=map_catalog_repo,
+            map_gw=map_gw,
+            map_usage=map_usage,
+        )
+
+        # POST /api/v1/maps/import: the directory and its vertex rows published
+        # together, swapped back if the rows cannot be written.
+        map_import_svc = init_map_import_service(
+            logger=logger,
+            map_repo=map_repo,
+            map_catalog_repo=map_catalog_repo,
+            map_usage=map_usage,
+        )
+
         # The latest restart of the live mode and how it ended; outlives the POST
         # because sys_manager replies only once the rebuild is over.
         restart_svc = init_mode_restart_service(logger=logger, robot_gw=robot_gw)
@@ -135,6 +169,11 @@ class SyncAIBackend(Node):
         safety_lock_svc = init_safety_lock_service(
             logger=logger, robot_gw=robot_gw, workflow_gw=workflow_gw
         )
+
+        # Where the last DOCK ended, so a MOVE off the dock undocks first. In
+        # memory on purpose (see services/dock_state.py); only the activities
+        # use it today.
+        dock_state_svc = init_dock_state_service()
 
         # One /tf + /tf_static subscription for the whole process (see
         # subscribers/tf.py).
@@ -184,30 +223,37 @@ class SyncAIBackend(Node):
             robot_gw=robot_gw,
             tts_gw=tts_gw,
             map_catalog_repo=map_catalog_repo,
-            conversion_svc=conversion_svc,
+            map_usage=map_usage,
             robot_repo=robot_repo,
+            dock_state=dock_state_svc,
         )
         start_rest_server(
             logger=logger,
-            workflow_gw=workflow_gw,
-            robot_repo=robot_repo,
-            robot_gw=robot_gw,
-            map_repo=map_repo,
-            map_catalog_repo=map_catalog_repo,
-            map_gw=map_gw,
-            pointcloud_repo=pointcloud_repo,
-            map_cloud_repo=map_cloud_repo,
-            telemetry_repo=telemetry_repo,
-            task_template_repo=task_template_repo,
-            worker_handle=worker_handle,
-            tts_gw=tts_gw,
-            webrtc_gw=webrtc_gw,
-            recording_gw=recording_gw,
-            recording_catalog_repo=recording_catalog_repo,
-            conversion_svc=conversion_svc,
-            restart_svc=restart_svc,
-            mapping_status_repo=mapping_status_repo,
-            safety_lock_svc=safety_lock_svc,
+            deps=RestDeps(
+                workflow_gw=workflow_gw,
+                robot_repo=robot_repo,
+                robot_gw=robot_gw,
+                map_repo=map_repo,
+                map_catalog_repo=map_catalog_repo,
+                map_gw=map_gw,
+                pointcloud_repo=pointcloud_repo,
+                map_cloud_repo=map_cloud_repo,
+                telemetry_repo=telemetry_repo,
+                task_template_repo=task_template_repo,
+                worker_handle=worker_handle,
+                tts_gw=tts_gw,
+                webrtc_gw=webrtc_gw,
+                recording_gw=recording_gw,
+                recording_catalog_repo=recording_catalog_repo,
+                conversion_svc=conversion_svc,
+                restart_svc=restart_svc,
+                mapping_status_repo=mapping_status_repo,
+                safety_lock_svc=safety_lock_svc,
+                map_switch_svc=map_switch_svc,
+                map_usage=map_usage,
+                job_gate=job_gate,
+                map_import_svc=map_import_svc,
+            ),
         )
 
 

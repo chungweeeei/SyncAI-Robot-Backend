@@ -138,7 +138,12 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain ex
 services/                  domain work that outlives a request: gridmap_conversion (recipes,
         │                  the registry of running threads, the gridmap.recipe.json protocol),
         │                  mode_restart (the latest restart_mode dispatch and its outcome),
-        │                  safety_lock (the driver lock's rising edge -> cancel every task)
+        │                  safety_lock (the driver lock's rising edge -> cancel every task),
+        │                  map_switch (activate's saga: localizer, map_server, Octo3D, INI and
+        │                  the undo for each), dock_state (the last DOCK's pose), map_usage
+        │                  (every "may this map change / be driven on" refusal: MapUsagePolicy
+        │                  from disk, safe in the worker; JobGate asks Temporal, loop only),
+        │                  map_import (the archive import's publish + vertex transaction + undo)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
@@ -147,6 +152,11 @@ repositories/              state: in-memory single-slot caches (robot, pointclou
         │                  mapping — pgo's latched run state, aged out after 5 s),
         │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
 database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate)
+
+tasks/                     the task model and its Temporal contract (schema: Step, groups,
+                           TaskState; config: queues, signals, the Temporal address;
+                           search_attributes), imported by REST, gateways/workflow and
+                           temporal/ alike and importing none of them
 
 subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
                            names the PCD, which the subscriber reads from the shared /dev/shm)
@@ -158,9 +168,10 @@ helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-ba
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/
-subscriber via `init_<x>(...)` factories and passes them into `start_rest_server(...)`,
-which hands them to `init_<x>_router(...)`. No DI container, no module-level singletons.
-Adding a dependency to a router means threading it through `main.py` → `server.py`.
+subscriber via `init_<x>(...)` factories and passes them into `start_rest_server(...)`
+as one frozen `RestDeps` (`server.py`), which hands each `init_<x>_router(...)` the
+fields it names. No DI container, no module-level singletons. Adding a dependency to a
+router means a `RestDeps` field, its value in `main.py`, and the router's call in `server.py`.
 
 That rule is why the gridmap conversion is a `services/` object rather than the
 module-level `_ACTIVE_CONVERSIONS` set it used to be inside `routers/map.py`: it is
@@ -237,11 +248,11 @@ the only caller that passes anything else.
   by `resolve_dir` and skipped by `list_maps`; the manifest `syncai_map.json` is archive
   metadata and never lands in the map directory. Replacing is refused for the same reasons
   delete is (`map_active` / `conversion_running` / `template_bound`, shared in
-  `_refuse_if_in_use`).
+  `MapUsagePolicy.refuse_destroy`, `services/map_usage.py`).
 - **A running job locks the map it is on.** Every route that edits what the planner,
   the costmaps or a job's waypoints read — vertex create/update/delete, `PUT …/grid`,
-  `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `_refuse_while_a_job_holds`
-  (an **async** dependency in front of plain `def` routes, so the Temporal call runs on
+  `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `JobGate.refuse_while_a_job_holds`
+  (`services/map_usage.py`; an **async** dependency in front of plain `def` routes, so the Temporal call runs on
   the event loop and the route still runs in the threadpool): 409 `task_running` while a
   run's `TaskMap` is the loaded map, 409 `tasks_unknown` when Temporal cannot be asked —
   refuse, never assume idle. A map other than the loaded one is let through without
@@ -321,7 +332,7 @@ must outlast the gateway's `SPEAK_START_TIMEOUT_S`, and a cancel only arrives pr
 because the worker caps the heartbeat throttle. Per-step state
 is a workflow **query**, not a table — and the task-level `PAUSED` is derived from it,
 because **Temporal has no paused status**: `pause`/`resume` are two idempotent workflow
-**signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `gateways/workflow/config.py`, shared by
+**signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `tasks/config.py`, shared by
 the workflow and the gateway) plus a flag the run checks before every step, parking that
 step as `PAUSED` in a `wait_condition`, and `get_task_state` reads the hold off the held
 step rather than asking a second time. A held run stays *running* to everything else
@@ -352,7 +363,7 @@ at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, a
 keeps on describe, list and update. `_build_schedule_spec` is the one gate every
 registration goes through, so the crons that would break that echo (`#`, a
 `CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
-Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`gateways/workflow/
+Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`tasks/
 search_attributes.py`), registered idempotently by the worker at connect; the history
 list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
 `TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`

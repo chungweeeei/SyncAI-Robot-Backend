@@ -4,37 +4,34 @@ import structlog
 from datetime import datetime, timezone
 from typing import List, Optional, Protocol
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
 from syncai_backend.exceptions import BadRequestError, ConflictError
 
-from syncai_backend.gateways.workflow.config import (
+from syncai_backend.tasks.config import (
     TASK_HISTORY_PAGE_SIZE_DEFAULT,
     TASK_HISTORY_PAGE_SIZE_MAX,
 )
-from syncai_backend.gateways.workflow.schema import (
-    GROUP_DESCRIPTION,
+from syncai_backend.tasks.schema import (
     MoveParams,
     NAV_STEP_TYPES,
     POSE_STEP_TYPES,
     Step,
     StepType,
     StepStatus,
-    StepParams,
     TaskKind,
     TaskProvenance,
     TaskSource,
     WorkflowTask,
     WorkflowTaskDefinition,
     step_group_problem,
-    validate_step_params,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
+from syncai_backend.interfaces.rest.schemas import StepRequest
 
-from syncai_backend.helpers.move_guard import move_refusal
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.map_usage import MapUsagePolicy
 
 
 class TaskStatus(str, Enum):
@@ -53,28 +50,6 @@ class TaskStatus(str, Enum):
     # Only answered by DELETE /tasks/{id}: a cancel is a request, and the run
     # may still finish COMPLETED before it lands. Do not answer CANCELED.
     CANCELING = "CANCELING"
-
-
-class StepRequest(BaseModel):
-    id: str = Field(
-        ..., description="Unique identifier of the step", examples=["step1"]
-    )
-    type: StepType = Field(..., description="Type of the step", examples=["MOVE"])
-    params: Optional[StepParams] = Field(
-        default=None,
-        description=(
-            "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK "
-            "(x/y/theta: the dock pose), SPEAK and WAIT"
-        ),
-    )
-    group: Optional[str] = Field(default=None, description=GROUP_DESCRIPTION)
-
-    # Same check as Step, so a mismatched body is a 422 here, not a 500 later.
-    @model_validator(mode="after")
-    def _check_params(self) -> "StepRequest":
-        validate_step_params(self.type, self.params)
-        return self
 
 
 # No `timestamp` field: it was never read. Callers that still send it are fine,
@@ -354,7 +329,7 @@ def init_task_router(
     logger: structlog.stdlib.BoundLogger,
     workflow_gw: WorkflowGateway,
     map_catalog_repo: MapCatalogRepo,
-    conversion_svc: GridmapConversionService,
+    map_usage: MapUsagePolicy,
     robot_gw: MoveMessageSource,
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
@@ -373,11 +348,7 @@ def init_task_router(
         map_name: Optional[str] = None
         if any(step.type in POSE_STEP_TYPES for step in req.steps):
             active = map_catalog_repo.active_name()
-            refusal = move_refusal(
-                req.map_name,
-                active,
-                active is not None and conversion_svc.is_converting(active),
-            )
+            refusal = map_usage.move_refusal(req.map_name, active)
             if refusal is not None:
                 raise ConflictError(refusal.message, code=refusal.code)
             map_name = active

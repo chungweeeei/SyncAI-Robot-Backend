@@ -37,9 +37,8 @@ import yaml  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from syncai_backend.gateways.workflow.schema import TaskKind  # noqa: E402
+from syncai_backend.tasks.schema import TaskKind  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
-from syncai_backend.interfaces.rest.routers import map as map_router_module  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
 from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
     MAPPING_STATUS_TTL_S,
@@ -50,6 +49,10 @@ from syncai_backend.services import gridmap_conversion as conversion_module  # n
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
+from syncai_backend.services import map_switch as map_switch_module  # noqa: E402
+from syncai_backend.services.map_import import MapImportService  # noqa: E402
+from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
+from syncai_backend.services.map_usage import JobGate, MapUsagePolicy  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
@@ -272,6 +275,11 @@ def client(
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: full\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
 
+    map_usage = MapUsagePolicy(
+        map_catalog_repo=catalog_repo,
+        conversion_svc=conversion_svc,
+        task_template_repo=task_template_repo,
+    )
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -281,9 +289,24 @@ def client(
             map_catalog_repo=catalog_repo,
             map_gw=map_gw,
             task_template_repo=task_template_repo,
-            workflow_gw=workflow_gw,
             conversion_svc=conversion_svc,
             mapping_status_repo=mapping_status_repo,
+            map_switch_svc=MapSwitchService(
+                logger=logger,
+                map_catalog_repo=catalog_repo,
+                map_gw=map_gw,
+                map_usage=map_usage,
+            ),
+            map_usage=map_usage,
+            job_gate=JobGate(
+                logger=logger, map_catalog_repo=catalog_repo, workflow_gw=workflow_gw
+            ),
+            map_import_svc=MapImportService(
+                logger=logger,
+                map_repo=map_repo,
+                map_catalog_repo=catalog_repo,
+                map_usage=map_usage,
+            ),
         )
     )
     return TestClient(app)
@@ -3269,7 +3292,7 @@ def test_activate_refuses_when_temporal_cannot_be_reached(
 def _job(map_name=None, kind=None):
     from datetime import datetime, timezone
 
-    from syncai_backend.gateways.workflow.schema import ActiveTask, TaskSource
+    from syncai_backend.tasks.schema import ActiveTask, TaskSource
 
     return ActiveTask(
         id="robot01-task-9",
@@ -3439,7 +3462,7 @@ def test_activate_rolls_back_both_steps_when_the_ini_cannot_be_written(
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_router_module, "set_active_map", _boom)
+    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
 
     response = _activate(client, "full")
 
@@ -3463,7 +3486,7 @@ def test_activate_says_so_when_the_old_grid_cannot_be_restored(
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_router_module, "set_active_map", _boom)
+    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
 
     response = _activate(client, "full")
 
@@ -3582,7 +3605,7 @@ def test_activate_reloads_the_keepout_only_after_the_ini_is_written(
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_router_module, "set_active_map", _boom)
+    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
 
     assert _activate(client, "full").status_code == 502
     assert map_gw.keepout_calls == []
@@ -3814,7 +3837,7 @@ def test_activate_rolls_the_3d_planner_back_to_none_for_a_previous_2d_map(
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_router_module, "set_active_map", _boom)
+    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
 
     response = _activate(client, "three")
 

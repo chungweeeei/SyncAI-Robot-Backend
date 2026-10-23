@@ -23,7 +23,7 @@ pytest.importorskip("yaml")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
     ActiveTask,
     TaskKind,
     TaskSource,
@@ -39,6 +39,9 @@ from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
+from syncai_backend.services.map_import import MapImportService  # noqa: E402
+from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
+from syncai_backend.services.map_usage import JobGate, MapUsagePolicy  # noqa: E402
 
 
 # No map_name: the owning map is the URL's path segment now.
@@ -100,6 +103,13 @@ def workflow_gw():
 
 @pytest.fixture
 def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
+    map_gw = _StubMapGateway()
+    conversion_svc = GridmapConversionService(logger=logger)
+    map_usage = MapUsagePolicy(
+        map_catalog_repo=catalog_repo,
+        conversion_svc=conversion_svc,
+        task_template_repo=task_template_repo,
+    )
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -107,14 +117,29 @@ def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
             logger=logger,
             map_repo=map_repo,
             map_catalog_repo=catalog_repo,
-            map_gw=_StubMapGateway(),
+            map_gw=map_gw,
             task_template_repo=task_template_repo,
-            workflow_gw=workflow_gw,
             # A real one: the vertex routes never start a conversion, but the
             # catalogue projection asks it whether one is running.
-            conversion_svc=GridmapConversionService(logger=logger),
+            conversion_svc=conversion_svc,
             # Real and empty: the vertex routes never read the run state.
             mapping_status_repo=init_mapping_status_repo(logger=logger),
+            map_switch_svc=MapSwitchService(
+                logger=logger,
+                map_catalog_repo=catalog_repo,
+                map_gw=map_gw,
+                map_usage=map_usage,
+            ),
+            map_usage=map_usage,
+            job_gate=JobGate(
+                logger=logger, map_catalog_repo=catalog_repo, workflow_gw=workflow_gw
+            ),
+            map_import_svc=MapImportService(
+                logger=logger,
+                map_repo=map_repo,
+                map_catalog_repo=catalog_repo,
+                map_usage=map_usage,
+            ),
         )
     )
     return TestClient(app)

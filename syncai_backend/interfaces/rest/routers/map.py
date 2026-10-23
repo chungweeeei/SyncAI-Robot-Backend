@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Hashable, List, Optional, Tuple
 
 import structlog
 from fastapi import APIRouter, Body, Depends, Request
@@ -23,14 +23,8 @@ from syncai_backend.exceptions import (
 )
 from syncai_backend.database.models import MapPoint
 from syncai_backend.gateways.map.map import MapGateway
-from syncai_backend.gateways.workflow.schema import ActiveTask
-from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.floors import detect_floor_levels, floor_name
 from syncai_backend.helpers.pgm import render_png, render_thumbnail
-from syncai_backend.helpers.system_config import (
-    set_active_map,
-    system_ini_path,
-)
 from syncai_backend.helpers.pointcloud import (
     cap_points,
     pack_xyz_f32,
@@ -39,15 +33,10 @@ from syncai_backend.helpers.pointcloud import (
 )
 from syncai_backend.helpers.map_archive import (
     ArchiveFormat,
-    MapArchiveError,
     build_archive,
-    extract_archive,
-    inspect_archive,
 )
 from syncai_backend.repositories.map.catalog import (
     OCTOMAP_KEY_MAX,
-    POINTCLOUD_PCD,
-    GridInfo,
     GridRecordStatus,
     KeepoutZone,
     MapCatalogRepo,
@@ -71,6 +60,9 @@ from syncai_backend.services.gridmap_conversion import (
     iso_now,
     parse_iso_utc,
 )
+from syncai_backend.services.map_import import MapImportService
+from syncai_backend.services.map_switch import MapSwitchService
+from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 
 
 # Decimation for a stored map.pcd. Duplicates PointCloudSubscriber's numbers so
@@ -1084,6 +1076,33 @@ def _not_modified(request: Request, tag: str) -> bool:
     return bool(header) and tag in [value.strip() for value in header.split(",")]
 
 
+class _RenderCache:
+    """Encoded renderings of each map, re-made only when their source changes.
+
+    One entry per (kind, map); each remembers the source ``version`` it was
+    made from, and ``get`` re-renders on any other version. So an entry is
+    never served stale -- ``forget`` exists only so a renamed or deleted map's
+    bytes do not sit in memory until restart. Plain dict operations, atomic
+    under the GIL; two threads racing a miss both render, which is harmless.
+    """
+
+    def __init__(self) -> None:
+        self._entries: Dict[Tuple[str, str], Tuple[Hashable, bytes]] = {}
+
+    def get(
+        self, kind: str, name: str, version: Hashable, render: Callable[[], bytes]
+    ) -> bytes:
+        cached = self._entries.get((kind, name))
+        if cached is None or cached[0] != version:
+            cached = (version, render())
+            self._entries[(kind, name)] = cached
+        return cached[1]
+
+    def forget(self, name: str) -> None:
+        for key in [key for key in self._entries if key[1] == name]:
+            self._entries.pop(key, None)
+
+
 # --- Router -----------------------------------------------------------------
 
 
@@ -1093,9 +1112,12 @@ def init_map_router(
     map_catalog_repo: MapCatalogRepo,
     map_gw: MapGateway,
     task_template_repo: TaskTemplateRepo,
-    workflow_gw: WorkflowGateway,
     conversion_svc: GridmapConversionService,
     mapping_status_repo: MappingStatusRepo,
+    map_switch_svc: MapSwitchService,
+    map_usage: MapUsagePolicy,
+    job_gate: JobGate,
+    map_import_svc: MapImportService,
 ) -> APIRouter:
 
     map_router = APIRouter(prefix="", tags=["Map"])
@@ -1129,11 +1151,9 @@ def init_map_router(
     # Plain (non-async) handlers throughout: they block on disk, PNG encoding
     # and psycopg2, so FastAPI must run them in its thread pool.
 
-    # Renderings are re-encoded only when their source changes. Keyed by map
-    # name, one entry per map.
-    thumbnail_cache: Dict[str, Tuple[str, bytes]] = {}
-    image_cache: Dict[str, Tuple[str, bytes]] = {}
-    cloud_cache: Dict[str, Tuple[Tuple[int, int], bytes]] = {}
+    # The image, thumbnail and packed cloud of each map, re-encoded only when
+    # their source changes.
+    renders = _RenderCache()
 
     def _vertex_count(name: str) -> int:
         # count_vertices, not len(list_vertices(...)): called once per map on
@@ -1147,96 +1167,9 @@ def init_map_router(
             raise NotFoundError(f"No map named '{name}' on this robot.")
         return stored
 
-    async def _running_tasks(change: str) -> List[ActiveTask]:
-        """What is running now, or 409 ``tasks_unknown`` if that cannot be known.
-
-        Refuse rather than assume idle: the gateway caches failures too, so an
-        error here is a real outage. ``change`` names what was refused.
-        """
-        try:
-            tasks, _ = await workflow_gw.list_active_tasks()
-        except Exception as exc:
-            logger.warning(
-                "Could not confirm the robot is idle before changing a map",
-                change=change,
-                error=str(exc),
-            )
-            raise ConflictError(
-                "Could not confirm that no job is running, and "
-                f"{change} under a moving robot is not safe to guess at. Check "
-                "the Tasks page and try again.",
-                code="tasks_unknown",
-            )
-        return tasks
-
-    async def _refuse_while_a_job_holds(name: str) -> None:
-        """409 ``task_running`` while a running job's positions are on ``name``.
-
-        Guards every route that edits what the planner, costmaps or a job's
-        waypoints read (vertices, grid, rebuild, keepout). Async so the Temporal
-        call runs on the event loop while the plain ``def`` route still runs in
-        the threadpool.
-
-        A map other than the loaded one passes without asking Temporal: a run
-        can only hold the loaded map, and editing an idle map should not need
-        Temporal up. Check-then-act, not a lock; execute_move's own check stops
-        a run that slipped through the window.
-        """
-        active = map_catalog_repo.active_name()
-        if name != active:
-            return
-        tasks = await _running_tasks("changing the map in use")
-        if any(task.map_in_use(active) == name for task in tasks):
-            raise ConflictError(
-                "The robot is running a job on this map. Cancel it or wait for "
-                "it to finish before changing the map.",
-                code="task_running",
-            )
-
-    job_lock = [Depends(_refuse_while_a_job_holds)]
-
-    def _refuse_if_in_use(name: str, *, verb: str, template_consequence: str) -> None:
-        """The three 409s that guard destroying a map's contents, in order.
-
-        Shared by delete and by an import that replaces a map:
-
-        - ``map_active``: map_server and the localizer hold ``map/<name>/``.
-        - ``conversion_running``: the thread would write its sidecar into a
-          directory that is gone (or into the *new* one).
-        - ``template_bound``: a template's MOVE steps name this map's vertex ids,
-          which would dangle. The operator is told which templates to unbind;
-          they are never deleted silently. Map-independent templates are
-          ignored.
-        """
-        if name == map_catalog_repo.active_name():
-            raise ConflictError(
-                f"'{name}' is the map the stack is running on and cannot be "
-                f"{verb} while it is in use. Switch the robot to another map "
-                "first.",
-                code="map_active",
-            )
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; try again "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
-
-        bound = task_template_repo.list_task_templates(
-            map_name=name, include_map_independent=False
-        )
-        if bound:
-            names = ", ".join(sorted(f"'{row.name}'" for row in bound))
-            raise ConflictError(
-                f"{len(bound)} task "
-                f"{'template' if len(bound) == 1 else 'templates'} still "
-                f"{'targets' if len(bound) == 1 else 'target'} '{name}' "
-                f"({names}). Point {'it' if len(bound) == 1 else 'them'} at "
-                "another map or delete "
-                f"{'it' if len(bound) == 1 else 'them'} first — "
-                f"{template_consequence}",
-                code="template_bound",
-            )
+    # Async so the Temporal call runs on the event loop while the plain
+    # ``def`` route still runs in the threadpool. See services/map_usage.py.
+    job_lock = [Depends(job_gate.refuse_while_a_job_holds)]
 
     @map_router.get("/api/v1/maps", response_model=List[MapSummaryResponse])
     def list_maps():
@@ -1321,12 +1254,9 @@ def init_map_router(
         is about to be replaced. Exporting the active map is fine.
         """
         _require(name)
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; export it once "
-                "the conversion has finished.",
-                code="conversion_running",
-            )
+        map_usage.refuse_while_converting(
+            name, "export it once the conversion has finished."
+        )
 
         vertices = [
             {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta, "z": v.z}
@@ -1379,141 +1309,30 @@ def init_map_router(
         ``template_bound``); 409 ``disk_low`` when the unpacked size exceeds
         free space (the replaced map's space does not count).
 
-        Order: unpack and verify into ``map/.import-<token>/``, publish with one
-        ``os.rename`` (parking the old map as ``.import-old-<token>``), then one
-        transaction deletes every row naming the map (orphans too) and inserts
-        the manifest's vertices; a DB failure swaps the directories back, and
-        the parked ``rmtree`` runs last. No conversion is started.
+        The steps and their undos (staging, the one-rename publish, the vertex
+        transaction, the parked map's ``rmtree`` last) are
+        services/map_import.py. No conversion is started.
         """
-        # Phase timings on the success log decide whether this should go async.
-        started = time.perf_counter()
-        try:
-            inspected = inspect_archive(payload)
-        except MapArchiveError as exc:
-            raise BadRequestError(str(exc))
-        inspect_ms = round((time.perf_counter() - started) * 1000)
-        manifest = inspected.manifest
-
-        if POINTCLOUD_PCD not in manifest.files:
-            raise BadRequestError(
-                f"The archive has no {POINTCLOUD_PCD}; it is not a map this robot "
-                "can localise on."
-            )
-        known_types = {member.value for member in VertexType}
-        unknown = sorted(
-            {str(v["type"]) for v in manifest.vertices if v["type"] not in known_types}
+        outcome = map_import_svc.import_archive(
+            payload, name, vertex_types={member.value for member in VertexType}
         )
-        if unknown:
-            raise BadRequestError(
-                f"Unknown vertex type(s) in the manifest: {', '.join(unknown)}."
-            )
-
-        target = name if name is not None else manifest.name
-        map_catalog_repo.resolve_dir(target)
-        replacing = map_catalog_repo.get_map(target) is not None
-        if replacing:
-            _refuse_if_in_use(
-                target,
-                verb="replaced",
-                template_consequence=(
-                    "its MOVE steps point at this map's current vertices, which the "
-                    "import replaces."
-                ),
-            )
-
-        if inspected.total_bytes > map_catalog_repo.free_bytes():
-            raise ConflictError(
-                f"Not enough disk for '{target}': the archive unpacks to "
-                f"{inspected.total_bytes} bytes.",
-                code="disk_low",
-            )
-
-        new_vertices = [
-            {
-                "name": v["name"],
-                "type": v["type"],
-                "x": float(v["x"]),
-                "y": float(v["y"]),
-                "theta": float(v["theta"]),
-                "z": float(v.get("z", 0.0)),
-            }
-            for v in manifest.vertices
-        ]
-
-        staging = map_catalog_repo.begin_import(target)
-        started = time.perf_counter()
-        try:
-            written = extract_archive(payload, inspected, staging)
-            _, displaced = map_catalog_repo.commit_import(target, staging)
-        except MapArchiveError as exc:
-            map_catalog_repo.abort_import(staging)
-            raise BadRequestError(str(exc))
-        except BaseException:
-            map_catalog_repo.abort_import(staging)
-            raise
-        extract_ms = round((time.perf_counter() - started) * 1000)
-
-        started = time.perf_counter()
-        try:
-            with map_repo.transaction(op="import_map") as session:
-                vertices_deleted = map_repo.delete_vertices(target, session=session)
-                created = (
-                    map_repo.create_vertices(target, new_vertices, session=session)
-                    if new_vertices
-                    else []
-                )
-        except Exception as exc:
-            map_catalog_repo.undo_import(target, displaced)
-            logger.error(
-                "Map import failed while writing its vertices",
-                map=target,
-                replaced=replacing,
-                error=str(exc),
-            )
-            raise UpstreamError(
-                f"Could not store the vertices for '{target}': {exc}. "
-                + (
-                    "The previous map was put back."
-                    if replacing
-                    else "The map directory was removed again; nothing was imported."
-                )
-            )
-        db_ms = round((time.perf_counter() - started) * 1000)
-
-        # The irreversible step last.
-        if displaced is not None:
-            map_catalog_repo.abort_import(displaced)
+        target, replacing = outcome.name, outcome.replaced
+        created, vertices_deleted = outcome.vertices_created, outcome.vertices_deleted
 
         # Renderings of an earlier map of this name are stale.
+        renders.forget(target)
 
-        thumbnail_cache.pop(target, None)
-        image_cache.pop(target, None)
-        cloud_cache.pop(target, None)
-
-        logger.info(
-            "Imported map",
-            map=target,
-            replaced=replacing,
-            format=inspected.format.value,
-            files=len(manifest.files),
-            bytes=written,
-            vertices_created=len(created),
-            vertices_deleted=vertices_deleted,
-            inspect_ms=inspect_ms,
-            extract_ms=extract_ms,
-            db_ms=db_ms,
-        )
         return ImportMapResponse(
             name=target,
             replaced=replacing,
-            files=len(manifest.files),
-            bytes=written,
-            vertices_created=len(created),
+            files=outcome.files,
+            bytes=outcome.bytes,
+            vertices_created=created,
             vertices_deleted=vertices_deleted,
             message=(
                 f"{'Replaced' if replacing else 'Imported'} '{target}': "
-                f"{len(manifest.files)} files and {len(created)} "
-                f"{'vertex' if len(created) == 1 else 'vertices'}"
+                f"{outcome.files} files and {created} "
+                f"{'vertex' if created == 1 else 'vertices'}"
                 + (
                     f" ({vertices_deleted} previous "
                     f"{'vertex' if vertices_deleted == 1 else 'vertices'} removed)."
@@ -1604,21 +1423,10 @@ def init_map_router(
         one transaction; if it fails the directory is moved back.
         """
         _require(name)
-
-        active_name = map_catalog_repo.active_name()
-        if name == active_name:
-            raise ConflictError(
-                f"'{name}' is the map the stack is running on and cannot be "
-                "renamed while it is in use. Switch the robot to another map "
-                "first.",
-                code="map_active",
-            )
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; rename it "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
+        map_usage.refuse_if_active(name, "renamed")
+        map_usage.refuse_while_converting(
+            name, "rename it once the conversion has finished."
+        )
 
         new_dir = map_catalog_repo.rename_map_dir(name, request.name)
 
@@ -1663,9 +1471,7 @@ def init_map_router(
             )
 
         # Never served stale (the cache is content-tagged), but would leak.
-        thumbnail_cache.pop(name, None)
-        image_cache.pop(name, None)
-        cloud_cache.pop(name, None)
+        renders.forget(name)
 
         logger.info(
             "Renamed map",
@@ -1694,7 +1500,7 @@ def init_map_router(
     def delete_map(name: str):
         """Delete a map: remove its directory and the vertices that name it.
 
-        404, then ``_refuse_if_in_use``'s 409s (``map_active``,
+        404, then ``MapUsagePolicy.refuse_destroy``'s 409s (``map_active``,
         ``conversion_running``, ``template_bound``) before any mutation.
 
         **Database first, filesystem last** (the inverse of rename): ``rmtree``
@@ -1706,7 +1512,7 @@ def init_map_router(
         so.
         """
         _require(name)
-        _refuse_if_in_use(
+        map_usage.refuse_destroy(
             name,
             verb="deleted",
             template_consequence=(
@@ -1731,9 +1537,7 @@ def init_map_router(
         map_catalog_repo.delete_map_dir(name)
 
         # Drop the renderings or they sit in memory until restart.
-        thumbnail_cache.pop(name, None)
-        image_cache.pop(name, None)
-        cloud_cache.pop(name, None)
+        renders.forget(name)
 
         logger.info("Deleted map", map=name, vertices_deleted=vertices_deleted)
         return DeleteMapResponse(
@@ -1746,43 +1550,6 @@ def init_map_router(
                 "their frozen steps."
             ),
         )
-
-    def _carry_keepout(name: str, grid: GridInfo) -> Tuple[bool, str]:
-        """Point filter_mask_server at ``name``'s keepout mask; never raises.
-
-        A map the nav session never booted into has no ``keepout.*``, so the
-        pair is written first (from ``keepout.json`` if any, else blank) —
-        the previous map's zones must be replaced by something.
-
-        Returns ``(reloaded, note)``; the note is an operator sentence, empty
-        when there is nothing to say.
-        """
-        zones = map_catalog_repo.read_keepout_zones(name)
-        yaml_path = map_catalog_repo.keepout_yaml_path(name)
-        if yaml_path is None:
-            try:
-                map_catalog_repo.write_keepout(name, zones, grid)
-            except OSError as exc:
-                logger.error(
-                    "Could not write the keepout mask for the new map",
-                    map=name,
-                    error=str(exc),
-                )
-                return False, f" The keepout mask could not be written: {exc}."
-            yaml_path = map_catalog_repo.keepout_yaml_path(name)
-            if yaml_path is None:
-                return False, " The keepout mask could not be written."
-
-        reloaded, detail = map_gw.reload_keepout(yaml_path)
-        if not reloaded:
-            logger.error(
-                "Switched maps but the keepout mask did not reload", map=name, error=detail
-            )
-            return False, f" The keepout mask could not be reloaded: {detail}."
-        if zones:
-            count = len(zones)
-            return True, f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
-        return True, ""
 
     @map_router.post(
         "/api/v1/maps/{name}/activate", response_model=ActivateMapResponse
@@ -1814,300 +1581,38 @@ def init_map_router(
 
         `[initial_pose]` is zeroed: an old-frame pose is meaningless here. The
         operator sets the pose; `localized` says whether registration converged
-        shortly after the swap.
+        shortly after the swap. The steps and their undos are
+        services/map_switch.py; this route owns only the Temporal question.
         """
         stored = _require(name)
-
-        previous = map_catalog_repo.active_name()
-        if name == previous:
-            # The no-op: reloading would only throw away a good registration.
+        status, grid_error = _grid_status(stored, False)
+        plan = map_switch_svc.plan(stored, status == GridStatus.OK, grid_error)
+        if plan is None:
             return ActivateMapResponse(
                 name=name,
-                previous=previous,
+                previous=name,
                 switched=False,
                 localized=None,
                 message=f"'{name}' is already the map the robot is running on.",
             )
 
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; switch to it "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
-
-        # 2D or 3D. The robot's own rule is "3D wins": its task_runner runs the
-        # 3D trees whenever Octo3D has a map, so a map with both is a 3D map
-        # here too (its grid is loaded as well, keeping map_server in step).
-        status, grid_error = _grid_status(stored, False)
-        has_grid = status == GridStatus.OK
-        octomap_path = map_catalog_repo.octomap_path(name)
-        is_3d = octomap_path is not None
-        if not has_grid and not is_3d:
-            # Refuse up front, before the localizer is swapped (and an
-            # unloadable yaml would crash map_server at the next launch).
-            detail = f" ({grid_error})" if grid_error else ""
-            raise ConflictError(
-                f"'{name}' has no usable gridmap{detail} and no 3D map "
-                "(octomap.bt). Build a grid from the map's Rebuild-grid control, "
-                "or let the robot's map cleaning write its 3D map, before "
-                "switching to it.",
-                code="grid_missing",
-            )
-
-        pcd_path = map_catalog_repo.pointcloud_path(name)
-        if pcd_path is None:
-            raise ConflictError(
-                f"'{name}' has no map.pcd, so the localizer has nothing to "
-                "match against. Only a map saved from a mapping run can be "
-                "switched to.",
-                code="pointcloud_missing",
-            )
-
-        yaml_path = map_catalog_repo.gridmap_yaml_path(name) if has_grid else None
-        if yaml_path is None and not is_3d:
-            raise ConflictError(
-                f"'{name}' has no gridmap.yaml to hand map_server.",
-                code="grid_missing",
-            )
-        previous_is_3d = (
-            previous is not None and map_catalog_repo.octomap_path(previous) is not None
-        )
-
-        ini_path = system_ini_path()
-        if not os.access(ini_path, os.W_OK):
-            # Preflighted so the swap's last step cannot fail after the move.
-            raise ConflictError(
-                f"The system INI ({ini_path}) is not writable, so a switch "
-                "could not be recorded and would not survive a restart.",
-                code="ini_not_writable",
-            )
-
-        # Any job, not only one holding a map (stricter than
-        # _refuse_while_a_job_holds): a switch re-points the localizer.
-        active_tasks = await _running_tasks("a map switch")
-
-        if active_tasks:
-            running = ", ".join(task.id for task in active_tasks)
-            raise ConflictError(
-                f"The robot is running {len(active_tasks)} "
-                f"{'task' if len(active_tasks) == 1 else 'tasks'} ({running}). "
-                "Cancel or wait for it before switching maps.",
-                code="task_running",
-            )
+        # Any job, not only one holding a map: a switch re-points the localizer.
+        await job_gate.refuse_while_any_job("a map switch", "switching maps")
 
         # The route is `async def` for the Temporal await (the client belongs to
-        # the uvicorn loop); everything below blocks for up to a minute, so it
-        # runs in a worker thread. On the loop it froze every WebSocket,
-        # including the teleop watchdog.
-
-        def _switch() -> ActivateMapResponse:
-            if not map_gw.nav_services_ready():
-                raise ConflictError(
-                    "map_server and the localizer are not reachable, so there is no "
-                    "running map to switch. The robot is in mapping mode, or the "
-                    "nav stack is down.",
-                    code="stack_not_ready",
-                )
-
-            # Asked before anything moves. Absent on a stack built without
-            # OctomapPlanner3D: fatal for a 3D map, nothing to unload for a 2D.
-            planner_3d = map_gw.planner_3d_available()
-            if is_3d and not planner_3d:
-                raise ConflictError(
-                    f"'{name}' is a 3D map, but the nav stack has no 3D planner "
-                    "(planner_server/Octo3D/load_map) to navigate it.",
-                    code="planner_3d_unavailable",
-                )
-
-            previous_pcd = (
-                map_catalog_repo.pointcloud_path(previous) if previous else None
-            )
-
-            def _restore_localizer(reason: str) -> str:
-                """Put the localizer back on the old cloud. Returns a sentence."""
-                if previous_pcd is None:
-                    # The INI named no map (the likely case when its write fails),
-                    # or that map lost its map.pcd.
-                    where = (
-                        f"'{previous}' has no map.pcd"
-                        if previous
-                        else "the INI named no previous map"
-                    )
-                    return (
-                        f" The localizer is now on '{name}' and could not be put "
-                        f"back — {where}."
-                    )
-                restored, detail = map_gw.swap_localizer_map(previous_pcd, 0.0, 0.0, 0.0)
-                if restored:
-                    return f" The localizer was put back on '{previous}'."
-                logger.error(
-                    "Could not restore the localizer after a failed map switch",
-                    map=name,
-                    previous=previous,
-                    reason=reason,
-                    error=detail,
-                )
-                return (
-                    f" The localizer is still on '{name}' and could not be put back "
-                    f"({detail}) — set the map by hand and restart the stack."
-                )
-
-            swapped, detail = map_gw.swap_localizer_map(pcd_path, 0.0, 0.0, 0.0)
-            if not swapped:
-                # Nothing has changed yet, so nothing to compensate.
-                logger.error("Map switch failed at the localizer", map=name, error=detail)
-                raise UpstreamError(
-                    f"Could not point the localizer at '{name}': {detail}. The robot "
-                    f"is still on '{previous}'."
-                )
-
-            def _restore_grid() -> str:
-                """Put map_server back on the old grid, if this switch moved it."""
-                if yaml_path is None:
-                    # A 3D map without a grid: map_server was never touched.
-                    return ""
-                previous_yaml = (
-                    map_catalog_repo.gridmap_yaml_path(previous) if previous else None
-                )
-                if previous_yaml is None:
-                    # Say so rather than leave map_server quietly serving a grid
-                    # that does not match the restored cloud.
-                    where = (
-                        f"'{previous}' has no gridmap.yaml"
-                        if previous
-                        else "the INI named no previous map"
-                    )
-                    return f" map_server is still serving '{name}' — {where} to put back."
-                back, back_detail = map_gw.reload_map(previous_yaml)
-                return "" if back else f" map_server is still serving '{name}' ({back_detail})."
-
-            def _restore_octomap() -> str:
-                """Put Octo3D back as the old map had it: its tree, or none."""
-                if not planner_3d:
-                    return ""
-                previous_bt = map_catalog_repo.octomap_path(previous) if previous else None
-                back, back_detail = map_gw.reload_octomap(previous_bt or "")
-                if back:
-                    return ""
-                logger.error(
-                    "Could not restore the 3D planner after a failed map switch",
-                    map=name,
-                    previous=previous,
-                    error=back_detail,
-                )
-                return (
-                    f" The 3D planner could not be put back on '{previous}' "
-                    f"({back_detail}) — restart the nav stack before navigating."
-                )
-
-            if yaml_path is not None:
-                reloaded, detail = map_gw.reload_map(yaml_path)
-                if not reloaded:
-                    logger.error("Map switch failed at map_server", map=name, error=detail)
-                    raise UpstreamError(
-                        f"The localizer moved to '{name}' but map_server would not load "
-                        f"its gridmap: {detail}." + _restore_localizer("load_map failed")
-                    )
-
-            # After the grid: a 3D map's tree takes seconds to build, and a
-            # refusal from map_server should not have paid for it. For a 2D map
-            # this unloads the previous 3D map, if the stack has a 3D planner.
-            if planner_3d:
-                octomap_loaded, detail = map_gw.reload_octomap(
-                    octomap_path if is_3d else ""
-                )
-                if not octomap_loaded:
-                    logger.error(
-                        "Map switch failed at the 3D planner", map=name, error=detail
-                    )
-                    what = (
-                        "load its 3D map" if is_3d else "unload the previous 3D map"
-                    )
-                    # Undone in the order done, as statements (see below).
-                    restored_cloud = _restore_localizer("Octo3D load_map failed")
-                    restored_grid = _restore_grid()
-                    restored_octomap = _restore_octomap()
-                    raise UpstreamError(
-                        f"The localizer moved to '{name}' but the 3D planner would not "
-                        f"{what}: {detail}."
-                        + restored_cloud
-                        + restored_grid
-                        + restored_octomap
-                    )
-
-            try:
-                set_active_map(name, logger)
-            except (OSError, ValueError) as exc:
-                logger.error(
-                    "Map switch failed at the INI write", map=name, error=str(exc)
-                )
-                # Undone in the order done, as statements: inside the message
-                # concatenation the order would follow the sentences.
-                restored_cloud = _restore_localizer("INI write failed")
-                restored_grid = _restore_grid()
-                restored_octomap = _restore_octomap()
-
-                raise UpstreamError(
-                    f"The robot moved to '{name}' but the switch could not be "
-                    f"recorded in {ini_path}: {exc}."
-                    + restored_cloud
-                    + restored_grid
-                    + restored_octomap
-                )
-
-            # The switch is recorded; nothing can fail it now. The keepout mask
-            # (still the previous map's) is carried over best-effort after this
-            # commit point: a mask problem goes in the message, not a failure.
-            # A 3D map's zones need no carrying: the 3D planner read the map's
-            # keepout.json (if any) as part of the load_map that just succeeded
-            # (2026-10-23; until then it read no zones at all).
-            if is_3d:
-                count = len(map_catalog_repo.read_keepout_zones(name))
-                keepout_reloaded, keepout_note = True, (
-                    " It is a 3D map: the 3D planner navigates it, with its "
-                    f"{count} forbidden zone{'s' if count != 1 else ''}."
-                )
-            else:
-                keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
-
-            # Renderings are keyed by map name, so nothing cached is stale.
-            localized = map_gw.localization_converged()
-
-            logger.info(
-                "Switched the active map",
-                map=name,
-                previous=previous,
-                map_kind="3d" if is_3d else "2d",
-                previous_was_3d=previous_is_3d,
-                localized=localized,
-                keepout_reloaded=keepout_reloaded,
-            )
-
-            message = f"The robot is now on '{name}'"
-            message += f" (was '{previous}')." if previous else "."
-            if localized:
-                message += " The localizer converged on the new map."
-            else:
-                message += (
-                    " The pose was reset to the map origin; set an initial pose on "
-                    "the dashboard, because the localizer has not converged"
-                )
-                message += (
-                    " yet." if localized is False else " and could not be asked."
-                )
-            message += keepout_note
-            return ActivateMapResponse(
-                name=name,
-                map_kind="3d" if is_3d else "2d",
-                previous=previous,
-                switched=True,
-                localized=localized,
-                keepout_reloaded=keepout_reloaded,
-                message=message,
-            )
-
-        return await asyncio.to_thread(_switch)
+        # the uvicorn loop); the switch blocks for up to a minute, so it runs in
+        # a worker thread. Renderings are keyed by map name: nothing cached is
+        # stale.
+        outcome = await asyncio.to_thread(map_switch_svc.execute, plan)
+        return ActivateMapResponse(
+            name=outcome.name,
+            map_kind=outcome.map_kind,
+            previous=outcome.previous,
+            switched=True,
+            localized=outcome.localized,
+            keepout_reloaded=outcome.keepout_reloaded,
+            message=outcome.message,
+        )
 
     # --- Localization -------------------------------------------------------
 
@@ -2133,15 +1638,7 @@ def init_map_router(
         localizer refusal is the uniform 502 with its sentence. ``async`` for
         the Temporal await, blocking half on a worker thread, as activate.
         """
-        active_tasks = await _running_tasks("finding the robot")
-        if active_tasks:
-            running = ", ".join(task.id for task in active_tasks)
-            raise ConflictError(
-                f"The robot is running {len(active_tasks)} "
-                f"{'task' if len(active_tasks) == 1 else 'tasks'} ({running}). "
-                "Cancel or wait for it before finding the robot.",
-                code="task_running",
-            )
+        await job_gate.refuse_while_any_job("finding the robot", "finding the robot")
 
         if not auto_localize_lock.acquire(blocking=False):
             raise ConflictError(
@@ -2421,7 +1918,6 @@ def init_map_router(
     def _png_response(
         name: str,
         request: Request,
-        cache: Dict[str, Tuple[str, bytes]],
         render: Callable[[bytes], bytes],
         what: str,
     ) -> Response:
@@ -2437,26 +1933,24 @@ def init_map_router(
         if _not_modified(request, tag):
             return Response(status_code=304, headers=headers)
 
-        cached = cache.get(name)
-        if cached is None or cached[0] != tag:
+        def _render() -> bytes:
             try:
-                png = render(payload)
+                return render(payload)
             except ValueError as exc:
                 logger.error(f"Failed to render map {what}", map=name, error=str(exc))
                 raise NotFoundError(f"Map '{name}' has no readable gridmap.")
-            cached = (tag, png)
-            cache[name] = cached
 
-        return Response(content=cached[1], media_type="image/png", headers=headers)
+        png = renders.get(what, name, tag, _render)
+        return Response(content=png, media_type="image/png", headers=headers)
 
     @map_router.get("/api/v1/maps/{name}/image")
     def get_map_image_by_name(name: str, request: Request):
         """The map's gridmap as a full-size PNG (raw bytes, not base64 JSON)."""
-        return _png_response(name, request, image_cache, render_png, "image")
+        return _png_response(name, request, render_png, "image")
 
     @map_router.get("/api/v1/maps/{name}/thumbnail")
     def get_map_thumbnail(name: str, request: Request):
-        return _png_response(name, request, thumbnail_cache, render_thumbnail, "thumbnail")
+        return _png_response(name, request, render_thumbnail, "thumbnail")
 
     @map_router.put(
         "/api/v1/maps/{name}/grid",
@@ -2484,14 +1978,12 @@ def init_map_router(
         """
         stored = _require(name)
 
-        if conversion_svc.is_converting(name):
-            # The conversion would overwrite the save, and the once-only
-            # gridmap_raw.pgm snapshot could capture a half-finished grid.
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; save the edit "
-                "once it has finished, or the conversion will overwrite it.",
-                code="conversion_running",
-            )
+        # The conversion would overwrite the save, and the once-only
+        # gridmap_raw.pgm snapshot could capture a half-finished grid.
+        map_usage.refuse_while_converting(
+            name,
+            "save the edit once it has finished, or the conversion will overwrite it.",
+        )
 
         # stored.grid parsed both the .pgm header and gridmap.yaml, so one None
         # test covers missing or torn files before map_server re-reads both.
@@ -2594,12 +2086,11 @@ def init_map_router(
         stored = _require(name)
         is_3d = map_catalog_repo.octomap_path(name) is not None
 
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; save the forbidden "
-                "zones once it has finished, so the mask matches the new grid.",
-                code="conversion_running",
-            )
+        map_usage.refuse_while_converting(
+            name,
+            "save the forbidden zones once it has finished, so the mask matches "
+            "the new grid.",
+        )
 
         if stored.grid is None and not is_3d:
             raise NotFoundError(
@@ -2683,9 +2174,7 @@ def init_map_router(
             logger.error("Failed to stat map cloud", map=name, error=str(exc))
             raise NotFoundError(f"Map '{name}' has no readable map.pcd.")
 
-        stamp = (stats.st_size, stats.st_mtime_ns)
-        cached = cloud_cache.get(name)
-        if cached is None or cached[0] != stamp:
+        def _pack() -> bytes:
             try:
                 points = read_pcd_xyz(path)
             except (OSError, ValueError) as exc:
@@ -2694,13 +2183,12 @@ def init_map_router(
 
             points = voxel_downsample(points=points, voxel_size=MAP_CLOUD_VOXEL_SIZE)
             points = cap_points(points=points, max_points=MAP_CLOUD_MAX_POINTS)
-            payload = struct.pack("<I", points.shape[0]) + pack_xyz_f32(points)
-            cached = (stamp, payload)
-            cloud_cache[name] = cached
             logger.info("packed stored map cloud", map=name, num_points=int(points.shape[0]))
+            return struct.pack("<I", points.shape[0]) + pack_xyz_f32(points)
 
+        payload = renders.get("cloud", name, (stats.st_size, stats.st_mtime_ns), _pack)
         return Response(
-            content=cached[1],
+            content=payload,
             media_type="application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )

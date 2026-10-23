@@ -6,14 +6,14 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
 with workflow.unsafe.imports_passed_through():
-    from syncai_backend.gateways.workflow.config import (
+    from syncai_backend.tasks.config import (
         PAUSE_SIGNAL,
         RESUME_SIGNAL,
         STEP_STARTED_SIGNAL,
         group_activity_id,
         io_task_queue_for,
     )
-    from syncai_backend.gateways.workflow.schema import (
+    from syncai_backend.tasks.schema import (
         NAV_STEP_TYPES,
         POSE_STEP_TYPES,
         Step,
@@ -22,7 +22,7 @@ with workflow.unsafe.imports_passed_through():
         WaitParams,
         WorkflowTask,
     )
-    from syncai_backend.gateways.workflow.search_attributes import TASK_MAP_KEY
+    from syncai_backend.tasks.search_attributes import TASK_MAP_KEY
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
 
 

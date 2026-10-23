@@ -171,8 +171,9 @@ def test_worker_run_dying_marks_dead():
         robot_gw=MagicMock(),
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
-        conversion_svc=MagicMock(),
+        map_usage=MagicMock(),
         robot_repo=MagicMock(),
+        dock_state=MagicMock(),
     )
     handle.thread.join(timeout=10)
 
@@ -186,30 +187,36 @@ def test_health_projects_worker_state():
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
 
-    from syncai_backend.interfaces.rest.server import init_rest_server
+    from syncai_backend.interfaces.rest.server import RestDeps, init_rest_server
 
     handle = TemporalWorkerHandle()
     app = init_rest_server(
         logger=logger,
-        workflow_gw=MagicMock(),
-        robot_repo=MagicMock(),
-        robot_gw=MagicMock(),
-        map_repo=MagicMock(),
-        map_catalog_repo=MagicMock(),
-        map_gw=MagicMock(),
-        pointcloud_repo=MagicMock(),
-        map_cloud_repo=MagicMock(),
-        telemetry_repo=MagicMock(),
-        task_template_repo=MagicMock(),
-        worker_handle=handle,
-        tts_gw=MagicMock(),
-        webrtc_gw=MagicMock(),
-        recording_gw=MagicMock(),
-        recording_catalog_repo=MagicMock(),
-        conversion_svc=MagicMock(),
-        restart_svc=MagicMock(),
-        mapping_status_repo=MagicMock(),
-        safety_lock_svc=MagicMock(),
+        deps=RestDeps(
+            workflow_gw=MagicMock(),
+            robot_repo=MagicMock(),
+            robot_gw=MagicMock(),
+            map_repo=MagicMock(),
+            map_catalog_repo=MagicMock(),
+            map_gw=MagicMock(),
+            pointcloud_repo=MagicMock(),
+            map_cloud_repo=MagicMock(),
+            telemetry_repo=MagicMock(),
+            task_template_repo=MagicMock(),
+            worker_handle=handle,
+            tts_gw=MagicMock(),
+            webrtc_gw=MagicMock(),
+            recording_gw=MagicMock(),
+            recording_catalog_repo=MagicMock(),
+            conversion_svc=MagicMock(),
+            restart_svc=MagicMock(),
+            mapping_status_repo=MagicMock(),
+            safety_lock_svc=MagicMock(),
+            map_switch_svc=MagicMock(),
+            map_usage=MagicMock(),
+            job_gate=MagicMock(),
+            map_import_svc=MagicMock(),
+        ),
     )
     client = TestClient(app)
 

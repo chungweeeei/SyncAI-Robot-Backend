@@ -10,11 +10,10 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from syncai_backend.temporal.shared import temporal_server_url
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
-from syncai_backend.gateways.workflow.config import io_task_queue, task_queue
-from syncai_backend.gateways.workflow.search_attributes import (
+from syncai_backend.tasks.config import io_task_queue, task_queue, temporal_server_url
+from syncai_backend.tasks.search_attributes import (
     ensure_search_attributes,
 )
 
@@ -23,7 +22,8 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.dock_state import DockStateService
+from syncai_backend.services.map_usage import MapUsagePolicy
 
 # Same bounded retry as database/postgres.py (compose services may come up after the
 # backend), but running out only marks the worker dead: there is no supervisor, and
@@ -171,8 +171,9 @@ def start_temporal_worker(
     robot_gw: RobotGateway,
     tts_gw: TtsGateway,
     map_catalog_repo: MapCatalogRepo,
-    conversion_svc: GridmapConversionService,
+    map_usage: MapUsagePolicy,
     robot_repo: RobotRepo,
+    dock_state: DockStateService,
 ) -> TemporalWorkerHandle:
 
     ready = threading.Event()
@@ -187,8 +188,9 @@ def start_temporal_worker(
                 robot_gw=robot_gw,
                 tts_gw=tts_gw,
                 map_catalog_repo=map_catalog_repo,
-                conversion_svc=conversion_svc,
+                map_usage=map_usage,
                 robot_repo=robot_repo,
+                dock_state=dock_state,
             )
             asyncio.run(
                 run_worker(

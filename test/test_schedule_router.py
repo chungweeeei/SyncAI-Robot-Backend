@@ -27,7 +27,7 @@ pytest.importorskip("temporalio")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
     MoveParams,
     ScheduleTrigger,
     ScheduleView,

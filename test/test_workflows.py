@@ -87,11 +87,11 @@ from temporalio.exceptions import (  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
-from syncai_backend.gateways.workflow.config import (  # noqa: E402
+from syncai_backend.tasks.config import (  # noqa: E402
     STEP_STARTED_SIGNAL,
     reports_start,
 )
-from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
     MoveParams,
     SpeakParams,
     Step,
@@ -101,7 +101,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     WorkflowTask,
     WorkflowTaskDefinition,
 )
-from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
+from syncai_backend.tasks.search_attributes import (  # noqa: E402
     TASK_MAP_KEY,
 )
 from syncai_backend.temporal.activities import ActivityResult  # noqa: E402

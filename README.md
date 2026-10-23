@@ -62,7 +62,11 @@ services/                  domain work that outlives a request: gridmap_conversi
         │                  recipes, the registry of running conversions, the
         │                  gridmap.recipe.json protocol); mode_restart (the latest
         │                  restart_mode dispatch and how it ended); safety_lock (the driver
-        │                  safety lock's rising edge → cancel every task)
+        │                  safety lock's rising edge → cancel every task); map_switch (the
+        │                  live map switch's steps and their undos); dock_state (the last
+        │                  DOCK's pose, for the auto-undock); map_usage (whether a map may
+        │                  be edited, destroyed, switched to or driven on); map_import (an
+        │                  archive's directory and vertex rows, published together)
         │
 gateways/                  outbound: ROS (robot, map), Temporal (workflow), speech (tts: HTTP
         │                  to the syncai_tts container), camera/speaker (webrtc: a dlopen'd Go
@@ -72,6 +76,10 @@ repositories/              state: in-memory caches, PostgreSQL CRUD, and the two
         │                  catalogues (map/, record/)
         │
 database/                  SQLAlchemy engine + ORM models
+
+tasks/                     the task model and its Temporal contract (steps, groups, queues,
+                           signals, search attributes) — REST, the workflow gateway and the
+                           worker all import it, and it imports none of them
 
 subscribers/               ROS topics → repositories (ingest) — except the map cloud, whose
                            topic only names a PCD the subscriber reads from the shared /dev/shm
@@ -571,7 +579,7 @@ while a running job holds the map (its `map_name` in `GET /api/v1/active_tasks`;
 `ActiveTask.map_in_use`), and 409 `tasks_unknown` when running jobs cannot be
 listed — refuse rather than assume idle. Each of those reloads into the running
 stack or rewrites the rows a job's MOVEs came from. One async dependency
-(`_refuse_while_a_job_holds`) sits in front of the plain `def` routes: it awaits
+(`JobGate.refuse_while_a_job_holds`, `services/map_usage.py`) sits in front of the plain `def` routes: it awaits
 Temporal on the loop, the route still runs in the threadpool. A map other than
 the loaded one passes without asking — activate refuses while anything runs, so
 only the loaded map can be held, and editing an idle map should not need

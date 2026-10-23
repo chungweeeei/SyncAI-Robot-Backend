@@ -2,9 +2,9 @@ import structlog
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
-from syncai_backend.gateways.workflow.schema import (
+from syncai_backend.tasks.schema import (
     Step,
     ScheduleTask,
     ScheduleTrigger,
@@ -12,32 +12,11 @@ from syncai_backend.gateways.workflow.schema import (
     step_group_problem,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
-from syncai_backend.interfaces.rest.routers.task import StepRequest
-
-
-class ScheduleTriggerRequest(BaseModel):
-    cron: Optional[str] = Field(
-        default=None,
-        description="Cron expression. Provide exactly one of cron or interval_seconds.",
-        examples=["*/3 * * * *"],
-    )
-    interval_seconds: Optional[int] = Field(
-        default=None,
-        gt=0,
-        description="Fire every N seconds. Provide exactly one of cron or interval_seconds.",
-        examples=[1800],
-    )
-    timezone: Optional[str] = Field(
-        default=None,
-        description="IANA timezone applied to cron (ignored for interval).",
-        examples=["Asia/Taipei"],
-    )
-
-    @model_validator(mode="after")
-    def _exactly_one(self) -> "ScheduleTriggerRequest":
-        if bool(self.cron) == bool(self.interval_seconds):
-            raise ValueError("Provide exactly one of 'cron' or 'interval_seconds'")
-        return self
+from syncai_backend.interfaces.rest.schemas import (
+    ScheduleResponse,
+    ScheduleTriggerRequest,
+    StepRequest,
+)
 
 
 class ScheduleRequest(BaseModel):
@@ -72,11 +51,6 @@ class ScheduleUpdateRequest(BaseModel):
             "and the paused state are left as they are."
         ),
     )
-
-
-class ScheduleResponse(BaseModel):
-    id: str = Field(..., description="Unique identifier of the schedule")
-    message: str = Field(..., description="Additional information about the schedule")
 
 
 class ScheduleTriggerResponse(BaseModel):

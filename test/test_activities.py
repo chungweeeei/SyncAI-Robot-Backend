@@ -31,8 +31,9 @@ from temporalio.testing import ActivityEnvironment  # noqa: E402
 
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
-from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams  # noqa: E402
+from syncai_backend.tasks.schema import MoveParams, SpeakParams  # noqa: E402
 from syncai_backend.services.dock_state import DockStateService  # noqa: E402
+from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.temporal.activities import RobotActivities  # noqa: E402
 
 
@@ -85,7 +86,12 @@ def activities(
         robot_gw=robot_gw,
         tts_gw=tts_gw,
         map_catalog_repo=map_catalog_repo,
-        conversion_svc=conversion_svc,
+        # Real, over the mocks: execute_move's check is the policy's rule.
+        map_usage=MapUsagePolicy(
+            map_catalog_repo=map_catalog_repo,
+            conversion_svc=conversion_svc,
+            task_template_repo=None,
+        ),
         robot_repo=robot_repo,
         dock_state=dock_state,
     )
@@ -643,7 +649,7 @@ class TestReportStarted:
 
         env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
 
-        from syncai_backend.gateways.workflow.config import STEP_STARTED_SIGNAL
+        from syncai_backend.tasks.config import STEP_STARTED_SIGNAL
 
         assert order[:4] == [
             ("beat", "sending"),
