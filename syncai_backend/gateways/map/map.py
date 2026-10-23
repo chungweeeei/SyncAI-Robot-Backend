@@ -436,7 +436,6 @@ class MapGateway:
         ``octomap`` is the save's 3D map choice; None sends OCTOMAP_DEFAULT,
         which leaves it to pgo's map_clean_octomap.
         """
-
         save_maps_client = self._service_clients.get("save_maps")
         if not save_maps_client.wait_for_service(timeout_sec=5.0):
             # Name the mode: pgo runs only in the MANUAL session.
