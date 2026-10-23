@@ -35,7 +35,7 @@ from temporalio.client import (  # noqa: E402
 )
 
 from syncai_backend.exceptions import NotFoundError  # noqa: E402
-from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
     ScheduleTask,
     ScheduleTrigger,
     WorkflowTaskDefinition,

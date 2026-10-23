@@ -44,8 +44,8 @@ from syncai_backend.exceptions import (  # noqa: E402
     UpstreamError,
     NotFoundError,
 )
-from syncai_backend.gateways.workflow.config import WORKFLOW_TYPE_NAME  # noqa: E402
-from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+from syncai_backend.tasks.config import WORKFLOW_TYPE_NAME  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
     MoveParams,
     ScheduleTask,
     ScheduleTrigger,
@@ -58,7 +58,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     WorkflowTask,
     WorkflowTaskDefinition,
 )
-from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
+from syncai_backend.tasks.search_attributes import (  # noqa: E402
     TASK_KIND_KEY,
     TASK_MAP_KEY,
     TASK_NAME_KEY,

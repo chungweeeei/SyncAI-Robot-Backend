@@ -36,9 +36,7 @@ from syncai_backend.exceptions import (
     NotFoundError,
 )
 
-from syncai_backend.temporal.shared import temporal_server_url
-
-from syncai_backend.gateways.workflow.schema import (
+from syncai_backend.tasks.schema import (
     ActiveTask,
     ScheduleTask,
     ScheduleTrigger,
@@ -53,12 +51,12 @@ from syncai_backend.gateways.workflow.schema import (
     TaskState,
     WorkflowTask,
 )
-from syncai_backend.gateways.workflow.search_attributes import (
+from syncai_backend.tasks.search_attributes import (
     TASK_KIND_KEY,
     TASK_MAP_KEY,
     TASK_NAME_KEY,
 )
-from syncai_backend.gateways.workflow.config import (
+from syncai_backend.tasks.config import (
     ACTIVE_TASK_CACHE_TTL_S,
     ACTIVE_TASK_LIST_LIMIT,
     ACTIVE_TASK_RPC_TIMEOUT_S,
@@ -68,6 +66,7 @@ from syncai_backend.gateways.workflow.config import (
     TASK_STATS_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
     task_queue,
+    temporal_server_url,
 )
 
 

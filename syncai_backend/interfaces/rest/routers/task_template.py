@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from syncai_backend.database.models import MapPoint, TaskTemplate
 from syncai_backend.exceptions import BadRequestError, NotFoundError
-from syncai_backend.gateways.workflow.schema import (
+from syncai_backend.tasks.schema import (
     POSE_STEP_TYPES,
     MoveParams,
     ScheduleTask,
@@ -42,11 +42,11 @@ from syncai_backend.gateways.workflow.schema import (
     step_group_problem,
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
-from syncai_backend.interfaces.rest.routers.schedule import (
+from syncai_backend.interfaces.rest.schemas import (
     ScheduleResponse,
     ScheduleTriggerRequest,
+    StepRequest,
 )
-from syncai_backend.interfaces.rest.routers.task import StepRequest
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.map.map import MapRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo

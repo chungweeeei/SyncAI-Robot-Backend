@@ -18,7 +18,7 @@ pytest.importorskip("temporalio")
 
 from temporalio.api.enums.v1 import IndexedValueType  # noqa: E402
 
-from syncai_backend.gateways.workflow.search_attributes import (  # noqa: E402
+from syncai_backend.tasks.search_attributes import (  # noqa: E402
     CUSTOM_SEARCH_ATTRIBUTES,
     TASK_KIND_KEY,
     TASK_MAP_KEY,

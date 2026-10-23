@@ -7,7 +7,7 @@ Temporal clients silently used the default whenever the variable lived only in
 that file.
 """
 
-from syncai_backend.temporal import shared
+from syncai_backend.tasks import config as shared
 
 
 def test_the_address_reflects_the_environment_at_call_time(monkeypatch):

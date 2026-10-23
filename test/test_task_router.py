@@ -21,7 +21,7 @@ from syncai_backend.exceptions import (  # noqa: E402
     ConflictError,
     NotFoundError,
 )
-from syncai_backend.gateways.workflow.schema import (  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
     ActiveTask,
     MoveParams,
     Step,

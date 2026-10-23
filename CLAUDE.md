@@ -153,6 +153,11 @@ repositories/              state: in-memory single-slot caches (robot, pointclou
         │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
 database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate)
 
+tasks/                     the task model and its Temporal contract (schema: Step, groups,
+                           TaskState; config: queues, signals, the Temporal address;
+                           search_attributes), imported by REST, gateways/workflow and
+                           temporal/ alike and importing none of them
+
 subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
                            names the PCD, which the subscriber reads from the shared /dev/shm)
 temporal/                  worker, RobotWorkflow, activities
@@ -327,7 +332,7 @@ must outlast the gateway's `SPEAK_START_TIMEOUT_S`, and a cancel only arrives pr
 because the worker caps the heartbeat throttle. Per-step state
 is a workflow **query**, not a table — and the task-level `PAUSED` is derived from it,
 because **Temporal has no paused status**: `pause`/`resume` are two idempotent workflow
-**signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `gateways/workflow/config.py`, shared by
+**signals** (`PAUSE_SIGNAL` / `RESUME_SIGNAL` in `tasks/config.py`, shared by
 the workflow and the gateway) plus a flag the run checks before every step, parking that
 step as `PAUSED` in a `wait_condition`, and `get_task_state` reads the hold off the held
 step rather than asking a second time. A held run stays *running* to everything else
@@ -358,7 +363,7 @@ at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, a
 keeps on describe, list and update. `_build_schedule_spec` is the one gate every
 registration goes through, so the crons that would break that echo (`#`, a
 `CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
-Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`gateways/workflow/
+Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`tasks/
 search_attributes.py`), registered idempotently by the worker at connect; the history
 list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
 `TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`

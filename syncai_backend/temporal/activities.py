@@ -12,8 +12,8 @@ from temporalio.exceptions import ApplicationError, CancelledError
 
 
 from syncai_backend.gateways.failure import Failure, failure_code
-from syncai_backend.gateways.workflow.config import STEP_STARTED_SIGNAL, reports_start
-from syncai_backend.gateways.workflow.schema import MoveParams, SpeakParams
+from syncai_backend.tasks.config import STEP_STARTED_SIGNAL, reports_start
+from syncai_backend.tasks.schema import MoveParams, SpeakParams
 from syncai_backend.gateways.robot.robot import (
     DOCK_BEHAVIOR_TREE,
     UNDOCK_BEHAVIOR_TREE,

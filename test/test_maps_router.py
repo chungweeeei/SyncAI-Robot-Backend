@@ -37,7 +37,7 @@ import yaml  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from syncai_backend.gateways.workflow.schema import TaskKind  # noqa: E402
+from syncai_backend.tasks.schema import TaskKind  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
 from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
@@ -3292,7 +3292,7 @@ def test_activate_refuses_when_temporal_cannot_be_reached(
 def _job(map_name=None, kind=None):
     from datetime import datetime, timezone
 
-    from syncai_backend.gateways.workflow.schema import ActiveTask, TaskSource
+    from syncai_backend.tasks.schema import ActiveTask, TaskSource
 
     return ActiveTask(
         id="robot01-task-9",

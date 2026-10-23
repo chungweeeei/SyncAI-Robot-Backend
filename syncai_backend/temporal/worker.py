@@ -10,11 +10,10 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
-from syncai_backend.temporal.shared import temporal_server_url
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
-from syncai_backend.gateways.workflow.config import io_task_queue, task_queue
-from syncai_backend.gateways.workflow.search_attributes import (
+from syncai_backend.tasks.config import io_task_queue, task_queue, temporal_server_url
+from syncai_backend.tasks.search_attributes import (
     ensure_search_attributes,
 )
 

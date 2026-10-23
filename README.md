@@ -77,6 +77,10 @@ repositories/              state: in-memory caches, PostgreSQL CRUD, and the two
         │
 database/                  SQLAlchemy engine + ORM models
 
+tasks/                     the task model and its Temporal contract (steps, groups, queues,
+                           signals, search attributes) — REST, the workflow gateway and the
+                           worker all import it, and it imports none of them
+
 subscribers/               ROS topics → repositories (ingest) — except the map cloud, whose
                            topic only names a PCD the subscriber reads from the shared /dev/shm
 temporal/                  worker, RobotWorkflow, activities

@@ -24,7 +24,7 @@ from typing import List, Optional
 import structlog
 
 from syncai_backend.exceptions import ConflictError
-from syncai_backend.gateways.workflow.schema import ActiveTask
+from syncai_backend.tasks.schema import ActiveTask
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.move_guard import MoveRefusal, move_refusal
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
