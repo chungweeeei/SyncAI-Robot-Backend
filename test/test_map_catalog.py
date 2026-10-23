@@ -432,6 +432,60 @@ def test_write_keepout_paints_the_zone_black(catalog_repo, maps_dir):
     assert sum(1 for value in body if value == 0) == 1
 
 
+def test_keepout_name_and_band_round_trip_and_unset_ones_are_omitted(catalog_repo, maps_dir):
+    from syncai_backend.repositories.map.catalog import KeepoutZone
+
+    zones = [
+        KeepoutZone(
+            id="a", points=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)), name="rack",
+            z_min=4.5, z_max=5.5,
+        ),
+        _zone("b", (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)),
+    ]
+    catalog_repo.write_keepout("full", zones, _grid_of(catalog_repo))
+
+    document = json.loads((maps_dir / "full" / "keepout.json").read_text())
+    assert document["zones"][0]["name"] == "rack"
+    assert document["zones"][0]["z_min"] == 4.5
+    assert set(document["zones"][1]) == {"id", "points"}
+    assert catalog_repo.read_keepout_zones("full") == zones
+
+
+def test_write_keepout_without_a_grid_writes_the_json_alone(catalog_repo, maps_dir):
+    catalog_repo.write_keepout("rawonly", [_zone("a", (0, 0), (1, 0), (1, 1))], None)
+
+    directory = maps_dir / "rawonly"
+    assert json.loads((directory / "keepout.json").read_text())["zones"][0]["id"] == "a"
+    assert not (directory / "keepout.pgm").exists()
+    assert not (directory / "keepout.yaml").exists()
+    assert catalog_repo.keepout_json_path("rawonly").endswith("rawonly/keepout.json")
+    assert catalog_repo.keepout_json_path("full") is None
+
+
+def test_read_keepout_takes_null_as_absent_and_skips_a_bad_band(catalog_repo, maps_dir):
+    points = [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}]
+    (maps_dir / "full" / "keepout.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "zones": [
+                    {"id": "null", "points": points, "name": None, "z_min": None, "z_max": 1},
+                    {"id": "upside", "points": points, "z_min": 2, "z_max": 1},
+                    {"id": "text", "points": points, "z_min": "low"},
+                    {"id": "flag", "points": points, "z_max": True},
+                ],
+            }
+        )
+    )
+
+    zones = catalog_repo.read_keepout_zones("full")
+
+    assert [zone.id for zone in zones] == ["null"]
+    assert zones[0].name is None
+    assert zones[0].z_min is None
+    assert zones[0].z_max == 1.0
+
+
 def test_write_keepout_rejects_an_unsafe_name(catalog_repo):
     with pytest.raises(BadRequestError):
         catalog_repo.write_keepout("../full", [], _grid_of(catalog_repo))

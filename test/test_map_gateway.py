@@ -73,6 +73,7 @@ def map_gw(logger) -> MapGateway:
         "map_server/load_map": MagicMock(),
         "filter_mask_server/load_map": MagicMock(),
         "planner_server/Octo3D/load_map": MagicMock(),
+        "planner_server/Octo3D/load_keepout": MagicMock(),
         "pgo/save_maps": MagicMock(),
         "pgo/reset_mapping": MagicMock(),
         "pgo/start_mapping": MagicMock(),
@@ -326,6 +327,70 @@ class TestReloadKeepout:
         success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
 
         assert (success, message) == (False, "filter_mask_server returned result 42")
+
+
+class TestReloadKeepout3d:
+    """Octo3D's forbidden zones: its own service, keepout.json, "" clears."""
+
+    def test_success_sends_the_absolute_json_path_to_octo3d_only(self, map_gw):
+        client = _arm(
+            map_gw,
+            "load_keepout_3d",
+            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
+        )
+
+        success, message = map_gw.reload_keepout_3d(json_path="~/map/full/keepout.json")
+
+        assert (success, message) == (True, "")
+        request = client.call_async.call_args[0][0]
+        assert request.map_url == os.path.join(
+            os.path.expanduser("~"), "map/full/keepout.json"
+        )
+        map_gw._service_clients["load_keepout"].call_async.assert_not_called()
+        map_gw._service_clients["load_octomap"].call_async.assert_not_called()
+
+    def test_empty_path_clears(self, map_gw):
+        client = _arm(
+            map_gw,
+            "load_keepout_3d",
+            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
+        )
+
+        assert map_gw.reload_keepout_3d(json_path="") == (True, "")
+        assert client.call_async.call_args[0][0].map_url == ""
+
+    def test_service_unavailable_says_when_the_zones_apply(self, map_gw):
+        client = _arm(map_gw, "load_keepout_3d", available=False)
+
+        success, message = map_gw.reload_keepout_3d(json_path="/map/full/keepout.json")
+
+        assert success is False
+        assert "planner_server/Octo3D/load_keepout is not available" in message
+        client.call_async.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "result_code,expected",
+        [
+            (
+                LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST,
+                "the 3D planner could not find the map yaml",
+            ),
+            (
+                LoadMap.Response.RESULT_INVALID_MAP_DATA,
+                "the 3D planner could not read keepout.json",
+            ),
+            (
+                LoadMap.Response.RESULT_UNDEFINED_FAILURE,
+                "the 3D planner has no 3D map loaded",
+            ),
+        ],
+    )
+    def test_each_failure_code_has_a_sentence(self, map_gw, result_code, expected):
+        _arm(map_gw, "load_keepout_3d", LoadMap.Response(result=result_code))
+
+        success, message = map_gw.reload_keepout_3d(json_path="/map/full/keepout.json")
+
+        assert (success, message) == (False, expected)
 
 
 class TestSaveMap:

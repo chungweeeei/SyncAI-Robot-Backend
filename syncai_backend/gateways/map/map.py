@@ -98,6 +98,14 @@ class MapGateway:
             srv_name="planner_server/Octo3D/load_map",
         )
 
+        # Octo3D's forbidden zones (2026-10-23): the map's keepout.json, read
+        # without rebuilding the tree. Same LoadMap type; an empty map_url
+        # clears them. load_map reads the file itself, so a switch needs no call.
+        load_keepout_3d_client = self._node.create_client(
+            srv_type=LoadMap,
+            srv_name="planner_server/Octo3D/load_keepout",
+        )
+
         save_maps_client = self._node.create_client(
             srv_type=SaveMaps,
             srv_name="pgo/save_maps",
@@ -143,6 +151,7 @@ class MapGateway:
                 "load_map": load_map_client,
                 "load_keepout": load_keepout_client,
                 "load_octomap": load_octomap_client,
+                "load_keepout_3d": load_keepout_3d_client,
                 "save_maps": save_maps_client,
                 "reset_mapping": reset_mapping_client,
                 "start_mapping": start_mapping_client,
@@ -375,6 +384,48 @@ class MapGateway:
         if response.result != LoadMap.Response.RESULT_SUCCESS:
             return False, _load_map_failure(
                 response.result, "filter_mask_server", "keepout.pgm", "keepout.yaml"
+            )
+
+        return True, ""
+
+    def reload_keepout_3d(self, json_path: str) -> tuple[bool, str]:
+        """Make the 3D planner (Octo3D) re-read a map's ``keepout.json``.
+
+        The 3D twin of ``reload_keepout``: Octo3D does not read the mask, it
+        rasterises the json's polygons (with their floor bands) onto its own
+        surface map, and ``planner_server/Octo3D/load_keepout`` swaps them in
+        without rebuilding the tree. A refused file keeps the zones in force;
+        the robot's running path is re-judged against the new ones within a
+        second. ``json_path=""`` clears them.
+
+        The bound covers the planner finishing a boot build or a plan first.
+        """
+        client = self._service_clients["load_keepout_3d"]
+        if not client.wait_for_service(timeout_sec=5.0):
+            return False, (
+                "planner_server/Octo3D/load_keepout is not available — the nav stack "
+                "is not in AUTO mode or predates 3D forbidden zones; the zones apply "
+                "when the nav stack next loads this map."
+            )
+
+        map_url = os.path.abspath(os.path.expanduser(json_path)) if json_path else ""
+
+        self._logger.info(
+            "[MapGateway] Reloading the 3D planner's forbidden zones",
+            map_url=map_url or "(clear)",
+        )
+
+        future = client.call_async(LoadMap.Request(map_url=map_url))
+        if not _wait_for_future(future, timeout=120.0):
+            return False, "Timeout waiting for planner_server/Octo3D/load_keepout response"
+
+        response = future.result()
+        if response.result == LoadMap.Response.RESULT_UNDEFINED_FAILURE:
+            # What the planner answers when it has no 3D map to draw zones on.
+            return False, "the 3D planner has no 3D map loaded"
+        if response.result != LoadMap.Response.RESULT_SUCCESS:
+            return False, _load_map_failure(
+                response.result, "the 3D planner", "keepout.json", "keepout.json"
             )
 
         return True, ""

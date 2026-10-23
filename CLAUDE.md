@@ -253,6 +253,13 @@ the only caller that passes anything else.
   unknown costmap cells. Written pgm → yaml → json. The nav session writes a blank pair
   (no json) at boot for a map that has none and never overwrites an existing one; a map
   switch must reload the mask itself (`filter_mask_server/load_map`), which `activate` does.
+  **The same json is a 3D map's zones** (2026-10-23): the robot's 3D planner reads it
+  beside `octomap.bt`, and each zone may carry `name` + a `z_min` / `z_max` floor band
+  (absent = every floor, what a 2D zone means; unset keys are omitted on disk; the mask
+  ignores them). A 3D-only map gets the json alone; a save on the active map reloads by
+  kind ("3D wins": `planner_server/Octo3D/load_keepout` via `reload_keepout_3d`, else
+  the mask); a 3D switch needs no keepout call (`load_map` reads it). Every rewrite must
+  keep the three keys — a dropped band widens a 3D zone to every storey.
 - **The 3D map (`map/<name>/octomap.bt`) is read, never parsed, never written.** The
   robot's `clean_map` writes it (with `map_clean_octomap`) and reports it in
   `map_clean.recipe.json`'s `params.octomap` / `measurements.octomap_written` /
@@ -274,8 +281,8 @@ the only caller that passes anything else.
   runs its 3D trees for as long as Octo3D has a map, so skipping it leaves a 2D map
   navigated on the previous map's octree. The call blocks until the tree is built and
   each later failure rolls Octo3D back to the previous map's state; 409
-  `planner_3d_unavailable` when the stack has no Octo3D and the map is 3D. A 3D map has
-  no keepout zones and its switch reloads no mask.
+  `planner_3d_unavailable` when the stack has no Octo3D and the map is 3D. A 3D map's
+  zones come in with its tree, so its switch reloads no mask (`keepout_reloaded: true`).
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
   gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this

@@ -50,6 +50,14 @@ GRIDMAP_PREV_RAW_PGM = "gridmap_prev_raw.pgm"
 # in the gridmap's geometry and served by ``filter_mask_server``. The nav
 # session writes a blank pair (no json) at boot for a map with none, so a pair
 # without a json means "no zones drawn yet".
+#
+# The same json is a 3D map's zones (2026-10-23): the robot's 3D planner
+# (Octo3D) reads it beside ``octomap.bt`` itself, so a 3D-only map has the json
+# and no pair. Each zone may carry ``name`` and a ``z_min`` / ``z_max`` band
+# naming the floor it forbids; without a band it covers every floor, which is
+# what a 2D zone means, so one file serves both. The mask ignores the bands
+# (one image has no floors). Rewrites must keep the three keys -- a 2D save
+# that dropped them would silently widen a 3D zone to every storey.
 KEEPOUT_PGM = "keepout.pgm"
 KEEPOUT_YAML = "keepout.yaml"
 KEEPOUT_JSON = "keepout.json"
@@ -145,10 +153,17 @@ class KeepoutZone:
 
     ``points`` are the corners in drawing order, not closed (the console's
     ``ZonePolygon``). The id is the console's handle; the mask ignores it.
+    ``name`` is for display. ``z_min`` / ``z_max`` bound the floor heights the
+    zone applies to on a 3D map (the robot's 3D planner compares them with the
+    ground's height); None is unbounded on that side, so a zone without them
+    covers every floor. The 2D mask ignores all three.
     """
 
     id: str
     points: Tuple[Tuple[float, float], ...]
+    name: Optional[str] = None
+    z_min: Optional[float] = None
+    z_max: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -321,6 +336,14 @@ class MapCatalogRepo:
     def octomap_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``octomap.bt``, or None if absent."""
         return self._artifact_path(name, OCTOMAP_BT)
+
+    def keepout_json_path(self, name: str) -> Optional[str]:
+        """Return the path of the map's ``keepout.json``, or None if absent.
+
+        What the robot's 3D planner is pointed at (``load_keepout``); absolute
+        and ``~``-free, as above.
+        """
+        return self._artifact_path(name, KEEPOUT_JSON)
 
     def keepout_yaml_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``keepout.yaml``, or None if unloadable.
@@ -873,7 +896,9 @@ class MapCatalogRepo:
         self.logger.info("[MapCatalogRepo] Wrote gridmap", map=name, width=width, height=height)
         return written
 
-    def write_keepout(self, name: str, zones: List[KeepoutZone], grid: GridInfo) -> None:
+    def write_keepout(
+        self, name: str, zones: List[KeepoutZone], grid: Optional[GridInfo]
+    ) -> None:
         """Replace the map's forbidden zones: rasterise ``zones`` and record them.
 
         Three files, in this order, each through a temp file + rename:
@@ -890,36 +915,46 @@ class MapCatalogRepo:
         cleared; the files are never deleted (a running KeepoutFilter keeps its
         last mask anyway). ``grid`` is the gridmap's geometry, which the mask
         must match cell for cell. Nothing written holds a path.
+
+        ``grid`` None (a 3D-only map: no gridmap, nothing to rasterise onto)
+        writes the json alone -- the robot's 3D planner reads it beside
+        ``octomap.bt``. A zone's ``name`` / ``z_min`` / ``z_max`` are written
+        only when set, so a 2D-only file keeps its old shape.
         """
         directory = self.resolve_dir(name)
-        mask = rasterize_zones(
-            [zone.points for zone in zones],
-            width=grid.width,
-            height=grid.height,
-            resolution=grid.resolution,
-            origin_xy=(grid.origin[0], grid.origin[1]),
-        )
-        write_pgm(
-            os.path.join(directory, KEEPOUT_PGM), grid.width, grid.height, mask.tobytes()
-        )
-        write_text_atomic(
-            os.path.join(directory, KEEPOUT_YAML),
-            keepout_yaml_text(
+        if grid is not None:
+            mask = rasterize_zones(
+                [zone.points for zone in zones],
+                width=grid.width,
+                height=grid.height,
                 resolution=grid.resolution,
                 origin_xy=(grid.origin[0], grid.origin[1]),
-                image=KEEPOUT_PGM,
-            ),
-        )
+            )
+            write_pgm(
+                os.path.join(directory, KEEPOUT_PGM), grid.width, grid.height, mask.tobytes()
+            )
+            write_text_atomic(
+                os.path.join(directory, KEEPOUT_YAML),
+                keepout_yaml_text(
+                    resolution=grid.resolution,
+                    origin_xy=(grid.origin[0], grid.origin[1]),
+                    image=KEEPOUT_PGM,
+                ),
+            )
         document = {
             "version": KEEPOUT_JSON_VERSION,
-            "zones": [
-                {"id": zone.id, "points": [{"x": x, "y": y} for x, y in zone.points]}
-                for zone in zones
-            ],
+            "zones": [_keepout_zone_document(zone) for zone in zones],
         }
         write_text_atomic(
             os.path.join(directory, KEEPOUT_JSON), json.dumps(document, indent=2) + "\n"
         )
+        if grid is None:
+            self.logger.info(
+                "[MapCatalogRepo] Wrote keepout zones (no gridmap: json only)",
+                map=name,
+                zones=len(zones),
+            )
+            return
         self.logger.info(
             "[MapCatalogRepo] Wrote keepout mask",
             map=name,
@@ -1100,7 +1135,37 @@ def _parse_keepout_zone(entry: object) -> Optional[KeepoutZone]:
         points.append((float(x), float(y)))
     if len(points) < 3:
         return None
-    return KeepoutZone(id=zone_id, points=tuple(points))
+    # The optional keys; null is absent (an unset optional field serialises so).
+    name = entry.get("name")
+    if name is not None and not isinstance(name, str):
+        return None
+    band = []
+    for key in ("z_min", "z_max"):
+        value = entry.get(key)
+        if value is None:
+            band.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            return None
+        band.append(float(value))
+    z_min, z_max = band
+    if z_min is not None and z_max is not None and z_min > z_max:
+        return None
+    return KeepoutZone(id=zone_id, points=tuple(points), name=name, z_min=z_min, z_max=z_max)
+
+
+def _keepout_zone_document(zone: KeepoutZone) -> dict:
+    """One ``KeepoutZone`` -> its ``keepout.json`` entry; unset optionals omitted."""
+    document: dict = {"id": zone.id, "points": [{"x": x, "y": y} for x, y in zone.points]}
+    if zone.name is not None:
+        document["name"] = zone.name
+    if zone.z_min is not None:
+        document["z_min"] = zone.z_min
+    if zone.z_max is not None:
+        document["z_max"] = zone.z_max
+    return document
 
 
 # The banner every ``.bt`` opens with; a few short text lines follow (``id``,

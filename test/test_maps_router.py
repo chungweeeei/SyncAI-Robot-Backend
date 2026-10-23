@@ -97,6 +97,9 @@ class _StubMapGateway:
         # to reload it *after* the INI write, the commit point.
         self.keepout_calls = []
         self.keepout_result = (True, "")
+        # Octo3D's forbidden zones (keepout.json), reloaded on a 3D map's save.
+        self.keepout_3d_calls = []
+        self.keepout_3d_result = (True, "")
         # The 3D planner (Octo3D). Off by default, as on a stack built without
         # it -- which is why the 2D switch tests keep their exact call order.
         # `octomap_results` queues one answer per call (default: success), so a
@@ -127,6 +130,11 @@ class _StubMapGateway:
         self.keepout_calls.append(yaml_path)
         self.order.append(("reload_keepout", yaml_path))
         return self.keepout_result
+
+    def reload_keepout_3d(self, json_path):
+        self.keepout_3d_calls.append(json_path)
+        self.order.append(("reload_keepout_3d", json_path))
+        return self.keepout_3d_result
 
     def planner_3d_available(self, timeout_sec=2.0):
         return self.planner_3d
@@ -3589,6 +3597,117 @@ def test_activate_noop_has_no_keepout_verdict(client, map_gw):
     assert map_gw.keepout_calls == []
 
 
+# --- keepout: one file for 2D and 3D (2026-10-23) -------------------------------
+#
+# keepout.json is also a 3D map's zones: each may carry a name and a z band
+# (the floor it forbids); the robot's 3D planner reads the json itself, so a
+# 3D-only map gets the json alone and its save reloads the 3D planner, while a
+# 2D map's save reloads the mask as before.
+
+
+def _banded(zone, name="rack", z_min=-0.5, z_max=0.5):
+    return {**zone, "name": name, "z_min": z_min, "z_max": z_max}
+
+
+def test_keepout_round_trips_name_and_band_and_omits_unset_ones(client, maps_dir):
+    zones = [_banded(_rect_zone("a")), _rect_zone("b")]
+    saved = _put_keepout(client, "full", zones).json()
+    fetched = client.get("/api/v1/maps/full/keepout").json()
+
+    assert saved["zones"] == fetched["zones"]
+    assert fetched["zones"][0]["name"] == "rack"
+    assert fetched["zones"][0]["z_min"] == -0.5
+    assert fetched["zones"][0]["z_max"] == 0.5
+    assert fetched["zones"][1]["z_min"] is None
+    # On disk an unset key is absent, so a 2D-only file keeps its old shape.
+    document = json.loads((maps_dir / "full" / "keepout.json").read_text())
+    assert set(document["zones"][0]) == {"id", "points", "name", "z_min", "z_max"}
+    assert set(document["zones"][1]) == {"id", "points"}
+
+
+def test_keepout_band_does_not_change_the_2d_mask(client, maps_dir):
+    _put_keepout(client, "full", [_rect_zone("a", cols=(1, 3), rows=(1, 2))])
+    plain = _keepout_cells(maps_dir, "full").copy()
+    _put_keepout(client, "full", [_banded(_rect_zone("a", cols=(1, 3), rows=(1, 2)))])
+
+    assert (_keepout_cells(maps_dir, "full") == plain).all()
+
+
+@pytest.mark.parametrize(
+    "band,fragment",
+    # Raw JSON text: 1e999 parses to inf, which no client library will encode
+    # for us on purpose (and Python would print it as the non-JSON "inf").
+    [
+        ('"z_min": 2.0, "z_max": 1.0', "above z_max"),
+        ('"z_min": null, "z_max": 1e999', "not a finite height"),
+    ],
+)
+def test_keepout_put_400s_a_bad_band(client, maps_dir, band, fragment):
+    body = json.dumps({"zones": [_rect_zone("a")]})[:-3]  # strip "}]}" to splice the band in
+    response = client.put(
+        "/api/v1/maps/full/keepout",
+        content=body + ", " + band + "}]}",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert fragment in response.json()["detail"]
+    assert not (maps_dir / "full" / "keepout.json").exists()
+
+
+def test_keepout_on_a_3d_only_map_writes_the_json_alone(client, maps_dir, make_pcd, make_bt):
+    directory = maps_dir / "three"
+    directory.mkdir()
+    make_pcd(directory / "map.pcd")
+    make_bt(directory / "octomap.bt")
+
+    response = _put_keepout(client, "three", [_banded(_rect_zone("a"), z_min=4.5, z_max=5.5)])
+
+    assert response.status_code == 200
+    assert response.json()["reloaded"] is False  # not the active map
+    assert json.loads((directory / "keepout.json").read_text())["zones"][0]["z_min"] == 4.5
+    assert not (directory / "keepout.pgm").exists()
+    assert not (directory / "keepout.yaml").exists()
+    assert client.get("/api/v1/maps/three/keepout").json()["zones"][0]["z_max"] == 5.5
+
+
+def test_keepout_on_an_active_3d_map_reloads_the_3d_planner_only(
+    client, maps_dir, map_gw, make_bt
+):
+    # 'full' is active; a tree makes it 3D ("3D wins"), grid or not.
+    make_bt(maps_dir / "full" / "octomap.bt")
+
+    body = _put_keepout(client, "full", [_rect_zone("a")]).json()
+
+    assert body["reloaded"] is True
+    assert "reloaded the 3D planner" in body["message"]
+    assert map_gw.keepout_3d_calls == [str(maps_dir / "full" / "keepout.json")]
+    assert map_gw.keepout_calls == []
+    # The grid is still there, so the mask is still derived for a later 2D use.
+    assert (maps_dir / "full" / "keepout.pgm").exists()
+
+
+def test_keepout_on_an_active_3d_map_reports_a_failed_reload(
+    client, maps_dir, map_gw, make_bt
+):
+    make_bt(maps_dir / "full" / "octomap.bt")
+    map_gw.keepout_3d_result = (False, "the 3D planner has no 3D map loaded")
+
+    response = _put_keepout(client, "full", [_rect_zone("a")])
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reloaded"] is False
+    assert "the 3D planner did not reload: the 3D planner has no 3D map loaded" in body["message"]
+
+
+def test_keepout_404s_a_map_with_neither_grid_nor_tree(client):
+    response = _put_keepout(client, "rawonly", [_rect_zone("a")])
+
+    assert response.status_code == 404
+    assert "neither a gridmap nor a 3D map" in response.json()["detail"]
+
+
 # --- 3D maps (octomap.bt) ---------------------------------------------------------
 #
 # A map is 2D (a usable gridmap) or 3D (an octomap.bt). A 3D map is loaded into the
@@ -3619,11 +3738,12 @@ def test_activate_loads_a_3d_map_into_the_3d_planner(
     body = response.json()
     assert body["switched"] is True
     assert body["map_kind"] == "3d"
-    # No grid to hand map_server, and no zones in 3D.
+    # No grid to hand map_server, and no mask either: Octo3D read the map's
+    # keepout.json with the tree, so the switch makes no keepout call.
     assert [step for step, _ in map_gw.order] == ["swap_localizer_map", "reload_octomap"]
     assert map_gw.order[1][1] == str(three_d / "octomap.bt")
-    assert body["keepout_reloaded"] is None
-    assert "no forbidden zones" in body["message"]
+    assert body["keepout_reloaded"] is True
+    assert "0 forbidden zones" in body["message"]
     assert "name: three" in ini.read_text()
 
 
