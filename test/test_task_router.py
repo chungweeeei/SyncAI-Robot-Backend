@@ -35,6 +35,7 @@ from syncai_backend.gateways.workflow.schema import (  # noqa: E402
     WaitParams,
 )
 from syncai_backend.interfaces.rest.routers.task import init_task_router  # noqa: E402
+from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
@@ -183,7 +184,11 @@ def client(logger, workflow_gw, catalog, conversions, robot_gw):
             logger=logger,
             workflow_gw=workflow_gw,
             map_catalog_repo=catalog,
-            conversion_svc=conversions,
+            map_usage=MapUsagePolicy(
+                map_catalog_repo=catalog,
+                conversion_svc=conversions,
+                task_template_repo=None,
+            ),
             robot_gw=robot_gw,
         )
     )

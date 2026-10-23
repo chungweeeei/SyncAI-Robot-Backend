@@ -33,6 +33,7 @@ from syncai_backend.services.gridmap_conversion import (
 )
 from syncai_backend.services.dock_state import init_dock_state_service
 from syncai_backend.services.map_switch import init_map_switch_service
+from syncai_backend.services.map_usage import init_job_gate, init_map_usage_policy
 from syncai_backend.services.mode_restart import init_mode_restart_service
 from syncai_backend.services.safety_lock import init_safety_lock_service
 
@@ -128,13 +129,25 @@ class SyncAIBackend(Node):
         # it like any other collaborator.
         conversion_svc = init_gridmap_conversion_service(logger=logger)
 
+        # Whether a map may be edited, destroyed, switched to or driven on. The
+        # policy reads disk and the registries only, so the worker holds it too;
+        # the gate asks Temporal and stays on the REST loop (WorkflowGateway's).
+        map_usage = init_map_usage_policy(
+            map_catalog_repo=map_catalog_repo,
+            conversion_svc=conversion_svc,
+            task_template_repo=task_template_repo,
+        )
+        job_gate = init_job_gate(
+            logger=logger, map_catalog_repo=map_catalog_repo, workflow_gw=workflow_gw
+        )
+
         # The live map switch: localizer, map_server, Octo3D and the INI moved
         # together, each later failure undoing the earlier ones.
         map_switch_svc = init_map_switch_service(
             logger=logger,
             map_catalog_repo=map_catalog_repo,
             map_gw=map_gw,
-            conversion_svc=conversion_svc,
+            map_usage=map_usage,
         )
 
         # The latest restart of the live mode and how it ended; outlives the POST
@@ -200,7 +213,7 @@ class SyncAIBackend(Node):
             robot_gw=robot_gw,
             tts_gw=tts_gw,
             map_catalog_repo=map_catalog_repo,
-            conversion_svc=conversion_svc,
+            map_usage=map_usage,
             robot_repo=robot_repo,
             dock_state=dock_state_svc,
         )
@@ -226,6 +239,8 @@ class SyncAIBackend(Node):
             mapping_status_repo=mapping_status_repo,
             safety_lock_svc=safety_lock_svc,
             map_switch_svc=map_switch_svc,
+            map_usage=map_usage,
+            job_gate=job_gate,
         )
 
 

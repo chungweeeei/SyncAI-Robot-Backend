@@ -22,11 +22,10 @@ from syncai_backend.gateways.robot.robot import (
 )
 from syncai_backend.gateways.tts.tts import TtsGateway
 
-from syncai_backend.helpers.move_guard import move_refusal
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.services.dock_state import DockStateService
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.map_usage import MapUsagePolicy
 
 
 # How often _wait_for_nav_goal reads the goal and heartbeats. A cancel arrives on a
@@ -85,17 +84,18 @@ class RobotActivities:
         robot_gw: RobotGateway,
         tts_gw: TtsGateway,
         map_catalog_repo: MapCatalogRepo,
-        conversion_svc: GridmapConversionService,
+        map_usage: MapUsagePolicy,
         robot_repo: RobotRepo,
         dock_state: DockStateService,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
         self._tts_gw = tts_gw
-        # Read-only, for execute_move's check; the same conversion registry the map
-        # routes write (shared process).
+        # Read-only: the loaded map, for the auto-undock.
         self._map_catalog_repo = map_catalog_repo
-        self._conversion_svc = conversion_svc
+        # execute_move's check, the same rule POST /api/v1/tasks applies; over
+        # the conversion registry the map routes write (shared process).
+        self._map_usage = map_usage
         # The latest RobotState (pose, motion state), for the auto-undock's checks.
         self._robot_repo = robot_repo
         # Where the last DOCK ended; see services/dock_state.py. One per process,
@@ -266,11 +266,8 @@ class RobotActivities:
         """Raise move_guard's refusal (non-retryable) for a goal planned on
         ``expected_map`` when another map is loaded or its floor plan is being
         rebuilt."""
-        active_map = self._map_catalog_repo.active_name()
-        refusal = move_refusal(
-            expected_map,
-            active_map,
-            active_map is not None and self._conversion_svc.is_converting(active_map),
+        refusal = self._map_usage.move_refusal(
+            expected_map, self._map_catalog_repo.active_name()
         )
         if refusal is not None:
             raise ApplicationError(refusal.message, type=refusal.code, non_retryable=True)

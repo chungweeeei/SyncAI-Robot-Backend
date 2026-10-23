@@ -171,7 +171,7 @@ def test_worker_run_dying_marks_dead():
         robot_gw=MagicMock(),
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
-        conversion_svc=MagicMock(),
+        map_usage=MagicMock(),
         robot_repo=MagicMock(),
         dock_state=MagicMock(),
     )
@@ -212,6 +212,8 @@ def test_health_projects_worker_state():
         mapping_status_repo=MagicMock(),
         safety_lock_svc=MagicMock(),
         map_switch_svc=MagicMock(),
+        map_usage=MagicMock(),
+        job_gate=MagicMock(),
     )
     client = TestClient(app)
 

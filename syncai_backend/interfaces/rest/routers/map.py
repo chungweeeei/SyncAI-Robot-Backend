@@ -23,8 +23,6 @@ from syncai_backend.exceptions import (
 )
 from syncai_backend.database.models import MapPoint
 from syncai_backend.gateways.map.map import MapGateway
-from syncai_backend.gateways.workflow.schema import ActiveTask
-from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.floors import detect_floor_levels, floor_name
 from syncai_backend.helpers.pgm import render_png, render_thumbnail
 from syncai_backend.helpers.pointcloud import (
@@ -67,6 +65,7 @@ from syncai_backend.services.gridmap_conversion import (
     parse_iso_utc,
 )
 from syncai_backend.services.map_switch import MapSwitchService
+from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 
 
 # Decimation for a stored map.pcd. Duplicates PointCloudSubscriber's numbers so
@@ -1089,10 +1088,11 @@ def init_map_router(
     map_catalog_repo: MapCatalogRepo,
     map_gw: MapGateway,
     task_template_repo: TaskTemplateRepo,
-    workflow_gw: WorkflowGateway,
     conversion_svc: GridmapConversionService,
     mapping_status_repo: MappingStatusRepo,
     map_switch_svc: MapSwitchService,
+    map_usage: MapUsagePolicy,
+    job_gate: JobGate,
 ) -> APIRouter:
 
     map_router = APIRouter(prefix="", tags=["Map"])
@@ -1144,96 +1144,9 @@ def init_map_router(
             raise NotFoundError(f"No map named '{name}' on this robot.")
         return stored
 
-    async def _running_tasks(change: str) -> List[ActiveTask]:
-        """What is running now, or 409 ``tasks_unknown`` if that cannot be known.
-
-        Refuse rather than assume idle: the gateway caches failures too, so an
-        error here is a real outage. ``change`` names what was refused.
-        """
-        try:
-            tasks, _ = await workflow_gw.list_active_tasks()
-        except Exception as exc:
-            logger.warning(
-                "Could not confirm the robot is idle before changing a map",
-                change=change,
-                error=str(exc),
-            )
-            raise ConflictError(
-                "Could not confirm that no job is running, and "
-                f"{change} under a moving robot is not safe to guess at. Check "
-                "the Tasks page and try again.",
-                code="tasks_unknown",
-            )
-        return tasks
-
-    async def _refuse_while_a_job_holds(name: str) -> None:
-        """409 ``task_running`` while a running job's positions are on ``name``.
-
-        Guards every route that edits what the planner, costmaps or a job's
-        waypoints read (vertices, grid, rebuild, keepout). Async so the Temporal
-        call runs on the event loop while the plain ``def`` route still runs in
-        the threadpool.
-
-        A map other than the loaded one passes without asking Temporal: a run
-        can only hold the loaded map, and editing an idle map should not need
-        Temporal up. Check-then-act, not a lock; execute_move's own check stops
-        a run that slipped through the window.
-        """
-        active = map_catalog_repo.active_name()
-        if name != active:
-            return
-        tasks = await _running_tasks("changing the map in use")
-        if any(task.map_in_use(active) == name for task in tasks):
-            raise ConflictError(
-                "The robot is running a job on this map. Cancel it or wait for "
-                "it to finish before changing the map.",
-                code="task_running",
-            )
-
-    job_lock = [Depends(_refuse_while_a_job_holds)]
-
-    def _refuse_if_in_use(name: str, *, verb: str, template_consequence: str) -> None:
-        """The three 409s that guard destroying a map's contents, in order.
-
-        Shared by delete and by an import that replaces a map:
-
-        - ``map_active``: map_server and the localizer hold ``map/<name>/``.
-        - ``conversion_running``: the thread would write its sidecar into a
-          directory that is gone (or into the *new* one).
-        - ``template_bound``: a template's MOVE steps name this map's vertex ids,
-          which would dangle. The operator is told which templates to unbind;
-          they are never deleted silently. Map-independent templates are
-          ignored.
-        """
-        if name == map_catalog_repo.active_name():
-            raise ConflictError(
-                f"'{name}' is the map the stack is running on and cannot be "
-                f"{verb} while it is in use. Switch the robot to another map "
-                "first.",
-                code="map_active",
-            )
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; try again "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
-
-        bound = task_template_repo.list_task_templates(
-            map_name=name, include_map_independent=False
-        )
-        if bound:
-            names = ", ".join(sorted(f"'{row.name}'" for row in bound))
-            raise ConflictError(
-                f"{len(bound)} task "
-                f"{'template' if len(bound) == 1 else 'templates'} still "
-                f"{'targets' if len(bound) == 1 else 'target'} '{name}' "
-                f"({names}). Point {'it' if len(bound) == 1 else 'them'} at "
-                "another map or delete "
-                f"{'it' if len(bound) == 1 else 'them'} first — "
-                f"{template_consequence}",
-                code="template_bound",
-            )
+    # Async so the Temporal call runs on the event loop while the plain
+    # ``def`` route still runs in the threadpool. See services/map_usage.py.
+    job_lock = [Depends(job_gate.refuse_while_a_job_holds)]
 
     @map_router.get("/api/v1/maps", response_model=List[MapSummaryResponse])
     def list_maps():
@@ -1318,12 +1231,9 @@ def init_map_router(
         is about to be replaced. Exporting the active map is fine.
         """
         _require(name)
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; export it once "
-                "the conversion has finished.",
-                code="conversion_running",
-            )
+        map_usage.refuse_while_converting(
+            name, "export it once the conversion has finished."
+        )
 
         vertices = [
             {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta, "z": v.z}
@@ -1409,7 +1319,7 @@ def init_map_router(
         map_catalog_repo.resolve_dir(target)
         replacing = map_catalog_repo.get_map(target) is not None
         if replacing:
-            _refuse_if_in_use(
+            map_usage.refuse_destroy(
                 target,
                 verb="replaced",
                 template_consequence=(
@@ -1601,21 +1511,10 @@ def init_map_router(
         one transaction; if it fails the directory is moved back.
         """
         _require(name)
-
-        active_name = map_catalog_repo.active_name()
-        if name == active_name:
-            raise ConflictError(
-                f"'{name}' is the map the stack is running on and cannot be "
-                "renamed while it is in use. Switch the robot to another map "
-                "first.",
-                code="map_active",
-            )
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; rename it "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
+        map_usage.refuse_if_active(name, "renamed")
+        map_usage.refuse_while_converting(
+            name, "rename it once the conversion has finished."
+        )
 
         new_dir = map_catalog_repo.rename_map_dir(name, request.name)
 
@@ -1691,7 +1590,7 @@ def init_map_router(
     def delete_map(name: str):
         """Delete a map: remove its directory and the vertices that name it.
 
-        404, then ``_refuse_if_in_use``'s 409s (``map_active``,
+        404, then ``MapUsagePolicy.refuse_destroy``'s 409s (``map_active``,
         ``conversion_running``, ``template_bound``) before any mutation.
 
         **Database first, filesystem last** (the inverse of rename): ``rmtree``
@@ -1703,7 +1602,7 @@ def init_map_router(
         so.
         """
         _require(name)
-        _refuse_if_in_use(
+        map_usage.refuse_destroy(
             name,
             verb="deleted",
             template_consequence=(
@@ -1789,18 +1688,8 @@ def init_map_router(
                 message=f"'{name}' is already the map the robot is running on.",
             )
 
-        # Any job, not only one holding a map (stricter than
-        # _refuse_while_a_job_holds): a switch re-points the localizer.
-        active_tasks = await _running_tasks("a map switch")
-
-        if active_tasks:
-            running = ", ".join(task.id for task in active_tasks)
-            raise ConflictError(
-                f"The robot is running {len(active_tasks)} "
-                f"{'task' if len(active_tasks) == 1 else 'tasks'} ({running}). "
-                "Cancel or wait for it before switching maps.",
-                code="task_running",
-            )
+        # Any job, not only one holding a map: a switch re-points the localizer.
+        await job_gate.refuse_while_any_job("a map switch", "switching maps")
 
         # The route is `async def` for the Temporal await (the client belongs to
         # the uvicorn loop); the switch blocks for up to a minute, so it runs in
@@ -1841,15 +1730,7 @@ def init_map_router(
         localizer refusal is the uniform 502 with its sentence. ``async`` for
         the Temporal await, blocking half on a worker thread, as activate.
         """
-        active_tasks = await _running_tasks("finding the robot")
-        if active_tasks:
-            running = ", ".join(task.id for task in active_tasks)
-            raise ConflictError(
-                f"The robot is running {len(active_tasks)} "
-                f"{'task' if len(active_tasks) == 1 else 'tasks'} ({running}). "
-                "Cancel or wait for it before finding the robot.",
-                code="task_running",
-            )
+        await job_gate.refuse_while_any_job("finding the robot", "finding the robot")
 
         if not auto_localize_lock.acquire(blocking=False):
             raise ConflictError(
@@ -2192,14 +2073,12 @@ def init_map_router(
         """
         stored = _require(name)
 
-        if conversion_svc.is_converting(name):
-            # The conversion would overwrite the save, and the once-only
-            # gridmap_raw.pgm snapshot could capture a half-finished grid.
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; save the edit "
-                "once it has finished, or the conversion will overwrite it.",
-                code="conversion_running",
-            )
+        # The conversion would overwrite the save, and the once-only
+        # gridmap_raw.pgm snapshot could capture a half-finished grid.
+        map_usage.refuse_while_converting(
+            name,
+            "save the edit once it has finished, or the conversion will overwrite it.",
+        )
 
         # stored.grid parsed both the .pgm header and gridmap.yaml, so one None
         # test covers missing or torn files before map_server re-reads both.
@@ -2302,12 +2181,11 @@ def init_map_router(
         stored = _require(name)
         is_3d = map_catalog_repo.octomap_path(name) is not None
 
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; save the forbidden "
-                "zones once it has finished, so the mask matches the new grid.",
-                code="conversion_running",
-            )
+        map_usage.refuse_while_converting(
+            name,
+            "save the forbidden zones once it has finished, so the mask matches "
+            "the new grid.",
+        )
 
         if stored.grid is None and not is_3d:
             raise NotFoundError(

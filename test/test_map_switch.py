@@ -17,6 +17,7 @@ from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
 from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
+from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 
 
 class _RecordingMapGateway:
@@ -73,7 +74,12 @@ def _service(logger, catalog_repo, map_gw):
         logger=logger,
         map_catalog_repo=catalog_repo,
         map_gw=map_gw,
-        conversion_svc=GridmapConversionService(logger=logger),
+        map_usage=MapUsagePolicy(
+            map_catalog_repo=catalog_repo,
+            conversion_svc=GridmapConversionService(logger=logger),
+            # The switch never asks about templates.
+            task_template_repo=None,
+        ),
     )
 
 

@@ -32,9 +32,8 @@ from syncai_backend.gateways.workflow.schema import (
 )
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 
-from syncai_backend.helpers.move_guard import move_refusal
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.map_usage import MapUsagePolicy
 
 
 class TaskStatus(str, Enum):
@@ -354,7 +353,7 @@ def init_task_router(
     logger: structlog.stdlib.BoundLogger,
     workflow_gw: WorkflowGateway,
     map_catalog_repo: MapCatalogRepo,
-    conversion_svc: GridmapConversionService,
+    map_usage: MapUsagePolicy,
     robot_gw: MoveMessageSource,
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
@@ -373,11 +372,7 @@ def init_task_router(
         map_name: Optional[str] = None
         if any(step.type in POSE_STEP_TYPES for step in req.steps):
             active = map_catalog_repo.active_name()
-            refusal = move_refusal(
-                req.map_name,
-                active,
-                active is not None and conversion_svc.is_converting(active),
-            )
+            refusal = map_usage.move_refusal(req.map_name, active)
             if refusal is not None:
                 raise ConflictError(refusal.message, code=refusal.code)
             map_name = active

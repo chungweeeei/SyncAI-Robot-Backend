@@ -51,6 +51,7 @@ from syncai_backend.services.gridmap_conversion import (  # noqa: E402
 )
 from syncai_backend.services import map_switch as map_switch_module  # noqa: E402
 from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
+from syncai_backend.services.map_usage import JobGate, MapUsagePolicy  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
@@ -273,6 +274,11 @@ def client(
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: full\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
 
+    map_usage = MapUsagePolicy(
+        map_catalog_repo=catalog_repo,
+        conversion_svc=conversion_svc,
+        task_template_repo=task_template_repo,
+    )
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -282,14 +288,17 @@ def client(
             map_catalog_repo=catalog_repo,
             map_gw=map_gw,
             task_template_repo=task_template_repo,
-            workflow_gw=workflow_gw,
             conversion_svc=conversion_svc,
             mapping_status_repo=mapping_status_repo,
             map_switch_svc=MapSwitchService(
                 logger=logger,
                 map_catalog_repo=catalog_repo,
                 map_gw=map_gw,
-                conversion_svc=conversion_svc,
+                map_usage=map_usage,
+            ),
+            map_usage=map_usage,
+            job_gate=JobGate(
+                logger=logger, map_catalog_repo=catalog_repo, workflow_gw=workflow_gw
             ),
         )
     )

@@ -42,7 +42,7 @@ from syncai_backend.exceptions import ConflictError, UpstreamError
 from syncai_backend.gateways.map.map import MapGateway
 from syncai_backend.helpers.system_config import set_active_map, system_ini_path
 from syncai_backend.repositories.map.catalog import GridInfo, MapCatalogRepo, StoredMap
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.map_usage import MapUsagePolicy
 
 
 @dataclass(frozen=True)
@@ -82,12 +82,12 @@ class MapSwitchService:
         logger: structlog.stdlib.BoundLogger,
         map_catalog_repo: MapCatalogRepo,
         map_gw: MapGateway,
-        conversion_svc: GridmapConversionService,
+        map_usage: MapUsagePolicy,
     ):
         self._logger = logger
         self._catalog = map_catalog_repo
         self._map_gw = map_gw
-        self._conversion_svc = conversion_svc
+        self._map_usage = map_usage
 
     # --- Preflight ---------------------------------------------------------
 
@@ -109,12 +109,9 @@ class MapSwitchService:
             # The no-op: reloading would only throw away a good registration.
             return None
 
-        if self._conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; switch to it "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
+        self._map_usage.refuse_while_converting(
+            name, "switch to it once the conversion has finished."
+        )
 
         # 2D or 3D. The robot's own rule is "3D wins": its task_runner runs the
         # 3D trees whenever Octo3D has a map, so a map with both is a 3D map
@@ -431,11 +428,11 @@ def init_map_switch_service(
     logger: structlog.stdlib.BoundLogger,
     map_catalog_repo: MapCatalogRepo,
     map_gw: MapGateway,
-    conversion_svc: GridmapConversionService,
+    map_usage: MapUsagePolicy,
 ) -> MapSwitchService:
     return MapSwitchService(
         logger=logger,
         map_catalog_repo=map_catalog_repo,
         map_gw=map_gw,
-        conversion_svc=conversion_svc,
+        map_usage=map_usage,
     )

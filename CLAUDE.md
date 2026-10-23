@@ -140,7 +140,9 @@ services/                  domain work that outlives a request: gridmap_conversi
         │                  mode_restart (the latest restart_mode dispatch and its outcome),
         │                  safety_lock (the driver lock's rising edge -> cancel every task),
         │                  map_switch (activate's saga: localizer, map_server, Octo3D, INI and
-        │                  the undo for each), dock_state (the last DOCK's pose)
+        │                  the undo for each), dock_state (the last DOCK's pose), map_usage
+        │                  (every "may this map change / be driven on" refusal: MapUsagePolicy
+        │                  from disk, safe in the worker; JobGate asks Temporal, loop only)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
@@ -239,11 +241,11 @@ the only caller that passes anything else.
   by `resolve_dir` and skipped by `list_maps`; the manifest `syncai_map.json` is archive
   metadata and never lands in the map directory. Replacing is refused for the same reasons
   delete is (`map_active` / `conversion_running` / `template_bound`, shared in
-  `_refuse_if_in_use`).
+  `MapUsagePolicy.refuse_destroy`, `services/map_usage.py`).
 - **A running job locks the map it is on.** Every route that edits what the planner,
   the costmaps or a job's waypoints read — vertex create/update/delete, `PUT …/grid`,
-  `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `_refuse_while_a_job_holds`
-  (an **async** dependency in front of plain `def` routes, so the Temporal call runs on
+  `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `JobGate.refuse_while_a_job_holds`
+  (`services/map_usage.py`; an **async** dependency in front of plain `def` routes, so the Temporal call runs on
   the event loop and the route still runs in the threadpool): 409 `task_running` while a
   run's `TaskMap` is the loaded map, 409 `tasks_unknown` when Temporal cannot be asked —
   refuse, never assume idle. A map other than the loaded one is let through without

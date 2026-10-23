@@ -46,6 +46,7 @@ from syncai_backend.gateways.recording.recording import RecordingGateway
 
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 from syncai_backend.services.map_switch import MapSwitchService
+from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 from syncai_backend.services.mode_restart import ModeRestartService
 from syncai_backend.services.safety_lock import SafetyLockService
 
@@ -111,6 +112,8 @@ def init_rest_server(
     mapping_status_repo: MappingStatusRepo,
     safety_lock_svc: SafetyLockService,
     map_switch_svc: MapSwitchService,
+    map_usage: MapUsagePolicy,
+    job_gate: JobGate,
 ) -> FastAPI:
 
     description = """
@@ -165,14 +168,14 @@ def init_rest_server(
             "task_server_error": worker_error,
         }
 
-    # The catalogue and the conversion registry answer which map a dispatched
-    # job is stamped with, and whether it may drive on it at all.
+    # The catalogue answers which map a dispatched job is stamped with, and
+    # map_usage whether it may drive on it at all.
     app.include_router(
         init_task_router(
             logger=logger,
             workflow_gw=workflow_gw,
             map_catalog_repo=map_catalog_repo,
-            conversion_svc=conversion_svc,
+            map_usage=map_usage,
             robot_gw=robot_gw,
         )
     )
@@ -189,9 +192,9 @@ def init_rest_server(
     app.include_router(init_network_router(logger=logger, robot_gw=robot_gw))
     # /api/v1/maps: catalogue on disk plus the vertex table. task_template_repo
     # is for rename (task_templates.map_name keys on the directory name);
-    # workflow_gw answers "is a task running", which gates map switches/edits;
-    # mapping_status_repo is pgo's latched run state; map_switch_svc is the
-    # live switch's saga.
+    # map_usage / job_gate answer whether a map may be changed (job_gate is
+    # the one that asks Temporal); mapping_status_repo is pgo's latched run
+    # state; map_switch_svc is the live switch's saga.
     app.include_router(
         init_map_router(
             logger=logger,
@@ -199,10 +202,11 @@ def init_rest_server(
             map_catalog_repo=map_catalog_repo,
             map_gw=map_gw,
             task_template_repo=task_template_repo,
-            workflow_gw=workflow_gw,
             conversion_svc=conversion_svc,
             mapping_status_repo=mapping_status_repo,
             map_switch_svc=map_switch_svc,
+            map_usage=map_usage,
+            job_gate=job_gate,
         )
     )
     # /api/v1/task_templates: map_repo resolves a MOVE step's vertex to its
@@ -279,6 +283,8 @@ def start_rest_server(
     mapping_status_repo: MappingStatusRepo,
     safety_lock_svc: SafetyLockService,
     map_switch_svc: MapSwitchService,
+    map_usage: MapUsagePolicy,
+    job_gate: JobGate,
 ):
 
     app = init_rest_server(
@@ -303,6 +309,8 @@ def start_rest_server(
         mapping_status_repo=mapping_status_repo,
         safety_lock_svc=safety_lock_svc,
         map_switch_svc=map_switch_svc,
+        map_usage=map_usage,
+        job_gate=job_gate,
     )
 
     def _run():
