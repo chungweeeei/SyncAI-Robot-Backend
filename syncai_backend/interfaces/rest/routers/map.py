@@ -622,12 +622,14 @@ class ActivateMapResponse(BaseModel):
     keepout_reloaded: Optional[bool] = Field(
         None,
         description=(
-            "Whether filter_mask_server now serves this map's forbidden zones "
-            "(its keepout.yaml, written blank first if the map had none). A map "
-            "switch does not move the mask on its own, so the switch does this "
-            "too, best-effort: false means the switch succeeded but the old map's "
-            "zones may still be in force until the nav stack restarts; null on "
-            "the switched: false no-op."
+            "Whether the planner now enforces this map's forbidden zones. On a "
+            "2D map: filter_mask_server serves its keepout.yaml (written blank "
+            "first if the map had none) — a map switch does not move the mask on "
+            "its own, so the switch does this too, best-effort: false means the "
+            "switch succeeded but the old map's zones may still be in force "
+            "until the nav stack restarts. On a 3D map: always true, since the "
+            "3D planner reads keepout.json beside the tree as part of loading "
+            "it. Null on the switched: false no-op."
         ),
     )
     message: str = Field(..., description="What happened, for the operator to read.")
@@ -791,11 +793,34 @@ class KeepoutZoneRequest(BaseModel):
             "At least three, all finite."
         ),
     )
+    name: Optional[str] = Field(
+        None, max_length=128, description="A label for the operator; display only."
+    )
+    z_min: Optional[float] = Field(
+        None,
+        description=(
+            "Lowest floor height (map-frame metres, the ground's z) the zone "
+            "applies to on a 3D map; null = unbounded. Write the floor's ground "
+            "z - 0.5. Ignored by the 2D mask."
+        ),
+    )
+    z_max: Optional[float] = Field(
+        None,
+        description=(
+            "Highest floor height the zone applies to on a 3D map; null = "
+            "unbounded. A zone with neither covers every floor. Clients that "
+            "edit only 2D must send back what they read, or a save widens a 3D "
+            "zone to every storey."
+        ),
+    )
 
 
 class KeepoutZoneResponse(BaseModel):
     id: str
     points: List[ZonePoint]
+    name: Optional[str] = None
+    z_min: Optional[float] = None
+    z_max: Optional[float] = None
 
 
 class SaveKeepoutRequest(BaseModel):
@@ -834,11 +859,12 @@ class SaveKeepoutResponse(BaseModel):
     reloaded: bool = Field(
         ...,
         description=(
-            "Whether the running filter_mask_server re-read the mask, so the "
-            "planner enforces the new zones now. False for any map that is not "
-            "the active one, and for an active map whose reload failed — the "
-            "save itself succeeded either way and the zones apply when the nav "
-            "stack next starts on this map."
+            "Whether the planner enforces the new zones now: on a 2D map the "
+            "running filter_mask_server re-read the mask, on a 3D map the 3D "
+            "planner re-read keepout.json (planner_server/Octo3D/load_keepout). "
+            "False for any map that is not the active one, and for an active map "
+            "whose reload failed — the save itself succeeded either way and the "
+            "zones apply when the nav stack next loads this map."
         ),
     )
     message: str = Field(..., description="What happened, for the operator to read.")
@@ -866,6 +892,13 @@ def _validate_zones(zones: List[KeepoutZoneRequest]) -> List[KeepoutZone]:
                 raise BadRequestError(
                     f"Zone {index} has a corner that is not a finite coordinate."
                 )
+        for label, value in (("z_min", zone.z_min), ("z_max", zone.z_max)):
+            if value is not None and not math.isfinite(value):
+                raise BadRequestError(f"Zone {index} has a {label} that is not a finite height.")
+        if zone.z_min is not None and zone.z_max is not None and zone.z_min > zone.z_max:
+            raise BadRequestError(
+                f"Zone {index} has z_min {zone.z_min} above z_max {zone.z_max}."
+            )
         zone_id = zone.id if zone.id is not None else uuid.uuid4().hex
         if not zone_id:
             raise BadRequestError(f"Zone {index} has an empty id.")
@@ -876,6 +909,9 @@ def _validate_zones(zones: List[KeepoutZoneRequest]) -> List[KeepoutZone]:
             KeepoutZone(
                 id=zone_id,
                 points=tuple((point.x, point.y) for point in zone.points),
+                name=zone.name,
+                z_min=zone.z_min,
+                z_max=zone.z_max,
             )
         )
     return result
@@ -883,7 +919,13 @@ def _validate_zones(zones: List[KeepoutZoneRequest]) -> List[KeepoutZone]:
 
 def _zone_responses(zones: List[KeepoutZone]) -> List[KeepoutZoneResponse]:
     return [
-        KeepoutZoneResponse(id=zone.id, points=[ZonePoint(x=x, y=y) for x, y in zone.points])
+        KeepoutZoneResponse(
+            id=zone.id,
+            points=[ZonePoint(x=x, y=y) for x, y in zone.points],
+            name=zone.name,
+            z_min=zone.z_min,
+            z_max=zone.z_max,
+        )
         for zone in zones
     ]
 
@@ -1761,9 +1803,10 @@ def init_map_router(
         map is loaded into Octo3D, which is what makes the robot run its 3D
         trees, and needs a stack that has it (409 ``planner_3d_unavailable``);
         a 2D map *unloads* Octo3D when the stack has one, or the robot would
-        keep planning on the previous map's octree. A 3D map has no keepout
-        zones, and map_server keeps the previous grid when the 3D map has none
-        (it cannot unload; nothing plans on it while Octo3D has a map).
+        keep planning on the previous map's octree. A 3D map's forbidden zones
+        come in with its tree (Octo3D reads keepout.json beside octomap.bt), and
+        map_server keeps the previous grid when the 3D map has none (it cannot
+        unload; nothing plans on it while Octo3D has a map).
 
         All refusals come first. `stack_not_ready` (e.g. mapping mode) is
         detected by service discoverability, not the cached RobotState, which
@@ -2016,12 +2059,14 @@ def init_map_router(
             # The switch is recorded; nothing can fail it now. The keepout mask
             # (still the previous map's) is carried over best-effort after this
             # commit point: a mask problem goes in the message, not a failure.
-            # A 3D map has no zones: the robot's 3D planner does not read the
-            # keepout (decided 2026-10-19), so there is no mask to carry.
+            # A 3D map's zones need no carrying: the 3D planner read the map's
+            # keepout.json (if any) as part of the load_map that just succeeded
+            # (2026-10-23; until then it read no zones at all).
             if is_3d:
-                keepout_reloaded, keepout_note = None, (
-                    " It is a 3D map: the 3D planner navigates it, and it has no "
-                    "forbidden zones."
+                count = len(map_catalog_repo.read_keepout_zones(name))
+                keepout_reloaded, keepout_note = True, (
+                    " It is a 3D map: the 3D planner navigates it, with its "
+                    f"{count} forbidden zone{'s' if count != 1 else ''}."
                 )
             else:
                 keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
@@ -2533,15 +2578,21 @@ def init_map_router(
         """Replace the map's forbidden zones, and reload them if it is the live map.
 
         Shaped like ``save_map_grid``: plain ``def``, 409 while converting (the
-        geometry may change), 404 with no gridmap, and 200 ``reloaded: false``
-        when the save worked but ``filter_mask_server`` did not reload.
+        geometry may change), 404 with neither a gridmap nor an octomap, and
+        200 ``reloaded: false`` when the save worked but the reload did not.
 
         The body is the *whole* list; ``[]`` clears the zones by rewriting the
         mask all-unknown (deleting files would not clear the running filter).
         Rasterised here to match ``gridmap.pgm`` cell for cell; see
-        ``helpers/keepout.py``.
+        ``helpers/keepout.py``. A 3D-only map (no gridmap) gets the json alone.
+
+        The reload follows the map's kind, as ``activate`` does ("3D wins"): an
+        active 3D map's zones go to the 3D planner
+        (``planner_server/Octo3D/load_keepout``), an active 2D map's mask to
+        ``filter_mask_server``.
         """
         stored = _require(name)
+        is_3d = map_catalog_repo.octomap_path(name) is not None
 
         if conversion_svc.is_converting(name):
             raise ConflictError(
@@ -2550,10 +2601,11 @@ def init_map_router(
                 code="conversion_running",
             )
 
-        if stored.grid is None:
+        if stored.grid is None and not is_3d:
             raise NotFoundError(
-                f"Map '{name}' has no gridmap to draw forbidden zones on. Convert "
-                f"its map.pcd first (POST /api/v1/maps/{name}/grid/convert)."
+                f"Map '{name}' has neither a gridmap nor a 3D map to draw forbidden "
+                f"zones on. Convert its map.pcd first "
+                f"(POST /api/v1/maps/{name}/grid/convert)."
             )
 
         zones = _validate_zones(request.zones)
@@ -2572,16 +2624,26 @@ def init_map_router(
             )
 
         # None only on a race with a delete; handled as a failed reload.
-        yaml_path = map_catalog_repo.keepout_yaml_path(name)
-        if yaml_path is None:
-            reloaded, detail = False, "keepout.yaml is missing"
+        if is_3d:
+            enforcer = "the 3D planner"
+            json_path = map_catalog_repo.keepout_json_path(name)
+            if json_path is None:
+                reloaded, detail = False, "keepout.json is missing"
+            else:
+                reloaded, detail = map_gw.reload_keepout_3d(json_path)
         else:
-            reloaded, detail = map_gw.reload_keepout(yaml_path)
+            enforcer = "the keepout filter"
+            yaml_path = map_catalog_repo.keepout_yaml_path(name)
+            if yaml_path is None:
+                reloaded, detail = False, "keepout.yaml is missing"
+            else:
+                reloaded, detail = map_gw.reload_keepout(yaml_path)
 
         if not reloaded:
             logger.error(
-                "Saved forbidden zones but filter_mask_server did not reload",
+                "Saved forbidden zones but the planner did not reload them",
                 map=name,
+                map_kind="3d" if is_3d else "2d",
                 error=detail,
             )
             return SaveKeepoutResponse(
@@ -2589,7 +2651,7 @@ def init_map_router(
                 zones=_zone_responses(zones),
                 active=True,
                 reloaded=False,
-                message=f"{saved}, but the keepout filter did not reload: {detail}",
+                message=f"{saved}, but {enforcer} did not reload: {detail}",
             )
 
         return SaveKeepoutResponse(
@@ -2597,7 +2659,7 @@ def init_map_router(
             zones=_zone_responses(zones),
             active=True,
             reloaded=True,
-            message=f"{saved} and reloaded the keepout filter.",
+            message=f"{saved} and reloaded {enforcer}.",
         )
 
     @map_router.get("/api/v1/maps/{name}/pointcloud")
