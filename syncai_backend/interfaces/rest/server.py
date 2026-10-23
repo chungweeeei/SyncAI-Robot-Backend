@@ -45,6 +45,7 @@ from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
 
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.map_import import MapImportService
 from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 from syncai_backend.services.mode_restart import ModeRestartService
@@ -114,6 +115,7 @@ def init_rest_server(
     map_switch_svc: MapSwitchService,
     map_usage: MapUsagePolicy,
     job_gate: JobGate,
+    map_import_svc: MapImportService,
 ) -> FastAPI:
 
     description = """
@@ -207,6 +209,7 @@ def init_rest_server(
             map_switch_svc=map_switch_svc,
             map_usage=map_usage,
             job_gate=job_gate,
+            map_import_svc=map_import_svc,
         )
     )
     # /api/v1/task_templates: map_repo resolves a MOVE step's vertex to its
@@ -285,6 +288,7 @@ def start_rest_server(
     map_switch_svc: MapSwitchService,
     map_usage: MapUsagePolicy,
     job_gate: JobGate,
+    map_import_svc: MapImportService,
 ):
 
     app = init_rest_server(
@@ -311,6 +315,7 @@ def start_rest_server(
         map_switch_svc=map_switch_svc,
         map_usage=map_usage,
         job_gate=job_gate,
+        map_import_svc=map_import_svc,
     )
 
     def _run():

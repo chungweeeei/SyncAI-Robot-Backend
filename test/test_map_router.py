@@ -39,6 +39,7 @@ from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
+from syncai_backend.services.map_import import MapImportService  # noqa: E402
 from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy  # noqa: E402
 
@@ -132,6 +133,12 @@ def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
             map_usage=map_usage,
             job_gate=JobGate(
                 logger=logger, map_catalog_repo=catalog_repo, workflow_gw=workflow_gw
+            ),
+            map_import_svc=MapImportService(
+                logger=logger,
+                map_repo=map_repo,
+                map_catalog_repo=catalog_repo,
+                map_usage=map_usage,
             ),
         )
     )

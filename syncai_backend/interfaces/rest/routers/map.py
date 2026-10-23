@@ -33,14 +33,10 @@ from syncai_backend.helpers.pointcloud import (
 )
 from syncai_backend.helpers.map_archive import (
     ArchiveFormat,
-    MapArchiveError,
     build_archive,
-    extract_archive,
-    inspect_archive,
 )
 from syncai_backend.repositories.map.catalog import (
     OCTOMAP_KEY_MAX,
-    POINTCLOUD_PCD,
     GridRecordStatus,
     KeepoutZone,
     MapCatalogRepo,
@@ -64,6 +60,7 @@ from syncai_backend.services.gridmap_conversion import (
     iso_now,
     parse_iso_utc,
 )
+from syncai_backend.services.map_import import MapImportService
 from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 
@@ -1093,6 +1090,7 @@ def init_map_router(
     map_switch_svc: MapSwitchService,
     map_usage: MapUsagePolicy,
     job_gate: JobGate,
+    map_import_svc: MapImportService,
 ) -> APIRouter:
 
     map_router = APIRouter(prefix="", tags=["Map"])
@@ -1286,141 +1284,32 @@ def init_map_router(
         ``template_bound``); 409 ``disk_low`` when the unpacked size exceeds
         free space (the replaced map's space does not count).
 
-        Order: unpack and verify into ``map/.import-<token>/``, publish with one
-        ``os.rename`` (parking the old map as ``.import-old-<token>``), then one
-        transaction deletes every row naming the map (orphans too) and inserts
-        the manifest's vertices; a DB failure swaps the directories back, and
-        the parked ``rmtree`` runs last. No conversion is started.
+        The steps and their undos (staging, the one-rename publish, the vertex
+        transaction, the parked map's ``rmtree`` last) are
+        services/map_import.py. No conversion is started.
         """
-        # Phase timings on the success log decide whether this should go async.
-        started = time.perf_counter()
-        try:
-            inspected = inspect_archive(payload)
-        except MapArchiveError as exc:
-            raise BadRequestError(str(exc))
-        inspect_ms = round((time.perf_counter() - started) * 1000)
-        manifest = inspected.manifest
-
-        if POINTCLOUD_PCD not in manifest.files:
-            raise BadRequestError(
-                f"The archive has no {POINTCLOUD_PCD}; it is not a map this robot "
-                "can localise on."
-            )
-        known_types = {member.value for member in VertexType}
-        unknown = sorted(
-            {str(v["type"]) for v in manifest.vertices if v["type"] not in known_types}
+        outcome = map_import_svc.import_archive(
+            payload, name, vertex_types={member.value for member in VertexType}
         )
-        if unknown:
-            raise BadRequestError(
-                f"Unknown vertex type(s) in the manifest: {', '.join(unknown)}."
-            )
-
-        target = name if name is not None else manifest.name
-        map_catalog_repo.resolve_dir(target)
-        replacing = map_catalog_repo.get_map(target) is not None
-        if replacing:
-            map_usage.refuse_destroy(
-                target,
-                verb="replaced",
-                template_consequence=(
-                    "its MOVE steps point at this map's current vertices, which the "
-                    "import replaces."
-                ),
-            )
-
-        if inspected.total_bytes > map_catalog_repo.free_bytes():
-            raise ConflictError(
-                f"Not enough disk for '{target}': the archive unpacks to "
-                f"{inspected.total_bytes} bytes.",
-                code="disk_low",
-            )
-
-        new_vertices = [
-            {
-                "name": v["name"],
-                "type": v["type"],
-                "x": float(v["x"]),
-                "y": float(v["y"]),
-                "theta": float(v["theta"]),
-                "z": float(v.get("z", 0.0)),
-            }
-            for v in manifest.vertices
-        ]
-
-        staging = map_catalog_repo.begin_import(target)
-        started = time.perf_counter()
-        try:
-            written = extract_archive(payload, inspected, staging)
-            _, displaced = map_catalog_repo.commit_import(target, staging)
-        except MapArchiveError as exc:
-            map_catalog_repo.abort_import(staging)
-            raise BadRequestError(str(exc))
-        except BaseException:
-            map_catalog_repo.abort_import(staging)
-            raise
-        extract_ms = round((time.perf_counter() - started) * 1000)
-
-        started = time.perf_counter()
-        try:
-            with map_repo.transaction(op="import_map") as session:
-                vertices_deleted = map_repo.delete_vertices(target, session=session)
-                created = (
-                    map_repo.create_vertices(target, new_vertices, session=session)
-                    if new_vertices
-                    else []
-                )
-        except Exception as exc:
-            map_catalog_repo.undo_import(target, displaced)
-            logger.error(
-                "Map import failed while writing its vertices",
-                map=target,
-                replaced=replacing,
-                error=str(exc),
-            )
-            raise UpstreamError(
-                f"Could not store the vertices for '{target}': {exc}. "
-                + (
-                    "The previous map was put back."
-                    if replacing
-                    else "The map directory was removed again; nothing was imported."
-                )
-            )
-        db_ms = round((time.perf_counter() - started) * 1000)
-
-        # The irreversible step last.
-        if displaced is not None:
-            map_catalog_repo.abort_import(displaced)
+        target, replacing = outcome.name, outcome.replaced
+        created, vertices_deleted = outcome.vertices_created, outcome.vertices_deleted
 
         # Renderings of an earlier map of this name are stale.
-
         thumbnail_cache.pop(target, None)
         image_cache.pop(target, None)
         cloud_cache.pop(target, None)
 
-        logger.info(
-            "Imported map",
-            map=target,
-            replaced=replacing,
-            format=inspected.format.value,
-            files=len(manifest.files),
-            bytes=written,
-            vertices_created=len(created),
-            vertices_deleted=vertices_deleted,
-            inspect_ms=inspect_ms,
-            extract_ms=extract_ms,
-            db_ms=db_ms,
-        )
         return ImportMapResponse(
             name=target,
             replaced=replacing,
-            files=len(manifest.files),
-            bytes=written,
-            vertices_created=len(created),
+            files=outcome.files,
+            bytes=outcome.bytes,
+            vertices_created=created,
             vertices_deleted=vertices_deleted,
             message=(
                 f"{'Replaced' if replacing else 'Imported'} '{target}': "
-                f"{len(manifest.files)} files and {len(created)} "
-                f"{'vertex' if len(created) == 1 else 'vertices'}"
+                f"{outcome.files} files and {created} "
+                f"{'vertex' if created == 1 else 'vertices'}"
                 + (
                     f" ({vertices_deleted} previous "
                     f"{'vertex' if vertices_deleted == 1 else 'vertices'} removed)."

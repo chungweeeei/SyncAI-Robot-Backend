@@ -142,7 +142,8 @@ services/                  domain work that outlives a request: gridmap_conversi
         │                  map_switch (activate's saga: localizer, map_server, Octo3D, INI and
         │                  the undo for each), dock_state (the last DOCK's pose), map_usage
         │                  (every "may this map change / be driven on" refusal: MapUsagePolicy
-        │                  from disk, safe in the worker; JobGate asks Temporal, loop only)
+        │                  from disk, safe in the worker; JobGate asks Temporal, loop only),
+        │                  map_import (the archive import's publish + vertex transaction + undo)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording

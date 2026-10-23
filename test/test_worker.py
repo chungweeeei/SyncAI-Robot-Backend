@@ -214,6 +214,7 @@ def test_health_projects_worker_state():
         map_switch_svc=MagicMock(),
         map_usage=MagicMock(),
         job_gate=MagicMock(),
+        map_import_svc=MagicMock(),
     )
     client = TestClient(app)
 

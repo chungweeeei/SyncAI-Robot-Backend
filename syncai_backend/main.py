@@ -32,6 +32,7 @@ from syncai_backend.services.gridmap_conversion import (
     init_gridmap_conversion_service,
 )
 from syncai_backend.services.dock_state import init_dock_state_service
+from syncai_backend.services.map_import import init_map_import_service
 from syncai_backend.services.map_switch import init_map_switch_service
 from syncai_backend.services.map_usage import init_job_gate, init_map_usage_policy
 from syncai_backend.services.mode_restart import init_mode_restart_service
@@ -150,6 +151,15 @@ class SyncAIBackend(Node):
             map_usage=map_usage,
         )
 
+        # POST /api/v1/maps/import: the directory and its vertex rows published
+        # together, swapped back if the rows cannot be written.
+        map_import_svc = init_map_import_service(
+            logger=logger,
+            map_repo=map_repo,
+            map_catalog_repo=map_catalog_repo,
+            map_usage=map_usage,
+        )
+
         # The latest restart of the live mode and how it ended; outlives the POST
         # because sys_manager replies only once the rebuild is over.
         restart_svc = init_mode_restart_service(logger=logger, robot_gw=robot_gw)
@@ -241,6 +251,7 @@ class SyncAIBackend(Node):
             map_switch_svc=map_switch_svc,
             map_usage=map_usage,
             job_gate=job_gate,
+            map_import_svc=map_import_svc,
         )
 
 

@@ -65,7 +65,8 @@ services/                  domain work that outlives a request: gridmap_conversi
         │                  safety lock's rising edge → cancel every task); map_switch (the
         │                  live map switch's steps and their undos); dock_state (the last
         │                  DOCK's pose, for the auto-undock); map_usage (whether a map may
-        │                  be edited, destroyed, switched to or driven on)
+        │                  be edited, destroyed, switched to or driven on); map_import (an
+        │                  archive's directory and vertex rows, published together)
         │
 gateways/                  outbound: ROS (robot, map), Temporal (workflow), speech (tts: HTTP
         │                  to the syncai_tts container), camera/speaker (webrtc: a dlopen'd Go
