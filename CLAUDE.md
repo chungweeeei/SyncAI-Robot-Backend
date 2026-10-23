@@ -163,9 +163,10 @@ helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-ba
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/
-subscriber via `init_<x>(...)` factories and passes them into `start_rest_server(...)`,
-which hands them to `init_<x>_router(...)`. No DI container, no module-level singletons.
-Adding a dependency to a router means threading it through `main.py` → `server.py`.
+subscriber via `init_<x>(...)` factories and passes them into `start_rest_server(...)`
+as one frozen `RestDeps` (`server.py`), which hands each `init_<x>_router(...)` the
+fields it names. No DI container, no module-level singletons. Adding a dependency to a
+router means a `RestDeps` field, its value in `main.py`, and the router's call in `server.py`.
 
 That rule is why the gridmap conversion is a `services/` object rather than the
 module-level `_ACTIVE_CONVERSIONS` set it used to be inside `routers/map.py`: it is

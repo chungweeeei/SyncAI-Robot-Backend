@@ -10,7 +10,7 @@ from syncai_backend.logger import setup_log_handler
 from syncai_backend.database.postgres import connect_to_postgres
 from syncai_backend.temporal.worker import start_temporal_worker
 
-from syncai_backend.interfaces.rest.server import start_rest_server
+from syncai_backend.interfaces.rest.server import RestDeps, start_rest_server
 
 from syncai_backend.repositories.robot.robot import init_robot_repo
 from syncai_backend.repositories.map.map import init_map_repo
@@ -229,29 +229,31 @@ class SyncAIBackend(Node):
         )
         start_rest_server(
             logger=logger,
-            workflow_gw=workflow_gw,
-            robot_repo=robot_repo,
-            robot_gw=robot_gw,
-            map_repo=map_repo,
-            map_catalog_repo=map_catalog_repo,
-            map_gw=map_gw,
-            pointcloud_repo=pointcloud_repo,
-            map_cloud_repo=map_cloud_repo,
-            telemetry_repo=telemetry_repo,
-            task_template_repo=task_template_repo,
-            worker_handle=worker_handle,
-            tts_gw=tts_gw,
-            webrtc_gw=webrtc_gw,
-            recording_gw=recording_gw,
-            recording_catalog_repo=recording_catalog_repo,
-            conversion_svc=conversion_svc,
-            restart_svc=restart_svc,
-            mapping_status_repo=mapping_status_repo,
-            safety_lock_svc=safety_lock_svc,
-            map_switch_svc=map_switch_svc,
-            map_usage=map_usage,
-            job_gate=job_gate,
-            map_import_svc=map_import_svc,
+            deps=RestDeps(
+                workflow_gw=workflow_gw,
+                robot_repo=robot_repo,
+                robot_gw=robot_gw,
+                map_repo=map_repo,
+                map_catalog_repo=map_catalog_repo,
+                map_gw=map_gw,
+                pointcloud_repo=pointcloud_repo,
+                map_cloud_repo=map_cloud_repo,
+                telemetry_repo=telemetry_repo,
+                task_template_repo=task_template_repo,
+                worker_handle=worker_handle,
+                tts_gw=tts_gw,
+                webrtc_gw=webrtc_gw,
+                recording_gw=recording_gw,
+                recording_catalog_repo=recording_catalog_repo,
+                conversion_svc=conversion_svc,
+                restart_svc=restart_svc,
+                mapping_status_repo=mapping_status_repo,
+                safety_lock_svc=safety_lock_svc,
+                map_switch_svc=map_switch_svc,
+                map_usage=map_usage,
+                job_gate=job_gate,
+                map_import_svc=map_import_svc,
+            ),
         )
 
 
