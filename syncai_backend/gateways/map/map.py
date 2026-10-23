@@ -430,7 +430,12 @@ class MapGateway:
 
         return True, ""
 
-    def save_map(self, directory: str) -> tuple[bool, str]:
+    def save_map(self, directory: str, octomap: Optional[bool] = None) -> tuple[bool, str]:
+        """Have pgo write the run into ``directory`` and end it.
+
+        ``octomap`` is the save's 3D map choice; None sends OCTOMAP_DEFAULT,
+        which leaves it to pgo's map_clean_octomap.
+        """
 
         save_maps_client = self._service_clients.get("save_maps")
         if not save_maps_client.wait_for_service(timeout_sec=5.0):
@@ -444,7 +449,17 @@ class MapGateway:
         self._logger.info("[MapGateway] Saving map", file_path=file_path)
 
         future = save_maps_client.call_async(
-            SaveMaps.Request(file_path=file_path, save_patches=True)
+            SaveMaps.Request(
+                file_path=file_path,
+                save_patches=True,
+                octomap=(
+                    SaveMaps.Request.OCTOMAP_DEFAULT
+                    if octomap is None
+                    else SaveMaps.Request.OCTOMAP_ON
+                    if octomap
+                    else SaveMaps.Request.OCTOMAP_OFF
+                ),
+            )
         )
 
         if not _wait_for_future(future, timeout=180.0):

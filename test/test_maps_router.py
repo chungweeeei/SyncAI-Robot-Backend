@@ -68,6 +68,7 @@ class _StubMapGateway:
         self.calls = []
         self.result = (True, "")
         self.save_calls = []
+        self.save_octomap = []
         self.save_result = (True, "")
         # Kept separate from save_*, deliberately: the tests below assert that
         # saving and resetting never reach into each other.
@@ -135,8 +136,9 @@ class _StubMapGateway:
         self.order.append(("reload_octomap", bt_path))
         return self.octomap_results.pop(0) if self.octomap_results else (True, "")
 
-    def save_map(self, directory):
+    def save_map(self, directory, octomap=None):
         self.save_calls.append(directory)
+        self.save_octomap.append(octomap)
         return self.save_result
 
     def reset_mapping(self, reset_lio=True):
@@ -1468,6 +1470,59 @@ def test_create_map_saves_through_the_gateway(client, map_gw, catalog_repo):
     directory = catalog_repo.resolve_dir("newmap")
     assert map_gw.save_calls == [directory]
     assert os.path.isdir(directory)
+
+
+def test_create_map_leaves_the_3d_map_to_the_robot_by_default(client, map_gw):
+    # An older console sends neither choice: the floor plan is converted as
+    # it always was, and pgo's own parameter decides the 3D map.
+    _post_map(client, {"name": "newmap"})
+
+    assert map_gw.save_octomap == [None]
+
+
+@pytest.mark.parametrize("octomap", [True, False])
+def test_create_map_passes_the_3d_map_choice_to_pgo(client, map_gw, octomap):
+    _post_map(client, {"name": "newmap", "octomap": octomap})
+
+    assert map_gw.save_octomap == [octomap]
+
+
+def test_create_map_without_a_floor_plan_starts_no_conversion(
+    client, conversion_svc, monkeypatch
+):
+    started = []
+    monkeypatch.setattr(conversion_svc, "start", lambda *a, **k: started.append(a) or True)
+
+    body = _post_map(client, {"name": "newmap", "grid": False, "octomap": True}).json()
+
+    assert started == []
+    assert body["grid_pending"] is False
+    assert "3D map" in body["message"]
+    # The operator's sentence names no route.
+    assert "/api/" not in body["message"]
+
+
+def test_create_map_with_a_floor_plan_starts_the_conversion(
+    client, conversion_svc, monkeypatch
+):
+    started = []
+    monkeypatch.setattr(conversion_svc, "start", lambda *a, **k: started.append(a[0]) or True)
+
+    body = _post_map(client, {"name": "newmap"}).json()
+
+    assert started == ["newmap"]
+    assert body["grid_pending"] is True
+
+
+def test_create_map_refuses_to_build_nothing(client, map_gw, catalog_repo):
+    # Refused before pgo: a save ends the run, and one that builds neither
+    # would leave a map nothing can load.
+    response = _post_map(client, {"name": "newmap", "grid": False, "octomap": False})
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "nothing_to_build"
+    assert map_gw.save_calls == []
+    assert not os.path.exists(catalog_repo.resolve_dir("newmap"))
 
 
 def test_create_map_lists_afterwards_with_a_null_grid(client, maps_dir, make_pcd):

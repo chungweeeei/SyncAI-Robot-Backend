@@ -406,6 +406,23 @@ class CreateMapRequest(BaseModel):
             "underscore). Becomes map/<name>/ on the robot."
         ),
     )
+    grid: bool = Field(
+        True,
+        description=(
+            "Convert the scan to a 2D gridmap after the save. False leaves the "
+            "map with grid_status none, which POST "
+            "/api/v1/maps/{name}/grid/convert can fill in later."
+        ),
+    )
+    octomap: Optional[bool] = Field(
+        None,
+        description=(
+            "Have the robot's map cleaning also build octomap.bt (the 3D map). "
+            "Null leaves it to the robot's map_clean_octomap parameter. Watch "
+            "the catalogue's octomap_status for the outcome: it is minutes "
+            "behind the save and may fail for lack of memory."
+        ),
+    )
 
 
 class CreateMapResponse(BaseModel):
@@ -1210,17 +1227,37 @@ def init_map_router(
         (``gridmap_conversion.wait_for_map_clean``), so ``grid_status`` stays
         ``converting`` for seconds to minutes.
         """
+        # Before the directory and before pgo: a save that builds nothing would
+        # end the run into a map that cannot be loaded.
+        if not request.grid and request.octomap is False:
+            raise BadRequestError(
+                "Choose at least one of the floor plan and the 3D map to build.",
+                code="nothing_to_build",
+            )
         _refuse_while_idle("save")
 
         directory = map_catalog_repo.create_map_dir(request.name)
 
-        saved, detail = map_gw.save_map(directory)
+        saved, detail = map_gw.save_map(directory, octomap=request.octomap)
         if not saved:
             map_catalog_repo.discard_empty_map_dir(request.name)
             logger.error("Failed to save map", map=request.name, error=detail)
             raise UpstreamError(detail)
 
-        grid_pending = conversion_svc.start(request.name, directory)
+        grid_pending = request.grid and conversion_svc.start(request.name, directory)
+
+        # Operator copy: what is being built in the background, never a route.
+        if grid_pending:
+            follow_up = (
+                " Building the floor plan in the background, once the robot "
+                "has removed people from the scan."
+            )
+        elif request.grid:
+            follow_up = " The floor plan could not be started; rebuild it from the map library."
+        else:
+            follow_up = ""
+        if request.octomap:
+            follow_up += " The 3D map is built after that and can take several minutes."
 
         return CreateMapResponse(
             name=request.name,
@@ -1228,16 +1265,7 @@ def init_map_router(
             grid_pending=grid_pending,
             message=(
                 f"Saved '{request.name}'. Mapping has stopped — start it again "
-                "for another map."
-                + (
-                    " Converting to a 2D gridmap in the background, once the "
-                    "robot has removed people from the point cloud."
-                    if grid_pending
-                    else (
-                        " Re-run the conversion through "
-                        f"POST /api/v1/maps/{request.name}/grid/convert."
-                    )
-                )
+                "for another map." + follow_up
             ),
         )
 
