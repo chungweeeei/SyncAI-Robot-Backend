@@ -55,41 +55,37 @@ from syncai_backend.services.safety_lock import SafetyLockService
 from syncai_backend.temporal.worker import TemporalWorkerHandle
 
 
+# Domain exception -> HTTP status. The exceptions stay HTTP-agnostic (services
+# and gateways raise them); this table is the one place that knows the codes.
+_STATUS_FOR = {
+    NotFoundError: status.HTTP_404_NOT_FOUND,
+    BadRequestError: status.HTTP_400_BAD_REQUEST,
+    ConflictError: status.HTTP_409_CONFLICT,
+    UnauthorizedError: status.HTTP_401_UNAUTHORIZED,
+    UpstreamError: status.HTTP_502_BAD_GATEWAY,
+}
+
+# Optional keys that ride beside ``detail`` when the exception sets them
+# (ConflictError: code; BadRequestError: code, step_id). Only when set, so
+# every body without one is the bare ``{"detail": ...}`` it always was.
+_EXTRA_KEYS = ("code", "step_id")
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Map domain exceptions to HTTP responses so routers don't have to."""
 
-    def _json(status_code: int, detail: str) -> JSONResponse:
-        return JSONResponse(status_code=status_code, content={"detail": detail})
-
-    @app.exception_handler(NotFoundError)
-    async def _not_found(_: Request, exc: NotFoundError) -> JSONResponse:
-        return _json(status.HTTP_404_NOT_FOUND, str(exc))
-
-    @app.exception_handler(BadRequestError)
-    async def _bad_request(_: Request, exc: BadRequestError) -> JSONResponse:
-        # Both keys only when set, so every pre-existing 400 is the body it was.
+    async def _handle(_: Request, exc: Exception) -> JSONResponse:
         content: dict = {"detail": str(exc)}
-        if getattr(exc, "code", None):
-            content["code"] = exc.code
-        if getattr(exc, "step_id", None):
-            content["step_id"] = exc.step_id
-        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=content)
+        for key in _EXTRA_KEYS:
+            value = getattr(exc, key, None)
+            if value:
+                content[key] = value
+        # By MRO, as Starlette picks the handler, so a subclass maps like its base.
+        code = next(_STATUS_FOR[t] for t in type(exc).__mro__ if t in _STATUS_FOR)
+        return JSONResponse(status_code=code, content=content)
 
-    @app.exception_handler(ConflictError)
-    async def _conflict(_: Request, exc: ConflictError) -> JSONResponse:
-        # ``code`` only when set, beside ``detail``.
-        content: dict = {"detail": str(exc)}
-        if getattr(exc, "code", None):
-            content["code"] = exc.code
-        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=content)
-
-    @app.exception_handler(UnauthorizedError)
-    async def _unauthorized(_: Request, exc: UnauthorizedError) -> JSONResponse:
-        return _json(status.HTTP_401_UNAUTHORIZED, str(exc))
-
-    @app.exception_handler(UpstreamError)
-    async def _upstream(_: Request, exc: UpstreamError) -> JSONResponse:
-        return _json(status.HTTP_502_BAD_GATEWAY, str(exc))
+    for exc_type in _STATUS_FOR:
+        app.add_exception_handler(exc_type, _handle)
 
 
 @dataclass(frozen=True)
