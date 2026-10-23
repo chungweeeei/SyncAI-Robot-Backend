@@ -31,6 +31,7 @@ from syncai_backend.gateways.recording.recording import init_recording_gateway
 from syncai_backend.services.gridmap_conversion import (
     init_gridmap_conversion_service,
 )
+from syncai_backend.services.dock_state import init_dock_state_service
 from syncai_backend.services.mode_restart import init_mode_restart_service
 from syncai_backend.services.safety_lock import init_safety_lock_service
 
@@ -136,6 +137,11 @@ class SyncAIBackend(Node):
             logger=logger, robot_gw=robot_gw, workflow_gw=workflow_gw
         )
 
+        # Where the last DOCK ended, so a MOVE off the dock undocks first. In
+        # memory on purpose (see services/dock_state.py); only the activities
+        # use it today.
+        dock_state_svc = init_dock_state_service()
+
         # One /tf + /tf_static subscription for the whole process (see
         # subscribers/tf.py).
         self._tf_listener = init_tf_listener(logger=logger, node=self)
@@ -186,6 +192,7 @@ class SyncAIBackend(Node):
             map_catalog_repo=map_catalog_repo,
             conversion_svc=conversion_svc,
             robot_repo=robot_repo,
+            dock_state=dock_state_svc,
         )
         start_rest_server(
             logger=logger,

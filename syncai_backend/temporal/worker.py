@@ -23,6 +23,7 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 # Same bounded retry as database/postgres.py (compose services may come up after the
@@ -173,6 +174,7 @@ def start_temporal_worker(
     map_catalog_repo: MapCatalogRepo,
     conversion_svc: GridmapConversionService,
     robot_repo: RobotRepo,
+    dock_state: DockStateService,
 ) -> TemporalWorkerHandle:
 
     ready = threading.Event()
@@ -189,6 +191,7 @@ def start_temporal_worker(
                 map_catalog_repo=map_catalog_repo,
                 conversion_svc=conversion_svc,
                 robot_repo=robot_repo,
+                dock_state=dock_state,
             )
             asyncio.run(
                 run_worker(

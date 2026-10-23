@@ -87,7 +87,7 @@ class RobotActivities:
         map_catalog_repo: MapCatalogRepo,
         conversion_svc: GridmapConversionService,
         robot_repo: RobotRepo,
-        dock_state: Optional[DockStateService] = None,
+        dock_state: DockStateService,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
@@ -99,8 +99,8 @@ class RobotActivities:
         # The latest RobotState (pose, motion state), for the auto-undock's checks.
         self._robot_repo = robot_repo
         # Where the last DOCK ended; see services/dock_state.py. One per process,
-        # and only the activities touch it.
-        self._dock_state = dock_state if dock_state is not None else DockStateService()
+        # built in main.py like every other collaborator.
+        self._dock_state = dock_state
         # Bound by run_worker, for _report_started: a sync activity cannot use the
         # async-only activity.client().
         self._client: Optional[Client] = None

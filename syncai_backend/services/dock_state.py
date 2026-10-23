@@ -101,3 +101,7 @@ class DockStateService:
             if not near:
                 self._record = None
             return near
+
+
+def init_dock_state_service() -> DockStateService:
+    return DockStateService()
