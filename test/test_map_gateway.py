@@ -346,6 +346,23 @@ class TestSaveMap:
         assert isinstance(request, SaveMaps.Request)
         assert request.file_path == os.path.join(os.path.expanduser("~"), "map/newsite")
         assert request.save_patches is True
+        # No choice from the console leaves the 3D map to pgo's parameter.
+        assert request.octomap == SaveMaps.Request.OCTOMAP_DEFAULT
+
+    @pytest.mark.parametrize(
+        "octomap, wire",
+        [
+            (True, SaveMaps.Request.OCTOMAP_ON),
+            (False, SaveMaps.Request.OCTOMAP_OFF),
+            (None, SaveMaps.Request.OCTOMAP_DEFAULT),
+        ],
+    )
+    def test_the_3d_map_choice_reaches_pgo(self, map_gw, octomap, wire):
+        client = _arm(map_gw, "save_maps", SimpleNamespace(success=True, message=""))
+
+        map_gw.save_map(directory="/map/newsite", octomap=octomap)
+
+        assert client.call_async.call_args[0][0].octomap == wire
 
     def test_pgo_refusal_passes_through_verbatim(self, map_gw):
         # e.g. "NO POSES!" — a run that never banked a keyframe. The gateway
