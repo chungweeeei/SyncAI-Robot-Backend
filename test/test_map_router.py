@@ -39,6 +39,7 @@ from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
+from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
 
 
 # No map_name: the owning map is the URL's path segment now.
@@ -100,6 +101,8 @@ def workflow_gw():
 
 @pytest.fixture
 def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
+    map_gw = _StubMapGateway()
+    conversion_svc = GridmapConversionService(logger=logger)
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -107,14 +110,20 @@ def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
             logger=logger,
             map_repo=map_repo,
             map_catalog_repo=catalog_repo,
-            map_gw=_StubMapGateway(),
+            map_gw=map_gw,
             task_template_repo=task_template_repo,
             workflow_gw=workflow_gw,
             # A real one: the vertex routes never start a conversion, but the
             # catalogue projection asks it whether one is running.
-            conversion_svc=GridmapConversionService(logger=logger),
+            conversion_svc=conversion_svc,
             # Real and empty: the vertex routes never read the run state.
             mapping_status_repo=init_mapping_status_repo(logger=logger),
+            map_switch_svc=MapSwitchService(
+                logger=logger,
+                map_catalog_repo=catalog_repo,
+                map_gw=map_gw,
+                conversion_svc=conversion_svc,
+            ),
         )
     )
     return TestClient(app)

@@ -32,6 +32,7 @@ from syncai_backend.services.gridmap_conversion import (
     init_gridmap_conversion_service,
 )
 from syncai_backend.services.dock_state import init_dock_state_service
+from syncai_backend.services.map_switch import init_map_switch_service
 from syncai_backend.services.mode_restart import init_mode_restart_service
 from syncai_backend.services.safety_lock import init_safety_lock_service
 
@@ -127,6 +128,15 @@ class SyncAIBackend(Node):
         # it like any other collaborator.
         conversion_svc = init_gridmap_conversion_service(logger=logger)
 
+        # The live map switch: localizer, map_server, Octo3D and the INI moved
+        # together, each later failure undoing the earlier ones.
+        map_switch_svc = init_map_switch_service(
+            logger=logger,
+            map_catalog_repo=map_catalog_repo,
+            map_gw=map_gw,
+            conversion_svc=conversion_svc,
+        )
+
         # The latest restart of the live mode and how it ended; outlives the POST
         # because sys_manager replies only once the rebuild is over.
         restart_svc = init_mode_restart_service(logger=logger, robot_gw=robot_gw)
@@ -215,6 +225,7 @@ class SyncAIBackend(Node):
             restart_svc=restart_svc,
             mapping_status_repo=mapping_status_repo,
             safety_lock_svc=safety_lock_svc,
+            map_switch_svc=map_switch_svc,
         )
 
 

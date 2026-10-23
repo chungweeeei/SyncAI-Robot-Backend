@@ -138,7 +138,9 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain ex
 services/                  domain work that outlives a request: gridmap_conversion (recipes,
         │                  the registry of running threads, the gridmap.recipe.json protocol),
         │                  mode_restart (the latest restart_mode dispatch and its outcome),
-        │                  safety_lock (the driver lock's rising edge -> cancel every task)
+        │                  safety_lock (the driver lock's rising edge -> cancel every task),
+        │                  map_switch (activate's saga: localizer, map_server, Octo3D, INI and
+        │                  the undo for each), dock_state (the last DOCK's pose)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording

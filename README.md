@@ -62,7 +62,9 @@ services/                  domain work that outlives a request: gridmap_conversi
         │                  recipes, the registry of running conversions, the
         │                  gridmap.recipe.json protocol); mode_restart (the latest
         │                  restart_mode dispatch and how it ended); safety_lock (the driver
-        │                  safety lock's rising edge → cancel every task)
+        │                  safety lock's rising edge → cancel every task); map_switch (the
+        │                  live map switch's steps and their undos); dock_state (the last
+        │                  DOCK's pose, for the auto-undock)
         │
 gateways/                  outbound: ROS (robot, map), Temporal (workflow), speech (tts: HTTP
         │                  to the syncai_tts container), camera/speaker (webrtc: a dlopen'd Go

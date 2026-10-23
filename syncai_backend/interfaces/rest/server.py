@@ -45,6 +45,7 @@ from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
 
 from syncai_backend.services.gridmap_conversion import GridmapConversionService
+from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.mode_restart import ModeRestartService
 from syncai_backend.services.safety_lock import SafetyLockService
 
@@ -109,6 +110,7 @@ def init_rest_server(
     restart_svc: ModeRestartService,
     mapping_status_repo: MappingStatusRepo,
     safety_lock_svc: SafetyLockService,
+    map_switch_svc: MapSwitchService,
 ) -> FastAPI:
 
     description = """
@@ -188,7 +190,8 @@ def init_rest_server(
     # /api/v1/maps: catalogue on disk plus the vertex table. task_template_repo
     # is for rename (task_templates.map_name keys on the directory name);
     # workflow_gw answers "is a task running", which gates map switches/edits;
-    # mapping_status_repo is pgo's latched run state.
+    # mapping_status_repo is pgo's latched run state; map_switch_svc is the
+    # live switch's saga.
     app.include_router(
         init_map_router(
             logger=logger,
@@ -199,6 +202,7 @@ def init_rest_server(
             workflow_gw=workflow_gw,
             conversion_svc=conversion_svc,
             mapping_status_repo=mapping_status_repo,
+            map_switch_svc=map_switch_svc,
         )
     )
     # /api/v1/task_templates: map_repo resolves a MOVE step's vertex to its
@@ -274,6 +278,7 @@ def start_rest_server(
     restart_svc: ModeRestartService,
     mapping_status_repo: MappingStatusRepo,
     safety_lock_svc: SafetyLockService,
+    map_switch_svc: MapSwitchService,
 ):
 
     app = init_rest_server(
@@ -297,6 +302,7 @@ def start_rest_server(
         restart_svc=restart_svc,
         mapping_status_repo=mapping_status_repo,
         safety_lock_svc=safety_lock_svc,
+        map_switch_svc=map_switch_svc,
     )
 
     def _run():

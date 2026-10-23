@@ -27,10 +27,6 @@ from syncai_backend.gateways.workflow.schema import ActiveTask
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.floors import detect_floor_levels, floor_name
 from syncai_backend.helpers.pgm import render_png, render_thumbnail
-from syncai_backend.helpers.system_config import (
-    set_active_map,
-    system_ini_path,
-)
 from syncai_backend.helpers.pointcloud import (
     cap_points,
     pack_xyz_f32,
@@ -47,7 +43,6 @@ from syncai_backend.helpers.map_archive import (
 from syncai_backend.repositories.map.catalog import (
     OCTOMAP_KEY_MAX,
     POINTCLOUD_PCD,
-    GridInfo,
     GridRecordStatus,
     KeepoutZone,
     MapCatalogRepo,
@@ -71,6 +66,7 @@ from syncai_backend.services.gridmap_conversion import (
     iso_now,
     parse_iso_utc,
 )
+from syncai_backend.services.map_switch import MapSwitchService
 
 
 # Decimation for a stored map.pcd. Duplicates PointCloudSubscriber's numbers so
@@ -1096,6 +1092,7 @@ def init_map_router(
     workflow_gw: WorkflowGateway,
     conversion_svc: GridmapConversionService,
     mapping_status_repo: MappingStatusRepo,
+    map_switch_svc: MapSwitchService,
 ) -> APIRouter:
 
     map_router = APIRouter(prefix="", tags=["Map"])
@@ -1747,43 +1744,6 @@ def init_map_router(
             ),
         )
 
-    def _carry_keepout(name: str, grid: GridInfo) -> Tuple[bool, str]:
-        """Point filter_mask_server at ``name``'s keepout mask; never raises.
-
-        A map the nav session never booted into has no ``keepout.*``, so the
-        pair is written first (from ``keepout.json`` if any, else blank) —
-        the previous map's zones must be replaced by something.
-
-        Returns ``(reloaded, note)``; the note is an operator sentence, empty
-        when there is nothing to say.
-        """
-        zones = map_catalog_repo.read_keepout_zones(name)
-        yaml_path = map_catalog_repo.keepout_yaml_path(name)
-        if yaml_path is None:
-            try:
-                map_catalog_repo.write_keepout(name, zones, grid)
-            except OSError as exc:
-                logger.error(
-                    "Could not write the keepout mask for the new map",
-                    map=name,
-                    error=str(exc),
-                )
-                return False, f" The keepout mask could not be written: {exc}."
-            yaml_path = map_catalog_repo.keepout_yaml_path(name)
-            if yaml_path is None:
-                return False, " The keepout mask could not be written."
-
-        reloaded, detail = map_gw.reload_keepout(yaml_path)
-        if not reloaded:
-            logger.error(
-                "Switched maps but the keepout mask did not reload", map=name, error=detail
-            )
-            return False, f" The keepout mask could not be reloaded: {detail}."
-        if zones:
-            count = len(zones)
-            return True, f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
-        return True, ""
-
     @map_router.post(
         "/api/v1/maps/{name}/activate", response_model=ActivateMapResponse
     )
@@ -1814,73 +1774,19 @@ def init_map_router(
 
         `[initial_pose]` is zeroed: an old-frame pose is meaningless here. The
         operator sets the pose; `localized` says whether registration converged
-        shortly after the swap.
+        shortly after the swap. The steps and their undos are
+        services/map_switch.py; this route owns only the Temporal question.
         """
         stored = _require(name)
-
-        previous = map_catalog_repo.active_name()
-        if name == previous:
-            # The no-op: reloading would only throw away a good registration.
+        status, grid_error = _grid_status(stored, False)
+        plan = map_switch_svc.plan(stored, status == GridStatus.OK, grid_error)
+        if plan is None:
             return ActivateMapResponse(
                 name=name,
-                previous=previous,
+                previous=name,
                 switched=False,
                 localized=None,
                 message=f"'{name}' is already the map the robot is running on.",
-            )
-
-        if conversion_svc.is_converting(name):
-            raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; switch to it "
-                "once the conversion has finished.",
-                code="conversion_running",
-            )
-
-        # 2D or 3D. The robot's own rule is "3D wins": its task_runner runs the
-        # 3D trees whenever Octo3D has a map, so a map with both is a 3D map
-        # here too (its grid is loaded as well, keeping map_server in step).
-        status, grid_error = _grid_status(stored, False)
-        has_grid = status == GridStatus.OK
-        octomap_path = map_catalog_repo.octomap_path(name)
-        is_3d = octomap_path is not None
-        if not has_grid and not is_3d:
-            # Refuse up front, before the localizer is swapped (and an
-            # unloadable yaml would crash map_server at the next launch).
-            detail = f" ({grid_error})" if grid_error else ""
-            raise ConflictError(
-                f"'{name}' has no usable gridmap{detail} and no 3D map "
-                "(octomap.bt). Build a grid from the map's Rebuild-grid control, "
-                "or let the robot's map cleaning write its 3D map, before "
-                "switching to it.",
-                code="grid_missing",
-            )
-
-        pcd_path = map_catalog_repo.pointcloud_path(name)
-        if pcd_path is None:
-            raise ConflictError(
-                f"'{name}' has no map.pcd, so the localizer has nothing to "
-                "match against. Only a map saved from a mapping run can be "
-                "switched to.",
-                code="pointcloud_missing",
-            )
-
-        yaml_path = map_catalog_repo.gridmap_yaml_path(name) if has_grid else None
-        if yaml_path is None and not is_3d:
-            raise ConflictError(
-                f"'{name}' has no gridmap.yaml to hand map_server.",
-                code="grid_missing",
-            )
-        previous_is_3d = (
-            previous is not None and map_catalog_repo.octomap_path(previous) is not None
-        )
-
-        ini_path = system_ini_path()
-        if not os.access(ini_path, os.W_OK):
-            # Preflighted so the swap's last step cannot fail after the move.
-            raise ConflictError(
-                f"The system INI ({ini_path}) is not writable, so a switch "
-                "could not be recorded and would not survive a restart.",
-                code="ini_not_writable",
             )
 
         # Any job, not only one holding a map (stricter than
@@ -1897,217 +1803,19 @@ def init_map_router(
             )
 
         # The route is `async def` for the Temporal await (the client belongs to
-        # the uvicorn loop); everything below blocks for up to a minute, so it
-        # runs in a worker thread. On the loop it froze every WebSocket,
-        # including the teleop watchdog.
-
-        def _switch() -> ActivateMapResponse:
-            if not map_gw.nav_services_ready():
-                raise ConflictError(
-                    "map_server and the localizer are not reachable, so there is no "
-                    "running map to switch. The robot is in mapping mode, or the "
-                    "nav stack is down.",
-                    code="stack_not_ready",
-                )
-
-            # Asked before anything moves. Absent on a stack built without
-            # OctomapPlanner3D: fatal for a 3D map, nothing to unload for a 2D.
-            planner_3d = map_gw.planner_3d_available()
-            if is_3d and not planner_3d:
-                raise ConflictError(
-                    f"'{name}' is a 3D map, but the nav stack has no 3D planner "
-                    "(planner_server/Octo3D/load_map) to navigate it.",
-                    code="planner_3d_unavailable",
-                )
-
-            previous_pcd = (
-                map_catalog_repo.pointcloud_path(previous) if previous else None
-            )
-
-            def _restore_localizer(reason: str) -> str:
-                """Put the localizer back on the old cloud. Returns a sentence."""
-                if previous_pcd is None:
-                    # The INI named no map (the likely case when its write fails),
-                    # or that map lost its map.pcd.
-                    where = (
-                        f"'{previous}' has no map.pcd"
-                        if previous
-                        else "the INI named no previous map"
-                    )
-                    return (
-                        f" The localizer is now on '{name}' and could not be put "
-                        f"back — {where}."
-                    )
-                restored, detail = map_gw.swap_localizer_map(previous_pcd, 0.0, 0.0, 0.0)
-                if restored:
-                    return f" The localizer was put back on '{previous}'."
-                logger.error(
-                    "Could not restore the localizer after a failed map switch",
-                    map=name,
-                    previous=previous,
-                    reason=reason,
-                    error=detail,
-                )
-                return (
-                    f" The localizer is still on '{name}' and could not be put back "
-                    f"({detail}) — set the map by hand and restart the stack."
-                )
-
-            swapped, detail = map_gw.swap_localizer_map(pcd_path, 0.0, 0.0, 0.0)
-            if not swapped:
-                # Nothing has changed yet, so nothing to compensate.
-                logger.error("Map switch failed at the localizer", map=name, error=detail)
-                raise UpstreamError(
-                    f"Could not point the localizer at '{name}': {detail}. The robot "
-                    f"is still on '{previous}'."
-                )
-
-            def _restore_grid() -> str:
-                """Put map_server back on the old grid, if this switch moved it."""
-                if yaml_path is None:
-                    # A 3D map without a grid: map_server was never touched.
-                    return ""
-                previous_yaml = (
-                    map_catalog_repo.gridmap_yaml_path(previous) if previous else None
-                )
-                if previous_yaml is None:
-                    # Say so rather than leave map_server quietly serving a grid
-                    # that does not match the restored cloud.
-                    where = (
-                        f"'{previous}' has no gridmap.yaml"
-                        if previous
-                        else "the INI named no previous map"
-                    )
-                    return f" map_server is still serving '{name}' — {where} to put back."
-                back, back_detail = map_gw.reload_map(previous_yaml)
-                return "" if back else f" map_server is still serving '{name}' ({back_detail})."
-
-            def _restore_octomap() -> str:
-                """Put Octo3D back as the old map had it: its tree, or none."""
-                if not planner_3d:
-                    return ""
-                previous_bt = map_catalog_repo.octomap_path(previous) if previous else None
-                back, back_detail = map_gw.reload_octomap(previous_bt or "")
-                if back:
-                    return ""
-                logger.error(
-                    "Could not restore the 3D planner after a failed map switch",
-                    map=name,
-                    previous=previous,
-                    error=back_detail,
-                )
-                return (
-                    f" The 3D planner could not be put back on '{previous}' "
-                    f"({back_detail}) — restart the nav stack before navigating."
-                )
-
-            if yaml_path is not None:
-                reloaded, detail = map_gw.reload_map(yaml_path)
-                if not reloaded:
-                    logger.error("Map switch failed at map_server", map=name, error=detail)
-                    raise UpstreamError(
-                        f"The localizer moved to '{name}' but map_server would not load "
-                        f"its gridmap: {detail}." + _restore_localizer("load_map failed")
-                    )
-
-            # After the grid: a 3D map's tree takes seconds to build, and a
-            # refusal from map_server should not have paid for it. For a 2D map
-            # this unloads the previous 3D map, if the stack has a 3D planner.
-            if planner_3d:
-                octomap_loaded, detail = map_gw.reload_octomap(
-                    octomap_path if is_3d else ""
-                )
-                if not octomap_loaded:
-                    logger.error(
-                        "Map switch failed at the 3D planner", map=name, error=detail
-                    )
-                    what = (
-                        "load its 3D map" if is_3d else "unload the previous 3D map"
-                    )
-                    # Undone in the order done, as statements (see below).
-                    restored_cloud = _restore_localizer("Octo3D load_map failed")
-                    restored_grid = _restore_grid()
-                    restored_octomap = _restore_octomap()
-                    raise UpstreamError(
-                        f"The localizer moved to '{name}' but the 3D planner would not "
-                        f"{what}: {detail}."
-                        + restored_cloud
-                        + restored_grid
-                        + restored_octomap
-                    )
-
-            try:
-                set_active_map(name, logger)
-            except (OSError, ValueError) as exc:
-                logger.error(
-                    "Map switch failed at the INI write", map=name, error=str(exc)
-                )
-                # Undone in the order done, as statements: inside the message
-                # concatenation the order would follow the sentences.
-                restored_cloud = _restore_localizer("INI write failed")
-                restored_grid = _restore_grid()
-                restored_octomap = _restore_octomap()
-
-                raise UpstreamError(
-                    f"The robot moved to '{name}' but the switch could not be "
-                    f"recorded in {ini_path}: {exc}."
-                    + restored_cloud
-                    + restored_grid
-                    + restored_octomap
-                )
-
-            # The switch is recorded; nothing can fail it now. The keepout mask
-            # (still the previous map's) is carried over best-effort after this
-            # commit point: a mask problem goes in the message, not a failure.
-            # A 3D map's zones need no carrying: the 3D planner read the map's
-            # keepout.json (if any) as part of the load_map that just succeeded
-            # (2026-10-23; until then it read no zones at all).
-            if is_3d:
-                count = len(map_catalog_repo.read_keepout_zones(name))
-                keepout_reloaded, keepout_note = True, (
-                    " It is a 3D map: the 3D planner navigates it, with its "
-                    f"{count} forbidden zone{'s' if count != 1 else ''}."
-                )
-            else:
-                keepout_reloaded, keepout_note = _carry_keepout(name, stored.grid)
-
-            # Renderings are keyed by map name, so nothing cached is stale.
-            localized = map_gw.localization_converged()
-
-            logger.info(
-                "Switched the active map",
-                map=name,
-                previous=previous,
-                map_kind="3d" if is_3d else "2d",
-                previous_was_3d=previous_is_3d,
-                localized=localized,
-                keepout_reloaded=keepout_reloaded,
-            )
-
-            message = f"The robot is now on '{name}'"
-            message += f" (was '{previous}')." if previous else "."
-            if localized:
-                message += " The localizer converged on the new map."
-            else:
-                message += (
-                    " The pose was reset to the map origin; set an initial pose on "
-                    "the dashboard, because the localizer has not converged"
-                )
-                message += (
-                    " yet." if localized is False else " and could not be asked."
-                )
-            message += keepout_note
-            return ActivateMapResponse(
-                name=name,
-                map_kind="3d" if is_3d else "2d",
-                previous=previous,
-                switched=True,
-                localized=localized,
-                keepout_reloaded=keepout_reloaded,
-                message=message,
-            )
-
-        return await asyncio.to_thread(_switch)
+        # the uvicorn loop); the switch blocks for up to a minute, so it runs in
+        # a worker thread. Renderings are keyed by map name: nothing cached is
+        # stale.
+        outcome = await asyncio.to_thread(map_switch_svc.execute, plan)
+        return ActivateMapResponse(
+            name=outcome.name,
+            map_kind=outcome.map_kind,
+            previous=outcome.previous,
+            switched=True,
+            localized=outcome.localized,
+            keepout_reloaded=outcome.keepout_reloaded,
+            message=outcome.message,
+        )
 
     # --- Localization -------------------------------------------------------
 
