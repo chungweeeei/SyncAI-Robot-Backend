@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Hashable, List, Optional, Tuple
 
 import structlog
 from fastapi import APIRouter, Body, Depends, Request
@@ -1076,6 +1076,33 @@ def _not_modified(request: Request, tag: str) -> bool:
     return bool(header) and tag in [value.strip() for value in header.split(",")]
 
 
+class _RenderCache:
+    """Encoded renderings of each map, re-made only when their source changes.
+
+    One entry per (kind, map); each remembers the source ``version`` it was
+    made from, and ``get`` re-renders on any other version. So an entry is
+    never served stale -- ``forget`` exists only so a renamed or deleted map's
+    bytes do not sit in memory until restart. Plain dict operations, atomic
+    under the GIL; two threads racing a miss both render, which is harmless.
+    """
+
+    def __init__(self) -> None:
+        self._entries: Dict[Tuple[str, str], Tuple[Hashable, bytes]] = {}
+
+    def get(
+        self, kind: str, name: str, version: Hashable, render: Callable[[], bytes]
+    ) -> bytes:
+        cached = self._entries.get((kind, name))
+        if cached is None or cached[0] != version:
+            cached = (version, render())
+            self._entries[(kind, name)] = cached
+        return cached[1]
+
+    def forget(self, name: str) -> None:
+        for key in [key for key in self._entries if key[1] == name]:
+            self._entries.pop(key, None)
+
+
 # --- Router -----------------------------------------------------------------
 
 
@@ -1124,11 +1151,9 @@ def init_map_router(
     # Plain (non-async) handlers throughout: they block on disk, PNG encoding
     # and psycopg2, so FastAPI must run them in its thread pool.
 
-    # Renderings are re-encoded only when their source changes. Keyed by map
-    # name, one entry per map.
-    thumbnail_cache: Dict[str, Tuple[str, bytes]] = {}
-    image_cache: Dict[str, Tuple[str, bytes]] = {}
-    cloud_cache: Dict[str, Tuple[Tuple[int, int], bytes]] = {}
+    # The image, thumbnail and packed cloud of each map, re-encoded only when
+    # their source changes.
+    renders = _RenderCache()
 
     def _vertex_count(name: str) -> int:
         # count_vertices, not len(list_vertices(...)): called once per map on
@@ -1295,9 +1320,7 @@ def init_map_router(
         created, vertices_deleted = outcome.vertices_created, outcome.vertices_deleted
 
         # Renderings of an earlier map of this name are stale.
-        thumbnail_cache.pop(target, None)
-        image_cache.pop(target, None)
-        cloud_cache.pop(target, None)
+        renders.forget(target)
 
         return ImportMapResponse(
             name=target,
@@ -1448,9 +1471,7 @@ def init_map_router(
             )
 
         # Never served stale (the cache is content-tagged), but would leak.
-        thumbnail_cache.pop(name, None)
-        image_cache.pop(name, None)
-        cloud_cache.pop(name, None)
+        renders.forget(name)
 
         logger.info(
             "Renamed map",
@@ -1516,9 +1537,7 @@ def init_map_router(
         map_catalog_repo.delete_map_dir(name)
 
         # Drop the renderings or they sit in memory until restart.
-        thumbnail_cache.pop(name, None)
-        image_cache.pop(name, None)
-        cloud_cache.pop(name, None)
+        renders.forget(name)
 
         logger.info("Deleted map", map=name, vertices_deleted=vertices_deleted)
         return DeleteMapResponse(
@@ -1899,7 +1918,6 @@ def init_map_router(
     def _png_response(
         name: str,
         request: Request,
-        cache: Dict[str, Tuple[str, bytes]],
         render: Callable[[bytes], bytes],
         what: str,
     ) -> Response:
@@ -1915,26 +1933,24 @@ def init_map_router(
         if _not_modified(request, tag):
             return Response(status_code=304, headers=headers)
 
-        cached = cache.get(name)
-        if cached is None or cached[0] != tag:
+        def _render() -> bytes:
             try:
-                png = render(payload)
+                return render(payload)
             except ValueError as exc:
                 logger.error(f"Failed to render map {what}", map=name, error=str(exc))
                 raise NotFoundError(f"Map '{name}' has no readable gridmap.")
-            cached = (tag, png)
-            cache[name] = cached
 
-        return Response(content=cached[1], media_type="image/png", headers=headers)
+        png = renders.get(what, name, tag, _render)
+        return Response(content=png, media_type="image/png", headers=headers)
 
     @map_router.get("/api/v1/maps/{name}/image")
     def get_map_image_by_name(name: str, request: Request):
         """The map's gridmap as a full-size PNG (raw bytes, not base64 JSON)."""
-        return _png_response(name, request, image_cache, render_png, "image")
+        return _png_response(name, request, render_png, "image")
 
     @map_router.get("/api/v1/maps/{name}/thumbnail")
     def get_map_thumbnail(name: str, request: Request):
-        return _png_response(name, request, thumbnail_cache, render_thumbnail, "thumbnail")
+        return _png_response(name, request, render_thumbnail, "thumbnail")
 
     @map_router.put(
         "/api/v1/maps/{name}/grid",
@@ -2158,9 +2174,7 @@ def init_map_router(
             logger.error("Failed to stat map cloud", map=name, error=str(exc))
             raise NotFoundError(f"Map '{name}' has no readable map.pcd.")
 
-        stamp = (stats.st_size, stats.st_mtime_ns)
-        cached = cloud_cache.get(name)
-        if cached is None or cached[0] != stamp:
+        def _pack() -> bytes:
             try:
                 points = read_pcd_xyz(path)
             except (OSError, ValueError) as exc:
@@ -2169,13 +2183,12 @@ def init_map_router(
 
             points = voxel_downsample(points=points, voxel_size=MAP_CLOUD_VOXEL_SIZE)
             points = cap_points(points=points, max_points=MAP_CLOUD_MAX_POINTS)
-            payload = struct.pack("<I", points.shape[0]) + pack_xyz_f32(points)
-            cached = (stamp, payload)
-            cloud_cache[name] = cached
             logger.info("packed stored map cloud", map=name, num_points=int(points.shape[0]))
+            return struct.pack("<I", points.shape[0]) + pack_xyz_f32(points)
 
+        payload = renders.get("cloud", name, (stats.st_size, stats.st_mtime_ns), _pack)
         return Response(
-            content=cached[1],
+            content=payload,
             media_type="application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )
