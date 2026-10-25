@@ -1,11 +1,14 @@
 import structlog
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Iterator, List, Optional
 from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 
-from syncai_backend.exceptions import BadRequestError, UpstreamError
+from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
 from syncai_backend.gateways.robot.robot import RobotGateway
+from syncai_backend.helpers.single_flight import SingleFlight
 
 
 class WifiNetwork(BaseModel):
@@ -68,11 +71,36 @@ def init_network_router(
 
     # Plain `def`: the gateway calls block for up to tens of seconds on ROS.
 
+    # A scan is read-only and the same for every caller, so a press while one
+    # runs (the console's button, pressed again after 20 s of nothing) joins
+    # it instead of holding a second threadpool thread for ~40 s and queueing
+    # a second scan behind the first in driver_manager.
+    scans: SingleFlight = SingleFlight()
+
+    # Connect, activate and delete each change NetworkManager's state and take
+    # up to 70 s; two at once would race (connect to A while activating B), and
+    # joining one to the other would answer a request that was never run. So
+    # one at a time, and the rest are a 409 the operator can retry.
+    changing = threading.Lock()
+
+    @contextmanager
+    def _one_change_at_a_time() -> Iterator[None]:
+        if not changing.acquire(blocking=False):
+            raise ConflictError(
+                "The robot is already changing its WiFi connection; wait for "
+                "that to finish.",
+                code="wifi_busy",
+            )
+        try:
+            yield
+        finally:
+            changing.release()
+
     @network_router.get(
         "/api/v1/network/wifi/scan", response_model=ScanWifiNetworksResponse
     )
     def scan_wifi_networks():
-        success, message, networks = robot_gw.scan_wifi_networks()
+        success, message, networks = scans.run(robot_gw.scan_wifi_networks)
         if not success:
             logger.error("Failed to scan WiFi networks", message=message)
             raise UpstreamError(message)
@@ -88,9 +116,10 @@ def init_network_router(
         "/api/v1/network/wifi/connect", response_model=ConnectWifiNetworkResponse
     )
     def connect_wifi_network(request: ConnectWifiNetworkRequest):
-        success, message = robot_gw.connect_wifi(
-            ssid=request.ssid, password=request.password
-        )
+        with _one_change_at_a_time():
+            success, message = robot_gw.connect_wifi(
+                ssid=request.ssid, password=request.password
+            )
         if not success:
             logger.error(
                 "Failed to connect to WiFi network", ssid=request.ssid, message=message
@@ -128,7 +157,8 @@ def init_network_router(
         response_model=ConnectWifiNetworkResponse,
     )
     def activate_wifi_connection(uuid: str):
-        success, message, ssid = robot_gw.activate_wifi_connection(uuid=uuid)
+        with _one_change_at_a_time():
+            success, message, ssid = robot_gw.activate_wifi_connection(uuid=uuid)
         if not success:
             # 400 like a failed connect: nmcli's sentence (a changed password,
             # a network out of range) is the operator's to act on.
@@ -145,7 +175,8 @@ def init_network_router(
         response_class=Response,
     )
     def delete_wifi_connection(uuid: str):
-        success, message = robot_gw.delete_wifi_connection(uuid=uuid)
+        with _one_change_at_a_time():
+            success, message = robot_gw.delete_wifi_connection(uuid=uuid)
         if not success:
             logger.error(
                 "Failed to delete saved WiFi network", uuid=uuid, message=message
