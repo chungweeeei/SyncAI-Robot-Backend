@@ -1085,10 +1085,18 @@ it (tmp + rename; a sibling file can be atomic). A rewrite that fails its
 verifying re-read puts the previous content back itself; a process killed inside
 the write (switch_mode kills the byobu session this process is a pane of, and
 an OOM kill or a power cut will do) leaves an empty INI, which
-`active_map_name` answers from the backup (with a warning) so this process keeps
-working — but every launch file reads `[system] robot_id` from the INI itself,
+`active_map_name` answers from the backup (with a warning) so the next start of
+this process keeps working — but every launch file reads `[system] robot_id` from the INI itself,
 so **restore it from the `.bak` before the next boot**. The backup is this
 package's only INI-shaped file; nothing else reads or writes it.
+
+**The loaded map is read from the INI once, at startup** (`MapCatalogRepo`'s
+constructor), and kept in memory; `activate` writes the INI and then that copy
+(`MapCatalogRepo.set_active`), and a failed write leaves the copy alone. Every
+dispatch, map-lock check and MOVE goal asks which map is loaded, several of them
+on the event loop, so none of them touches the disk. `set_active_map` is the
+INI's only writer, so nothing is missed — except a hand edit, which, like every
+other setting, needs a backend restart.
 
 There are **no ROS parameters** — nothing calls `declare_parameter`. Everything
 configurable is the INI, the environment, or a commented constant.
@@ -1357,7 +1365,8 @@ linters (`test_copyright`, `test_flake8`, `test_pep257`) run alongside.
 
 - **Configuration is read once, at startup.** The INI (`[map]`, `robot_id`),
   `.env` and the environment are all read during construction — any change needs
-  a backend restart.
+  a backend restart. That includes restoring `[map] name` from `system.ini.bak`
+  or editing it by hand: only `activate` changes the map this process reports.
 - Relative topic names are not optional — see the namespace section.
 - **Exactly two latched subscriptions, both pgo's: `pgo/map_cloud_file` and
   `pgo/mapping_status`.** (`map` and `localizer/map_cloud` went away with the

@@ -120,8 +120,11 @@ Consequences:
   ~70 s, psycopg2, PNG encoding) so FastAPI runs them in its thread pool. Keep that
   distinction when adding endpoints. A route that must be `async def` (it awaits
   Temporal) runs its disk reads in `asyncio.to_thread`, as `activate_map` does —
-  even a "small" read: the map walk and the INI share the loop with teleop and the
-  telemetry streams. (JobGate's and `trigger_task`'s INI reads are still on the loop.)
+  even a "small" read: the map walk shares the loop with teleop and the telemetry
+  streams. The loaded map is no read at all: `MapCatalogRepo.active_name()` is the
+  INI's `[map] name` cached at startup and updated only by `set_active` (the
+  switch's INI write, cache after the write succeeds); never call
+  `set_active_map` around it, and a hand-edited INI needs a restart.
 - **ROS service calls go through `gateways/ros.py`'s `call_service`**, never a raw
   `call_async` + wait: on timeout it `remove_pending_request`s the abandoned request,
   which otherwise stays in the client's pending table for the life of the process when
