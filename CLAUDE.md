@@ -207,7 +207,8 @@ Routers raise from `exceptions.py`; `server.py:register_exception_handlers` maps
 `NotFoundError`→404, `BadRequestError`→400 (optional `code` and `step_id` beside
 `detail`, for a refusal about one step of a task body), `ConflictError`→409 (optional
 machine-readable `code` beside `detail`, e.g. `conversion_running`, `map_active`),
-`UnauthorizedError`→401, `UpstreamError`→502 (a downstream — Temporal or a ROS service —
+`UnauthorizedError`→401, `PayloadTooLargeError`→413 (optional `code`; the import's
+`archive_too_large`), `UpstreamError`→502 (a downstream — Temporal or a ROS service —
 failed). Cross-field validation errors answer 400 with a sentence, not 422.
 
 `WorkflowGateway` raises those directly. The rest return `(success, message, …)` and the
@@ -269,7 +270,13 @@ the only caller that passes anything else.
   by `resolve_dir` and skipped by `list_maps`; the manifest `syncai_map.json` is archive
   metadata and never lands in the map directory. Replacing is refused for the same reasons
   delete is (`map_active` / `conversion_running` / `template_bound`, shared in
-  `MapUsagePolicy.refuse_destroy`, `services/map_usage.py`).
+  `MapUsagePolicy.refuse_destroy`, `services/map_usage.py`). **Neither direction holds
+  an archive in memory**: the upload is streamed into an anonymous temp file on the maps'
+  disk (`MapCatalogRepo.scratch_file`, unlinked at once, so nothing is left in `map/`),
+  413 `archive_too_large` past `MAP_IMPORT_MAX_BYTES` (4 GiB, on `Content-Length` and
+  again on the bytes received), and the export is written to one and streamed out. Do not
+  go back to `bytes = Body(...)` or a `Response(content=...)` of the archive: either holds
+  a map's size (`map.pcd` does not compress) in the process that supervises the job.
 - **A running job locks the map it is on.** Every route that edits what the planner,
   the costmaps or a job's waypoints read — vertex create/update/delete, `PUT …/grid`,
   `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `JobGate.refuse_while_a_job_holds`
