@@ -1,9 +1,10 @@
 import asyncio
 import structlog
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Awaitable, Callable, Iterator, List, Optional, Tuple
 
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.client import (
@@ -13,6 +14,7 @@ from temporalio.client import (
     ScheduleActionStartWorkflow,
     ScheduleAlreadyRunningError,
     ScheduleDescription,
+    ScheduleHandle,
     ScheduleIntervalSpec,
     ScheduleOverlapPolicy,
     SchedulePolicy,
@@ -495,6 +497,35 @@ class WorkflowGateway:
                 )
             return self._client
 
+    async def _connect(self) -> Client:
+        """``_get_client`` for a verb: a failed connect is logged and is the
+        caller's 502. Every public method starts here."""
+        try:
+            return await self._get_client()
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
+            )
+            raise UpstreamError("Failed to connect to Temporal server")
+
+    @contextmanager
+    def _rpc_refusals(
+        self, *, not_found: str, failure: str, log: str, **context
+    ) -> Iterator[None]:
+        """Translate an RPCError from the block into this module's two answers.
+
+        NOT_FOUND is ``NotFoundError(not_found)`` (404: the id is gone, or
+        never was); anything else is logged as ``log`` and is
+        ``UpstreamError(failure)`` (502). Other exceptions pass through.
+        """
+        try:
+            yield
+        except RPCError as err:
+            if err.status == RPCStatusCode.NOT_FOUND:
+                raise NotFoundError(not_found)
+            self._logger.error(f"[WorkflowGateway] {log}", error=str(err), **context)
+            raise UpstreamError(failure)
+
     async def _require_idle(self, client: Client) -> None:
         """Refuse to dispatch while anything is already running on this robot.
 
@@ -558,13 +589,7 @@ class WorkflowGateway:
         """Dispatch a run. `provenance` is stamped as search attributes, not passed
         as the argument: history filters on them, and the map must also reach
         scheduled runs, which only attributes do."""
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
+        client = await self._connect()
 
         await self._require_idle(client)
 
@@ -599,25 +624,16 @@ class WorkflowGateway:
         ``failure_message`` names the verb in the UpstreamError a failed describe
         raises.
         """
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
+        client = await self._connect()
 
         handle = client.get_workflow_handle(task_id)
 
-        try:
+        with self._rpc_refusals(
+            not_found=f"Task {task_id} not found",
+            failure=failure_message,
+            log="Failed to describe workflow",
+        ):
             description = await handle.describe()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Task {task_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to describe workflow", error=str(err)
-            )
-            raise UpstreamError(failure_message)
 
         if description.task_queue != self._task_queue:
             raise NotFoundError(f"Task {task_id} not found")
@@ -714,12 +730,9 @@ class WorkflowGateway:
             return _ActiveSnapshot(fetched_at=fetched_at, as_of=as_of, error=err)
 
         try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            return failed(UpstreamError("Failed to connect to Temporal server"))
+            client = await self._connect()
+        except UpstreamError as err:
+            return failed(err)
 
         tasks: List[ActiveTask] = []
         try:
@@ -786,6 +799,30 @@ class WorkflowGateway:
         )
         return _ActiveSnapshot(fetched_at=fetched_at, as_of=as_of, tasks=tasks)
 
+    def _history_filter(
+        self,
+        status: Optional[str],
+        since: Optional[datetime],
+        until: Optional[datetime],
+        kind: Optional[TaskKind],
+        name: Optional[str],
+    ) -> str:
+        """The List Filter the history page and its stats share, validated.
+
+        ``status`` comes from a REST enum: an unknown one is a bug here, not a
+        400. Checked before connecting, as it always was.
+        """
+        if status is not None and status not in _CLOSED_STATUS_FILTER:
+            raise ValueError(f"Not a closed task status: {status}")
+        return _history_query(
+            self._task_queue,
+            status=status,
+            since=since,
+            until=until,
+            kind=kind,
+            name=name,
+        )
+
     async def list_task_history(
         self,
         page_size: int,
@@ -802,26 +839,9 @@ class WorkflowGateway:
         valid only for the same filters. Reach is the namespace retention: the
         backend stores no runs.
         """
-        # `status` comes from a REST enum: an unknown one is a bug here, not a 400.
-        if status is not None and status not in _CLOSED_STATUS_FILTER:
-            raise ValueError(f"Not a closed task status: {status}")
+        query = self._history_filter(status, since, until, kind, name)
+        client = await self._connect()
 
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
-
-        query = _history_query(
-            self._task_queue,
-            status=status,
-            since=since,
-            until=until,
-            kind=kind,
-            name=name,
-        )
         # One page only: `async for` would follow the token to the end of retention.
         pages = client.list_workflows(
             query,
@@ -903,25 +923,9 @@ class WorkflowGateway:
         list_task_history's filter, answered by one `count_workflows ... GROUP BY
         ExecutionStatus` (see TASK_STATS_RPC_TIMEOUT_S).
         """
-        if status is not None and status not in _CLOSED_STATUS_FILTER:
-            raise ValueError(f"Not a closed task status: {status}")
+        query = self._history_filter(status, since, until, kind, name)
+        client = await self._connect()
 
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
-
-        query = _history_query(
-            self._task_queue,
-            status=status,
-            since=since,
-            until=until,
-            kind=kind,
-            name=name,
-        )
         try:
             result = await client.count_workflows(
                 query + " GROUP BY ExecutionStatus",
@@ -968,15 +972,12 @@ class WorkflowGateway:
         # cancel a no-op; a deleted one answers NOT_FOUND).
         handle, _ = await self._describe_owned_task(task_id, "Cancel workflow failed")
 
-        try:
+        with self._rpc_refusals(
+            not_found=f"Task {task_id} not found",
+            failure="Cancel workflow failed",
+            log="Failed to cancel workflow",
+        ):
             await handle.cancel()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Task {task_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to cancel workflow", error=str(err)
-            )
-            raise UpstreamError("Cancel workflow failed")
 
     async def cancel_active_tasks(self) -> List[str]:
         """Cancel every run on this robot's task queue; the ids that were asked.
@@ -1039,28 +1040,18 @@ class WorkflowGateway:
         if description.status is not WorkflowExecutionStatus.RUNNING:
             raise ConflictError(f"Task {task_id} is not running", code="task_not_running")
 
-        try:
+        with self._rpc_refusals(
+            not_found=f"Task {task_id} not found",
+            failure=failure_message,
+            log="Failed to signal workflow",
+            task_id=task_id,
+            signal=signal,
+        ):
             await handle.signal(signal)
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Task {task_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to signal workflow",
-                task_id=task_id,
-                signal=signal,
-                error=str(err),
-            )
-            raise UpstreamError(failure_message)
 
     async def create_schedule(self, schedule: ScheduleTask):
 
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
+        client = await self._connect()
 
         spec = _build_schedule_spec(schedule.trigger)
 
@@ -1118,15 +1109,12 @@ class WorkflowGateway:
         """
         handle = client.get_schedule_handle(schedule_id)
 
-        try:
+        with self._rpc_refusals(
+            not_found=f"Schedule {schedule_id} not found",
+            failure="Describe schedule failed",
+            log="Failed to describe schedule",
+        ):
             desc = await handle.describe()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Schedule {schedule_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to describe schedule", error=str(err)
-            )
-            raise UpstreamError("Describe schedule failed")
 
         if _schedule_task_queue(desc) != self._task_queue:
             raise NotFoundError(f"Schedule {schedule_id} not found")
@@ -1135,13 +1123,7 @@ class WorkflowGateway:
 
     async def get_schedule(self, schedule_id: str) -> ScheduleView:
 
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
+        client = await self._connect()
 
         desc = await self._require_owned_schedule(client, schedule_id)
 
@@ -1229,13 +1211,7 @@ class WorkflowGateway:
 
     async def list_schedules(self) -> List[ScheduleView]:
 
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
+        client = await self._connect()
 
         schedules: List[ScheduleView] = []
         try:
@@ -1274,80 +1250,36 @@ class WorkflowGateway:
 
         return schedules
 
-    async def delete_schedule(self, schedule_id: str):
+    async def _change_owned_schedule(
+        self,
+        schedule_id: str,
+        verb: str,
+        change: Callable[[ScheduleHandle], Awaitable[None]],
+    ) -> None:
+        """Apply ``change`` to one of this robot's schedules.
 
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
-
-        # Ownership gate; the verify->act race is benign (NOT_FOUND below).
+        The ownership gate first (a foreign id is a 404); the verify->act race
+        is benign, since a schedule deleted in between answers NOT_FOUND, which
+        is the same 404. ``verb`` names it in the log and the 502.
+        """
+        client = await self._connect()
         await self._require_owned_schedule(client, schedule_id)
 
-        handle = client.get_schedule_handle(schedule_id)
+        with self._rpc_refusals(
+            not_found=f"Schedule {schedule_id} not found",
+            failure=f"{verb.capitalize()} schedule failed",
+            log=f"Failed to {verb} schedule",
+        ):
+            await change(client.get_schedule_handle(schedule_id))
 
-        try:
-            await handle.delete()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Schedule {schedule_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to delete schedule", error=str(err)
-            )
-            raise UpstreamError("Delete schedule failed")
+    async def delete_schedule(self, schedule_id: str):
+        await self._change_owned_schedule(schedule_id, "delete", lambda h: h.delete())
 
     async def pause_schedule(self, schedule_id: str):
-
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
-
-        # Ownership gate — see delete_schedule.
-        await self._require_owned_schedule(client, schedule_id)
-
-        handle = client.get_schedule_handle(schedule_id)
-
-        try:
-            await handle.pause()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Schedule {schedule_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to pause schedule", error=str(err)
-            )
-            raise UpstreamError("Pause schedule failed")
+        await self._change_owned_schedule(schedule_id, "pause", lambda h: h.pause())
 
     async def resume_schedule(self, schedule_id: str):
-
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
-
-        # Ownership gate — see delete_schedule.
-        await self._require_owned_schedule(client, schedule_id)
-
-        handle = client.get_schedule_handle(schedule_id)
-
-        try:
-            await handle.unpause()
-        except RPCError as err:
-            if err.status == RPCStatusCode.NOT_FOUND:
-                raise NotFoundError(f"Schedule {schedule_id} not found")
-            self._logger.error(
-                "[WorkflowGateway] Failed to resume schedule", error=str(err)
-            )
-            raise UpstreamError("Resume schedule failed")
+        await self._change_owned_schedule(schedule_id, "resume", lambda h: h.unpause())
 
     async def update_schedule_trigger(self, schedule_id: str, trigger: ScheduleTrigger):
         """Replace a schedule's firing rule in place, touching nothing else.
@@ -1361,13 +1293,7 @@ class WorkflowGateway:
         so no extra RPC; raising aborts the update). 404 for a foreign schedule.
         The memo is left alone: it carries no trigger, and the server ignores it.
         """
-        try:
-            client = await self._get_client()
-        except Exception as err:
-            self._logger.error(
-                "[WorkflowGateway] Failed to connect to Temporal server", error=str(err)
-            )
-            raise UpstreamError("Failed to connect to Temporal server")
+        client = await self._connect()
 
         # Validate before any RPC: a malformed trigger is the caller's 400.
         spec = _build_schedule_spec(trigger)
