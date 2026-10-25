@@ -90,21 +90,23 @@ gateways/                  outbound: ROS (robot, map), Temporal (workflow), spee
 repositories/              state: in-memory caches, PostgreSQL CRUD, and the two on-disk
         │                  catalogues (map/, record/)
         │
-database/                  SQLAlchemy engine + ORM models
+database/                  SQLAlchemy engine + ORM models; the shared session factory
 
 tasks/                     the task model and its Temporal contract (steps, groups, queues,
                            signals, search attributes) — REST, the workflow gateway and the
                            worker all import it, and it imports none of them
 
 subscribers/               ROS topics → repositories (ingest) — except the map cloud, whose
-                           topic only names a PCD the subscriber reads from the shared /dev/shm
+                           topic only names a PCD the subscriber reads from the shared /dev/shm;
+                           QoS from qos.py (latched / best_effort), per the table below
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   occupancy_grid (OccupancyGrid→PNG), pointcloud (read a binary PCD,
                            downsample / transform / pack), pgm, pcd_to_gridmap (z-band
                            recipe), keepout (forbidden-zone mask rasteriser), traversable
                            (traversability recipe), system_config (INI reader), map_archive
                            (checksummed zip / tar.gz of a map dir), move_guard (a run's
-                           TaskMap against the loaded map)
+                           TaskMap against the loaded map), disk (directory size + newest
+                           mtime), single_flight (concurrent callers share one slow read)
 ```
 
 Wiring is explicit: `main.py` constructs every repo/gateway/subscriber and passes
