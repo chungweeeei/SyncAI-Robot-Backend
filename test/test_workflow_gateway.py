@@ -59,6 +59,7 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     WorkflowTaskDefinition,
 )
 from syncai_backend.tasks.search_attributes import (  # noqa: E402
+    ROBOT_ID_KEY,
     TASK_KIND_KEY,
     TASK_MAP_KEY,
     TASK_NAME_KEY,
@@ -68,6 +69,7 @@ from syncai_backend.gateways.workflow.workflow import (  # noqa: E402
     _build_schedule_spec,
     _history_query,
     _read_trigger,
+    _schedule_list_query,
     _spec_to_trigger,
     init_workflow_gateway,
 )
@@ -1045,6 +1047,10 @@ class TestWorkflowGateway:
         # And the map its frozen positions are on, which the memo cannot hand
         # a run: what lets a run that fires after a map switch refuse to drive.
         assert attributes.get(TASK_MAP_KEY) == "full"
+        # The schedule itself carries the robot, for the list's server-side
+        # filter; the runs do not need it (their task queue scopes them).
+        assert kwargs["search_attributes"].get(ROBOT_ID_KEY) == "robot01"
+        assert attributes.get(ROBOT_ID_KEY) is None
 
     def test_create_schedule_without_a_template_stamps_only_the_kind(
         self, workflow_gw, mock_client
@@ -1324,11 +1330,89 @@ class TestWorkflowGateway:
         # The list path cannot reach the frozen args; steps are describe-only.
         assert views[0].steps == []
 
+    @staticmethod
+    def _rows(*items, fail=None):
+        """The SDK's shape: nothing happens until the first __anext__, which
+        is where the first page's RPC -- and so any refusal -- happens."""
+
+        async def _iterator():
+            if fail is not None:
+                raise fail
+            for item in items:
+                yield item
+
+        return _iterator()
+
+    @staticmethod
+    def _row(schedule_id="robot01-sched-001"):
+        return SimpleNamespace(
+            id=schedule_id,
+            schedule=SimpleNamespace(
+                action=SimpleNamespace(workflow=WORKFLOW_TYPE_NAME),
+                spec=ScheduleSpec(),
+                state=SimpleNamespace(paused=False),
+            ),
+            info=SimpleNamespace(next_action_times=[]),
+            memo=AsyncMock(return_value={"robot_id": "robot01", "interval_seconds": 60}),
+        )
+
+    def test_list_schedules_asks_the_server_for_this_robots_only(
+        self, workflow_gw, mock_client
+    ):
+        mock_client.list_schedules.return_value = self._rows(self._row())
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            views = asyncio.run(workflow_gw.list_schedules())
+
+        assert [view.id for view in views] == ["robot01-sched-001"]
+        assert mock_client.list_schedules.call_args.args == (
+            "RobotId = 'robot01' OR RobotId IS NULL",
+        )
+
+    def test_list_schedules_falls_back_while_the_attribute_is_unregistered(
+        self, workflow_gw, mock_client
+    ):
+        """The worker registers RobotId at connect and may not have yet; the
+        server then refuses the filter (INVALID_ARGUMENT, probed on 1.29.7) on
+        the first page, i.e. while iterating, not on the await."""
+        unknown = RPCError(
+            "Namespace default has no mapping defined for search attribute RobotId",
+            RPCStatusCode.INVALID_ARGUMENT,
+            b"",
+        )
+        mock_client.list_schedules.side_effect = [
+            self._rows(fail=unknown),
+            self._rows(self._row()),
+        ]
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            views = asyncio.run(workflow_gw.list_schedules())
+
+        assert [view.id for view in views] == ["robot01-sched-001"]
+        first, second = mock_client.list_schedules.call_args_list
+        assert first.args == ("RobotId = 'robot01' OR RobotId IS NULL",)
+        assert second.args == ()
+
+    def test_list_schedules_does_not_fall_back_on_other_failures(
+        self, workflow_gw, mock_client
+    ):
+        mock_client.list_schedules.side_effect = [
+            self._rows(fail=RPCError("down", RPCStatusCode.UNAVAILABLE, b"")),
+        ]
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError, match="List schedules failed"):
+                asyncio.run(workflow_gw.list_schedules())
+        assert mock_client.list_schedules.call_count == 1
+
     def test_list_schedules_maps_failures_to_internal(self, workflow_gw, mock_client):
         mock_client.list_schedules.side_effect = Exception("boom")
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             with pytest.raises(UpstreamError, match="List schedules failed"):
                 asyncio.run(workflow_gw.list_schedules())
+
+
+def test_schedule_list_query_quotes_the_robot_id():
+    assert _schedule_list_query("robot'01") == (
+        "RobotId = 'robot\\'01' OR RobotId IS NULL"
+    )
 
 
 class TestHistoryQuery:
