@@ -225,7 +225,8 @@ TF frame names are not namespaced.
 ### Configuration
 
 Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
-`TTS_SERVICE_URL`, `SYNCAI_WEBRTC_LIB`; the WebRTC worker's own `*_RTP_PORT` /
+`TTS_SERVICE_URL`, `SYNCAI_WEBRTC_LIB`, `LOG_LEVEL` (default `info`), `LOG_FORMAT`
+(`console` / `json`); the WebRTC worker's own `*_RTP_PORT` /
 `STUN_SERVERS` / `TURN_*` are only `setdefault`ed before `InitWorker`), loaded from the cwd `.env` via python-dotenv at import time — see
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
 Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
@@ -380,7 +381,10 @@ keeps on describe, list and update. `_build_schedule_spec` is the one gate every
 registration goes through, so the crons that would break that echo (`#`, a
 `CRON_TZ=`/`TZ=` prefix, `@every`) are 400 on create as much as on edit.
 Runs carry three custom search attributes, `TaskKind` / `TaskName` / `TaskMap` (`tasks/
-search_attributes.py`), registered idempotently by the worker at connect; the history
+search_attributes.py`), and every schedule a fourth, `RobotId`, which the schedule list
+filters on server-side (`RobotId = '<id>' OR RobotId IS NULL`; INVALID_ARGUMENT while it
+is unregistered falls back to the whole namespace). All four are registered
+idempotently by the worker at connect; the history
 list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
 `TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`
 is the map a run's MOVE positions are in: stamped by the backend (the loaded map at

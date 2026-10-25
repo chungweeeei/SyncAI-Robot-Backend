@@ -545,7 +545,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/task_history` | **Finished** runs, newest close first, one visibility page per call. Query: `page_size` (1–100, default 20), `page_token` (previous `next_page_token`), `status` (`COMPLETED` / `FAILED` / `CANCELED`), `since` / `until` (close time; naive is UTC; `until` before `since` is 400), `kind` (`goal` / `standup` / `liedown` / `task` / `schedule`), `name` (exact template name). `kind` / `name` / `map_name` are `null` for runs dispatched without them or predating the attribute — no fallback. Bounded by namespace retention |
 | GET | `/api/v1/task_history/stats` | The same runs counted: `total`, `by_status`, `success_rate` (`COMPLETED` / `total`, `null` when nothing finished). Same filters as `task_history`; one count RPC |
 | POST | `/api/v1/schedules` | Create a schedule (cron **or** interval). A cron with its own `#`, a `CRON_TZ=`/`TZ=` prefix (use `timezone`) or `@every` (use `interval_seconds`) is 400 — see *Task orchestration* |
-| GET | `/api/v1/schedules` | List with next run times |
+| GET | `/api/v1/schedules` | List with next run times. This robot's only, filtered by the server on the schedule's `RobotId` (see *Provenance* under task history) |
 | GET | `/api/v1/schedules/{id}` | Describe one |
 | PATCH | `/api/v1/schedules/{id}` | Change when it fires: `{trigger: {cron, timezone}}` or `{trigger: {interval_seconds}}`, replacing the old rule whole. In place — id, frozen steps, provenance, paused state and `SKIP` stay. No renaming (delete + create). Same cron restrictions |
 | DELETE | `/api/v1/schedules/{id}` | Delete |
@@ -566,8 +566,8 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/robot/set_motion_key` | Gait key `"0"`–`"5"`; `"4"` (ESTOP) is accepted but **not** forwarded — 200 with `sent: false` |
 | POST | `/api/v1/robot/estop` | `{"locked": bool}` → `set_safety_lock` on `syncai_driver_manager`. `true` engages the lock and, on the `false → true` edge only, starts cancelling every running task and nav goal in the background (`cancel_requested: true`; started, not finished). `false` releases it, cancelling nothing. 502 if the driver is unreachable, nothing cancelled. Not the ESTOP motion key |
 | POST | `/api/v1/robot/set_policy_mode` | Gait-controller policy index; only `0` (PPO) and `1` (HIMLOCO) |
-| GET | `/api/v1/network/wifi/scan` | Scan networks (blocks up to 45 s) |
-| POST | `/api/v1/network/wifi/connect` | Connect via `nmcli` (blocks up to 70 s) |
+| GET | `/api/v1/network/wifi/scan` | Scan networks (blocks up to 45 s). A scan requested while one runs joins it and gets its answer, instead of holding a second thread and queueing a second scan in driver_manager |
+| POST | `/api/v1/network/wifi/connect` | Connect via `nmcli` (blocks up to 70 s). Connect, activate and delete of a saved network change NetworkManager's state, so one runs at a time: the others are 409 `wifi_busy` |
 | GET | `/api/v1/maps` | Map directories on disk with geometry, vertex counts and `grid_status` — **the conversion-status surface**; there is no job resource. `none` / `converting` / `ok` / `failed` (reason in `grid_error`) / `interrupted` (backend restarted mid-conversion). `grid_converting` is the deprecated boolean it replaces. The 3D map's twin: `octomap_status` (same five words, off `octomap.bt` and the cleaning sidecar), `octomap_error`, `octomap_version` (changes when the file does) and `octomap_resolution` |
 | GET | `/api/v1/maps/{name}` | One map's summary |
 | POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, then (unless `grid: false`) z-band conversion in a background thread, after the robot's map cleaning (`grid_pending` only means started — poll `grid_status`, which stays `converting` through the cleaning too). On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. `octomap: true / false` has the map cleaning build `octomap.bt` or not for this save (omitted or null: pgo's `map_clean_octomap`); watch `octomap_status`. 400 `nothing_to_build` for `grid: false, octomap: false`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
@@ -967,11 +967,20 @@ Details that matter when editing this path:
   - **Provenance is three Keyword search attributes**, `TaskKind`, `TaskName`,
     `TaskMap`, stamped by `start_task` from the request's `kind` / `name` and the
     map loaded at dispatch, and by every schedule's action (`kind = schedule`,
-    the template's name, the schedule's `map_name`). The worker registers them at
-    connect (`ensure_search_attributes`, idempotent, non-fatal); by hand:
-    `docker exec temporal sh -c 'temporal operator search-attribute create --address $(hostname -i):7233 --namespace default --name TaskKind --type Keyword --name TaskName --type Keyword --name TaskMap --type Keyword'`.
+    the template's name, the schedule's `map_name`). A fourth, `RobotId`, is on
+    the **schedule itself**, not its runs: `GET /api/v1/schedules` lists with
+    `RobotId = '<robot_id>' OR RobotId IS NULL`, so the server drops the rest
+    of the fleet's schedules instead of this process pulling and memo-filtering
+    them all (`IS NULL` keeps the ones from before the attribute, which the memo
+    filter still scopes). While `RobotId` is unregistered the server answers that
+    filter INVALID_ARGUMENT and the listing falls back to the whole namespace,
+    with a warning. Checked against 1.29.7 on Postgres visibility. The worker
+    registers all four at connect (`ensure_search_attributes`, idempotent,
+    non-fatal); by hand:
+    `docker exec temporal sh -c 'temporal operator search-attribute create --address $(hostname -i):7233 --namespace default --name TaskKind --type Keyword --name TaskName --type Keyword --name TaskMap --type Keyword --name RobotId --type Keyword'`.
     A start naming an unknown attribute is refused, so until `TaskMap` exists
-    every dispatch stamping it answers 502; until they all exist, `kind` / `name`
+    every dispatch stamping it answers 502 (and until `RobotId` exists, every
+    schedule create); until they all exist, `kind` / `name`
     filters and `/stats` answer 502 and the log names the attribute.
     `kind=schedule` is answered from `TemporalScheduledById IS NOT NULL` (stamped
     by the server), so pre-attribute schedules still count (their runs carry no
@@ -1046,6 +1055,8 @@ Details that matter when editing this path:
 | `POSTGRES_PASSWORD` | `syncrobotic` | ditto |
 | `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads, e.g. `[map]`) |
 | `TTS_SERVICE_URL` | `http://syncai_tts:8080` | `gateways/tts` — the syncai_tts container by compose service name; `http://127.0.0.1:8080` with the backend on the host (the compose service uses `http://127.0.0.1:9090`, the port syncai_tts publishes) |
+| `LOG_LEVEL` | `info` | `logger.py`. Any stdlib level name; an unknown one logs a warning and keeps `info`. It was unfiltered (`NOTSET`) until 2026-10 |
+| `LOG_FORMAT` | `console` | `logger.py`. `json` for one object per line (ISO UTC timestamps, tracebacks as text) for a log collector; `console` is the coloured human one |
 | `SYNCAI_WEBRTC_LIB` | `~/robot_ws/lib/libsyncai_worker.so` | `gateways/webrtc` — the Go worker to dlopen. A nonexistent path is the only way to disable WebRTC: a loaded c-shared library cannot be unloaded |
 | `VIDEO_RTP_PORT` · `VIDEO_AUDIO_RTP_PORT` · `AUDIO_RTP_PORT` · `STUN_SERVERS` | `5006` · `5007` · `5004` · `stun:stun.l.google.com:19302` | Read by the **worker**, not Python; `gateways/webrtc` only `setdefault`s them right before `InitWorker`, which freezes them for the process. The compose service sets `STUN_SERVERS=""` (LAN robot), `VIDEO_FORMAT=rtpjpeg`, so video comes from the camera feeder's RTP/JPEG on `127.0.0.1:5008` instead of each session opening `/dev/syncai/camera0` itself (which fails "busy" while the feeder holds it), and `VIDEO_FRAMERATE=30`, the feeder's rate with stabilization on, which under `rtpjpeg` only sets the half-second IDR interval. `TURN_SERVERS` / `TURN_USERNAME` / `TURN_PASSWORD` have no default on purpose — `.env` is their only source |
 
