@@ -71,7 +71,9 @@ starts two extra threads:
 A convention, not enforced by tooling:
 
 ```
-interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; no business logic
+interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; no business logic. The map
+        │                  routes are routers/maps/, one module per area, composed by
+        │                  routers/map.py's init_map_router
         │
 services/                  domain work that outlives a request: gridmap_conversion (the two
         │                  recipes, the registry of running conversions, the
