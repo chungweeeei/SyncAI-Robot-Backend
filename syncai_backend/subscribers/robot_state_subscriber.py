@@ -1,10 +1,9 @@
 import structlog
-import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from syncai_common.msg import RobotState as RobotStateMsg
 
+from syncai_backend.subscribers import qos
 from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.services.safety_lock import SafetyLockService
 
@@ -41,12 +40,7 @@ class RobotStateSubscriber:
             msg_type=RobotStateMsg,
             topic="robot_state",
             callback=self._robot_state_cb,
-            qos_profile=QoSProfile(
-                depth=3,
-                reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
-                durability=rclpy.qos.DurabilityPolicy.VOLATILE,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.best_effort(depth=3),
         )
 
     def _robot_state_cb(self, msg: RobotStateMsg):

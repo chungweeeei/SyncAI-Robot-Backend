@@ -2,12 +2,11 @@ from typing import Callable, Tuple
 
 import structlog
 
-import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from nav_msgs.msg import Path
 
+from syncai_backend.subscribers import qos
 from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 
 
@@ -76,12 +75,7 @@ class PathSubscriber:
             msg_type=Path,
             topic=self._topic,  # relative, so it inherits the robot_id namespace
             callback=self._plan_cb,
-            qos_profile=QoSProfile(
-                depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
-                durability=rclpy.qos.DurabilityPolicy.VOLATILE,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.best_effort(depth=1),
         )
 
     def _plan_cb(self, msg: Path):

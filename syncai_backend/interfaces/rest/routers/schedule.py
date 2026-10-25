@@ -5,13 +5,11 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from syncai_backend.tasks.schema import (
-    Step,
     ScheduleTask,
-    ScheduleTrigger,
     WorkflowTaskDefinition,
     step_group_problem,
 )
-from syncai_backend.gateways.workflow.workflow import WorkflowGateway
+from syncai_backend.gateways.workflow.workflow import ScheduleView, WorkflowGateway
 from syncai_backend.interfaces.rest.schemas import (
     ScheduleResponse,
     ScheduleTriggerRequest,
@@ -107,16 +105,9 @@ def init_schedule_router(
             raise problem.refusal()
         schedule_task = ScheduleTask(
             id=req.id,
-            trigger=ScheduleTrigger(
-                cron=req.trigger.cron,
-                interval_seconds=req.trigger.interval_seconds,
-                timezone=req.trigger.timezone,
-            ),
+            trigger=req.trigger.to_trigger(),
             definition=WorkflowTaskDefinition(
-                steps=[
-                    Step(id=step.id, type=step.type, params=step.params, group=step.group)
-                    for step in req.steps
-                ],
+                steps=[step.to_step() for step in req.steps],
             ),
             map_name=req.map_name,
         )
@@ -128,40 +119,10 @@ def init_schedule_router(
             message=f"Schedule {req.id} has been created.",
         )
 
-    @schedule_router.get(
-        "/api/v1/schedules", response_model=List[ScheduleStateResponse]
-    )
-    async def list_schedules():
-        views = await workflow_gw.list_schedules()
-
-        return [
-            ScheduleStateResponse(
-                id=view.id,
-                trigger=ScheduleTriggerResponse(
-                    cron=view.trigger.cron,
-                    interval_seconds=view.trigger.interval_seconds,
-                    timezone=view.trigger.timezone,
-                ),
-                paused=view.paused,
-                next_run_times=view.next_run_times,
-                map_name=view.map_name,
-                task_template_id=view.task_template_id,
-                task_template_name=view.task_template_name,
-                # `steps` left at its default here — see the field's description.
-            )
-            for view in views
-        ]
-
-    @schedule_router.get(
-        "/api/v1/schedules/{id}",
-        response_model=ScheduleStateResponse,
-        # Load-bearing: BaseSchema's to_camel aliases would otherwise answer
-        # multi-word Step fields in camelCase; the frontend is snake_case-only.
-        response_model_by_alias=False,
-    )
-    async def get_schedule(id: str):
-        view = await workflow_gw.get_schedule(schedule_id=id)
-
+    def _state_response(
+        view: ScheduleView, steps: Optional[List[StepRequest]] = None
+    ) -> ScheduleStateResponse:
+        # `steps` None on the list path: see the field's description.
         return ScheduleStateResponse(
             id=view.id,
             trigger=ScheduleTriggerResponse(
@@ -174,6 +135,27 @@ def init_schedule_router(
             map_name=view.map_name,
             task_template_id=view.task_template_id,
             task_template_name=view.task_template_name,
+            steps=steps or [],
+        )
+
+    @schedule_router.get(
+        "/api/v1/schedules", response_model=List[ScheduleStateResponse]
+    )
+    async def list_schedules():
+        return [_state_response(view) for view in await workflow_gw.list_schedules()]
+
+    @schedule_router.get(
+        "/api/v1/schedules/{id}",
+        response_model=ScheduleStateResponse,
+        # Load-bearing: BaseSchema's to_camel aliases would otherwise answer
+        # multi-word Step fields in camelCase; the frontend is snake_case-only.
+        response_model_by_alias=False,
+    )
+    async def get_schedule(id: str):
+        view = await workflow_gw.get_schedule(schedule_id=id)
+
+        return _state_response(
+            view,
             steps=[
                 StepRequest(
                     id=step.id, type=step.type, params=step.params, group=step.group
@@ -191,11 +173,7 @@ def init_schedule_router(
         """
         await workflow_gw.update_schedule_trigger(
             schedule_id=id,
-            trigger=ScheduleTrigger(
-                cron=req.trigger.cron,
-                interval_seconds=req.trigger.interval_seconds,
-                timezone=req.trigger.timezone,
-            ),
+            trigger=req.trigger.to_trigger(),
         )
 
         return ScheduleResponse(

@@ -6,7 +6,6 @@ import rclpy
 import structlog
 
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from nav_msgs.msg import Odometry
 
@@ -15,6 +14,7 @@ from tf2_ros.buffer import Buffer
 
 from syncai_common.msg import MotorStates
 
+from syncai_backend.subscribers import qos
 from syncai_backend.helpers.pointcloud import quat_to_rotation_matrix
 from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 
@@ -96,16 +96,11 @@ class TelemetrySubscriber:
     def register(self, node: Node):
         # Best-effort keep-last: only the newest sample matters. Matches odom
         # (reliable) and motor_states (SensorDataQoS, best-effort, must match).
-        qos = QoSProfile(
-            depth=5,
-            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
-            durability=rclpy.qos.DurabilityPolicy.VOLATILE,
-            history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-        )
+        profile = qos.best_effort(depth=5)
 
         # Relative topic names, so both inherit the robot_id namespace.
         node.create_subscription(
-            msg_type=Odometry, topic="odom", callback=self._odom_cb, qos_profile=qos
+            msg_type=Odometry, topic="odom", callback=self._odom_cb, qos_profile=profile
         )
         # The mapping-mode pose feed, subscribed unconditionally: an unpublished
         # topic costs nothing.
@@ -113,13 +108,13 @@ class TelemetrySubscriber:
             msg_type=Odometry,
             topic="pointlio/lio_odom",
             callback=self._lio_odom_cb,
-            qos_profile=qos,
+            qos_profile=profile,
         )
         node.create_subscription(
             msg_type=MotorStates,
             topic="motor_states",
             callback=self._motor_states_cb,
-            qos_profile=qos,
+            qos_profile=profile,
         )
 
     def _odom_cb(self, msg: Odometry):

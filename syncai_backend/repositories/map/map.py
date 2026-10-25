@@ -7,9 +7,10 @@ from typing import Optional, TypedDict
 
 from sqlalchemy import Engine, delete, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from syncai_backend.database.models import MapPoint, _utcnow
+from syncai_backend.database.session import logged_session, session_factory
 from syncai_backend.exceptions import ConflictError
 
 
@@ -35,25 +36,13 @@ class MapRepo:
     ):
         self.logger = logger
 
-        # Register database session factory (per-repo session convention).
-        self.session_maker = sessionmaker(
-            autocommit=False,
-            autoflush=False,
-            expire_on_commit=False,
-            bind=engine,
-        )
+        self.session_maker = session_factory(engine)
 
-    @contextmanager
-    def _session(self, op: str) -> Generator[Session, None, None]:
-        with self.session_maker() as session:
-            try:
-                yield session
-            except ConflictError:
-                # A domain outcome (duplicate name), not a DB fault: no traceback.
-                raise
-            except Exception:
-                self.logger.error(f"[MapRepo][{op}] database operation failed", exc_info=True)
-                raise
+    def _session(self, op: str):
+        # ConflictError is a domain outcome (a duplicate name), not a DB fault.
+        return logged_session(
+            self.session_maker, self.logger, f"[MapRepo][{op}]", quiet=(ConflictError,)
+        )
 
     @contextmanager
     def transaction(self, op: str) -> Generator[Session, None, None]:

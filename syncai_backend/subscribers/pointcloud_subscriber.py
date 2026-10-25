@@ -5,7 +5,6 @@ import yaml
 
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
@@ -13,6 +12,7 @@ from sensor_msgs_py import point_cloud2
 from tf2_ros import LookupException, TransformException
 from tf2_ros.buffer import Buffer
 
+from syncai_backend.subscribers import qos
 from syncai_backend.repositories.pointcloud.pointcloud import PointCloudRepo
 from syncai_backend.helpers.pointcloud import (
     cap_points,
@@ -96,12 +96,7 @@ class PointCloudSubscriber:
             msg_type=PointCloud2,
             topic="pointlio/body_cloud",
             callback=self._cloud_cb,
-            qos_profile=QoSProfile(
-                depth=5,
-                reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
-                durability=rclpy.qos.DurabilityPolicy.VOLATILE,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.best_effort(depth=5),
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
 

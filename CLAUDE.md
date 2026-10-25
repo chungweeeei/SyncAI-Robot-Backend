@@ -167,7 +167,8 @@ gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), 
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
         │                  mapping — pgo's latched run state, aged out after 5 s),
         │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
-database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate)
+database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate); session.py
+                           is the one session factory + log-and-reraise every repo uses
 
 tasks/                     the task model and its Temporal contract (schema: Step, groups,
                            TaskState; config: queues, signals, the Temporal address;
@@ -175,12 +176,15 @@ tasks/                     the task model and its Temporal contract (schema: Ste
                            temporal/ alike and importing none of them
 
 subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
-                           names the PCD, which the subscriber reads from the shared /dev/shm)
+                           names the PCD, which the subscriber reads from the shared /dev/shm);
+                           qos.py names the two subscription shapes (latched, best_effort)
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), keepout
                            (forbidden-zone mask rasteriser), traversable, system_config,
                            map_archive (checksummed zip / tar.gz of a map dir),
-                           move_guard (a run's TaskMap against the loaded map)
+                           move_guard (a run's TaskMap against the loaded map),
+                           disk (a tree's bytes + newest mtime, for both catalogues and the
+                           recording gateway), single_flight (join a slow read in progress)
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/

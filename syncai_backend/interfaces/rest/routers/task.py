@@ -3,7 +3,7 @@ import binascii
 import structlog
 from datetime import datetime, timezone
 from typing import List, Optional, Protocol
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
@@ -304,6 +304,58 @@ def _check_window(since: Optional[datetime], until: Optional[datetime]) -> None:
         raise BadRequestError("until must not be before since")
 
 
+class _HistoryFilter:
+    """The filters GET /task_history and /task_history/stats share, as one
+    dependency: declared once, so the two cannot drift, and checked once.
+
+    A class dependency, so OpenAPI still lists the five query parameters.
+    Naive datetimes become UTC and an inverted window is the 400 sentence
+    (raised from here, it goes through the same exception handlers).
+    """
+
+    def __init__(
+        self,
+        status: Optional[TaskHistoryStatus] = Query(
+            None, description="Only runs that finished with this status"
+        ),
+        since: Optional[datetime] = Query(
+            None,
+            description="Only runs that closed at or after this time; naive is UTC",
+        ),
+        until: Optional[datetime] = Query(
+            None,
+            description="Only runs that closed at or before this time; naive is UTC",
+        ),
+        kind: Optional[TaskKind] = Query(
+            None,
+            description="Only runs started this way: goal / standup / liedown / task / schedule",
+        ),
+        name: Optional[str] = Query(
+            None,
+            min_length=1,
+            max_length=255,
+            description="Only runs dispatched from the task template with this exact name",
+        ),
+    ):
+        since, until = _utc(since), _utc(until)
+        _check_window(since, until)
+        self.status = status.value if status is not None else None
+        self.since = since
+        self.until = until
+        self.kind = kind
+        self.name = name
+
+    def as_kwargs(self) -> dict:
+        """What the gateway's history verbs take."""
+        return {
+            "status": self.status,
+            "since": self.since,
+            "until": self.until,
+            "kind": self.kind,
+            "name": self.name,
+        }
+
+
 # Temporal's page token is opaque bytes; the REST surface carries it as
 # unpadded base64url so it survives a query string untouched.
 def _encode_page_token(token: Optional[bytes]) -> Optional[str]:
@@ -356,15 +408,7 @@ def init_task_router(
         workflow_task = WorkflowTask(
             id=req.id,
             definition=WorkflowTaskDefinition(
-                steps=[
-                    Step(
-                        id=step.id,
-                        type=step.type,
-                        params=step.params,
-                        group=step.group,
-                    )
-                    for step in req.steps
-                ],
+                steps=[step.to_step() for step in req.steps],
             ),
         )
 
@@ -424,39 +468,12 @@ def init_task_router(
         page_token: Optional[str] = Query(
             None, description="next_page_token from the previous page"
         ),
-        status: Optional[TaskHistoryStatus] = Query(
-            None, description="Only runs that finished with this status"
-        ),
-        since: Optional[datetime] = Query(
-            None,
-            description="Only runs that closed at or after this time; naive is UTC",
-        ),
-        until: Optional[datetime] = Query(
-            None,
-            description="Only runs that closed at or before this time; naive is UTC",
-        ),
-        kind: Optional[TaskKind] = Query(
-            None,
-            description="Only runs started this way: goal / standup / liedown / task / schedule",
-        ),
-        name: Optional[str] = Query(
-            None,
-            min_length=1,
-            max_length=255,
-            description="Only runs dispatched from the task template with this exact name",
-        ),
+        filters: _HistoryFilter = Depends(),
     ):
-        since, until = _utc(since), _utc(until)
-        _check_window(since, until)
-
         entries, next_token = await workflow_gw.list_task_history(
             page_size=page_size,
             next_page_token=_decode_page_token(page_token),
-            status=status.value if status is not None else None,
-            since=since,
-            until=until,
-            kind=kind,
-            name=name,
+            **filters.as_kwargs(),
         )
 
         return TaskHistoryResponse(
@@ -482,39 +499,8 @@ def init_task_router(
     @task_router.get(
         "/api/v1/task_history/stats", response_model=TaskHistoryStatsResponse
     )
-    async def task_history_stats(
-        status: Optional[TaskHistoryStatus] = Query(
-            None, description="Only runs that finished with this status"
-        ),
-        since: Optional[datetime] = Query(
-            None,
-            description="Only runs that closed at or after this time; naive is UTC",
-        ),
-        until: Optional[datetime] = Query(
-            None,
-            description="Only runs that closed at or before this time; naive is UTC",
-        ),
-        kind: Optional[TaskKind] = Query(
-            None,
-            description="Only runs started this way: goal / standup / liedown / task / schedule",
-        ),
-        name: Optional[str] = Query(
-            None,
-            min_length=1,
-            max_length=255,
-            description="Only runs dispatched from the task template with this exact name",
-        ),
-    ):
-        since, until = _utc(since), _utc(until)
-        _check_window(since, until)
-
-        stats = await workflow_gw.task_history_stats(
-            status=status.value if status is not None else None,
-            since=since,
-            until=until,
-            kind=kind,
-            name=name,
-        )
+    async def task_history_stats(filters: _HistoryFilter = Depends()):
+        stats = await workflow_gw.task_history_stats(**filters.as_kwargs())
 
         return TaskHistoryStatsResponse(
             as_of=stats.as_of,

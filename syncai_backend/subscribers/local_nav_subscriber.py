@@ -6,7 +6,6 @@ import structlog
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from nav2_msgs.msg import Costmap
 from nav_msgs.msg import Path
@@ -14,6 +13,7 @@ from nav_msgs.msg import Path
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 
+from syncai_backend.subscribers import qos
 from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 
 
@@ -83,12 +83,7 @@ class LocalNavSubscriber:
             msg_type=Costmap,
             topic="local_costmap/costmap/raw",  # relative: the robot_id namespace
             callback=self._costmap_cb,
-            qos_profile=QoSProfile(
-                depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.latched(),
         )
         # BEST_EFFORT against MPPI's RELIABLE depth-1 publisher: only the
         # newest trajectory is worth drawing.
@@ -96,12 +91,7 @@ class LocalNavSubscriber:
             msg_type=Path,
             topic="local_plan",
             callback=self._local_plan_cb,
-            qos_profile=QoSProfile(
-                depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
-                durability=rclpy.qos.DurabilityPolicy.VOLATILE,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.best_effort(depth=1),
         )
 
     def _map_from(self, frame: str) -> Optional[Tuple[float, float, float]]:

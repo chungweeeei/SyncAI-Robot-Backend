@@ -10,12 +10,11 @@ unknown code is a warning that leaves the slot as it was.
 """
 
 import structlog
-import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from syncai_common.msg import MappingStatus as MappingStatusMsg
 
+from syncai_backend.subscribers import qos
 from syncai_backend.repositories.mapping.mapping import (
     MappingState,
     MappingStatusRepo,
@@ -41,12 +40,7 @@ class MappingStatusSubscriber:
             msg_type=MappingStatusMsg,
             topic="pgo/mapping_status",
             callback=self._status_cb,
-            qos_profile=QoSProfile(
-                depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.latched(),
         )
 
     def _status_cb(self, msg: MappingStatusMsg):

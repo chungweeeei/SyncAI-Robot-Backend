@@ -1,14 +1,13 @@
 import uuid
 import structlog
 
-from collections.abc import Generator
-from contextlib import contextmanager
 from typing import Any, Optional
 
 from sqlalchemy import Engine, or_, select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from syncai_backend.database.models import TaskTemplate, _utcnow
+from syncai_backend.database.session import logged_session, session_factory
 
 
 class TaskTemplateRepo:
@@ -19,28 +18,11 @@ class TaskTemplateRepo:
     ):
         self.logger = logger
 
-        # Register database session factory (per-repo session convention).
-        self.session_maker = sessionmaker(
-            autocommit=False,
-            autoflush=False,
-            expire_on_commit=False,
-            bind=engine,
-        )
+        self.session_maker = session_factory(engine)
 
-    @contextmanager
-    def _session(self, op: str) -> Generator[Session, None, None]:
-        """A session for one repo operation, naming ``op`` if it fails.
-
-        Log-and-reraise: the SQLAlchemy error carries the failed statement.
-        """
-        with self.session_maker() as session:
-            try:
-                yield session
-            except Exception:
-                self.logger.error(
-                    f"[TaskTemplateRepo][{op}] database operation failed", exc_info=True
-                )
-                raise
+    def _session(self, op: str):
+        """A session for one repo operation, naming ``op`` if it fails."""
+        return logged_session(self.session_maker, self.logger, f"[TaskTemplateRepo][{op}]")
 
     def create_task_template(
         self,
