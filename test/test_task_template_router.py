@@ -54,6 +54,7 @@ def client(logger, task_template_repo, map_repo, catalog_repo, workflow_gw, tmp_
     ini = tmp_path / "system.ini"
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: full\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
 
     app = FastAPI()
     register_exception_handlers(app)

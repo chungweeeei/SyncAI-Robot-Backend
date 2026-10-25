@@ -277,6 +277,7 @@ def client(
     ini = tmp_path / "system.ini"
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: full\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
 
     map_usage = MapUsagePolicy(
         map_catalog_repo=catalog_repo,
@@ -3073,7 +3074,7 @@ def test_convert_endpoint_reloads_the_active_map(
 
 
 def test_convert_endpoint_does_not_reload_a_map_switched_away_from(
-    client, map_gw, tmp_path, monkeypatch
+    client, catalog_repo, map_gw, monkeypatch
 ):
     """'full' is active when the convert is requested; the robot switches to
     'rawonly' while the conversion (which can wait on a clean and run for
@@ -3093,10 +3094,8 @@ def test_convert_endpoint_does_not_reload_a_map_switched_away_from(
     assert response.status_code == 200
     assert len(deferred) == 1
 
-    # The switch, as the fixture's INI sees it (what active_name reads).
-    (tmp_path / "system.ini").write_text(
-        "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n"
-    )
+    # The switch's own record of it (the INI and the catalogue's cache).
+    catalog_repo.set_active("rawonly")
     real_thread.start(deferred[0])
     deferred[0].join(10.0)
     assert not deferred[0].is_alive()
@@ -3328,9 +3327,9 @@ def test_convert_endpoint_passes_debug_and_overrides_through(
 #
 # The fixture INI pins `full` active, and `full` is the only fixture map with a
 # gridmap, so most switch tests point the INI at `rawonly` first and switch *to*
-# `full`. Writing the file rather than re-parameterising the fixture is
-# deliberate: `active_map_name` re-reads the INI on every call, which is the
-# property the route depends on and therefore one worth exercising.
+# `full`. Each test writes a real INI and reloads the catalogue from it (the
+# robot booting on that file), since the switch rewrites that file in place and
+# the tests read back what it wrote.
 
 _INTERPOLATED_INI = (
     "[system]\nrobot_id: robot01\n\n"
@@ -3344,10 +3343,16 @@ _INTERPOLATED_INI = (
 )
 
 
-def _point_ini_at(monkeypatch, tmp_path, text):
+def _ini_naming(name):
+    return f"[system]\nrobot_id: robot01\n\n[map]\nname: {name}\n"
+
+
+def _point_ini_at(catalog_repo, monkeypatch, tmp_path, text):
     ini = tmp_path / "system.ini"
     ini.write_text(text)
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    # The repo read its INI when it was built; this is the robot booting on it.
+    catalog_repo.load_active()
     return ini
 
 
@@ -3416,8 +3421,10 @@ def test_activate_unknown_map_is_a_404(client, map_gw):
     assert map_gw.order == []
 
 
-def test_activate_refuses_a_map_with_no_gridmap(client, map_gw, monkeypatch, tmp_path):
-    _point_ini_at(monkeypatch, tmp_path, "[system]\nrobot_id: robot01\n\n[map]\nname: full\n")
+def test_activate_refuses_a_map_with_no_gridmap(
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
+):
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("full"))
 
     response = _activate(client, "rawonly")
 
@@ -3442,9 +3449,9 @@ def test_activate_refuses_a_map_with_no_pointcloud(
 
 
 def test_activate_refuses_while_a_conversion_runs(
-    client, conversion_svc, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, conversion_svc, map_gw, monkeypatch, tmp_path
 ):
-    _point_ini_at(monkeypatch, tmp_path, "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("rawonly"))
 
     _mark_converting(conversion_svc, "full")
 
@@ -3456,9 +3463,9 @@ def test_activate_refuses_while_a_conversion_runs(
 
 
 def test_activate_refuses_while_a_task_is_running(
-    client, map_gw, workflow_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, workflow_gw, monkeypatch, tmp_path
 ):
-    _point_ini_at(monkeypatch, tmp_path, "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("rawonly"))
     workflow_gw.tasks = [types.SimpleNamespace(id="task-7")]
 
     response = _activate(client, "full")
@@ -3470,10 +3477,10 @@ def test_activate_refuses_while_a_task_is_running(
 
 
 def test_activate_refuses_when_temporal_cannot_be_reached(
-    client, map_gw, workflow_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, workflow_gw, monkeypatch, tmp_path
 ):
     """A Temporal outage must not be read as "nothing is running"."""
-    _point_ini_at(monkeypatch, tmp_path, "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("rawonly"))
     workflow_gw.error = RuntimeError("connection refused")
 
     response = _activate(client, "full")
@@ -3565,10 +3572,10 @@ def test_a_map_that_is_not_loaded_is_edited_without_asking(
 
 
 def test_activate_refuses_when_the_nav_stack_is_not_up(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
     """How "the robot is in mapping mode" is detected."""
-    _point_ini_at(monkeypatch, tmp_path, "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("rawonly"))
     map_gw.services_ready = False
 
     response = _activate(client, "full")
@@ -3579,9 +3586,9 @@ def test_activate_refuses_when_the_nav_stack_is_not_up(
 
 
 def test_activate_moves_the_localizer_before_map_server(
-    client, map_gw, maps_dir, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, maps_dir, monkeypatch, tmp_path
 ):
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
 
     response = _activate(client, "full")
 
@@ -3591,6 +3598,8 @@ def test_activate_moves_the_localizer_before_map_server(
     assert body["name"] == "full"
     assert body["previous"] == "rawonly"
     assert body["localized"] is True
+    # Everything that asks which map is loaded now hears the new one.
+    assert catalog_repo.active_name() == "full"
 
     # The ordering is the contract: the localizer's failure is the clean one, so
     # it goes first.
@@ -3618,9 +3627,9 @@ def test_activate_moves_the_localizer_before_map_server(
 
 
 def test_activate_puts_the_localizer_back_when_map_server_refuses(
-    client, map_gw, maps_dir, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, maps_dir, monkeypatch, tmp_path
 ):
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.result = (False, "map_server rejected gridmap.yaml")
 
     response = _activate(client, "full")
@@ -3637,7 +3646,7 @@ def test_activate_puts_the_localizer_back_when_map_server_refuses(
 
 
 def test_activate_rolls_back_both_steps_when_the_ini_cannot_be_written(
-    client, map_gw, maps_dir, make_pcd, make_pgm, make_gridmap_yaml,
+    catalog_repo, client, map_gw, maps_dir, make_pcd, make_pgm, make_gridmap_yaml,
     monkeypatch, tmp_path,
 ):
     """The INI write is preflighted, so reaching it and failing must undo the rest.
@@ -3653,13 +3662,18 @@ def test_activate_rolls_back_both_steps_when_the_ini_cannot_be_written(
     make_pgm(prior / "gridmap.pgm", 6, 4)
     make_gridmap_yaml(prior / "gridmap.yaml", origin=(0.0, 0.0, 0.0))
     _point_ini_at(
-        monkeypatch, tmp_path, _INTERPOLATED_INI.replace("name: rawonly", "name: prior")
+        catalog_repo,
+        monkeypatch,
+        tmp_path,
+        _INTERPOLATED_INI.replace("name: rawonly", "name: prior"),
     )
 
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
+    monkeypatch.setattr(
+        "syncai_backend.repositories.map.catalog.set_active_map", _boom
+    )
 
     response = _activate(client, "full")
 
@@ -3672,18 +3686,22 @@ def test_activate_rolls_back_both_steps_when_the_ini_cannot_be_written(
     ]
     assert map_gw.order[2][1] == str(prior / "map.pcd")
     assert map_gw.order[3][1] == str(prior / "gridmap.yaml")
+    # Nothing was recorded, so the loaded map is still the one the INI names.
+    assert catalog_repo.active_name() == "prior"
 
 
 def test_activate_says_so_when_the_old_grid_cannot_be_restored(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
     """Rolling back onto a map with no gridmap.yaml leaves a mismatch worth naming."""
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
 
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
+    monkeypatch.setattr(
+        "syncai_backend.repositories.map.catalog.set_active_map", _boom
+    )
 
     response = _activate(client, "full")
 
@@ -3699,9 +3717,9 @@ def test_activate_says_so_when_the_old_grid_cannot_be_restored(
 
 
 def test_activate_refuses_when_the_ini_is_not_writable(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     os.chmod(ini, 0o444)
     try:
         response = _activate(client, "full")
@@ -3714,10 +3732,10 @@ def test_activate_refuses_when_the_ini_is_not_writable(
 
 
 def test_activate_reports_an_unconverged_localizer(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
     """A swap that lands but does not converge is a success with a warning."""
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.converged = False
 
     body = _activate(client, "full").json()
@@ -3728,9 +3746,9 @@ def test_activate_reports_an_unconverged_localizer(
 
 
 def test_activate_reports_an_unreachable_localizer_check(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.converged = None
 
     body = _activate(client, "full").json()
@@ -3741,10 +3759,10 @@ def test_activate_reports_an_unreachable_localizer_check(
 
 
 def test_activate_writes_a_blank_mask_for_a_map_never_booted_into(
-    client, map_gw, maps_dir, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, maps_dir, monkeypatch, tmp_path
 ):
     """filter_mask_server holds the old map's zones until it is handed this one's."""
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     assert not (maps_dir / "full" / "keepout.yaml").exists()
 
     body = _activate(client, "full").json()
@@ -3760,9 +3778,9 @@ def test_activate_writes_a_blank_mask_for_a_map_never_booted_into(
 
 
 def test_activate_carries_zones_drawn_while_the_map_was_inactive(
-    client, map_gw, maps_dir, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, maps_dir, monkeypatch, tmp_path
 ):
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     _put_keepout(client, "full", [_rect_zone("a"), _rect_zone("b", cols=(5, 5), rows=(3, 3))])
     map_gw.keepout_calls.clear()
     written = (maps_dir / "full" / "keepout.pgm").read_bytes()
@@ -3777,9 +3795,9 @@ def test_activate_carries_zones_drawn_while_the_map_was_inactive(
 
 
 def test_activate_reports_a_failed_keepout_reload_without_failing_the_switch(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.keepout_result = (False, "filter_mask_server rejected keepout.yaml")
 
     response = _activate(client, "full")
@@ -3794,15 +3812,17 @@ def test_activate_reports_a_failed_keepout_reload_without_failing_the_switch(
 
 
 def test_activate_reloads_the_keepout_only_after_the_ini_is_written(
-    client, map_gw, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
 ):
     """A rolled-back switch must not hand the mask server the map it backed out of."""
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
 
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
+    monkeypatch.setattr(
+        "syncai_backend.repositories.map.catalog.set_active_map", _boom
+    )
 
     assert _activate(client, "full").status_code == 502
     assert map_gw.keepout_calls == []
@@ -3947,9 +3967,9 @@ def three_d(maps_dir, make_pcd, make_bt):
 
 
 def test_activate_loads_a_3d_map_into_the_3d_planner(
-    client, map_gw, three_d, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, three_d, monkeypatch, tmp_path
 ):
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.planner_3d = True
 
     response = _activate(client, "three")
@@ -3968,9 +3988,9 @@ def test_activate_loads_a_3d_map_into_the_3d_planner(
 
 
 def test_activate_refuses_a_3d_map_on_a_stack_without_the_3d_planner(
-    client, map_gw, three_d, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, three_d, monkeypatch, tmp_path
 ):
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
 
     response = _activate(client, "three")
 
@@ -3981,10 +4001,10 @@ def test_activate_refuses_a_3d_map_on_a_stack_without_the_3d_planner(
 
 
 def test_activate_unloads_the_3d_planner_for_a_2d_map(
-    client, map_gw, maps_dir, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, maps_dir, monkeypatch, tmp_path
 ):
     """The other half: a 3D map left loaded keeps the robot on its 3D trees."""
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.planner_3d = True
 
     body = _activate(client, "full").json()
@@ -4001,11 +4021,11 @@ def test_activate_unloads_the_3d_planner_for_a_2d_map(
 
 
 def test_activate_rolls_back_when_the_3d_planner_will_not_load(
-    client, map_gw, maps_dir, three_d, make_bt, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, maps_dir, three_d, make_bt, monkeypatch, tmp_path
 ):
     """Octo3D drops its map before building, so a failed load must put the old one back."""
     make_bt(maps_dir / "rawonly" / "octomap.bt")
-    ini = _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.planner_3d = True
     map_gw.octomap_results = [(False, "the 3D planner could not read octomap.bt")]
 
@@ -4026,15 +4046,17 @@ def test_activate_rolls_back_when_the_3d_planner_will_not_load(
 
 
 def test_activate_rolls_the_3d_planner_back_to_none_for_a_previous_2d_map(
-    client, map_gw, three_d, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, three_d, monkeypatch, tmp_path
 ):
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.planner_3d = True
 
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
+    monkeypatch.setattr(
+        "syncai_backend.repositories.map.catalog.set_active_map", _boom
+    )
 
     response = _activate(client, "three")
 
@@ -4050,9 +4072,9 @@ def test_activate_rolls_the_3d_planner_back_to_none_for_a_previous_2d_map(
 
 
 def test_activate_says_so_when_the_3d_planner_cannot_be_put_back(
-    client, map_gw, three_d, monkeypatch, tmp_path
+    catalog_repo, client, map_gw, three_d, monkeypatch, tmp_path
 ):
-    _point_ini_at(monkeypatch, tmp_path, _INTERPOLATED_INI)
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
     map_gw.planner_3d = True
     map_gw.octomap_results = [
         (False, "the 3D planner could not read octomap.bt"),

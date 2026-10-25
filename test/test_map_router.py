@@ -362,12 +362,13 @@ def test_vertex_under_an_unknown_map_returns_404(client):
 
 
 @pytest.fixture
-def loaded(tmp_path, monkeypatch):
+def loaded(catalog_repo, tmp_path, monkeypatch):
     """Make _MAP the loaded map. Without it no map is loaded, so nothing is
     held and the tests above never ask the task service anything."""
     ini = tmp_path / "system.ini"
     ini.write_text(f"[system]\nrobot_id: robot01\n\n[map]\nname: {_MAP}\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
 
 
 def _job(map_name):

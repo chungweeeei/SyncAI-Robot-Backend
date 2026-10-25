@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -17,7 +18,7 @@ from syncai_backend.helpers.disk import walk_stats
 from syncai_backend.helpers.floors import read_pose_heights
 from syncai_backend.helpers.keepout import keepout_yaml_text, rasterize_zones
 from syncai_backend.helpers.pgm import read_pgm_size, write_pgm, write_text_atomic
-from syncai_backend.helpers.system_config import active_map_name
+from syncai_backend.helpers.system_config import active_map_name, set_active_map
 
 
 # Deliberately strict: the only thing between a URL path segment (or a rename
@@ -306,6 +307,13 @@ class MapCatalogRepo:
         # Logged: the path is not configurable, so an unexpected HOME is
         # otherwise invisible.
         self.logger.info("[MapCatalogRepo] Serving maps", path=self.maps_dir)
+
+        # The loaded map, read from the INI once here (at startup, off any
+        # event loop) and then kept by set_active; see active_name.
+        self._active_lock = threading.Lock()
+        self._active: Optional[str] = None
+        self.load_active()
+        self.logger.info("[MapCatalogRepo] Active map", map=self._active)
 
     # --- Paths --------------------------------------------------------------
 
@@ -638,7 +646,39 @@ class MapCatalogRepo:
         return os.path.isdir(self.resolve_dir(name))
 
     def active_name(self) -> Optional[str]:
-        return active_map_name(self.logger)
+        """The loaded map: the INI's ``[map] name`` as read at startup, then
+        as ``set_active`` last wrote it. No disk read.
+
+        Every dispatch, every map-lock check and every MOVE goal asks, several
+        of them on the event loop; the INI has one writer and it is
+        ``set_active``, in this process. An INI edited by hand is seen at the
+        next restart (README *Gotchas*: configuration is read once).
+        """
+        return self._active
+
+    def load_active(self) -> Optional[str]:
+        """Read the active map from the INI into the cache; return it.
+
+        The constructor's read. Tests call it again after pointing
+        ``SYNCAI_SYSTEM_INI`` at their own INI; nothing in production does.
+        """
+        with self._active_lock:
+            self._active = active_map_name(self.logger)
+            return self._active
+
+    def set_active(self, name: str) -> str:
+        """Record ``name`` as the loaded map: the INI first, then the cache.
+        Returns the INI's path.
+
+        Raises what ``set_active_map`` raises (OSError, ValueError) with the
+        cache untouched, so a failed write never leaves this process naming a
+        map the next boot will not load. The lock keeps the cache in the
+        order the writes happened.
+        """
+        with self._active_lock:
+            path = set_active_map(name, self.logger)
+            self._active = name
+            return path
 
     # --- Writing ------------------------------------------------------------
 
