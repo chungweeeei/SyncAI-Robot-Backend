@@ -61,7 +61,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_usage = ctx.map_usage
     map_import_svc = ctx.map_import_svc
     renders = ctx.renders
-    _require = ctx.require
+    _require_exists = ctx.require_exists
 
     @map_router.get("/api/v1/maps/{name}/export")
     def export_map(name: str, format: ArchiveFormat = ArchiveFormat.ZIP):
@@ -72,7 +72,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         in ``helpers/map_archive``. 409 ``conversion_running``, since the grid
         is about to be replaced. Exporting the active map is fine.
         """
-        _require(name)
+        _require_exists(name)
         map_usage.refuse_while_converting(
             name, "export it once the conversion has finished."
         )

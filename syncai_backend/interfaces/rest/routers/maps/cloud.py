@@ -30,7 +30,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     logger = ctx.logger
     map_catalog_repo = ctx.map_catalog_repo
     renders = ctx.renders
-    _require = ctx.require
+    _require_exists = ctx.require_exists
 
     @map_router.get("/api/v1/maps/{name}/pointcloud")
     def get_map_pointcloud_by_name(name: str):
@@ -42,7 +42,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Cached on (size, mtime), not a content hash: map.pcd is only ever
         replaced wholesale, never edited in place.
         """
-        _require(name)
+        _require_exists(name)
         path = map_catalog_repo.pointcloud_path(name)
         if path is None:
             raise NotFoundError(f"Map '{name}' has no map.pcd.")

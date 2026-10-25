@@ -618,10 +618,24 @@ class MapCatalogRepo:
         return maps
 
     def get_map(self, name: str) -> Optional[StoredMap]:
+        """Everything the console shows about map ``name``, or None.
+
+        Not cheap: ``_read`` walks every file under the map (``walk_stats``;
+        ``patches/`` alone holds hundreds) and opens its sidecars. A caller
+        that only needs to know the map is there wants ``exists``.
+        """
         path = self.resolve_dir(name)
         if not os.path.isdir(path):
             return None
         return self._read(name, path)
+
+    def exists(self, name: str) -> bool:
+        """Whether map ``name`` is on this robot: one ``isdir``.
+
+        ``get_map(name) is not None`` without reading the map. Same refusals:
+        an invalid or staging name is ``resolve_dir``'s BadRequestError.
+        """
+        return os.path.isdir(self.resolve_dir(name))
 
     def active_name(self) -> Optional[str]:
         return active_map_name(self.logger)

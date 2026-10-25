@@ -40,6 +40,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_usage = ctx.map_usage
     renders = ctx.renders
     _require = ctx.require
+    _require_exists = ctx.require_exists
     job_lock = ctx.job_lock
 
     @map_router.post(
@@ -211,7 +212,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
 
         Never served raw: /image's lossless PNG is the grid's wire format.
         """
-        _require(name)
+        _require_exists(name)
         path = map_catalog_repo.gridmap_path(name)
         if path is None:
             raise _no_gridmap(name)

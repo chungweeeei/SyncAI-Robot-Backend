@@ -552,6 +552,42 @@ def test_list_counts_every_map_in_one_query(client, map_repo, monkeypatch):
 # --- /api/v1/maps/{name} ----------------------------------------------------
 
 
+@pytest.mark.parametrize("method, path", [
+    ("GET", "/api/v1/maps/full/vertices"),
+    ("GET", "/api/v1/maps/full/image"),
+    ("GET", "/api/v1/maps/full/thumbnail"),
+    ("GET", "/api/v1/maps/full/keepout"),
+    ("GET", "/api/v1/maps/full/pointcloud"),
+    ("GET", "/api/v1/maps/full/floors"),
+    ("GET", "/api/v1/maps/full/export"),
+])
+def test_a_route_that_only_needs_the_map_to_exist_does_not_read_it_whole(
+    client, catalog_repo, monkeypatch, method, path
+):
+    """get_map walks every file of the map (hundreds under patches/) and opens
+    its sidecars; these routes only refused an unknown name with it, then read
+    what they needed themselves -- an image 304 paid that walk on every poll."""
+    monkeypatch.setattr(
+        catalog_repo, "get_map", lambda name: pytest.fail(f"{path} read the whole map")
+    )
+
+    response = client.request(method, path)
+
+    assert response.status_code < 500, response.text
+
+
+@pytest.mark.parametrize("path", [
+    "/api/v1/maps/nosuchmap/vertices",
+    "/api/v1/maps/nosuchmap/image",
+    "/api/v1/maps/nosuchmap/export",
+])
+def test_an_unknown_map_is_still_the_same_404(client, path):
+    response = client.get(path)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No map named 'nosuchmap' on this robot."
+
+
 def test_get_returns_one_summary(client):
     response = client.get("/api/v1/maps/full")
 

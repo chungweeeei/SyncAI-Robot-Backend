@@ -103,7 +103,8 @@ class MapImportService:
 
         target = name if name is not None else manifest.name
         self._catalog.resolve_dir(target)
-        replacing = self._catalog.get_map(target) is not None
+        # exists, not get_map: a yes/no, and get_map walks the whole map.
+        replacing = self._catalog.exists(target)
         if replacing:
             self._map_usage.refuse_destroy(
                 target,

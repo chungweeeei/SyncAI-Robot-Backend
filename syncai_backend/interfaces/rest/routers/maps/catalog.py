@@ -35,6 +35,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     _refuse_while_idle = ctx.refuse_while_idle
     renders = ctx.renders
     _require = ctx.require
+    _require_exists = ctx.require_exists
 
     def _vertex_count(name: str) -> int:
         # One map's count (GET /maps/{name}); the listing uses
@@ -130,7 +131,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         needs no compensation. Vertices and template bindings are re-keyed in
         one transaction; if it fails the directory is moved back.
         """
-        _require(name)
+        _require_exists(name)
         map_usage.refuse_if_active(name, "renamed")
         map_usage.refuse_while_converting(
             name, "rename it once the conversion has finished."
@@ -219,7 +220,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Registered schedules keep firing their frozen steps; the response says
         so.
         """
-        _require(name)
+        _require_exists(name)
         map_usage.refuse_destroy(
             name,
             verb="deleted",

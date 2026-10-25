@@ -34,7 +34,7 @@ FLOOR_MIN_SEPARATION_M = 1.0
 
 def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_catalog_repo = ctx.map_catalog_repo
-    _require = ctx.require
+    _require_exists = ctx.require_exists
 
     def _floor_models(floors: List[MapFloor]) -> List[MapFloorModel]:
         return [MapFloorModel(name=floor.name, level=floor.level) for floor in floors]
@@ -54,7 +54,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Detected on every read from poses.txt (a few thousand lines), so a
         map that has never been looked at needs no step to have floors.
         """
-        _require(name)
+        _require_exists(name)
         detected = _detected_floors(name)
         saved = map_catalog_repo.read_floors(name)
         return MapFloorsResponse(
@@ -100,7 +100,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Not held by a running job: the floors only decide what the console
         shows, and nothing on the robot reads them.
         """
-        _require(name)
+        _require_exists(name)
         floors = map_catalog_repo.write_floors(name, _validate_floors(request.floors))
         count = len(floors)
         message = (

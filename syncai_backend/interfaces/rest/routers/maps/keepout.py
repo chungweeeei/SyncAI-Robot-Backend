@@ -25,6 +25,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_gw = ctx.map_gw
     map_usage = ctx.map_usage
     _require = ctx.require
+    _require_exists = ctx.require_exists
     job_lock = ctx.job_lock
 
     @map_router.get("/api/v1/maps/{name}/keepout", response_model=KeepoutResponse)
@@ -34,7 +35,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Read from ``keepout.json`` (the source of truth), not the mask, so a
         mask with no json answers ``zones: []``.
         """
-        _require(name)
+        _require_exists(name)
         zones = map_catalog_repo.read_keepout_zones(name)
         return KeepoutResponse(
             name=name,
