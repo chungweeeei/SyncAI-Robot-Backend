@@ -10,6 +10,7 @@ status-code mapping is the real one. Repos are real, over a tmp_path maps tree a
 in-memory SQLite.
 """
 
+import asyncio
 import builtins
 import hashlib
 import io
@@ -3352,6 +3353,51 @@ def _point_ini_at(monkeypatch, tmp_path, text):
 
 def _activate(client, name):
     return client.post(f"/api/v1/maps/{name}/activate")
+
+
+def _off_the_loop(calls, label, real):
+    """Wrap ``real`` to record whether it ran on a thread with a running event
+    loop (the uvicorn loop, in production) or in a worker thread."""
+
+    def wrapper(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            calls.append((label, "ON THE EVENT LOOP"))
+        except RuntimeError:
+            calls.append((label, "worker thread"))
+        return real(*args, **kwargs)
+
+    return wrapper
+
+
+@pytest.mark.parametrize("name, expected_status", [("full", 200), ("nosuchmap", 404)])
+def test_activate_reads_the_map_and_the_ini_off_the_event_loop(
+    client, catalog_repo, monkeypatch, name, expected_status
+):
+    """activate_map is async (it awaits Temporal). Reading the map walks every
+    file under it and plan() reads the INI; on the loop, a slow eMMC froze
+    teleop and the telemetry streams for that long. 'full' is the active map
+    (the no-op answer), 'nosuchmap' the 404 raised from the worker thread."""
+    calls = []
+    monkeypatch.setattr(
+        catalog_repo, "get_map", _off_the_loop(calls, "get_map", catalog_repo.get_map)
+    )
+    monkeypatch.setattr(
+        catalog_repo,
+        "active_name",
+        _off_the_loop(calls, "active_name", catalog_repo.active_name),
+    )
+    monkeypatch.setattr(
+        map_switch_module.MapSwitchService,
+        "plan",
+        _off_the_loop(calls, "plan", map_switch_module.MapSwitchService.plan),
+    )
+
+    response = _activate(client, name)
+
+    assert response.status_code == expected_status, response.text
+    assert calls, "nothing was read"
+    assert all(where == "worker thread" for _, where in calls), calls
 
 
 def test_activate_the_active_map_is_a_noop(client, map_gw):
