@@ -54,10 +54,21 @@ class MapRouteContext:
         self.job_lock = [Depends(self.job_gate.refuse_while_a_job_holds)]
 
     def require(self, name: str) -> StoredMap:
+        """The map, read whole (see ``get_map``), or 404. For a route that
+        uses what it reads; one that only refuses an unknown name wants
+        ``require_exists``."""
         stored = self.map_catalog_repo.get_map(name)
         if stored is None:
             raise NotFoundError(f"No map named '{name}' on this robot.")
         return stored
+
+    def require_exists(self, name: str) -> None:
+        """404 for a map this robot does not have, and nothing else: one
+        ``isdir``. Was ``require`` everywhere, which walked every file of the
+        map (hundreds under ``patches/``) to answer a yes/no, before the route
+        read what it needed itself -- a 304 on an image paid that walk."""
+        if not self.map_catalog_repo.exists(name):
+            raise NotFoundError(f"No map named '{name}' on this robot.")
 
     # pgo's latched run state, or None if it has not reported. The run routes
     # turn pgo's refusals into a coded 409 instead of a 502. Check-then-act,

@@ -288,7 +288,7 @@ def init_task_template_router(
         """
         if map_name is None:
             return
-        if map_catalog_repo.get_map(map_name) is None:
+        if not map_catalog_repo.exists(map_name):
             raise BadRequestError(f"No map named '{map_name}' on this robot.")
 
     def _referenced_ids(

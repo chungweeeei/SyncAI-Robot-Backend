@@ -25,13 +25,13 @@ from syncai_backend.interfaces.rest.routers.maps.context import MapRouteContext
 
 def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_repo = ctx.map_repo
-    _require = ctx.require
+    _require_exists = ctx.require_exists
     job_lock = ctx.job_lock
 
     @map_router.get("/api/v1/maps/{name}/vertices", response_model=List[MapVertexResponse])
     def list_map_vertices(name: str, type: Optional[VertexType] = None):
         # _require first, so an unknown map is a 404 rather than [].
-        _require(name)
+        _require_exists(name)
         vertices = map_repo.list_vertices(map=name, type=type.value if type else None)
         return [_vertex_response(vertex) for vertex in vertices]
 
@@ -41,7 +41,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         dependencies=job_lock,
     )
     def create_map_vertices(name: str, reqs: List[MapVertexRequest] = Body(..., min_length=1)):
-        _require(name)
+        _require_exists(name)
         vertices = map_repo.create_vertices(
             map=name,
             vertices=[
@@ -64,7 +64,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         The id alone finds the row; the URL's map is checked so no vertex is
         reachable through another map's URL. A row on another map is a 404.
         """
-        _require(name)
+        _require_exists(name)
         vertex = map_repo.get_vertex(vertex_id=vertex_id)
         if vertex is None or vertex.map != name:
             raise NotFoundError(f"Map vertex {vertex_id} was not found in '{name}'.")

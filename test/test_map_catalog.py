@@ -69,6 +69,26 @@ def test_missing_map_returns_none(catalog_repo):
     assert catalog_repo.get_map("nosuchmap") is None
 
 
+def test_exists_agrees_with_get_map(catalog_repo):
+    """The cheap yes/no and the full read must never disagree about a name."""
+    for name in ("full", "rawonly", "nosuchmap"):
+        assert catalog_repo.exists(name) is (catalog_repo.get_map(name) is not None)
+
+
+def test_exists_does_not_read_the_map(catalog_repo, monkeypatch):
+    """One isdir: no walk of the map's files, no sidecar."""
+    monkeypatch.setattr(
+        catalog_repo, "_read", lambda *a: pytest.fail("exists read the map")
+    )
+    assert catalog_repo.exists("full") is True
+
+
+@pytest.mark.parametrize("bad", ["../etc", ".import-abc", "a/b"])
+def test_exists_refuses_what_get_map_refuses(catalog_repo, bad):
+    with pytest.raises(BadRequestError):
+        catalog_repo.exists(bad)
+
+
 def test_missing_maps_dir_lists_empty(logger, tmp_path):
     repo = init_map_catalog_repo(logger=logger)
     repo.maps_dir = str(tmp_path / "absent")

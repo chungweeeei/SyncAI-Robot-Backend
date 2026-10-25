@@ -36,6 +36,7 @@ OCTOMAP_EDITS_MAX = 1_000_000
 def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_catalog_repo = ctx.map_catalog_repo
     _require = ctx.require
+    _require_exists = ctx.require_exists
     job_lock = ctx.job_lock
 
     def _require_octomap(name: str) -> Tuple[StoredMap, str]:
@@ -96,7 +97,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         disk has had them applied: the file is the record, the tree is the
         robot's.
         """
-        _require(name)
+        _require_exists(name)
         edits = map_catalog_repo.read_octomap_edits(name)
         if edits is None:
             return OctomapEditsResponse(name=name, res=None, fill_key=[], created_at=None)
