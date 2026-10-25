@@ -69,10 +69,11 @@ class _StubWorkflowHandle:
         self.cancelled = False
         self.signals = []
 
-    async def describe(self):
+    # rpc_timeout as the SDK's handle takes it; the gateway bounds both.
+    async def describe(self, rpc_timeout=None):
         return self._description
 
-    async def query(self, name, result_type=None):
+    async def query(self, name, result_type=None, rpc_timeout=None):
         return self._steps
 
     async def cancel(self):
