@@ -1082,6 +1082,24 @@ def _not_modified(request: Request, tag: str) -> bool:
     return bool(header) and tag in [value.strip() for value in header.split(",")]
 
 
+def _revalidate(request: Request, tag: str) -> Tuple[Dict[str, str], Optional[Response]]:
+    """The validator headers for ``tag``, and the 304 to answer if the client
+    already holds it (else None). Every ETag'd GET here revalidates the same
+    way: ``no-cache`` so the browser asks every time, cheaply."""
+    headers = {"ETag": tag, "Cache-Control": "no-cache"}
+    if _not_modified(request, tag):
+        return headers, Response(status_code=304, headers=headers)
+    return headers, None
+
+
+def _no_gridmap(name: str) -> NotFoundError:
+    """The 404 for a map with no gridmap, naming the route that makes one."""
+    return NotFoundError(
+        f"Map '{name}' has no gridmap. Convert its map.pcd first "
+        f"(POST /api/v1/maps/{name}/grid/convert)."
+    )
+
+
 class _RenderCache:
     """Encoded renderings of each map, re-made only when their source changes.
 
@@ -1927,10 +1945,7 @@ def init_map_router(
         _require(name)
         path = map_catalog_repo.gridmap_path(name)
         if path is None:
-            raise NotFoundError(
-                f"Map '{name}' has no gridmap. Convert its map.pcd first "
-                f"(POST /api/v1/maps/{name}/grid/convert)."
-            )
+            raise _no_gridmap(name)
         try:
             return path, os.stat(path)
         except OSError as exc:
@@ -1950,11 +1965,10 @@ def init_map_router(
         """
         path, stats = _gridmap_file(name)
         tag = _file_tag(stats)
-        headers = {"ETag": tag, "Cache-Control": "no-cache"}
-
         # Before rendering, so a 304 costs no read and no PNG encode.
-        if _not_modified(request, tag):
-            return Response(status_code=304, headers=headers)
+        headers, not_modified = _revalidate(request, tag)
+        if not_modified is not None:
+            return not_modified
 
         def _render() -> bytes:
             try:
@@ -2017,10 +2031,7 @@ def init_map_router(
         # stored.grid parsed both the .pgm header and gridmap.yaml, so one None
         # test covers missing or torn files before map_server re-reads both.
         if stored.grid is None:
-            raise NotFoundError(
-                f"Map '{name}' has no gridmap. Convert its map.pcd first "
-                f"(POST /api/v1/maps/{name}/grid/convert)."
-            )
+            raise _no_gridmap(name)
 
         expected = stored.grid.width * stored.grid.height
         if len(payload) != expected:
@@ -2268,10 +2279,9 @@ def init_map_router(
         tree = stored.octomap
         assert tree is not None  # _require_octomap
         tag = f'"{tree.version}"'
-        headers = {"ETag": tag, "Cache-Control": "no-cache"}
-
-        if _not_modified(request, tag):
-            return Response(status_code=304, headers=headers)
+        headers, not_modified = _revalidate(request, tag)
+        if not_modified is not None:
+            return not_modified
 
         return FileResponse(path, media_type="application/octet-stream", headers=headers)
 

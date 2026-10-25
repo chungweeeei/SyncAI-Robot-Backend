@@ -34,7 +34,6 @@ from syncai_backend.tasks.schema import (
     POSE_STEP_TYPES,
     MoveParams,
     ScheduleTask,
-    ScheduleTrigger,
     Step,
     StepParams,
     StepType,
@@ -619,11 +618,7 @@ def init_task_template_router(
         await workflow_gw.create_schedule(
             schedule=ScheduleTask(
                 id=req.id,
-                trigger=ScheduleTrigger(
-                    cron=req.trigger.cron,
-                    interval_seconds=req.trigger.interval_seconds,
-                    timezone=req.trigger.timezone,
-                ),
+                trigger=req.trigger.to_trigger(),
                 definition=WorkflowTaskDefinition(steps=steps),
                 map_name=row.map_name,
                 task_template_id=str(row.id),

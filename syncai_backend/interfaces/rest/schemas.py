@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from syncai_backend.tasks.schema import (
     GROUP_DESCRIPTION,
+    ScheduleTrigger,
+    Step,
     StepParams,
     StepType,
     validate_step_params,
@@ -38,6 +40,10 @@ class StepRequest(BaseModel):
         validate_step_params(self.type, self.params)
         return self
 
+    def to_step(self) -> Step:
+        """The task model's step, as dispatched or frozen into a schedule."""
+        return Step(id=self.id, type=self.type, params=self.params, group=self.group)
+
 
 # POST / PATCH /api/v1/schedules and POST /api/v1/task_templates/{id}/schedule.
 class ScheduleTriggerRequest(BaseModel):
@@ -63,6 +69,14 @@ class ScheduleTriggerRequest(BaseModel):
         if bool(self.cron) == bool(self.interval_seconds):
             raise ValueError("Provide exactly one of 'cron' or 'interval_seconds'")
         return self
+
+    def to_trigger(self) -> ScheduleTrigger:
+        """The task model's trigger, for every route that registers or edits one."""
+        return ScheduleTrigger(
+            cron=self.cron,
+            interval_seconds=self.interval_seconds,
+            timezone=self.timezone,
+        )
 
 
 class ScheduleResponse(BaseModel):

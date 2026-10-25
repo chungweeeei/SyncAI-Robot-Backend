@@ -43,6 +43,16 @@ class WebRtcStatusResponse(BaseModel):
     )
 
 
+# What the three create routes answer, for OpenAPI: no response_model, the
+# body is the answer SDP.
+_SDP_ANSWER = {
+    201: {
+        "content": {"application/sdp": {}},
+        "description": "The answer SDP. `Location` carries the session URL.",
+    }
+}
+
+
 def init_webrtc_router(
     logger: structlog.stdlib.BoundLogger, webrtc_gw: WebRtcGateway
 ) -> APIRouter:
@@ -73,6 +83,23 @@ def init_webrtc_router(
             raise BadRequestError("offer SDP carries no media sections")
         return text
 
+    def _created(kind: str, label: str, payload: dict) -> Response:
+        """The 201 every create route answers: the answer SDP, and the session's
+        URL in ``Location``.
+
+        Relative on purpose: an absolute one built from the request works from
+        one network and not another. ``status_code`` here too: the decorator's
+        is only what OpenAPI reads.
+        """
+        session_id = payload["session_id"]
+        logger.info(f"{label} session created", session_id=session_id)
+        return Response(
+            status_code=201,
+            content=payload["answer_sdp"],
+            media_type="application/sdp",
+            headers={"Location": f"/api/v1/webrtc/{kind}/{session_id}"},
+        )
+
     def _raise_for(message: str) -> None:
         # Only a pending session gets a code (409); everything else is 502 with
         # the worker's sentence. Camera-busy gets no code: the Go error cannot
@@ -85,12 +112,7 @@ def init_webrtc_router(
     @webrtc_router.post(
         "/api/v1/webrtc/whep",
         status_code=201,
-        responses={
-            201: {
-                "content": {"application/sdp": {}},
-                "description": "The answer SDP. `Location` carries the session URL.",
-            }
-        },
+        responses=_SDP_ANSWER,
         response_class=Response,
     )
     # Defaulted to empty so _decode_offer answers a 400 sentence, not a 422.
@@ -112,19 +134,7 @@ def init_webrtc_router(
             logger.error("WHEP session creation failed", message=message)
             _raise_for(message)
 
-        session_id = payload["session_id"]
-        logger.info("WHEP session created", session_id=session_id)
-
-        # Location is relative on purpose: an absolute one built from the
-        # request works from one network and not another.
-        #
-        # status_code here too: the decorator's is only what OpenAPI reads.
-        return Response(
-            status_code=201,
-            content=payload["answer_sdp"],
-            media_type="application/sdp",
-            headers={"Location": f"/api/v1/webrtc/whep/{session_id}"},
-        )
+        return _created("whep", "WHEP", payload)
 
     @webrtc_router.delete(
         "/api/v1/webrtc/whep/{session_id}", status_code=204, response_class=Response
@@ -147,12 +157,7 @@ def init_webrtc_router(
     @webrtc_router.post(
         "/api/v1/webrtc/whip",
         status_code=201,
-        responses={
-            201: {
-                "content": {"application/sdp": {}},
-                "description": "The answer SDP. `Location` carries the session URL.",
-            }
-        },
+        responses=_SDP_ANSWER,
         response_class=Response,
     )
     def whip_create(offer: bytes = Body(b"", media_type="application/sdp")):
@@ -176,15 +181,7 @@ def init_webrtc_router(
             logger.error("WHIP session creation failed", message=message)
             _raise_for(message)
 
-        session_id = payload["session_id"]
-        logger.info("WHIP session created", session_id=session_id)
-
-        return Response(
-            status_code=201,
-            content=payload["answer_sdp"],
-            media_type="application/sdp",
-            headers={"Location": f"/api/v1/webrtc/whip/{session_id}"},
-        )
+        return _created("whip", "WHIP", payload)
 
     @webrtc_router.delete(
         "/api/v1/webrtc/whip/{session_id}", status_code=204, response_class=Response
@@ -209,12 +206,7 @@ def init_webrtc_router(
     @webrtc_router.post(
         "/api/v1/webrtc/duplex",
         status_code=201,
-        responses={
-            201: {
-                "content": {"application/sdp": {}},
-                "description": "The answer SDP. `Location` carries the session URL.",
-            }
-        },
+        responses=_SDP_ANSWER,
         response_class=Response,
     )
     def duplex_create(offer: bytes = Body(b"", media_type="application/sdp")):
@@ -241,15 +233,7 @@ def init_webrtc_router(
             logger.error("Duplex session creation failed", message=message)
             _raise_for(message)
 
-        session_id = payload["session_id"]
-        logger.info("Duplex session created", session_id=session_id)
-
-        return Response(
-            status_code=201,
-            content=payload["answer_sdp"],
-            media_type="application/sdp",
-            headers={"Location": f"/api/v1/webrtc/duplex/{session_id}"},
-        )
+        return _created("duplex", "Duplex", payload)
 
     @webrtc_router.delete(
         "/api/v1/webrtc/duplex/{session_id}", status_code=204, response_class=Response
