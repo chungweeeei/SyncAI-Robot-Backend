@@ -13,6 +13,7 @@ from syncai_backend.exceptions import (
     ConflictError,
     UpstreamError,
     NotFoundError,
+    PayloadTooLargeError,
     UnauthorizedError,
 )
 
@@ -63,6 +64,8 @@ _STATUS_FOR = {
     ConflictError: status.HTTP_409_CONFLICT,
     UnauthorizedError: status.HTTP_401_UNAUTHORIZED,
     UpstreamError: status.HTTP_502_BAD_GATEWAY,
+    # A literal: Starlette renamed the constant, and the new name is not in older ones.
+    PayloadTooLargeError: 413,
 }
 
 # Optional keys that ride beside ``detail`` when the exception sets them

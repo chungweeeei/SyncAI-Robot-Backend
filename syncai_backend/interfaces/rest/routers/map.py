@@ -5,19 +5,21 @@ import struct
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Dict, Hashable, List, Optional, Tuple
+from typing import AsyncIterator, BinaryIO, Callable, Dict, Hashable, List, Optional, Tuple
 
 import structlog
 from fastapi import APIRouter, Body, Depends, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from syncai_backend.exceptions import (
     BadRequestError,
     ConflictError,
     NotFoundError,
+    PayloadTooLargeError,
     UpstreamError,
 )
 from syncai_backend.database.models import MapPoint
@@ -32,7 +34,7 @@ from syncai_backend.helpers.pointcloud import (
 )
 from syncai_backend.helpers.map_archive import (
     ArchiveFormat,
-    build_archive,
+    write_archive,
 )
 from syncai_backend.repositories.map.catalog import (
     OCTOMAP_KEY_MAX,
@@ -68,6 +70,32 @@ from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 # the router does not depend on a subscriber; keep the two in step.
 MAP_CLOUD_VOXEL_SIZE = 0.3
 MAP_CLOUD_MAX_POINTS = 300000
+
+# The largest archive POST /api/v1/maps/import reads. A map is a few hundred MB
+# (map.pcd dominates; the octree and grids are smaller); a body past this is the
+# wrong file, refused before it fills the disk. Checked on Content-Length first,
+# and again while the body streams in, since the header is the client's word.
+MAP_IMPORT_MAX_BYTES = 4 << 30
+
+# Spooling granularity, both directions: an upload is written to disk (off the
+# event loop) in pieces this big, and an export is sent in pieces this big.
+_SPOOL_CHUNK = 1 << 20
+
+# What POST /api/v1/maps/import documents as its body. Spelled out because the
+# route reads the request stream itself (no Body parameter for FastAPI to
+# describe); identical to what Body(..., media_type=octet-stream) produced.
+_IMPORT_REQUEST_BODY = {
+    "content": {
+        "application/octet-stream": {
+            "schema": {
+                "contentMediaType": "application/octet-stream",
+                "title": "Payload",
+                "type": "string",
+            }
+        }
+    },
+    "required": True,
+}
 
 # A cleaning sidecar saying ``converting`` this long after its ``started_at``
 # belongs to a clean that died hard (the longest measured is ~5 min; cleans
@@ -1100,31 +1128,68 @@ def _no_gridmap(name: str) -> NotFoundError:
     )
 
 
+# What the render cache may hold, in bytes. A map costs up to ~4-5 MB (the
+# packed cloud is capped at MAP_CLOUD_MAX_POINTS x 12 B; the PNGs are far
+# smaller), so this keeps a dozen-odd maps: more than one operator looks at,
+# and a ceiling where there was none.
+RENDER_CACHE_MAX_BYTES = 64 << 20
+
+
 class _RenderCache:
-    """Encoded renderings of each map, re-made only when their source changes.
+    """Encoded renderings of each map, re-made only when their source changes,
+    the least recently used dropped past ``max_bytes``.
 
     One entry per (kind, map); each remembers the source ``version`` it was
-    made from, and ``get`` re-renders on any other version. So an entry is
-    never served stale -- ``forget`` exists only so a renamed or deleted map's
-    bytes do not sit in memory until restart. Plain dict operations, atomic
-    under the GIL; two threads racing a miss both render, which is harmless.
+    made from, and ``get`` re-renders on any other version, so an entry is
+    never served stale. It had no bound: every map ever opened kept its
+    renderings until restart (``forget`` runs only on rename, delete and
+    import), which read as a leak. The entry just stored is never evicted,
+    even alone over budget, so a big map still renders once per version.
+
+    The lock covers the bookkeeping only, never ``render`` (seconds for a
+    cloud): two threads racing a miss both render, which is harmless.
     """
 
-    def __init__(self) -> None:
-        self._entries: Dict[Tuple[str, str], Tuple[Hashable, bytes]] = {}
+    def __init__(self, max_bytes: int = RENDER_CACHE_MAX_BYTES) -> None:
+        self._max_bytes = max_bytes
+        self._entries: "OrderedDict[Tuple[str, str], Tuple[Hashable, bytes]]" = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
 
     def get(
         self, kind: str, name: str, version: Hashable, render: Callable[[], bytes]
     ) -> bytes:
-        cached = self._entries.get((kind, name))
-        if cached is None or cached[0] != version:
-            cached = (version, render())
-            self._entries[(kind, name)] = cached
-        return cached[1]
+        key = (kind, name)
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is not None and cached[0] == version:
+                self._entries.move_to_end(key)
+                return cached[1]
+
+        data = render()
+
+        with self._lock:
+            self._drop(key)
+            self._entries[key] = (version, data)
+            self._bytes += len(data)
+            while self._bytes > self._max_bytes and len(self._entries) > 1:
+                oldest = next(iter(self._entries))
+                self._drop(oldest)
+        return data
 
     def forget(self, name: str) -> None:
-        for key in [key for key in self._entries if key[1] == name]:
-            self._entries.pop(key, None)
+        with self._lock:
+            for key in [key for key in self._entries if key[1] == name]:
+                self._drop(key)
+
+    @property
+    def size_bytes(self) -> int:
+        return self._bytes
+
+    def _drop(self, key: Tuple[str, str]) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._bytes -= len(entry[1])
 
 
 # --- Router -----------------------------------------------------------------
@@ -1288,45 +1353,109 @@ def init_map_router(
             {"name": v.name, "type": v.type, "x": v.x, "y": v.y, "theta": v.theta, "z": v.z}
             for v in map_repo.list_vertices(map=name)
         ]
+        # Built into an anonymous file on the maps' disk and streamed from it:
+        # held in memory, the archive was about the map's size (map.pcd does
+        # not compress) twice over at the peak, for as long as the download
+        # took, in the process that also supervises the running job.
         started = time.perf_counter()
-        data = build_archive(
-            map_catalog_repo.resolve_dir(name),
-            name,
-            vertices,
-            format,
-            exported_at=iso_now(),
-            exclude_dirs=(TRAVERSABLE_DEBUG_SUBDIR_NAME,),
-        )
-
+        spool = map_catalog_repo.scratch_file()
+        try:
+            write_archive(
+                map_catalog_repo.resolve_dir(name),
+                name,
+                vertices,
+                format,
+                exported_at=iso_now(),
+                dest=spool,
+                exclude_dirs=(TRAVERSABLE_DEBUG_SUBDIR_NAME,),
+            )
+            size = spool.seek(0, os.SEEK_END)
+            spool.seek(0)
+        except BaseException:
+            spool.close()
+            raise
         logger.info(
             "Exported map",
             map=name,
             format=format.value,
-            bytes=len(data),
+            bytes=size,
             vertices=len(vertices),
             build_ms=round((time.perf_counter() - started) * 1000),
         )
-        return Response(
-            content=data,
+
+        def _chunks():
+            # Closing frees the disk; an abandoned download closes it when the
+            # generator is collected.
+            with spool:
+                while chunk := spool.read(_SPOOL_CHUNK):
+                    yield chunk
+
+        return StreamingResponse(
+            _chunks(),
             media_type=format.media_type,
             headers={
                 # No quoting needed: _NAME_RE admits only [A-Za-z0-9._-].
                 "Content-Disposition": f'attachment; filename="{name}.{format.extension}"',
+                "Content-Length": str(size),
                 "Cache-Control": "no-store",
             },
         )
 
+    async def _spooled_upload(request: Request) -> AsyncIterator[BinaryIO]:
+        """The request body, streamed into an anonymous file on the maps' disk.
+
+        It was ``bytes = Body(...)``: the whole upload in memory before the
+        route ran, with no limit, so one wrong file (a 4 GB bag) could take
+        the process down mid-job. Now at most ``_SPOOL_CHUNK`` is held, and
+        anything over ``MAP_IMPORT_MAX_BYTES`` is a 413 -- on the declared
+        length before reading, and on the bytes actually received while
+        reading. Writes go to a thread: this runs on the event loop.
+        """
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAP_IMPORT_MAX_BYTES:
+            raise _too_large()
+
+        spool = await asyncio.to_thread(map_catalog_repo.scratch_file)
+        try:
+            received = 0
+            pending = bytearray()
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > MAP_IMPORT_MAX_BYTES:
+                    raise _too_large()
+                pending += chunk
+                if len(pending) >= _SPOOL_CHUNK:
+                    full, pending = pending, bytearray()
+                    await asyncio.to_thread(spool.write, full)
+            if pending:
+                await asyncio.to_thread(spool.write, pending)
+            yield spool
+        finally:
+            spool.close()
+
+    def _too_large() -> PayloadTooLargeError:
+        return PayloadTooLargeError(
+            f"The archive is larger than {MAP_IMPORT_MAX_BYTES >> 30} GiB; a map "
+            "export is far smaller. Is this the right file?",
+            code="archive_too_large",
+        )
+
     @map_router.post(
-        "/api/v1/maps/import", status_code=201, response_model=ImportMapResponse
+        "/api/v1/maps/import",
+        status_code=201,
+        response_model=ImportMapResponse,
+        openapi_extra={"requestBody": _IMPORT_REQUEST_BODY},
     )
     def import_map(
         name: Optional[str] = None,
-        payload: bytes = Body(..., media_type="application/octet-stream"),
+        payload: BinaryIO = Depends(_spooled_upload),
     ):
         """Create — or replace — a map from an archive ``export_map`` produced.
 
         The raw body is the archive (zip or tar.gz by magic bytes); the target
-        is ``?name=`` or the manifest's name.
+        is ``?name=`` or the manifest's name. Spooled to disk as it arrives
+        (``_spooled_upload``); 413 ``archive_too_large`` past
+        ``MAP_IMPORT_MAX_BYTES``.
 
         Nothing is written until the archive is judged: a missing or mismatched
         manifest, a link or escaping member is 400, as is no ``map.pcd``, an

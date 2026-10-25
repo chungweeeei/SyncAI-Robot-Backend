@@ -27,6 +27,7 @@ import structlog
 from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
 from syncai_backend.helpers.map_archive import (
     ArchiveFormat,
+    ArchiveSource,
     MapArchiveError,
     extract_archive,
     inspect_archive,
@@ -62,11 +63,14 @@ class MapImportService:
 
     def import_archive(
         self,
-        payload: bytes,
+        payload: ArchiveSource,
         name: Optional[str],
         vertex_types: AbstractSet[str],
     ) -> ImportOutcome:
         """Import ``payload`` as ``name`` (or the manifest's name); blocking.
+
+        ``payload`` is the archive as bytes or a seekable file (the route
+        spools the upload to one); it is read twice, to judge and to unpack.
 
         ``vertex_types`` is what a manifest's vertices may be: the REST layer's
         ``VertexType``, the only place that set is defined.
