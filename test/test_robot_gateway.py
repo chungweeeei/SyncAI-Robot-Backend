@@ -3,7 +3,7 @@
 The rclpy seams are mocked the way CoreManager's robot-gateway tests mock their
 socket/gRPC seams: ``ActionClient`` is patched at the module import site and the
 node is a MagicMock, so no ROS graph (or rclpy.init) is needed. Futures are
-replaced by ``_Future`` below — the gateway's ``_wait_for_future`` only relies
+replaced by ``_Future`` below — ``gateways.ros.wait_for_future`` only relies
 on ``add_done_callback``/``result``, and a controllable future is what lets a
 test hold a goal in EXECUTING, then deliver the result callback and watch the
 state machine move.
@@ -29,6 +29,7 @@ from geometry_msgs.msg import Twist  # noqa: E402
 from syncai_common.action import NavigateToGoal  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
+from syncai_backend.gateways import ros as ros_module  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
 from syncai_backend.gateways.robot.robot import (  # noqa: E402
     DOCK_BEHAVIOR_TREE,
@@ -384,7 +385,7 @@ class TestAbandonedGoals:
         def _interrupted(future, timeout=None):
             raise self._ThreadCancel()
 
-        monkeypatch.setattr(robot_module, "_wait_for_future", _interrupted)
+        monkeypatch.setattr(ros_module, "wait_for_future", _interrupted)
         handle, response = self._unanswered_send(move_client)
 
         with pytest.raises(self._ThreadCancel):
@@ -405,7 +406,7 @@ class TestAbandonedGoals:
             response.complete(handle)
             raise self._ThreadCancel()
 
-        monkeypatch.setattr(robot_module, "_wait_for_future", _accept_then_interrupt)
+        monkeypatch.setattr(ros_module, "wait_for_future", _accept_then_interrupt)
 
         with pytest.raises(self._ThreadCancel):
             robot_gw.move(x=0.0, y=0.0, yaw=0.0)

@@ -39,6 +39,7 @@ from geometry_msgs.msg import (
     Twist,
 )
 
+from syncai_backend.gateways import ros
 from syncai_backend.gateways.failure import Failure, fail
 
 
@@ -122,12 +123,6 @@ UNDOCK_BEHAVIOR_TREE = "undock.xml"
 # The value itself is not read; this one says "a few centimetres".
 INITIAL_POSE_Z_VARIANCE_INDEX = 14
 INITIAL_POSE_Z_VARIANCE = 0.01
-
-
-def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
-    event = threading.Event()
-    future.add_done_callback(lambda _: event.set())
-    return event.wait(timeout=timeout)
 
 
 def _goal_id_str(goal_handle: ClientGoalHandle) -> str:
@@ -274,12 +269,11 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Scanning WiFi networks")
 
-        future = scan_client.call_async(ScanWifiNetworks.Request())
         # The service rescans (10s) then lists (30s); leave headroom on top.
-        if not _wait_for_future(future, timeout=45.0):
+        response = ros.call_service(scan_client, ScanWifiNetworks.Request(), timeout_s=45.0)
+        if response is None:
             return False, "Timeout waiting for scan_wifi response", []
 
-        response = future.result()
         if not response.success:
             return False, response.message, []
 
@@ -292,14 +286,15 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Connecting to WiFi network", ssid=ssid)
 
-        future = connect_client.call_async(
-            ConnectWifiNetwork.Request(ssid=ssid, password=password)
-        )
         # The service itself waits up to 60s for nmcli; leave headroom on top.
-        if not _wait_for_future(future, timeout=70.0):
+        response = ros.call_service(
+            connect_client,
+            ConnectWifiNetwork.Request(ssid=ssid, password=password),
+            timeout_s=70.0,
+        )
+        if response is None:
             return False, "Timeout waiting for connect_wifi response"
 
-        response = future.result()
         return response.success, response.message
 
     def list_wifi_connections(self) -> Tuple[bool, str, List[WifiConnection]]:
@@ -307,12 +302,11 @@ class RobotGateway:
         if not list_client.wait_for_service(timeout_sec=5.0):
             return False, "list_wifi_connections service is not available", []
 
-        future = list_client.call_async(ListWifiConnections.Request())
         # One 10 s list plus a short SSID read per profile.
-        if not _wait_for_future(future, timeout=15.0):
+        response = ros.call_service(list_client, ListWifiConnections.Request(), timeout_s=15.0)
+        if response is None:
             return False, "Timeout waiting for list_wifi_connections response", []
 
-        response = future.result()
         if not response.success:
             return False, response.message, []
 
@@ -326,12 +320,13 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Activating saved WiFi network", uuid=uuid)
 
-        future = activate_client.call_async(ActivateWifiConnection.Request(uuid=uuid))
         # The service waits up to 60s for nmcli, as connect_wifi does.
-        if not _wait_for_future(future, timeout=70.0):
+        response = ros.call_service(
+            activate_client, ActivateWifiConnection.Request(uuid=uuid), timeout_s=70.0
+        )
+        if response is None:
             return False, "Timeout waiting for activate_wifi_connection response", ""
 
-        response = future.result()
         return response.success, response.message, response.ssid
 
     def delete_wifi_connection(self, uuid: str) -> Tuple[bool, str]:
@@ -341,12 +336,13 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Deleting saved WiFi network", uuid=uuid)
 
-        future = delete_client.call_async(DeleteWifiConnection.Request(uuid=uuid))
         # A list to find the profile, then a 15 s delete.
-        if not _wait_for_future(future, timeout=30.0):
+        response = ros.call_service(
+            delete_client, DeleteWifiConnection.Request(uuid=uuid), timeout_s=30.0
+        )
+        if response is None:
             return False, "Timeout waiting for delete_wifi_connection response"
 
-        response = future.result()
         return response.success, response.message
 
     def set_motion_key(self, key: MotionKey) -> Tuple[bool, str]:
@@ -358,11 +354,12 @@ class RobotGateway:
 
         # .value: the srv field is a plain string and rosidl stores whatever
         # it is handed.
-        future = motion_key_client.call_async(SetMotionKey.Request(key=key.value))
-        if not _wait_for_future(future, timeout=10.0):
+        response = ros.call_service(
+            motion_key_client, SetMotionKey.Request(key=key.value), timeout_s=10.0
+        )
+        if response is None:
             return False, "Timeout waiting for set_motion_key response"
 
-        response = future.result()
         return response.success, response.message
 
     def set_policy_mode(self, mode: int) -> Tuple[bool, str]:
@@ -382,13 +379,14 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Setting policy mode", mode=mode)
 
-        future = policy_mode_client.call_async(SetPolicyMode.Request(mode=mode))
         # Same 10.0 as set_motion_key: the callback cannot block, but ~1 s would
         # turn a discovery hiccup or a starved executor into a spurious 502.
-        if not _wait_for_future(future, timeout=10.0):
+        response = ros.call_service(
+            policy_mode_client, SetPolicyMode.Request(mode=mode), timeout_s=10.0
+        )
+        if response is None:
             return False, "Timeout waiting for set_policy_mode response"
 
-        response = future.result()
         return response.success, response.message
 
     def set_safety_lock(self, locked: bool) -> Tuple[bool, str]:
@@ -405,12 +403,13 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Setting safety lock", locked=locked)
 
-        future = safety_lock_client.call_async(SetBool.Request(data=locked))
         # Same 10.0 as its siblings: the callback cannot block.
-        if not _wait_for_future(future, timeout=10.0):
+        response = ros.call_service(
+            safety_lock_client, SetBool.Request(data=locked), timeout_s=10.0
+        )
+        if response is None:
             return False, "Timeout waiting for set_safety_lock response"
 
-        response = future.result()
         return response.success, response.message
 
     def switch_mode(self, mode: int) -> Tuple[Optional[bool], str]:
@@ -431,11 +430,12 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Switching operating mode", mode=mode)
 
-        future = switch_mode_client.call_async(SwitchMode.Request(mode=mode))
-        if not _wait_for_future(future, timeout=SWITCH_MODE_ACK_TIMEOUT):
+        response = ros.call_service(
+            switch_mode_client, SwitchMode.Request(mode=mode), timeout_s=SWITCH_MODE_ACK_TIMEOUT
+        )
+        if response is None:
             return None, "Mode switch dispatched; the stack is rebuilding"
 
-        response = future.result()
         return response.success, response.message
 
     def restart_mode(
@@ -460,8 +460,11 @@ class RobotGateway:
 
         self._logger.info("[RobotGateway] Restarting the live operating mode")
 
+        # Not ros.call_service: a late answer is wanted here. The request stays
+        # pending on purpose so the done callback below can report the outcome
+        # the operator's GET /robot/restart is waiting for.
         future = restart_mode_client.call_async(RestartMode.Request())
-        if not _wait_for_future(future, timeout=SWITCH_MODE_ACK_TIMEOUT):
+        if not ros.wait_for_future(future, timeout=SWITCH_MODE_ACK_TIMEOUT):
             if on_done is not None:
                 future.add_done_callback(
                     lambda done: on_done(*self._late_restart_outcome(done))
@@ -611,7 +614,7 @@ class RobotGateway:
         future.add_done_callback(lambda fut: self._goal_response_cb(fut, pending))
 
         try:
-            answered = _wait_for_future(future, timeout=NAV_ACCEPT_WAIT_S)
+            answered = ros.wait_for_future(future, timeout=NAV_ACCEPT_WAIT_S)
         except BaseException:
             # Typically Temporal's CancelledError: the goal must not keep running.
             self._disown_pending(pending)
@@ -847,7 +850,7 @@ class RobotGateway:
         self._logger.info("[RobotGateway] Cancelling goal", goal_id=goal_id)
 
         cancel_future = goal_handle.cancel_goal_async()
-        if not _wait_for_future(cancel_future, timeout=CANCEL_RESPONSE_WAIT_S):
+        if not ros.wait_for_future(cancel_future, timeout=CANCEL_RESPONSE_WAIT_S):
             # No answer to a cancel means no result is coming either: the
             # server is gone. Land the goal here, or it is EXECUTING forever.
             self._lose_goal(goal_id, "no answer to the cancel request")
