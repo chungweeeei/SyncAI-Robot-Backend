@@ -243,3 +243,115 @@ def test_health_projects_worker_state():
     assert response.json()["status"] == "degraded"
     assert response.json()["task_server"] == "dead"
     assert "Connection refused" in response.json()["task_server_error"]
+
+
+# --- Shutdown ----------------------------------------------------------------
+#
+# main.py stops the worker on SIGTERM / SIGINT / SIGHUP before the ROS context
+# goes. Until it did, the daemon thread died with the process, the in-flight
+# MOVE's `except CancelledError` never ran, and nav2 kept driving the goal.
+
+
+class _BlockingStubWorker(_StubWorker):
+    """A worker that polls until told to stop, as the real one does."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stop = asyncio.Event()
+        self.shutdown_calls = 0
+
+    async def run(self):
+        await self._stop.wait()
+
+    async def shutdown(self):
+        self.shutdown_calls += 1
+        self._stop.set()
+
+
+def _start(monkeypatch):
+    monkeypatch.setattr(worker_mod, "Worker", _BlockingStubWorker)
+    return start_temporal_worker(
+        logger,
+        robot_id="robot01",
+        robot_gw=MagicMock(),
+        tts_gw=MagicMock(),
+        map_catalog_repo=MagicMock(),
+        map_usage=MagicMock(),
+        robot_repo=MagicMock(),
+        dock_state=MagicMock(),
+    )
+
+
+def test_request_shutdown_stops_both_workers_and_ends_the_thread(monkeypatch):
+    handle = _start(monkeypatch)
+    assert handle.thread.is_alive()
+    assert handle.snapshot()[0] == TemporalWorkerHandle.STATUS_RUNNING
+
+    assert handle.request_shutdown(timeout_s=5.0) is True
+
+    assert not handle.thread.is_alive()
+    assert handle.snapshot()[0] == TemporalWorkerHandle.STATUS_STOPPED
+    assert all(worker.shutdown_calls == 1 for worker in handle._workers)
+    assert len(handle._workers) == 2
+
+
+def test_request_shutdown_is_idempotent(monkeypatch):
+    handle = _start(monkeypatch)
+    handle.request_shutdown(timeout_s=5.0)
+
+    assert handle.request_shutdown(timeout_s=1.0) is True
+
+
+def test_request_shutdown_before_the_worker_exists_answers_at_once():
+    assert TemporalWorkerHandle().request_shutdown(timeout_s=1.0) is True
+
+
+def test_request_shutdown_after_the_worker_died_answers_at_once():
+    _StubWorker.run_error = RuntimeError("poller exploded")
+    handle = start_temporal_worker(
+        logger,
+        robot_id="robot01",
+        robot_gw=MagicMock(),
+        tts_gw=MagicMock(),
+        map_catalog_repo=MagicMock(),
+        map_usage=MagicMock(),
+        robot_repo=MagicMock(),
+        dock_state=MagicMock(),
+    )
+    handle.thread.join(timeout=10)
+
+    assert handle.request_shutdown(timeout_s=1.0) is True
+    assert handle.snapshot()[0] == TemporalWorkerHandle.STATUS_DEAD
+
+
+def test_request_shutdown_reports_a_worker_that_will_not_stop(monkeypatch):
+    class _Stuck(_BlockingStubWorker):
+        async def shutdown(self):
+            self.shutdown_calls += 1  # and never sets the stop
+
+    monkeypatch.setattr(worker_mod, "Worker", _Stuck)
+    handle = start_temporal_worker(
+        logger,
+        robot_id="robot01",
+        robot_gw=MagicMock(),
+        tts_gw=MagicMock(),
+        map_catalog_repo=MagicMock(),
+        map_usage=MagicMock(),
+        robot_repo=MagicMock(),
+        dock_state=MagicMock(),
+    )
+
+    # False, not a hang: main.py shuts down anyway and says so.
+    assert handle.request_shutdown(timeout_s=0.2) is False
+    assert handle.thread.is_alive()
+    # Release the daemon thread so it does not outlive the test.
+    for worker in handle._workers:
+        worker._stop.set()
+    handle.thread.join(timeout=5)
+
+
+def test_the_shutdown_budget_fits_under_the_compose_grace_period():
+    """docker-compose stop_grace_period is 30 s: the worker's budget plus
+    rclpy's own teardown must fit, or docker SIGKILLs the cleanup it was
+    waiting for."""
+    assert worker_mod.WORKER_SHUTDOWN_TIMEOUT_S < 30.0

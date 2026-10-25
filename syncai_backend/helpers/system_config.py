@@ -32,16 +32,23 @@ def system_ini_path() -> str:
     return os.environ.get(SYSTEM_INI_ENV, DEFAULT_SYSTEM_INI)
 
 
-def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
-    """Return the bare name of the map the stack was launched with, or None.
+# The copy `set_active_map` takes of the INI before rewriting it in place, next
+# to it (`system.ini.bak`). The in-place rewrite truncates the file first, and a
+# process killed in that window -- switch_mode kills the byobu session this
+# process is a pane of; an OOM kill or a power cut will do -- left an empty
+# INI: no `[map]` for this process, and no `[system] robot_id` for every launch
+# file at the next boot. The copy is what `active_map_name` falls back to and
+# what an operator restores the INI from.
+BACKUP_SUFFIX = ".bak"
 
-    From the INI, not ``RobotState.map``: the cached state is only kept once
-    localization is valid, so a freshly booted robot would report no active map.
-    Falls back to the parent directory of ``[map] map``
-    (``map/dp2f/gridmap.yaml`` -> ``dp2f``) for older files without ``name``.
-    Never raises, so a robot without a usable INI can still list its maps.
-    """
-    path = system_ini_path()
+
+def backup_ini_path(path: Optional[str] = None) -> str:
+    return (path or system_ini_path()) + BACKUP_SUFFIX
+
+
+def _map_name_from(path: str, logger: structlog.stdlib.BoundLogger) -> Optional[str]:
+    """``[map] name`` of the INI at ``path`` (or the ``[map] map`` fallback),
+    None when the file is missing, malformed or names no map."""
     config = configparser.ConfigParser()
 
     try:
@@ -65,6 +72,37 @@ def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
 
     logger.warning("[SystemConfig] No [map] name in system INI", path=path)
     return None
+
+
+def active_map_name(logger: structlog.stdlib.BoundLogger) -> Optional[str]:
+    """Return the bare name of the map the stack was launched with, or None.
+
+    From the INI, not ``RobotState.map``: the cached state is only kept once
+    localization is valid, so a freshly booted robot would report no active map.
+    Falls back to the parent directory of ``[map] map``
+    (``map/dp2f/gridmap.yaml`` -> ``dp2f``) for older files without ``name``,
+    and to ``set_active_map``'s backup copy when the INI itself names no map
+    (empty after an interrupted rewrite, or gone).
+    Never raises, so a robot without a usable INI can still list its maps.
+    """
+    path = system_ini_path()
+    name = _map_name_from(path, logger)
+    if name is not None:
+        return name
+
+    backup = backup_ini_path(path)
+    if not os.path.exists(backup):
+        return None
+    name = _map_name_from(backup, logger)
+    if name is not None:
+        logger.warning(
+            "[SystemConfig] System INI names no map; answering from its backup. "
+            "Restore the INI from the backup before the next boot.",
+            path=path,
+            backup=backup,
+            map=name,
+        )
+    return name
 
 
 # The keys `set_active_map` rewrites. `[initial_pose]` is zeroed so a pose from
@@ -91,7 +129,10 @@ def set_active_map(name: str, logger: structlog.stdlib.BoundLogger) -> str:
 
     **Rewritten in place, never temp file + rename.** The INI is a single-file
     bind mount; a rename gives it a new inode the container never sees. A torn
-    write is caught by the verifying re-read.
+    write is caught by the verifying re-read, which then puts the previous
+    content back; a crash inside the write leaves the copy taken first, at
+    ``backup_ini_path()`` (tmp + rename, a sibling file, so that one is
+    atomic), for ``active_map_name`` to read and the operator to restore.
 
     **Edited line by line, not via ConfigParser.write().** ``[map]`` uses
     interpolation (``pcd: map/%(name)s/map.pcd``); a write-back would bake in
@@ -102,6 +143,25 @@ def set_active_map(name: str, logger: structlog.stdlib.BoundLogger) -> str:
     """
     with _INI_LOCK:
         return _set_active_map_locked(name, logger)
+
+
+def _write_backup(path: str, lines: list[str]) -> str:
+    """``lines`` (the INI as read) to the backup path, atomically."""
+    backup = backup_ini_path(path)
+    tmp = backup + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, backup)
+    return backup
+
+
+def _write_in_place(path: str, lines: list[str]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _set_active_map_locked(name: str, logger: structlog.stdlib.BoundLogger) -> str:
@@ -158,11 +218,36 @@ def _set_active_map_locked(name: str, logger: structlog.stdlib.BoundLogger) -> s
     if not seen_name:
         raise ValueError(f"{path} has no [{_MAP_SECTION}] {_MAP_NAME_KEY} to rewrite")
 
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.writelines(out)
+    # The copy first, before the in-place write truncates the only other one.
+    backup = _write_backup(path, lines)
 
-    # Verify before reporting success; interpolation off so the raw `%(name)s`
-    # values are read as written.
+    try:
+        _write_in_place(path, out)
+        _verify_written(path, name)
+    except Exception:
+        # A torn write this process survived (disk full, a read-only mount
+        # flipped): the previous content goes back, so the stack keeps
+        # booting on the map it had. Best effort; the backup stays either way.
+        try:
+            _write_in_place(path, lines)
+        except OSError:
+            logger.error(
+                "[SystemConfig] Could not restore the system INI after a failed "
+                "rewrite; restore it from the backup by hand",
+                path=path,
+                backup=backup,
+                exc_info=True,
+            )
+        raise
+
+    logger.info("[SystemConfig] Active map written to the system INI",
+                path=path, map=name, backup=backup)
+    return path
+
+
+def _verify_written(path: str, name: str) -> None:
+    """Raise ValueError unless the INI at ``path`` now names ``name``."""
+    # Interpolation off so the raw `%(name)s` values are read as written.
     check = configparser.ConfigParser(interpolation=None)
     try:
         if not check.read(path):
@@ -176,7 +261,3 @@ def _set_active_map_locked(name: str, logger: structlog.stdlib.BoundLogger) -> s
             f"{path} still reads [{_MAP_SECTION}] {_MAP_NAME_KEY} = {written!r} "
             f"after being rewritten to {name!r}"
         )
-
-    logger.info("[SystemConfig] Active map written to the system INI",
-                path=path, map=name)
-    return path

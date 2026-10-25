@@ -452,6 +452,8 @@ class WorkflowGateway:
         # on the main thread, before that loop exists.
         self._active_snapshot: Optional[_ActiveSnapshot] = None
         self._active_lock: Optional[asyncio.Lock] = None
+        # Single-flight for the lazy connect, made lazily for the same reason.
+        self._connect_lock: Optional[asyncio.Lock] = None
 
         # The last task start_task started, for _require_idle's first check:
         # visibility is eventually consistent, describe-by-id is not, so this
@@ -460,18 +462,25 @@ class WorkflowGateway:
         self._last_started_task_id: Optional[str] = None
 
     async def _get_client(self) -> Client:
+        """The one Temporal client this gateway uses, connected on first use.
+
+        Under a lock: the console opens a page with four requests at once
+        (active tasks, schedules, history, stats), and every one of them
+        found ``_client`` None after a backend or Temporal restart and opened
+        a connection of its own -- the last assigned won, the rest leaked.
+        """
         if self._client is not None:
             return self._client
 
-        try:
-            self._client = await Client.connect(
-                target_host=temporal_server_url(),
-                data_converter=pydantic_data_converter,
-            )
-        except Exception as err:
-            raise err
-
-        return self._client
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        async with self._connect_lock:
+            if self._client is None:
+                self._client = await Client.connect(
+                    target_host=temporal_server_url(),
+                    data_converter=pydantic_data_converter,
+                )
+            return self._client
 
     async def _require_idle(self, client: Client) -> None:
         """Refuse to dispatch while anything is already running on this robot.

@@ -50,6 +50,21 @@ starts two extra threads:
   OccupancyGrid→PNG encoding — are **plain `def`, not `async def`**, so FastAPI
   runs them in its thread pool instead of stalling the event loop. Keep that
   distinction when adding endpoints.
+- **Shutdown is ordered: the Temporal worker first, the ROS context last.**
+  `main.py` installs its own handlers for SIGTERM (docker stop), SIGINT (`ros2
+  launch`, Ctrl-C) and SIGHUP (the byobu session being killed by `switch_mode`)
+  and asks rclpy for none (`SignalHandlerOptions.NO`). A stop signal starts a
+  shutdown thread that calls `TemporalWorkerHandle.request_shutdown`
+  (`Worker.shutdown` on both workers, up to `WORKER_SHUTDOWN_TIMEOUT_S`, 20 s)
+  while the main thread keeps spinning the executor; only once the worker
+  thread has ended does the spin loop exit and `rclpy.shutdown()` run. The
+  reason is the in-flight MOVE: the SDK cancels it on shutdown and its `except
+  CancelledError` cancels the nav2 goal and restores locomotion — ROS traffic
+  that needs the executor alive. With rclpy's default handlers the context went
+  first, the daemon worker thread died with the process, and the goal drove on
+  unsupervised until the next worker re-sent it. A second signal exits at once.
+  A requested stop exits 0, anything else 1. `docker-compose.yml`'s
+  `stop_grace_period: 30s` is sized to this budget.
 
 ## Layering
 
@@ -404,6 +419,23 @@ which `GET /api/v1/tasks/{id}` returns as a running MOVE step's `message`.
 `RobotGateway` keeps a goal-id → `MoveGoal` table so an activity can poll
 status and cancel, and the latest feedback per goal for that read.
 
+**Every goal reaches a terminal state, with or without the server.** The result
+callback is the normal way out of `EXECUTING`, and it only runs when the task
+runner delivers a result — which one that restarted or crashed mid-goal
+(`POST /api/v1/robot/restart` rebuilds the AUTO session under a running backend)
+never does. Such a goal used to stay `EXECUTING` for the life of the process:
+teleop refused with "autonomous move in progress", the telemetry stream's local
+picture gated open, `cancel_active_moves` failing on every safety-lock trip. The
+gateway now marks a goal **lost** — `aborted`, `error_msg` the reason, no
+`error_code` — wherever it learns no result is coming: the result future
+completing with an exception or an `UNKNOWN` status, a cancel unanswered within
+`CANCEL_RESPONSE_WAIT_S` (10 s), a cancel refused with `UNKNOWN_GOAL_ID` (a
+restarted server; `GOAL_TERMINATED` means the result is on its way and is left
+alone), or no action server at the next `move()`. A real result arriving late
+replaces the loss. What still needs a nudge: a server that restarted while no
+task was cancelling — the next cancel, safety-lock trip or `move()` is what
+resolves it.
+
 `DOCK` / `UNDOCK` steps are goals on the **same** client: `move(...,
 behavior_tree=...)` sets the goal's `behavior_tree` to `dock.xml` / `undock.xml`
 (`DOCK_BEHAVIOR_TREE` / `UNDOCK_BEHAVIOR_TREE`; `""` is the task runner's default
@@ -543,7 +575,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/maps/{name}/export?format=zip\|tar.gz` | The map dir as one archive (default `zip`; `Content-Disposition: attachment; filename="<name>.<ext>"`): files relative to the root — no top-level folder, no `traversable_debug/` — plus `syncai_map.json` `{format, version: 1, name, exported_at, files: {relpath: md5}, vertices: [...]}`. Vertex **ids are not exported** (regenerated on import); templates are not included (their steps bind vertex ids). 409 `conversion_running`; the active map may be exported |
 | POST | `/api/v1/maps/import?name=` | Create or **replace** a map from such an archive; raw `application/octet-stream`, zip / tar.gz by magic bytes. **Nothing is written until the archive is judged**: manifest required (version 1; newer refused), every file md5-verified; an unlisted or missing member, a link/device member, an absolute or `..` path, no `map.pcd`, or an unknown vertex type is 400. Name is `?name=` else the manifest's. Replacing takes the delete's refusals (`map_active` / `conversion_running` / `template_bound`) plus 409 `disk_low`. 201 `{name, replaced, files, bytes, vertices_created, vertices_deleted, message}`. Starts no conversion; an imported `gridmap.recipe.json` is kept as-is. Staging: see *Layering* |
 | POST | `/api/v1/maps/{name}/activate` | Switch maps live, no session restart: `relocalize` first (its refusals precede any mutation), then map_server `load_map`, then `[map] name` into the instance INI so it survives a restart (`[initial_pose]` zeroed — re-seed). `switched: false` is the no-op. `localized` is a best-effort `relocalize_check` poll: `false` = not yet (registration retries forever), `null` = could not ask; **not** `RobotState.localization_valid`, which is TF-presence only. Refusals, all before mutating: 409 `grid_missing`, `pointcloud_missing`, `conversion_running`, `ini_not_writable`, `task_running` (any job), `tasks_unknown` (refuse rather than assume idle), `stack_not_ready` (service discoverability — how mapping mode is detected, not the cached mode). Lifts `map_active` on rename and delete. Also hands `filter_mask_server` this map's `keepout.yaml` (blank if never booted), since `load_map` leaves the *previous* zones in force; best-effort and after the commit point, so `keepout_reloaded: false` = switched, old zones may still apply (`null` on the no-op). **3D maps (2026-10):** a map with an `octomap.bt` is 3D (with a grid too, still 3D — the robot's own rule), otherwise it needs a usable grid (`grid_missing` names both). After `load_map` (skipped when a 3D map has no grid; map_server then keeps the previous grid, which nothing plans on), the robot's 3D planner is pointed at the map: `planner_server/Octo3D/load_map` with the `octomap.bt` for a 3D map, **with an empty `map_url` for a 2D one** — that unload is what moves the robot off its 3D trees, which it runs whenever Octo3D has a map. It blocks until the tree is built (120 s bound) and its success is a result; a failure rolls back the localizer, the grid and Octo3D (onto the previous map's tree, or none). 409 `planner_3d_unavailable` refuses a 3D map on a stack without Octo3D; on such a stack a 2D switch skips the unload. A 3D map's forbidden zones come in with its tree (Octo3D reads `keepout.json` in `load_map`), so `keepout_reloaded` is `true` and no mask is touched. `map_kind` is `2d` / `3d` (`null` on the no-op) |
-| POST | `/api/v1/maps/{name}/grid/convert` | (Re)build the gridmap from `map.pcd`: recipe `z-band` (default; optional `z_band_offsets`, `floor_reference` `local` default / `global`) or `traversability` (`gap_fill_size`), `debug` for intermediate clouds. `started: true` only means the thread launched — outcome in `grid_status`. 409 `conversion_running`, or `gridmap_hand_edited` (confirm with `overwrite_edits`; the edit survives as `gridmap_prev.pgm` + `gridmap_prev.recipe.json`). Reloads map_server when active |
+| POST | `/api/v1/maps/{name}/grid/convert` | (Re)build the gridmap from `map.pcd`: recipe `z-band` (default; optional `z_band_offsets`, `floor_reference` `local` default / `global`) or `traversability` (`gap_fill_size`), `debug` for intermediate clouds. `started: true` only means the thread launched — outcome in `grid_status`. 409 `conversion_running`, or `gridmap_hand_edited` (confirm with `overwrite_edits`; the edit survives as `gridmap_prev.pgm` + `gridmap_prev.recipe.json`). Reloads map_server when active — decided when the grid lands, not at the request: a switch away during the (minutes-long) conversion is not refused, and reloading then would put map_server on this grid while the localizer, Octo3D and the INI name the other map |
 | GET | `/api/v1/maps/{name}/image` · `/thumbnail` | Gridmap as full-size / downscaled PNG, content-hash ETag'd |
 | PUT | `/api/v1/maps/{name}/grid` | Write edited cells (raw `application/octet-stream`); reloads map_server when active. 409 `conversion_running` (it would overwrite the edit) |
 | GET | `/api/v1/maps/{name}/keepout` | Forbidden zones as saved through this API: `zones: [{id, points: [{x, y}, …], name, z_min, z_max}]` in map-frame metres (the last three `null` when unset; the band is the floor on a 3D map), plus `active`. Read from `keepout.json`, so a boot-time blank or hand-drawn mask answers `[]` |
@@ -1021,6 +1053,19 @@ environment. This package resolves that INI by an **absolute** default
 `helpers/system_config.py`: the old relative `config/system.ini` only worked
 because every entrypoint happened to run from the workspace root, and tests and
 shells do not. Override with `system_config:=` or `SYNCAI_SYSTEM_INI`.
+
+`set_active_map` (behind `POST /api/v1/maps/{name}/activate`) rewrites that INI
+**in place** — it is a single-file bind mount, so a temp file + rename would
+leave the container on the old inode — and in-place means truncate, then write.
+Before it does, it copies the previous content to **`system.ini.bak`** beside
+it (tmp + rename; a sibling file can be atomic). A rewrite that fails its
+verifying re-read puts the previous content back itself; a process killed inside
+the write (switch_mode kills the byobu session this process is a pane of, and
+an OOM kill or a power cut will do) leaves an empty INI, which
+`active_map_name` answers from the backup (with a warning) so this process keeps
+working — but every launch file reads `[system] robot_id` from the INI itself,
+so **restore it from the `.bak` before the next boot**. The backup is this
+package's only INI-shaped file; nothing else reads or writes it.
 
 There are **no ROS parameters** — nothing calls `declare_parameter`. Everything
 configurable is the INI, the environment, or a commented constant.

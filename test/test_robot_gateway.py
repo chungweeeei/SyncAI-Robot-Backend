@@ -777,3 +777,163 @@ class TestRestartMode:
         assert success is False
         assert failure_code(message) is None
         client.call_async.assert_not_called()
+
+
+class TestLostGoals:
+    """A goal the server will never answer for lands in ABORTED, not EXECUTING.
+
+    ``_move_result_cb`` used to be the only way out of EXECUTING, and it only
+    runs when rclpy completes the result future -- which a task runner that
+    restarted or crashed mid-goal never does. The goal then sat EXECUTING for
+    the life of the process: teleop refused ("autonomous move in progress"),
+    the telemetry stream's local picture gated open, and cancel_active_moves
+    failing on every safety-lock trip. What is pinned here is every place the
+    gateway itself learns the result is not coming, and that each of them
+    lands a terminal state with a reason the MOVE step can show.
+    """
+
+    def _cancel_answer(self, move_client, goals_canceling, return_code=None):
+        handle = move_client.send_goal_async.return_value.result()
+        response = SimpleNamespace(goals_canceling=goals_canceling)
+        if return_code is not None:
+            response.return_code = return_code
+        handle.cancel_goal_async.return_value = _Future(result=response)
+        return handle
+
+    def test_a_failed_result_request_lands_aborted(self, robot_gw, move_client):
+        class _ResultFailed(_Future):
+            def result(self):
+                raise RuntimeError("client destroyed")
+
+        goal_id, _ = _send_goal(robot_gw, move_client, result_future=_ResultFailed())
+
+        status = robot_gw.get_move_status(goal_id=goal_id)
+        assert status["state"] == MoveState.ABORTED.value
+        assert "client destroyed" in status["error_msg"]
+        assert "error_code" not in status
+        assert robot_gw.navigation_active() is False
+
+    def test_an_unknown_terminal_status_lands_aborted(self, robot_gw, move_client):
+        goal_id, result_future = _send_goal(robot_gw, move_client)
+
+        result_future.complete(
+            SimpleNamespace(status=GoalStatus.STATUS_UNKNOWN, result=SimpleNamespace())
+        )
+
+        status = robot_gw.get_move_status(goal_id=goal_id)
+        assert status["state"] == MoveState.ABORTED.value
+        assert "status" in status["error_msg"]
+
+    def test_a_cancel_nobody_answers_marks_the_goal_lost(
+        self, robot_gw, move_client, monkeypatch
+    ):
+        monkeypatch.setattr(robot_module, "CANCEL_RESPONSE_WAIT_S", 0.01)
+        goal_id, _ = _send_goal(robot_gw, move_client)
+        handle = move_client.send_goal_async.return_value.result()
+        handle.cancel_goal_async.return_value = _Future(completed=False)
+
+        success, message = robot_gw.cancel_move(goal_id=goal_id)
+
+        assert success is False
+        assert "lost" in message
+        status = robot_gw.get_move_status(goal_id=goal_id)
+        assert status["state"] == MoveState.ABORTED.value
+        assert "cancel" in status["error_msg"]
+        # The point of it all: the robot can be driven by hand again.
+        assert robot_gw.navigation_active() is False
+        assert robot_gw.teleop_cmd_vel(vx=0.5, vy=0.0, wz=0.0) == (True, "")
+
+    def test_a_cancel_for_a_goal_the_server_never_heard_of_marks_it_lost(
+        self, robot_gw, move_client
+    ):
+        """A restarted task runner: it answers UNKNOWN_GOAL_ID, and there is no
+        result to wait for."""
+        from action_msgs.srv import CancelGoal
+
+        goal_id, _ = _send_goal(robot_gw, move_client)
+        self._cancel_answer(
+            move_client, [], return_code=CancelGoal.Response.ERROR_UNKNOWN_GOAL_ID
+        )
+
+        success, message = robot_gw.cancel_move(goal_id=goal_id)
+
+        assert success is False
+        assert "unknown goal" in message
+        assert robot_gw.get_move_status(goal_id=goal_id)["state"] == MoveState.ABORTED.value
+
+    def test_a_cancel_refused_for_a_goal_that_just_ended_waits_for_the_result(
+        self, robot_gw, move_client
+    ):
+        """GOAL_TERMINATED means the result is on its way: not lost."""
+        from action_msgs.srv import CancelGoal
+
+        goal_id, result_future = _send_goal(robot_gw, move_client)
+        self._cancel_answer(
+            move_client, [], return_code=CancelGoal.Response.ERROR_GOAL_TERMINATED
+        )
+
+        success, _ = robot_gw.cancel_move(goal_id=goal_id)
+        assert success is False
+        assert robot_gw.get_move_status(goal_id=goal_id)["state"] == MoveState.EXECUTING.value
+
+        result_future.complete(
+            SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED, result=None)
+        )
+        assert robot_gw.get_move_status(goal_id=goal_id)["state"] == MoveState.SUCCEEDED.value
+
+    def test_a_cancel_refused_without_a_code_is_not_a_loss(self, robot_gw, move_client):
+        # The pre-existing refusal shape (test_cancel_rejected_by_server):
+        # nothing is known about why, so the goal stays as it was.
+        goal_id, _ = _send_goal(robot_gw, move_client)
+        self._cancel_answer(move_client, [])
+
+        robot_gw.cancel_move(goal_id=goal_id)
+
+        assert robot_gw.get_move_status(goal_id=goal_id)["state"] == MoveState.EXECUTING.value
+
+    def test_a_server_that_went_away_loses_every_executing_goal(
+        self, robot_gw, move_client
+    ):
+        """The next send finds no server: whatever was executing against the
+        old one is lost, and the send still fails as before."""
+        goal_id, _ = _send_goal(robot_gw, move_client)
+        move_client.wait_for_server.return_value = False
+
+        accepted, message, _ = robot_gw.move(x=0.0, y=0.0, yaw=0.0)
+
+        assert (accepted, message) == (False, "Action server is not available")
+        status = robot_gw.get_move_status(goal_id=goal_id)
+        assert status["state"] == MoveState.ABORTED.value
+        assert "went away" in status["error_msg"]
+        assert robot_gw.navigation_active() is False
+
+    def test_cancel_active_moves_no_longer_fails_forever_on_a_lost_goal(
+        self, robot_gw, move_client, monkeypatch
+    ):
+        """The safety lock's path: the first sweep gives up on the goal, the
+        second has nothing left to cancel."""
+        monkeypatch.setattr(robot_module, "CANCEL_RESPONSE_WAIT_S", 0.01)
+        _send_goal(robot_gw, move_client)
+        handle = move_client.send_goal_async.return_value.result()
+        handle.cancel_goal_async.return_value = _Future(completed=False)
+
+        success, _ = robot_gw.cancel_active_moves()
+        assert success is False
+
+        assert robot_gw.cancel_active_moves() == (True, "no goal was executing")
+
+    def test_a_late_real_result_replaces_the_loss(self, robot_gw, move_client, monkeypatch):
+        """The server was only slow: its answer is the truth, reason and all."""
+        monkeypatch.setattr(robot_module, "CANCEL_RESPONSE_WAIT_S", 0.01)
+        goal_id, result_future = _send_goal(robot_gw, move_client)
+        handle = move_client.send_goal_async.return_value.result()
+        handle.cancel_goal_async.return_value = _Future(completed=False)
+        robot_gw.cancel_move(goal_id=goal_id)
+
+        result_future.complete(
+            SimpleNamespace(status=GoalStatus.STATUS_CANCELED, result=None)
+        )
+
+        status = robot_gw.get_move_status(goal_id=goal_id)
+        assert status["state"] == MoveState.CANCELED.value
+        assert "error_msg" not in status

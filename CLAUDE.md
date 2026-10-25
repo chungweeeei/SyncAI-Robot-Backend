@@ -122,8 +122,19 @@ Consequences:
 - Heavy point-cloud callbacks each get their own `MutuallyExclusiveCallbackGroup` so they
   cannot starve `robot_state` / telemetry / TF.
 - Postgres is a hard dependency (20 retries × 5 s, then the process exits); Temporal is
-  soft — `TemporalWorkerHandle` records `connecting`/`running`/`dead` and `/health`
+  soft — `TemporalWorkerHandle` records `connecting`/`running`/`dead`/`stopped` and `/health`
   reports `degraded` instead of crashing.
+- **Shutdown order: Temporal worker first, ROS context last.** `main.py` owns the stop
+  signals (SIGTERM/SIGINT/SIGHUP; rclpy gets `SignalHandlerOptions.NO`) and keeps the
+  executor spinning until `TemporalWorkerHandle.request_shutdown` returns, because the
+  cancelled MOVE's cleanup (cancel the nav2 goal, restore locomotion) is ROS traffic. Do
+  not reintroduce `executor.spin()` with rclpy's handlers: that is what left goals driving
+  unsupervised. README *Process model* has the sequence and the budget.
+- A nav goal always reaches a terminal state: `RobotGateway` marks a goal **lost**
+  (ABORTED, `error_msg` the reason) when it learns no result is coming — the result
+  future failing, a cancel unanswered within `CANCEL_RESPONSE_WAIT_S`, `UNKNOWN_GOAL_ID`
+  on a cancel, the action server gone at the next send. Until then a goal whose task
+  runner restarted sat EXECUTING for the life of the process, refusing teleop.
 - **`WorkflowGateway` belongs to the uvicorn loop** (its Temporal client and caches are
   touched from nowhere else). Work started from a ROS callback that needs it — today only
   `SafetyLockService`'s cancel on the safety lock's rising edge — is handed over with
