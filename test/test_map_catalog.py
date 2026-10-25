@@ -188,7 +188,7 @@ def test_write_gridmap_replaces_the_cells(catalog_repo, maps_dir):
 
 
 def test_write_gridmap_returns_the_file_contents(catalog_repo, maps_dir):
-    """The REST layer hashes this for the ETag."""
+    """Header and body, as written -- what a reader of the file would see."""
     written = catalog_repo.write_gridmap("full", b"\x00" * 24)
 
     assert written == (maps_dir / "full" / "gridmap.pgm").read_bytes()

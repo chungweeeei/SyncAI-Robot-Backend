@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import math
 import os
 import struct
@@ -1060,14 +1059,21 @@ def _summary(
     )
 
 
-def _content_tag(data: bytes) -> str:
-    """Build a strong ETag over the gridmap's own bytes.
+def _file_tag(stats: os.stat_result) -> str:
+    """Build a strong ETag for a gridmap from its stat, without reading it.
 
-    Not ``(mtime, size)``: an edited gridmap keeps its size and this filesystem's
-    mtime is coarse, so the pair survives a save and the pre-edit image would be
-    served. One blake2b pass costs a few ms.
+    ``(inode, size, mtime_ns)``, not a content hash: the console revalidates
+    every map's image and thumbnail on a timer, and hashing meant reading the
+    whole .pgm (4-16 MB off the bind mount) per request, 304s included. The
+    inode is what makes stat safe here -- an edited gridmap keeps its size, and
+    a save inside one mtime tick would otherwise look unchanged -- because
+    every writer of ``gridmap.pgm`` in this process (``write_pgm``: the grid
+    PUT and the conversion) goes through a temp file + rename, so a save is a
+    new inode every time. The blind spot is a hand edit that rewrites the file
+    in place with its mtime preserved (``cp -p`` over it); nothing on the robot
+    does that.
     """
-    return f'"{hashlib.blake2b(data, digest_size=16).hexdigest()}"'
+    return f'"{stats.st_ino:x}-{stats.st_size:x}-{stats.st_mtime_ns:x}"'
 
 
 def _not_modified(request: Request, tag: str) -> bool:
@@ -1911,8 +1917,8 @@ def init_map_router(
         map_repo.delete_vertex(vertex_id=id)
         return DeleteResponse(message=f"Map vertex {id} has been deleted.")
 
-    def _read_gridmap(name: str) -> bytes:
-        """Read the map's gridmap.pgm bytes, 404ing with the reason if absent.
+    def _gridmap_file(name: str) -> Tuple[str, os.stat_result]:
+        """The map's gridmap.pgm path and stat, 404ing with the reason if absent.
 
         Never served raw: /image's lossless PNG is the grid's wire format.
         """
@@ -1924,10 +1930,9 @@ def init_map_router(
                 f"(POST /api/v1/maps/{name}/grid/convert)."
             )
         try:
-            with open(path, "rb") as handle:
-                return handle.read()
+            return path, os.stat(path)
         except OSError as exc:
-            logger.error("Failed to read gridmap", map=name, error=str(exc))
+            logger.error("Failed to stat gridmap", map=name, error=str(exc))
             raise NotFoundError(f"Map '{name}' has no readable gridmap.")
 
     def _png_response(
@@ -1938,17 +1943,24 @@ def init_map_router(
     ) -> Response:
         """Serve a PNG rendered from the map's gridmap, cached and revalidated.
 
-        Cache and ETag key on the *source* .pgm bytes, not the encoded PNG.
+        Cache and ETag key on the *source* .pgm's stat (``_file_tag``), not the
+        encoded PNG; the file is read only when there is a PNG to render.
         """
-        payload = _read_gridmap(name)
-        tag = _content_tag(payload)
+        path, stats = _gridmap_file(name)
+        tag = _file_tag(stats)
         headers = {"ETag": tag, "Cache-Control": "no-cache"}
 
-        # Before rendering, so a 304 costs no PNG encode.
+        # Before rendering, so a 304 costs no read and no PNG encode.
         if _not_modified(request, tag):
             return Response(status_code=304, headers=headers)
 
         def _render() -> bytes:
+            try:
+                with open(path, "rb") as handle:
+                    payload = handle.read()
+            except OSError as exc:
+                logger.error("Failed to read gridmap", map=name, error=str(exc))
+                raise NotFoundError(f"Map '{name}' has no readable gridmap.")
             try:
                 return render(payload)
             except ValueError as exc:
@@ -2015,11 +2027,13 @@ def init_map_router(
                 f"{stored.grid.width}x{stored.grid.height} = {expected} cells."
             )
 
-        written = map_catalog_repo.write_gridmap(name, payload)
+        map_catalog_repo.write_gridmap(name, payload)
 
-        # No cache eviction by design: _png_response re-hashes the file before
-        # consulting the cache, so a stale entry is never served.
-        tag = _content_tag(written)
+        # No cache eviction by design: _png_response stats the file before
+        # consulting the cache, so a stale entry is never served. The tag is
+        # the new inode's, so it is the one the next GET answers with.
+        _, stats = _gridmap_file(name)
+        tag = _file_tag(stats)
         response.headers["ETag"] = tag
 
         active = name == map_catalog_repo.active_name()

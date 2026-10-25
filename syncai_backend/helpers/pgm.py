@@ -111,8 +111,9 @@ def write_pgm(path: str, width: int, height: int, body: bytes) -> bytes:
     ``syncai_map_server``'s ``LoadMap`` right after a save (a torn P5 can decode
     shorter and mis-register the map nav2 plans on), and the router's ETag cache.
 
-    Returns the whole file (header and body), since the router's ETag hashes the
-    whole file.
+    Returns the whole file (header and body) for callers that want it. The
+    rename is also what the router's ETag leans on: a save is a new inode, so
+    a stat-based tag changes even when the size does not.
     """
     if len(body) != width * height:
         raise ValueError(
