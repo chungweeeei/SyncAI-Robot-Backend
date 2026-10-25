@@ -1,10 +1,10 @@
-"""The map router's _RenderCache: never stale, and now bounded (LRU by bytes)."""
+"""The map routes' _RenderCache (routers/maps/common.py): never stale, and bounded."""
 
 import pytest
 
 pytest.importorskip("rclpy")  # the router module imports the ROS gateways
 
-from syncai_backend.interfaces.rest.routers.map import _RenderCache  # noqa: E402
+from syncai_backend.interfaces.rest.routers.maps.common import _RenderCache  # noqa: E402
 
 
 def _renderer(data: bytes):

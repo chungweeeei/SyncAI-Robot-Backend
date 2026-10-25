@@ -40,7 +40,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 from syncai_backend.tasks.schema import TaskKind  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
-from syncai_backend.interfaces.rest.routers import map as map_router_module  # noqa: E402
+# The import limit is read where the import route lives.
+from syncai_backend.interfaces.rest.routers.maps import archive as map_router_module  # noqa: E402
 from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
     MAPPING_STATUS_TTL_S,
     MappingState,

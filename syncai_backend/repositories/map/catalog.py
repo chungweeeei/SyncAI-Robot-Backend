@@ -138,7 +138,7 @@ class GridRecordStatus(str, Enum):
     Only what a conversion writes; ``interrupted`` is derived by the REST layer
     (``converting`` with no thread behind it).
 
-    Not ``GridStatus`` in ``interfaces/rest/routers/map.py``, the wire contract:
+    Not ``GridStatus`` in ``interfaces/rest/routers/maps/schemas.py``, the wire contract:
     disk and wire vocabularies may drift apart, and only that module's
     ``_grid_status`` converts between them.
 
@@ -827,7 +827,7 @@ class MapCatalogRepo:
 
         ``gridmap_raw.pgm`` existing **and differing** from ``gridmap.pgm``: a
         save without changes leaves an identical raw. A full byte compare,
-        since size/mtime are unreliable here (see the router's ``_file_tag``).
+        since size/mtime are unreliable here (see ``_file_tag`` in ``routers/maps/common.py``).
         """
         directory = self.resolve_dir(name)
         raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
