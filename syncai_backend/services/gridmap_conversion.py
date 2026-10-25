@@ -79,7 +79,7 @@ FLOOR_AREA_CELL_M = 0.5
 # conversion looks like a map never converted.
 
 # Where the segmentation's intermediates go with ``debug: true`` on re-convert.
-# Off by default: MapCatalogRepo._walk_stats recurses, so they would inflate
+# Off by default: helpers.disk.walk_stats recurses, so they would inflate
 # every catalogue card's size. The service's ``debug_subdir`` forces it on.
 TRAVERSABLE_DEBUG_SUBDIR_NAME = "traversable_debug"
 

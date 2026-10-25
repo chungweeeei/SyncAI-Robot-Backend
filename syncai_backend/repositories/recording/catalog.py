@@ -3,12 +3,13 @@ import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import structlog
 import yaml
 
 from syncai_backend.exceptions import BadRequestError, NotFoundError
+from syncai_backend.helpers.disk import walk_stats
 
 
 # As strict as MapCatalogRepo's: the only thing between a URL path segment and
@@ -137,7 +138,7 @@ class RecordingCatalogRepo:
     def _read(self, name: str, path: str) -> Optional[StoredRecording]:
         """Describe one directory; None only if it disappeared mid-scan."""
         try:
-            size_bytes, newest_mtime = _walk_stats(path)
+            size_bytes, newest_mtime = walk_stats(path)
         except FileNotFoundError:
             return None
 
@@ -198,27 +199,6 @@ class RecordingCatalogRepo:
             # rosbag2 writes "" for an uncompressed bag.
             compression=compression or None,
         )
-
-
-def _walk_stats(path: str) -> Tuple[int, float]:
-    """Return total bytes and newest mtime under ``path``, dir itself included.
-
-    A real walk: a long run splits into several ``<name>_N.db3`` files.
-    """
-    total = 0
-    newest = os.stat(path).st_mtime
-
-    for root, _dirs, files in os.walk(path):
-        for filename in files:
-            try:
-                stats = os.stat(os.path.join(root, filename))
-            except FileNotFoundError:
-                # Removed mid-walk (a split being rotated).
-                continue
-            total += stats.st_size
-            newest = max(newest, stats.st_mtime)
-
-    return total, newest
 
 
 def init_recording_catalog_repo(

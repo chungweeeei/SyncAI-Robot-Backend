@@ -10,6 +10,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import structlog
 
 from syncai_backend.gateways.failure import Failure, fail
+from syncai_backend.helpers.disk import tree_size
 
 
 # The LIO inputs: replaying them is the only way to recover a mapping run that
@@ -133,7 +134,7 @@ class RecordingGateway:
             "started_at": active.started_at,
             "elapsed_seconds": time.monotonic() - active.started_monotonic,
             "compression": active.compression,
-            "size_bytes": _dir_size(active.path),
+            "size_bytes": tree_size(active.path),
         }
 
     # --- API ----------------------------------------------------------------
@@ -283,7 +284,7 @@ class RecordingGateway:
                 "topics": list(active.topics),
                 "started_at": active.started_at,
                 "elapsed_seconds": time.monotonic() - active.started_monotonic,
-                "size_bytes": _dir_size(active.path),
+                "size_bytes": tree_size(active.path),
                 "stopped_by": stopped_by,
                 "complete": complete,
             },
@@ -413,22 +414,6 @@ def _dir_progress(path: str) -> Tuple[Tuple[str, int, int], ...]:
     except FileNotFoundError:
         pass
     return tuple(sorted(entries))
-
-
-def _dir_size(path: str) -> int:
-    """Bytes under ``path``, or 0 if it is not there yet.
-
-    Duplicated from the catalogue repo's _walk_stats: a gateway importing a
-    repository would invert the layering.
-    """
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for filename in files:
-            try:
-                total += os.stat(os.path.join(root, filename)).st_size
-            except FileNotFoundError:
-                continue
-    return total
 
 
 def _free_bytes(path: str) -> int:
