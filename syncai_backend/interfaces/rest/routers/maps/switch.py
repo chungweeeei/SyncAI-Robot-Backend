@@ -62,9 +62,17 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         shortly after the swap. The steps and their undos are
         services/map_switch.py; this route owns only the Temporal question.
         """
-        stored = _require(name)
-        status, grid_error = _grid_status(stored, False)
-        plan = map_switch_svc.plan(stored, status == GridStatus.OK, grid_error)
+        def _plan():
+            stored = _require(name)
+            status, grid_error = _grid_status(stored, False)
+            return map_switch_svc.plan(stored, status == GridStatus.OK, grid_error)
+
+        # Off the event loop, like the switch below: reading the map walks every
+        # file under it (hundreds under patches/, the files least likely to be
+        # in the page cache) and plan() reads the INI, and this route is async.
+        # On the loop, a slow eMMC (a bag recording, a conversion writing) froze
+        # teleop and the telemetry streams for as long as that took.
+        plan = await asyncio.to_thread(_plan)
         if plan is None:
             return ActivateMapResponse(
                 name=name,
