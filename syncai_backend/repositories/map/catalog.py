@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, BinaryIO, Callable, List, Optional, Tuple
 
 import structlog
 import yaml
@@ -809,12 +809,25 @@ class MapCatalogRepo:
         """Free space on the filesystem that holds the maps, in bytes."""
         return shutil.disk_usage(self.maps_dir).free
 
+    def scratch_file(self) -> BinaryIO:
+        """An anonymous temp file on the maps' filesystem, for spooling an
+        archive (an import's upload, an export's build) instead of holding it
+        in memory.
+
+        On the maps' filesystem because that is where the space for a map is
+        known to be (the container's own /tmp is its overlay layer). Anonymous
+        (``TemporaryFile``: unlinked at once on Linux), so it never shows up in
+        ``map/`` and nothing is left behind when the request is cut off or the
+        process dies: the space is freed when the descriptor closes.
+        """
+        return tempfile.TemporaryFile(dir=self.maps_dir)
+
     def gridmap_edited(self, name: str) -> bool:
         """Report whether this map's gridmap carries hand edits.
 
         ``gridmap_raw.pgm`` existing **and differing** from ``gridmap.pgm``: a
         save without changes leaves an identical raw. A full byte compare,
-        since size/mtime are unreliable here (see the router's ``_content_tag``).
+        since size/mtime are unreliable here (see the router's ``_file_tag``).
         """
         directory = self.resolve_dir(name)
         raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)

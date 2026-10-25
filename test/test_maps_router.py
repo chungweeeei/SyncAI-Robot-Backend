@@ -40,6 +40,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from syncai_backend.tasks.schema import TaskKind  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
+from syncai_backend.interfaces.rest.routers import map as map_router_module  # noqa: E402
 from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
     MAPPING_STATUS_TTL_S,
     MappingState,
@@ -4100,6 +4101,64 @@ def test_export_round_trips_through_import(client, maps_dir, map_repo, exportabl
     listing = _by_name(client.get("/api/v1/maps").json())
     assert listing["copy"]["vertex_count"] == 2
     assert listing["copy"]["active"] is False
+
+
+def test_export_streams_from_a_spool_and_declares_its_length(client, maps_dir, exportable):
+    """Built into an anonymous file and streamed, not held in memory: the
+    length is still declared, and nothing is left in map/ afterwards."""
+    before = sorted(p.name for p in maps_dir.iterdir())
+
+    response = _export(client, "full")
+
+    assert response.status_code == 200
+    assert int(response.headers["content-length"]) == len(response.content)
+    assert zipfile.ZipFile(io.BytesIO(response.content)).namelist()[-1] == _MANIFEST
+    assert sorted(p.name for p in maps_dir.iterdir()) == before
+
+
+def test_an_import_over_the_limit_by_its_declared_length_is_413(
+    client, maps_dir, catalog_repo, monkeypatch
+):
+    """Refused on Content-Length, before a byte is spooled: no spool is even
+    opened (the streamed count would also say 413, so this is what tells the
+    early refusal apart)."""
+    monkeypatch.setattr(map_router_module, "MAP_IMPORT_MAX_BYTES", 1024)
+    monkeypatch.setattr(
+        catalog_repo, "scratch_file", lambda: pytest.fail("spooled a refused upload")
+    )
+
+    response = _import(client, _handmade(files={"map.pcd": b"x" * 4096}))
+
+    assert response.status_code == 413
+    assert response.json()["code"] == "archive_too_large"
+    assert _hidden_dirs(maps_dir) == []
+    assert not (maps_dir / "handmade").exists()
+
+
+def test_an_import_over_the_limit_without_a_declared_length_is_413(
+    client, maps_dir, monkeypatch
+):
+    """Chunked: no Content-Length to trust, so the bytes received are counted."""
+    monkeypatch.setattr(map_router_module, "MAP_IMPORT_MAX_BYTES", 1024)
+    archive = _handmade(files={"map.pcd": b"x" * 4096})
+
+    def _chunked():
+        for start in range(0, len(archive), 512):
+            yield archive[start:start + 512]
+
+    response = client.post("/api/v1/maps/import", content=_chunked(), headers=_OCTET)
+
+    assert response.status_code == 413
+    assert response.json()["code"] == "archive_too_large"
+    assert not (maps_dir / "handmade").exists()
+
+
+def test_an_import_leaves_nothing_but_the_map_in_map_dir(client, maps_dir):
+    before = {p.name for p in maps_dir.iterdir()}
+
+    assert _import(client, _handmade()).status_code == 201
+
+    assert {p.name for p in maps_dir.iterdir()} == before | {"handmade"}
 
 
 def test_export_defaults_to_zip(client):

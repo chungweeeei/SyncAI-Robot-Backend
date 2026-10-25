@@ -26,6 +26,7 @@ from syncai_backend.helpers.map_archive import (
     extract_archive,
     inspect_archive,
     sniff_format,
+    write_archive,
 )
 
 
@@ -505,3 +506,58 @@ def test_total_bytes_sums_only_listed_files():
     payload = _zip(extra_infos=[("patches/", b"")], manifest=_manifest())
 
     assert inspect_archive(payload).total_bytes == sum(len(d) for d in _FILES.values())
+
+
+# --- Files, not bytes ---------------------------------------------------------
+#
+# The routes spool to an anonymous temp file so a map of hundreds of MB is never
+# held in memory whole; the archive helpers read and write that file directly.
+
+
+@pytest.mark.parametrize("fmt", list(ArchiveFormat))
+def test_an_archive_written_to_a_file_round_trips_from_that_file(map_dir, tmp_path, fmt):
+    with open(tmp_path / "spool", "w+b") as spool:
+        write_archive(
+            str(map_dir), "full", _VERTICES, fmt, "2026-10-03T00:00:00Z",
+            dest=spool, exclude_dirs=("traversable_debug",),
+        )
+        # Left wherever the writer left it: the readers must rewind.
+        inspected = inspect_archive(spool)
+        assert inspected.format is fmt
+        assert set(inspected.manifest.files) == set(_FILES)
+
+        dest = tmp_path / "out"
+        dest.mkdir()
+        written = extract_archive(spool, inspected, str(dest))
+
+    assert written == sum(len(data) for data in _FILES.values())
+    for rel, data in _FILES.items():
+        assert (dest / rel).read_bytes() == data
+
+
+@pytest.mark.parametrize("fmt", list(ArchiveFormat))
+def test_build_archive_is_write_archive_into_memory(map_dir, fmt):
+    """Same bytes either way, so the bytes path the tests use is the file path."""
+    stamp = "2026-10-03T00:00:00Z"
+    built = build_archive(str(map_dir), "full", _VERTICES, fmt, stamp)
+    buffer = io.BytesIO()
+    write_archive(str(map_dir), "full", _VERTICES, fmt, stamp, dest=buffer)
+
+    assert inspect_archive(built).manifest == inspect_archive(buffer.getvalue()).manifest
+
+
+def test_sniffing_a_file_rewinds_it(tmp_path):
+    with open(tmp_path / "a.zip", "w+b") as spool:
+        spool.write(_zip(manifest=_manifest()))
+        spool.seek(7)
+
+        assert sniff_format(spool) is ArchiveFormat.ZIP
+        assert spool.tell() == 0
+
+
+def test_a_readers_file_is_left_open_for_its_owner(tmp_path):
+    with open(tmp_path / "a.zip", "w+b") as spool:
+        spool.write(_zip(manifest=_manifest()))
+        inspect_archive(spool)
+
+        assert not spool.closed

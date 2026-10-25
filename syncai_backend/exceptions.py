@@ -38,6 +38,15 @@ class ConflictError(Exception):
         self.code = code
 
 
+class PayloadTooLargeError(Exception):
+    """A request body over the route's limit (HTTP 413), refused before or
+    while it is read, so the limit bounds the disk an upload can take."""
+
+    def __init__(self, message: str, code: "str | None" = None):
+        super().__init__(message)
+        self.code = code
+
+
 # 502: a downstream dependency (Temporal, a ROS service) failed.
 class UpstreamError(Exception):
     pass
