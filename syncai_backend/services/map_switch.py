@@ -40,7 +40,7 @@ import structlog
 
 from syncai_backend.exceptions import ConflictError, UpstreamError
 from syncai_backend.gateways.map.map import MapGateway
-from syncai_backend.helpers.system_config import set_active_map, system_ini_path
+from syncai_backend.helpers.system_config import system_ini_path
 from syncai_backend.repositories.map.catalog import GridInfo, MapCatalogRepo, StoredMap
 from syncai_backend.services.map_usage import MapUsagePolicy
 
@@ -239,7 +239,8 @@ class MapSwitchService:
                 )
 
         try:
-            set_active_map(name, self._logger)
+            # The INI and the catalogue's cache of it, in that order.
+            self._catalog.set_active(name)
         except (OSError, ValueError) as exc:
             self._logger.error(
                 "Map switch failed at the INI write", map=name, error=str(exc)

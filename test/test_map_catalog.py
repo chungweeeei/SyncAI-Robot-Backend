@@ -17,6 +17,7 @@ from syncai_backend.exceptions import BadRequestError, NotFoundError  # noqa: E4
 from syncai_backend.helpers.system_config import (  # noqa: E402
     SYSTEM_INI_ENV,
 )
+from syncai_backend.repositories.map import catalog as catalog_module  # noqa: E402
 from syncai_backend.repositories.map.catalog import (  # noqa: E402
     GridRecordStatus,
     init_map_catalog_repo,
@@ -165,6 +166,7 @@ def test_active_name_from_ini(catalog_repo, tmp_path, monkeypatch):
     ini = tmp_path / "system.ini"
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: full\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
 
     assert catalog_repo.active_name() == "full"
 
@@ -174,6 +176,7 @@ def test_active_name_falls_back_to_the_map_path(catalog_repo, tmp_path, monkeypa
     ini = tmp_path / "system.ini"
     ini.write_text("[map]\nmap: map/full/gridmap.yaml\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
 
     assert catalog_repo.active_name() == "full"
 
@@ -181,6 +184,7 @@ def test_active_name_falls_back_to_the_map_path(catalog_repo, tmp_path, monkeypa
 def test_active_name_is_none_without_an_ini(catalog_repo, tmp_path, monkeypatch):
     """A robot with no INI must still be able to list its maps."""
     monkeypatch.setenv(SYSTEM_INI_ENV, str(tmp_path / "absent.ini"))
+    catalog_repo.load_active()
 
     assert catalog_repo.active_name() is None
     assert _names(catalog_repo.list_maps()) == ["full", "rawonly"]
@@ -191,8 +195,64 @@ def test_active_name_is_none_without_a_map_section(catalog_repo, tmp_path,
     ini = tmp_path / "system.ini"
     ini.write_text("[system]\nrobot_id: robot01\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
 
     assert catalog_repo.active_name() is None
+
+
+def _ini_naming(tmp_path, monkeypatch, name):
+    ini = tmp_path / "system.ini"
+    ini.write_text(f"[system]\nrobot_id: robot01\n\n[map]\nname: {name}\n")
+    monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    return ini
+
+
+def test_active_name_is_read_when_the_repo_is_built(logger, tmp_path, monkeypatch):
+    """At startup, so no request ever waits on the INI."""
+    _ini_naming(tmp_path, monkeypatch, "full")
+
+    assert init_map_catalog_repo(logger=logger).active_name() == "full"
+
+
+def test_active_name_does_not_read_the_ini_again(catalog_repo, tmp_path, monkeypatch):
+    """A hand edit is seen at the next restart, as README *Gotchas* says."""
+    ini = _ini_naming(tmp_path, monkeypatch, "full")
+    catalog_repo.load_active()
+    ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")
+
+    def _no_read(logger):
+        raise AssertionError("active_name read the INI")
+
+    monkeypatch.setattr(catalog_module, "active_map_name", _no_read)
+
+    assert catalog_repo.active_name() == "full"
+
+
+def test_set_active_writes_the_ini_and_then_answers_from_it(
+    catalog_repo, tmp_path, monkeypatch
+):
+    ini = _ini_naming(tmp_path, monkeypatch, "full")
+    catalog_repo.load_active()
+
+    assert catalog_repo.set_active("rawonly") == str(ini)
+
+    assert catalog_repo.active_name() == "rawonly"
+    assert "name: rawonly" in ini.read_text()
+
+
+def test_a_failed_set_active_keeps_the_previous_map(catalog_repo, tmp_path, monkeypatch):
+    """The next boot loads what the INI says; the cache must not run ahead."""
+    _ini_naming(tmp_path, monkeypatch, "full")
+    catalog_repo.load_active()
+
+    def _boom(name, logger):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(catalog_module, "set_active_map", _boom)
+
+    with pytest.raises(OSError):
+        catalog_repo.set_active("rawonly")
+    assert catalog_repo.active_name() == "full"
 
 
 # --- write_gridmap ----------------------------------------------------------

@@ -38,9 +38,9 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Four parts must agree: the localizer's cloud (`relocalize`),
         map_server's grid (`load_map`), the 3D planner's tree
         (`planner_server/Octo3D/load_map`) and `[map] name` in the INI (what
-        `active_name()` reports and a restart reads). The localizer goes first
-        because a refusal there mutates nothing; each later step compensates the
-        earlier ones on failure. The INI is last and preflighted for
+        a restart reads; `active_name()` reports it once written). The
+        localizer goes first because a refusal there mutates nothing; each
+        later step compensates the earlier ones on failure. The INI is last and preflighted for
         writability, since an unrecorded swap would leave REST naming the wrong
         map.
 

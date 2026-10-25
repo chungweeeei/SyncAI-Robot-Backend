@@ -12,7 +12,6 @@ pytest.importorskip("syncai_common")
 
 from syncai_backend.exceptions import ConflictError, UpstreamError  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
-from syncai_backend.services import map_switch as map_switch_module  # noqa: E402
 from syncai_backend.services.gridmap_conversion import (  # noqa: E402
     GridmapConversionService,
 )
@@ -56,7 +55,8 @@ class _RecordingMapGateway:
 
 
 @pytest.fixture
-def prior(maps_dir, make_pcd, make_pgm, make_gridmap_yaml, tmp_path, monkeypatch):
+def prior(maps_dir, make_pcd, make_pgm, make_gridmap_yaml, catalog_repo, tmp_path,
+          monkeypatch):
     """A converted map named ``prior``, which the INI says is loaded."""
     directory = maps_dir / "prior"
     directory.mkdir()
@@ -66,6 +66,7 @@ def prior(maps_dir, make_pcd, make_pgm, make_gridmap_yaml, tmp_path, monkeypatch
     ini = tmp_path / "system.ini"
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: prior\n")
     monkeypatch.setenv(SYSTEM_INI_ENV, str(ini))
+    catalog_repo.load_active()
     return directory
 
 
@@ -162,7 +163,9 @@ def test_an_ini_failure_undoes_every_step_and_says_what_was_put_back(
     def _boom(name, logger):
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(map_switch_module, "set_active_map", _boom)
+    monkeypatch.setattr(
+        "syncai_backend.repositories.map.catalog.set_active_map", _boom
+    )
     map_gw = _RecordingMapGateway()
     svc = _service(logger, catalog_repo, map_gw)
 
