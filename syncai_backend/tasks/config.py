@@ -84,6 +84,18 @@ ACTIVE_TASK_LIST_LIMIT = 10
 ACTIVE_TASK_RPC_TIMEOUT_S = 3.0
 
 
+# --- One task (GET /api/v1/tasks/{id}, and cancel / pause / resume) ---------
+#
+# The describe every single-task verb starts with, and the step-state query the
+# detail page polls. The query is the one that hangs: it is answered by a worker,
+# and with none polling the server holds it until its own deadline. Measured on
+# the pinned server (auto-setup 1.29.7, 2026-10-25): with no rpc_timeout the query
+# took 29-30 s to fail (worker gone; or never run), with 3 s it failed in 2-3 s and
+# the page degraded to "no steps" as designed. Describe answered at once either way;
+# bounded anyway, since it is in front of every verb.
+TASK_STATE_RPC_TIMEOUT_S = 3.0
+
+
 # --- "What has run" (GET /api/v1/task_history) ------------------------------
 #
 # One visibility page per request, uncached (paged by hand, not polled). How far back

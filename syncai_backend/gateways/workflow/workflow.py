@@ -66,6 +66,7 @@ from syncai_backend.tasks.config import (
     PAUSE_SIGNAL,
     RESUME_SIGNAL,
     TASK_HISTORY_RPC_TIMEOUT_S,
+    TASK_STATE_RPC_TIMEOUT_S,
     TASK_STATS_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
     task_queue,
@@ -93,6 +94,9 @@ _WORKFLOW_STATUS_MAP = {
 # schedule's), and the authority for "a schedule started it", since schedules
 # registered before TaskKind/TaskName fire without them.
 _SCHEDULED_BY_KEY = SearchAttributeKey.for_keyword("TemporalScheduledById")
+
+
+_TASK_STATE_RPC = timedelta(seconds=TASK_STATE_RPC_TIMEOUT_S)
 
 
 def _active_query(task_queue: str) -> str:
@@ -549,7 +553,7 @@ class WorkflowGateway:
         if self._last_started_task_id is not None:
             handle = client.get_workflow_handle(self._last_started_task_id)
             try:
-                description = await handle.describe()
+                description = await handle.describe(rpc_timeout=_TASK_STATE_RPC)
             except RPCError as err:
                 if err.status == RPCStatusCode.NOT_FOUND:
                     # Retention already dropped it; certainly not running.
@@ -633,7 +637,7 @@ class WorkflowGateway:
             failure=failure_message,
             log="Failed to describe workflow",
         ):
-            description = await handle.describe()
+            description = await handle.describe(rpc_timeout=_TASK_STATE_RPC)
 
         if description.task_queue != self._task_queue:
             raise NotFoundError(f"Task {task_id} not found")
@@ -655,9 +659,12 @@ class WorkflowGateway:
             raise UpstreamError("Unknown workflow status")
 
         # Per-step state is a workflow query. It can fail before the first workflow
-        # task runs or with no worker polling; degrade to no steps.
+        # task runs or with no worker polling; degrade to no steps. Bounded: with no
+        # worker the server held it ~30 s (TASK_STATE_RPC_TIMEOUT_S), every poll.
         try:
-            steps = await handle.query("get_step_states", result_type=List[Step])
+            steps = await handle.query(
+                "get_step_states", result_type=List[Step], rpc_timeout=_TASK_STATE_RPC
+            )
         except Exception as err:
             self._logger.warn(
                 "[WorkflowGateway] Failed to query step states",

@@ -44,7 +44,10 @@ from syncai_backend.exceptions import (  # noqa: E402
     UpstreamError,
     NotFoundError,
 )
-from syncai_backend.tasks.config import WORKFLOW_TYPE_NAME  # noqa: E402
+from syncai_backend.tasks.config import (  # noqa: E402
+    TASK_STATE_RPC_TIMEOUT_S,
+    WORKFLOW_TYPE_NAME,
+)
 from syncai_backend.tasks.schema import (  # noqa: E402
     MoveParams,
     ScheduleTask,
@@ -455,6 +458,55 @@ class TestWorkflowGateway:
 
         assert state.status == "IN_PROGRESS"
         assert state.steps == []
+
+    def test_get_task_state_bounds_both_rpcs(self, workflow_gw, mock_client):
+        """With no worker polling, the server held the step query ~30 s (measured
+        on 1.29.7); every poll of the detail page waited that long."""
+        handle = self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+            ),
+            steps=[MOVE_STEP],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(workflow_gw.get_task_state("robot01-task-001"))
+
+        bound = timedelta(seconds=TASK_STATE_RPC_TIMEOUT_S)
+        assert handle.describe.await_args.kwargs["rpc_timeout"] == bound
+        assert handle.query.await_args.kwargs["rpc_timeout"] == bound
+        assert TASK_STATE_RPC_TIMEOUT_S <= 5
+
+    def test_get_task_state_degrades_when_no_worker_answers_the_query(
+        self, workflow_gw, mock_client
+    ):
+        """What the server answers once the bound expires with the worker gone
+        (the status and sentence 1.29.7 sent): the run's status, no steps."""
+        handle = self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(
+                status=WorkflowExecutionStatus.RUNNING, task_queue=OWN_QUEUE
+            ),
+        )
+        handle.query.side_effect = RPCError(
+            "no poller seen for task queue recently, worker may be down",
+            RPCStatusCode.FAILED_PRECONDITION,
+            b"",
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            state = asyncio.run(workflow_gw.get_task_state("robot01-task-001"))
+
+        assert state.status == "IN_PROGRESS"
+        assert state.steps == []
+
+    def test_a_describe_that_times_out_is_a_502(self, workflow_gw, mock_client):
+        handle = self._workflow_handle(mock_client)
+        handle.describe.side_effect = RPCError(
+            "Timeout expired", RPCStatusCode.DEADLINE_EXCEEDED, b""
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError):
+                asyncio.run(workflow_gw.get_task_state("robot01-task-001"))
 
     def test_get_task_state_reads_paused_off_the_held_step(self, workflow_gw, mock_client):
         # Temporal has no paused status — a held run is RUNNING to it. The

@@ -909,7 +909,11 @@ Details that matter when editing this path:
   the blocking `speak()` (`wait=true`).
 - **Per-step state is a workflow query** (`get_step_states`), not a table.
   `GET /api/v1/tasks/{id}` degrades to an empty step list if the query fails (no
-  worker polling yet) instead of failing the request.
+  worker polling yet) instead of failing the request. The query and the describe
+  in front of it are bounded at `TASK_STATE_RPC_TIMEOUT_S` (3 s): with no worker
+  polling, the pinned server held the query ~30 s before failing it (measured
+  2026-10-25), so every poll of the detail page hung that long; bounded, it
+  degrades in 2-3 s. A describe that times out is a 502.
 - **The hold is two workflow signals** (`pause` / `resume`, via
   `POST /api/v1/tasks/{id}/pause` · `/resume`) plus a flag; both idempotent, so a
   second pause or stray resume changes nothing. The run checks the flag before
