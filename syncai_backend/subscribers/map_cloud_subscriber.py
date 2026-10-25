@@ -3,15 +3,14 @@ import json
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-import rclpy
 import structlog
 
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
 
 from std_msgs.msg import String
 
+from syncai_backend.subscribers import qos
 from syncai_backend.repositories.pointcloud.pointcloud import PointCloudRepo
 from syncai_backend.helpers.pointcloud import cap_points, pack_xyz_f32, read_pcd_xyz
 
@@ -116,12 +115,7 @@ class MapCloudSubscriber:
             msg_type=String,
             topic="pgo/map_cloud_file",
             callback=self._notice_cb,
-            qos_profile=QoSProfile(
-                depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            ),
+            qos_profile=qos.latched(),
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
 
