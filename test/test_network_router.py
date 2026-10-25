@@ -6,6 +6,7 @@ scan is the robot's fault (502), a failed connect is usually the caller's
 credentials (400).
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -189,3 +190,74 @@ def test_forgetting_the_active_network_is_a_400(client, robot_gw):
 
     assert response.status_code == 400
     assert "Cannot forget" in response.json()["detail"]
+
+
+# --- One NetworkManager change at a time --------------------------------------
+
+
+def _hold(robot_gw, method):
+    """Make ``method`` block until released; returns (entered, release)."""
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(robot_gw, method)
+
+    def held(*args, **kwargs):
+        entered.set()
+        release.wait(5)
+        return original(*args, **kwargs)
+
+    setattr(robot_gw, method, held)
+    return entered, release
+
+
+def _in_background(call):
+    box = {}
+    thread = threading.Thread(target=lambda: box.setdefault("response", call()))
+    thread.start()
+    return thread, box
+
+
+def test_a_change_while_another_runs_is_a_409(client, robot_gw):
+    """Connect to A while activating B would race in NetworkManager; joining
+    one to the other would answer a request never run. So: refuse."""
+    entered, release = _hold(robot_gw, "connect_wifi")
+    thread, box = _in_background(
+        lambda: client.post(
+            "/api/v1/network/wifi/connect", json={"ssid": "net", "password": "pw"}
+        )
+    )
+    assert entered.wait(5)
+
+    activate = client.post("/api/v1/network/wifi/connections/u-2/activate")
+    delete = client.delete("/api/v1/network/wifi/connections/u-2")
+    release.set()
+    thread.join(5)
+
+    assert activate.status_code == 409
+    assert activate.json()["code"] == "wifi_busy"
+    assert delete.status_code == 409
+    assert robot_gw.activate_calls == [] and robot_gw.delete_calls == []
+    assert box["response"].status_code == 200
+
+
+def test_the_guard_is_released_after_a_change_ends_either_way(client, robot_gw):
+    robot_gw.connect_result = (False, "Secrets were required")
+    assert client.post(
+        "/api/v1/network/wifi/connect", json={"ssid": "net", "password": "x"}
+    ).status_code == 400
+
+    assert client.post("/api/v1/network/wifi/connections/u-2/activate").status_code == 200
+
+
+def test_a_scan_is_not_blocked_by_a_change(client, robot_gw):
+    """Reading what is visible does not touch NetworkManager's state."""
+    entered, release = _hold(robot_gw, "connect_wifi")
+    thread, _ = _in_background(
+        lambda: client.post("/api/v1/network/wifi/connect", json={"ssid": "net"})
+    )
+    assert entered.wait(5)
+
+    scan = client.get("/api/v1/network/wifi/scan")
+    release.set()
+    thread.join(5)
+
+    assert scan.status_code == 200

@@ -1162,8 +1162,8 @@ def init_map_router(
     renders = _RenderCache()
 
     def _vertex_count(name: str) -> int:
-        # count_vertices, not len(list_vertices(...)): called once per map on
-        # every listing, so avoid hydrating every vertex.
+        # One map's count (GET /maps/{name}); the listing uses
+        # count_vertices_by_map. Never len(list_vertices(...)).
 
         return map_repo.count_vertices(map=name)
 
@@ -1180,8 +1180,10 @@ def init_map_router(
     @map_router.get("/api/v1/maps", response_model=List[MapSummaryResponse])
     def list_maps():
         active_name = map_catalog_repo.active_name()
+        # One GROUP BY for the whole listing, not a count per map.
+        counts = map_repo.count_vertices_by_map()
         return [
-            _summary(stored, active_name, _vertex_count(stored.name), conversion_svc)
+            _summary(stored, active_name, counts.get(stored.name, 0), conversion_svc)
             for stored in map_catalog_repo.list_maps()
         ]
 

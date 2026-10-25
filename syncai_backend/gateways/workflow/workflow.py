@@ -52,6 +52,7 @@ from syncai_backend.tasks.schema import (
     WorkflowTask,
 )
 from syncai_backend.tasks.search_attributes import (
+    ROBOT_ID_KEY,
     TASK_KIND_KEY,
     TASK_MAP_KEY,
     TASK_NAME_KEY,
@@ -130,6 +131,18 @@ def _quote(value: str) -> str:
     ``column op literal`` anyway, so this is not the only injection guard.
     """
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _schedule_list_query(robot_id: str) -> str:
+    """The List Filter behind GET /api/v1/schedules: this robot's, server-side.
+
+    The namespace is the fleet's, so an unfiltered list pulled every robot's
+    schedules to keep this one's. ``RobotId`` is stamped on each schedule at
+    create; ``IS NULL`` keeps the ones from before it, which the memo filter
+    after the list still scopes. Checked on the pinned server (1.29.7, Postgres
+    visibility): mine and legacy listed, another robot's new one not.
+    """
+    return f"RobotId = {_quote(robot_id)} OR RobotId IS NULL"
 
 
 def _kind_predicate(kind: TaskKind) -> str:
@@ -1079,6 +1092,11 @@ class WorkflowGateway:
                 ),
                 # Never empty: robot_id is always present, so no `or None`.
                 memo=memo,
+                # On the schedule itself (not its runs): what list_schedules
+                # asks the server to filter on.
+                search_attributes=TypedSearchAttributes(
+                    [SearchAttributePair(ROBOT_ID_KEY, self._robot_id)]
+                ),
             )
         except ScheduleAlreadyRunningError:
             raise BadRequestError(f"Schedule {schedule.id} already exists")
@@ -1181,6 +1199,34 @@ class WorkflowGateway:
         self._schedule_owner_cache[schedule_id] = owned
         return owned
 
+    async def _list_schedule_items(self, client: Client) -> list:
+        """The schedule list rows, filtered server-side when the server can.
+
+        Read to the end here, not handed back as the iterator: the SDK sends
+        the first page's RPC on the first ``__anext__``, not on the ``await``,
+        so a refusal only surfaces while iterating, and has to be caught where
+        the iterating happens.
+
+        INVALID_ARGUMENT is the namespace without ``RobotId`` registered yet
+        (the worker registers it at connect, and may not have yet): fall back
+        to the whole namespace, which the memo filter in the caller scopes as
+        it always did. Probed on 1.29.7: an unregistered attribute in the
+        filter is exactly that status. Anything else is the listing failing.
+        """
+        try:
+            # `list_schedules` is a coroutine returning the iterator, hence the
+            # await (`list_workflows` is not; do not copy this shape there).
+            query = _schedule_list_query(self._robot_id)
+            return [item async for item in await client.list_schedules(query)]
+        except RPCError as err:
+            if err.status != RPCStatusCode.INVALID_ARGUMENT:
+                raise
+            self._logger.warn(
+                "[WorkflowGateway] RobotId not queryable; listing every schedule",
+                error=str(err),
+            )
+            return [item async for item in await client.list_schedules()]
+
     async def list_schedules(self) -> List[ScheduleView]:
 
         try:
@@ -1193,9 +1239,7 @@ class WorkflowGateway:
 
         schedules: List[ScheduleView] = []
         try:
-            # `list_schedules` is a coroutine returning the iterator, hence the
-            # await (`list_workflows` is not; do not copy this shape there).
-            async for item in await client.list_schedules():
+            for item in await self._list_schedule_items(client):
                 memo = await _read_memo(item)
                 # The namespace is shared; keep only this robot's schedules.
                 if not await self._owns_listed_schedule(client, item.id, memo):

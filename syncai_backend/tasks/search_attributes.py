@@ -9,8 +9,13 @@ because a scheduled run inherits only its action's search attributes. Read by th
 active-task list (which map a job holds, for the map routes' refusal) and by
 RobotActivities.execute_move (checked against the loaded map).
 
+``RobotId`` is on the *schedule*, not its runs: the namespace is shared by the fleet,
+and ``GET /api/v1/schedules`` asks the server for this robot's schedules (plus those
+from before the attribute, which carry none) instead of pulling every robot's and
+filtering on the memo here.
+
 Keyword, not Text: SQL visibility allows ``=`` / ``IN`` / ``STARTS_WITH`` only on
-Keyword. On the pinned server (auto-setup 1.29.7, Postgres) these take three of the
+Keyword. On the pinned server (auto-setup 1.29.7, Postgres) these take four of the
 ``Keyword01..10`` columns.
 
 auto-setup registers custom attributes only on a fresh install, with no knob for
@@ -32,12 +37,14 @@ from temporalio.common import SearchAttributeKey
 TASK_KIND_KEY = SearchAttributeKey.for_keyword("TaskKind")
 TASK_NAME_KEY = SearchAttributeKey.for_keyword("TaskName")
 TASK_MAP_KEY = SearchAttributeKey.for_keyword("TaskMap")
+ROBOT_ID_KEY = SearchAttributeKey.for_keyword("RobotId")
 
 # Name -> type, the shape AddSearchAttributesRequest takes.
 CUSTOM_SEARCH_ATTRIBUTES: Dict[str, "IndexedValueType.ValueType"] = {
     TASK_KIND_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
     TASK_NAME_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
     TASK_MAP_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+    ROBOT_ID_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
 }
 
 

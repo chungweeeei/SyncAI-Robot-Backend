@@ -158,6 +158,17 @@ class MapRepo:
             stmt = self._scope(select(func.count()).select_from(MapPoint), map, type)
             return session.scalars(stmt).one()
 
+    def count_vertices_by_map(self) -> dict[str, int]:
+        """Every map's vertex count in one ``GROUP BY``, for the map listing.
+
+        ``count_vertices`` per map was one session and one round trip per map
+        on every ``GET /api/v1/maps``. A map with no vertices has no row here;
+        read it with ``.get(name, 0)``.
+        """
+        with self._session(op="count_vertices_by_map") as session:
+            stmt = select(MapPoint.map, func.count()).group_by(MapPoint.map)
+            return {name: count for name, count in session.execute(stmt).all()}
+
     def get_vertex(self, vertex_id: uuid.UUID) -> Optional[MapPoint]:
         with self._session(op="get_vertex") as session:
             return session.get(MapPoint, vertex_id)

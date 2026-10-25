@@ -529,6 +529,24 @@ def test_list_counts_vertices_of_that_map_only(client, map_repo):
     assert body["rawonly"]["vertex_count"] == 1
 
 
+def test_list_counts_every_map_in_one_query(client, map_repo, monkeypatch):
+    """One GROUP BY for the listing, not a count per map; a map with no
+    vertices (no row in the grouping) still reads 0."""
+
+    def per_map(*args, **kwargs):
+        raise AssertionError("the listing must not count map by map")
+
+    monkeypatch.setattr(map_repo, "count_vertices", per_map)
+    map_repo.create_vertices(map="full", vertices=[
+        {"name": "a", "type": "MOVE", "x": 1.0, "y": 2.0, "theta": 0.0},
+    ])
+
+    body = _by_name(client.get("/api/v1/maps").json())
+
+    assert body["full"]["vertex_count"] == 1
+    assert body["rawonly"]["vertex_count"] == 0
+
+
 # --- /api/v1/maps/{name} ----------------------------------------------------
 
 

@@ -137,6 +137,23 @@ def test_count_vertices_matches_list_under_the_same_filters(map_repo):
         ), filters
 
 
+def test_count_vertices_by_map_agrees_with_count_vertices(map_repo):
+    """The listing's one GROUP BY must say what a count per map would."""
+    _create(map_repo, name="g1", type="MOVE", map="warehouse")
+    _create(map_repo, name="a1", type="CHARGE", map="warehouse")
+    _create(map_repo, name="g2", type="MOVE", map="office")
+
+    counts = map_repo.count_vertices_by_map()
+
+    assert counts == {"warehouse": 2, "office": 1}
+    for name in ("warehouse", "office", "empty-map"):
+        assert counts.get(name, 0) == map_repo.count_vertices(map=name)
+
+
+def test_count_vertices_by_map_is_empty_on_an_empty_table(map_repo):
+    assert map_repo.count_vertices_by_map() == {}
+
+
 def test_count_vertices_is_zero_not_none_on_an_empty_table(map_repo):
     # count(*) returns a row even with nothing to count; callers render this
     # straight into a response field, so it must be an int.
