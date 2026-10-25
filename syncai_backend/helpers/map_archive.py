@@ -14,6 +14,11 @@ manifest without writing anything; ``extract_archive`` streams only the listed
 files, hashing as it writes. Never use ``extractall``/``extract``: on Python
 3.10 they honour absolute names, links, modes and owners (``data_filter`` is
 3.12+).
+
+**Bytes or a file.** Both readers take the archive as ``bytes`` or as a
+seekable binary file, and ``write_archive`` writes into one: the routes spool
+to an anonymous temp file, so a map of hundreds of MB is never held in memory
+whole. ``build_archive`` (bytes out) is the same writer into a ``BytesIO``.
 """
 
 import hashlib
@@ -29,7 +34,7 @@ import zipfile
 import zlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import BinaryIO, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 MANIFEST_NAME = "syncai_map.json"
 MANIFEST_FORMAT = "syncai-map"
@@ -41,6 +46,10 @@ MAX_MEMBERS = 50_000
 MAX_MANIFEST_BYTES = 16 << 20
 
 _CHUNK = 1 << 20
+
+# What the readers take: the archive in memory, or a seekable binary file
+# (read from the start, left open for the caller).
+ArchiveSource = Union[bytes, BinaryIO]
 _MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 _VERTEX_NUMBERS = ("x", "y", "theta")
 
@@ -171,15 +180,16 @@ class _HashingReader:
         return chunk
 
 
-def build_archive(
+def write_archive(
     map_dir: str,
     name: str,
     vertices: Sequence[Mapping[str, object]],
     fmt: ArchiveFormat,
     exported_at: str,
+    dest: BinaryIO,
     exclude_dirs: Sequence[str] = (),
-) -> bytes:
-    """Archive ``map_dir`` with its manifest and return the bytes.
+) -> None:
+    """Archive ``map_dir`` with its manifest into ``dest``, a binary file.
 
     Each file is hashed and stored in one read, so the md5 matches the stored
     bytes even if the file is rewritten meanwhile. No top-level ``<name>/``
@@ -188,10 +198,9 @@ def build_archive(
     """
     files = _collect_files(map_dir, exclude_dirs)
     hashes: Dict[str, str] = {}
-    buffer = io.BytesIO()
 
     if fmt is ArchiveFormat.ZIP:
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for rel, path in files:
                 info = zipfile.ZipInfo.from_file(path, arcname=rel, strict_timestamps=False)
                 info.compress_type = zipfile.ZIP_DEFLATED
@@ -203,7 +212,7 @@ def build_archive(
                 hashes[rel] = digest.hexdigest()
             archive.writestr(MANIFEST_NAME, _manifest_bytes(name, exported_at, hashes, vertices))
     else:
-        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        with tarfile.open(fileobj=dest, mode="w:gz") as archive:
             for rel, path in files:
                 info = archive.gettarinfo(path, arcname=rel)
                 info.uid = info.gid = 0
@@ -220,20 +229,40 @@ def build_archive(
             info.mtime = int(time.time())
             archive.addfile(info, io.BytesIO(payload))
 
+
+def build_archive(
+    map_dir: str,
+    name: str,
+    vertices: Sequence[Mapping[str, object]],
+    fmt: ArchiveFormat,
+    exported_at: str,
+    exclude_dirs: Sequence[str] = (),
+) -> bytes:
+    """``write_archive`` into memory, returning the bytes. For tests and small
+    maps; the export route writes to a temp file instead."""
+    buffer = io.BytesIO()
+    write_archive(map_dir, name, vertices, fmt, exported_at, buffer, exclude_dirs)
     return buffer.getvalue()
 
 
 # --- Reading ----------------------------------------------------------------
 
 
-def sniff_format(payload: bytes) -> ArchiveFormat:
-    """Which container ``payload`` is, from its magic bytes.
+def sniff_format(source: ArchiveSource) -> ArchiveFormat:
+    """Which container ``source`` is, from its magic bytes.
 
-    A plain ``.tar`` is refused: export never produces one.
+    A plain ``.tar`` is refused: export never produces one. A file is read
+    from its start and rewound.
     """
-    if payload[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+    if isinstance(source, (bytes, bytearray)):
+        head = bytes(source[:4])
+    else:
+        source.seek(0)
+        head = source.read(4)
+        source.seek(0)
+    if head in (b"PK\x03\x04", b"PK\x05\x06"):
         return ArchiveFormat.ZIP
-    if payload[:2] == b"\x1f\x8b":
+    if head[:2] == b"\x1f\x8b":
         return ArchiveFormat.TAR_GZ
     raise MapArchiveError("Unsupported archive: expected a .zip or .tar.gz export of a map.")
 
@@ -250,15 +279,21 @@ class _Member:
 class _Reader:
     """One open archive, read-only, uniform over the two containers."""
 
-    def __init__(self, payload: bytes, fmt: ArchiveFormat):
-        self._buffer = io.BytesIO(payload)
+    def __init__(self, source: ArchiveSource, fmt: ArchiveFormat):
+        # A caller's file is read from the start and never closed here:
+        # ZipFile / TarFile close only what they opened themselves.
+        if isinstance(source, (bytes, bytearray)):
+            self._file: BinaryIO = io.BytesIO(source)
+        else:
+            source.seek(0)
+            self._file = source
         self._zip: Optional[zipfile.ZipFile] = None
         self._tar: Optional[tarfile.TarFile] = None
         try:
             if fmt is ArchiveFormat.ZIP:
-                self._zip = zipfile.ZipFile(self._buffer)
+                self._zip = zipfile.ZipFile(self._file)
             else:
-                self._tar = tarfile.open(fileobj=self._buffer, mode="r:gz")
+                self._tar = tarfile.open(fileobj=self._file, mode="r:gz")
         except (zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, zlib.error) as exc:
             raise MapArchiveError(f"Not a readable {fmt.value} archive: {exc}") from exc
 
@@ -434,8 +469,9 @@ def _parse_manifest(raw: bytes) -> ArchiveManifest:
     )
 
 
-def inspect_archive(payload: bytes) -> InspectedArchive:
-    """Validate ``payload`` without writing anything; raise or describe it.
+def inspect_archive(payload: ArchiveSource) -> InspectedArchive:
+    """Validate ``payload`` (bytes or a seekable file) without writing anything;
+    raise or describe it.
 
     Checks the container, member count, every member name, that all members
     are plain files or dirs, one root manifest that parses, and that the
@@ -494,7 +530,9 @@ def inspect_archive(payload: bytes) -> InspectedArchive:
     return InspectedArchive(format=fmt, manifest=manifest, total_bytes=total)
 
 
-def extract_archive(payload: bytes, inspected: InspectedArchive, dest_dir: str) -> int:
+def extract_archive(
+    payload: ArchiveSource, inspected: InspectedArchive, dest_dir: str
+) -> int:
     """Write the manifest's files under ``dest_dir``; return the bytes written.
 
     ``dest_dir`` is a fresh staging directory the caller owns and cleans up.
