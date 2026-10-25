@@ -119,6 +119,11 @@ Consequences:
 - **Blocking REST handlers are plain `def`, not `async def`** (ROS service calls up to
   ~70 s, psycopg2, PNG encoding) so FastAPI runs them in its thread pool. Keep that
   distinction when adding endpoints.
+- **ROS service calls go through `gateways/ros.py`'s `call_service`**, never a raw
+  `call_async` + wait: on timeout it `remove_pending_request`s the abandoned request,
+  which otherwise stays in the client's pending table for the life of the process when
+  the server was restarted under it. `restart_mode` is the one exception (its late
+  answer is wanted); `test_ros_call_service.py` enforces the rest.
 - Heavy point-cloud callbacks each get their own `MutuallyExclusiveCallbackGroup` so they
   cannot starve `robot_state` / telemetry / TF.
 - Postgres is a hard dependency (20 retries × 5 s, then the process exits); Temporal is
