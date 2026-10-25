@@ -7,7 +7,7 @@ out a *distinct* mock per service name — a bare MagicMock would return the sam
 object for both calls, and a test could then never prove that reload_map left
 ``pgo/save_maps`` alone.
 
-The timeout paths are pinned by patching the module's ``_wait_for_future``
+The timeout paths are pinned by patching ``gateways.ros.wait_for_future``
 rather than a shrunken constant: map.py inlines its 20 s / 180 s deadlines
 (there is no module-level knob like robot.py's SWITCH_MODE_ACK_TIMEOUT), and
 waiting out even a shrunken real deadline buys nothing the patched helper does
@@ -32,11 +32,9 @@ from syncai_common.srv import (  # noqa: E402
     ResetMapping, ResetOdometry, SaveMaps, StartMapping,
 )
 
-from syncai_backend.gateways.map import map as map_module  # noqa: E402
-from syncai_backend.gateways.map.map import (  # noqa: E402
-    MapGateway,
-    _wait_for_future,
-)
+from syncai_backend.gateways import ros as ros_module  # noqa: E402
+from syncai_backend.gateways.map.map import MapGateway  # noqa: E402
+from syncai_backend.gateways.ros import wait_for_future  # noqa: E402
 
 
 class _Future:
@@ -107,17 +105,17 @@ class TestWaitForFuture:
     def test_a_done_future_returns_true_immediately(self):
         # add_done_callback on a completed future fires at once, so the Event
         # is set before wait() is entered — no timeout needed at all.
-        assert _wait_for_future(_Future(completed=True)) is True
+        assert wait_for_future(_Future(completed=True)) is True
 
     def test_an_unanswered_future_times_out_false(self):
-        assert _wait_for_future(_Future(completed=False), timeout=0.01) is False
+        assert wait_for_future(_Future(completed=False), timeout=0.01) is False
 
     def test_a_completion_from_another_thread_wakes_the_waiter(self):
         # The production shape: the FastAPI worker parks here while an executor
         # thread delivers the response.
         future = _Future(completed=False)
         threading.Timer(0.01, future.complete, args=(None,)).start()
-        assert _wait_for_future(future, timeout=5.0) is True
+        assert wait_for_future(future, timeout=5.0) is True
 
 
 class TestReloadMap:
@@ -152,7 +150,7 @@ class TestReloadMap:
 
     def test_timeout_reports_the_load_map_deadline(self, map_gw, monkeypatch):
         client = _arm(map_gw, "load_map", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
 
@@ -284,7 +282,7 @@ class TestReloadKeepout:
 
     def test_timeout_reports_the_mask_server_deadline(self, map_gw, monkeypatch):
         client = _arm(map_gw, "load_keepout", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
 
@@ -450,7 +448,7 @@ class TestSaveMap:
 
     def test_timeout_reports_the_save_maps_deadline(self, map_gw, monkeypatch):
         client = _arm(map_gw, "save_maps", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         success, message = map_gw.save_map(directory="/map/newsite")
 
@@ -549,7 +547,7 @@ class TestResetMapping:
 
     def test_timeout_reports_the_reset_deadline(self, map_gw, monkeypatch):
         client = _arm(map_gw, "reset_mapping", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         success, message = map_gw.reset_mapping()
 
@@ -646,7 +644,7 @@ class TestStartMapping:
 
     def test_timeout_reports_the_start_deadline(self, map_gw, monkeypatch):
         client = _arm(map_gw, "start_mapping", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         success, message = map_gw.start_mapping()
 
@@ -723,7 +721,7 @@ class TestSwapLocalizerMap:
 
     def test_timeout_reports_the_relocalize_deadline(self, map_gw, monkeypatch):
         _arm(map_gw, "relocalize", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         success, message = map_gw.swap_localizer_map("/map/dp1f/map.pcd", 0.0, 0.0, 0.0)
 
@@ -772,7 +770,7 @@ class TestLocalizationConverged:
 
     def test_a_timeout_is_none_not_false(self, map_gw, monkeypatch):
         _arm(map_gw, "relocalize_check", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", lambda f, timeout: False)
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
 
         assert map_gw.localization_converged(timeout_s=0.1) is None
 
@@ -854,7 +852,7 @@ class TestAutoLocalize:
             return False
 
         _arm(map_gw, "reset_odometry", completed=False)
-        monkeypatch.setattr(map_module, "_wait_for_future", _wait)
+        monkeypatch.setattr(ros_module, "wait_for_future", _wait)
 
         assert map_gw.auto_localize() == (
             False, "Timeout waiting for reset_odometry response", None,

@@ -19,7 +19,6 @@ absence is a capability answer, not a mode one — see ``planner_3d_available``.
 
 import math
 import os
-import threading
 import time
 import structlog
 from typing import Optional
@@ -32,6 +31,8 @@ from nav2_msgs.srv import LoadMap
 from syncai_common.srv import (
     IsValid, Relocalize, ResetMapping, ResetOdometry, SaveMaps, StartMapping,
 )
+
+from syncai_backend.gateways import ros
 
 
 def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
@@ -49,18 +50,6 @@ def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
         LoadMap.Response.RESULT_UNDEFINED_FAILURE: f"{server} reported an undefined failure",
     }
     return messages.get(result, f"{server} returned result {result}")
-
-
-def _wait_for_future(future, timeout: Optional[float] = None) -> bool:
-    """Bridge a ROS future to the FastAPI worker thread that is waiting on it.
-
-    Duplicated from ``gateways/robot/robot.py`` to avoid importing it; a third
-    user should move it to ``gateways/__init__.py``. Not
-    ``spin_until_future_complete``: off the executor thread, that deadlocks.
-    """
-    event = threading.Event()
-    future.add_done_callback(lambda _: event.set())
-    return event.wait(timeout=timeout)
 
 
 class MapGateway:
@@ -197,18 +186,19 @@ class MapGateway:
 
         self._logger.info("[MapGateway] Relocalizing onto map cloud", pcd=map_path)
 
-        future = relocalize_client.call_async(
+        # Reads and downsamples a ~100-200 MB PCD; bounded since this holds a
+        # FastAPI worker thread.
+        response = ros.call_service(
+            relocalize_client,
             Relocalize.Request(
                 pcd_path=map_path, x=float(x), y=float(y), z=0.0,
                 yaw=float(yaw), pitch=0.0, roll=0.0,
-            )
+            ),
+            timeout_s=60.0,
         )
-        # Reads and downsamples a ~100-200 MB PCD; bounded since this holds a
-        # FastAPI worker thread.
-        if not _wait_for_future(future, timeout=60.0):
+        if response is None:
             return False, "Timeout waiting for relocalize response"
 
-        response = future.result()
         if not response.success:
             return False, f"localizer refused the map: {response.message}"
 
@@ -258,11 +248,11 @@ class MapGateway:
 
         deadline = time.monotonic() + timeout_s
         while True:
-            future = check_client.call_async(IsValid.Request(code=0))
             remaining = max(0.5, deadline - time.monotonic())
-            if not _wait_for_future(future, timeout=remaining):
+            response = ros.call_service(check_client, IsValid.Request(code=0), timeout_s=remaining)
+            if response is None:
                 return None
-            if future.result().valid:
+            if response.valid:
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -300,11 +290,10 @@ class MapGateway:
 
         self._logger.info("[MapGateway] Auto-localizing (reset odometry + search)")
 
-        future = client.call_async(ResetOdometry.Request(skip_seed=True))
-        if not _wait_for_future(future, timeout=40.0):
+        response = ros.call_service(client, ResetOdometry.Request(skip_seed=True), timeout_s=40.0)
+        if response is None:
             return False, "Timeout waiting for reset_odometry response", None
 
-        response = future.result()
         self._logger.info(
             "[MapGateway] Auto-localize answered",
             success=response.success,
@@ -335,13 +324,14 @@ class MapGateway:
 
         self._logger.info("[MapGateway] Reloading map", map_url=map_url)
 
-        future = load_map_client.call_async(LoadMap.Request(map_url=map_url))
         # Under a second in practice; 20 s is headroom yet short enough that a
         # wedged map_server does not hold a worker thread for long.
-        if not _wait_for_future(future, timeout=20.0):
+        response = ros.call_service(
+            load_map_client, LoadMap.Request(map_url=map_url), timeout_s=20.0
+        )
+        if response is None:
             return False, "Timeout waiting for map_server/load_map response"
 
-        response = future.result()
         if response.result != LoadMap.Response.RESULT_SUCCESS:
             return False, _load_map_failure(
                 response.result, "map_server", "gridmap.pgm", "gridmap.yaml"
@@ -375,12 +365,11 @@ class MapGateway:
 
         self._logger.info("[MapGateway] Reloading keepout mask", map_url=map_url)
 
-        future = client.call_async(LoadMap.Request(map_url=map_url))
         # Same as reload_map.
-        if not _wait_for_future(future, timeout=20.0):
+        response = ros.call_service(client, LoadMap.Request(map_url=map_url), timeout_s=20.0)
+        if response is None:
             return False, "Timeout waiting for filter_mask_server/load_map response"
 
-        response = future.result()
         if response.result != LoadMap.Response.RESULT_SUCCESS:
             return False, _load_map_failure(
                 response.result, "filter_mask_server", "keepout.pgm", "keepout.yaml"
@@ -415,11 +404,10 @@ class MapGateway:
             map_url=map_url or "(clear)",
         )
 
-        future = client.call_async(LoadMap.Request(map_url=map_url))
-        if not _wait_for_future(future, timeout=120.0):
+        response = ros.call_service(client, LoadMap.Request(map_url=map_url), timeout_s=120.0)
+        if response is None:
             return False, "Timeout waiting for planner_server/Octo3D/load_keepout response"
 
-        response = future.result()
         if response.result == LoadMap.Response.RESULT_UNDEFINED_FAILURE:
             # What the planner answers when it has no 3D map to draw zones on.
             return False, "the 3D planner has no 3D map loaded"
@@ -469,11 +457,10 @@ class MapGateway:
             map_url=map_url or "(unload)",
         )
 
-        future = client.call_async(LoadMap.Request(map_url=map_url))
-        if not _wait_for_future(future, timeout=120.0):
+        response = ros.call_service(client, LoadMap.Request(map_url=map_url), timeout_s=120.0)
+        if response is None:
             return False, "Timeout waiting for planner_server/Octo3D/load_map response"
 
-        response = future.result()
         if response.result != LoadMap.Response.RESULT_SUCCESS:
             return False, _load_map_failure(
                 response.result, "the 3D planner", "octomap.bt", "the octomap path"
@@ -498,7 +485,8 @@ class MapGateway:
         file_path = os.path.abspath(os.path.expanduser(directory))
         self._logger.info("[MapGateway] Saving map", file_path=file_path)
 
-        future = save_maps_client.call_async(
+        response = ros.call_service(
+            save_maps_client,
             SaveMaps.Request(
                 file_path=file_path,
                 save_patches=True,
@@ -509,13 +497,12 @@ class MapGateway:
                     if octomap
                     else SaveMaps.Request.OCTOMAP_OFF
                 ),
-            )
+            ),
+            timeout_s=180.0,
         )
-
-        if not _wait_for_future(future, timeout=180.0):
+        if response is None:
             return False, "Timeout waiting for pgo/save_maps response"
 
-        response = future.result()
         return response.success, response.message
 
     def reset_mapping(self, reset_lio: bool = True) -> tuple[bool, str]:
@@ -541,12 +528,12 @@ class MapGateway:
 
         self._logger.info("[MapGateway] Resetting the mapping run", reset_lio=reset_lio)
 
-        future = reset_client.call_async(ResetMapping.Request(reset_lio=reset_lio))
-
-        if not _wait_for_future(future, timeout=30.0):
+        response = ros.call_service(
+            reset_client, ResetMapping.Request(reset_lio=reset_lio), timeout_s=30.0
+        )
+        if response is None:
             return False, "Timeout waiting for pgo/reset_mapping response"
 
-        response = future.result()
         if response.success:
             # Zero means the run had banked no keyframes yet.
             self._logger.info(
@@ -576,12 +563,12 @@ class MapGateway:
 
         self._logger.info("[MapGateway] Starting the mapping run", reset_lio=reset_lio)
 
-        future = start_client.call_async(StartMapping.Request(reset_lio=reset_lio))
-
-        if not _wait_for_future(future, timeout=30.0):
+        response = ros.call_service(
+            start_client, StartMapping.Request(reset_lio=reset_lio), timeout_s=30.0
+        )
+        if response is None:
             return False, "Timeout waiting for pgo/start_mapping response"
 
-        response = future.result()
         if response.success:
             self._logger.info(
                 "[MapGateway] Mapping run started",

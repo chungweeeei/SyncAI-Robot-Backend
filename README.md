@@ -487,7 +487,7 @@ the robot side keeps its trees stateless. Consequences:
 - The UNDOCK step stays (API, stored templates and schedules), and its success
   forgets the dock too; the console no longer offers it.
 
-**Service clients.**
+**Service clients.** Every call goes through `gateways/ros.py`'s `call_service`: send, wait off the executor thread, and on timeout `remove_pending_request` the abandoned request, which otherwise sat in the client's pending table for the life of the process whenever its server was restarted under it (`switch_mode` / `restart_mode` rebuild them all). `restart_mode` alone keeps its request pending, for the late answer that reports the restart's outcome. `test_ros_call_service.py` fails on a new raw `call_async`.
 
 - `RobotGateway`: `scan_wifi`, `connect_wifi`, `switch_mode`, `restart_mode`
   (`syncai_common/srv`, `syncai_sys_manager`); `set_motion_key` /
