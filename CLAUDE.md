@@ -153,7 +153,10 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain ex
         │                  The map routes are a package, routers/maps/: one module per area
         │                  (catalog, archive, mapping, switch, grid, vertices, keepout, cloud,
         │                  octomap, floors) with register(map_router, ctx), sharing schemas.py,
-        │                  common.py and a MapRouteContext; routers/map.py composes them
+        │                  common.py and a MapRouteContext; routers/map.py composes them.
+        │                  ctx.require_exists (one isdir) for a 404 on an unknown map;
+        │                  ctx.require only where the route uses the StoredMap, since
+        │                  get_map walks every file of the map (patches/: hundreds)
         │
 services/                  domain work that outlives a request: gridmap_conversion (recipes,
         │                  the registry of running threads, the gridmap.recipe.json protocol),
