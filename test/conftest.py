@@ -6,7 +6,12 @@ The database layer is exercised against an in-memory SQLite engine instead of
 PostgreSQL, so no database server is required.
 """
 
+import asyncio
+import builtins
+import io
 import math
+import os
+import sys
 
 import pytest
 import structlog
@@ -14,7 +19,82 @@ import structlog
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
+import syncai_backend
 from syncai_backend.database.models import Base
+
+
+# --- No disk I/O on the event loop -----------------------------------------
+#
+# The REST server's loop is shared by every async route, teleop and the
+# telemetry streams; one blocking read there (an INI, a map walk) stalls all of
+# them for as long as the disk takes. Blocking routes are plain `def` (the
+# threadpool) and async ones put disk work in `asyncio.to_thread` (CLAUDE.md).
+# This guard holds every test to that: a file opened or stat'ed by package code
+# on a thread with a running loop fails the test that did it.
+#
+# Python-level entry points only, which is what package code calls: `open`,
+# and the `os` functions behind os.path.isdir / exists / getmtime / realpath and
+# os.walk. Imports go through `posix` directly and are not seen.
+
+_PACKAGE_DIR = os.path.dirname(syncai_backend.__file__) + os.sep
+
+_GUARDED = (
+    (builtins, "open"),
+    (io, "open"),
+    (os, "stat"),
+    (os, "lstat"),
+    (os, "scandir"),
+    (os, "listdir"),
+    (os, "access"),
+)
+
+
+def _package_caller():
+    """The innermost package frame on this thread's stack, or None: a test
+    body's own file access on the loop is the test's business."""
+    frame = sys._getframe(2)
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename.startswith(_PACKAGE_DIR):
+            return f"{filename[len(_PACKAGE_DIR):]}:{frame.f_lineno} ({frame.f_code.co_name})"
+        frame = frame.f_back
+    return None
+
+
+@pytest.fixture(autouse=True)
+def no_disk_io_on_the_event_loop(monkeypatch):
+    """Yields what it found, {caller: [first call, count]}, for its own test."""
+    found = {}
+
+    def _guard(name, real):
+        def guarded(*args, **kwargs):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return real(*args, **kwargs)
+            caller = _package_caller()
+            if caller is not None:
+                target = args[0] if args else kwargs.get("file", kwargs.get("path"))
+                found.setdefault(caller, [f"{name}({target!r})", 0])[1] += 1
+            return real(*args, **kwargs)
+
+        return guarded
+
+    for module, name in _GUARDED:
+        monkeypatch.setattr(
+            module, name, _guard(f"{module.__name__}.{name}", getattr(module, name))
+        )
+
+    yield found
+
+    assert not found, (
+        "Disk I/O on the event loop (an async route reads the disk; put it in "
+        "asyncio.to_thread or make the route a plain def):\n  "
+        + "\n  ".join(
+            f"{caller}: {first}" + (f" and {count - 1} more" if count > 1 else "")
+            for caller, (first, count) in found.items()
+        )
+    )
 
 
 @pytest.fixture
