@@ -125,6 +125,9 @@ Consequences:
   INI's `[map] name` cached at startup and updated only by `set_active` (the
   switch's INI write, cache after the write succeeds); never call
   `set_active_map` around it, and a hand-edited INI needs a restart.
+  `test/conftest.py` enforces this: an autouse guard fails any test in which
+  package code opens, stats or lists a file on a thread with a running loop
+  (`test_loop_guard.py` checks the guard still fires).
 - **ROS service calls go through `gateways/ros.py`'s `call_service`**, never a raw
   `call_async` + wait: on timeout it `remove_pending_request`s the abandoned request,
   which otherwise stays in the client's pending table for the life of the process when
