@@ -12,6 +12,7 @@ from rclpy.client import Client
 from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
 from action_msgs.msg import GoalStatus
+from action_msgs.srv import CancelGoal
 
 from syncai_common.action import NavigateToGoal
 from syncai_common.msg import WifiConnection, WifiNetwork
@@ -67,6 +68,8 @@ class MoveState(str, Enum):
 
 # One NavigateToGoal goal. `feedback` is the latest Feedback (status_msg shows
 # beside a running MOVE step); `result` the Result (error_code / error_msg).
+# `lost` is set when this gateway gave up on the goal with no result from the
+# server (see _lose_goal): the goal reads ABORTED with `lost` as its reason.
 @dataclass
 class MoveGoal:
     goal_id: str
@@ -74,6 +77,13 @@ class MoveGoal:
     state: MoveState = MoveState.EXECUTING
     feedback: Optional[Any] = None
     result: Optional[Any] = None
+    lost: Optional[str] = None
+
+
+# How long cancel_move waits for the action server's answer. Past it the goal
+# is treated as lost (see _lose_goal), since a server that does not answer a
+# cancel will not deliver a result either.
+CANCEL_RESPONSE_WAIT_S = 10.0
 
 
 # How many finished MOVE goals _goals keeps (otherwise it grows without bound).
@@ -585,6 +595,9 @@ class RobotGateway:
     ) -> Tuple[bool, str, Optional[str]]:
         client = self._action_clients.get(client_name)
         if not client.wait_for_server(timeout_sec=NAV_SERVER_WAIT_S):
+            # A goal still EXECUTING against a server that is gone will never
+            # get its result; it would otherwise refuse teleop forever.
+            self._lose_executing_goals("the navigation server went away")
             return False, "Action server is not available", None
 
         # The response callback (executor thread) registers the goal, so a goal
@@ -658,6 +671,45 @@ class RobotGateway:
             )
             goal.goal_handle.cancel_goal_async()
 
+    def _lose_goal_locked(self, goal: MoveGoal, reason: str) -> bool:
+        """Land ``goal`` in ABORTED with ``reason`` when the server will not.
+
+        Caller holds self._lock. The one way a goal leaves EXECUTING without
+        a result from the action server. Until this existed, a server that
+        died mid-goal (a task runner restart or crash) left the goal EXECUTING
+        for the life of the process: teleop refused, the telemetry stream
+        gated open, and cancel_active_moves failing every time. Returns
+        whether the goal was still executing.
+        """
+        if goal.state is not MoveState.EXECUTING:
+            return False
+        goal.state = MoveState.ABORTED
+        goal.result = None
+        goal.lost = reason
+        return True
+
+    def _lose_goal(self, goal_id: str, reason: str) -> None:
+        with self._lock:
+            goal = self._goals.get(goal_id)
+            lost = goal is not None and self._lose_goal_locked(goal, reason)
+        if lost:
+            self._logger.warning(
+                "[RobotGateway] Goal lost without a result", goal_id=goal_id, reason=reason
+            )
+
+    def _lose_executing_goals(self, reason: str) -> None:
+        """``_lose_goal`` for every goal still executing."""
+        with self._lock:
+            lost = [
+                goal_id
+                for goal_id, goal in self._goals.items()
+                if self._lose_goal_locked(goal, reason)
+            ]
+        for goal_id in lost:
+            self._logger.warning(
+                "[RobotGateway] Goal lost without a result", goal_id=goal_id, reason=reason
+            )
+
     def _evict_finished_goals(self) -> None:
         """Trim _goals to MAX_TRACKED_GOALS, oldest finished first.
 
@@ -713,7 +765,19 @@ class RobotGateway:
             goal.feedback = feedback_msg.feedback
 
     def _move_result_cb(self, goal_id: str, future):
-        result = future.result()
+        """Land the server's result. Runs on the executor thread.
+
+        Always leaves the goal in a terminal state: a result future that
+        completed with an exception (rclpy only warns about one raised from a
+        done-callback) or an unexpected status would otherwise keep the goal
+        EXECUTING for good.
+        """
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._lose_goal(goal_id, f"the result request failed: {exc}")
+            return
+
         with self._lock:
             goal = self._goals.get(goal_id)
             if not goal:
@@ -725,7 +789,16 @@ class RobotGateway:
                 goal.state = MoveState.CANCELED
             elif result.status == GoalStatus.STATUS_ABORTED:
                 goal.state = MoveState.ABORTED
+            else:
+                # UNKNOWN: the server lost the goal. Terminal, with the reason
+                # in place of a Result it never produced.
+                goal.state = MoveState.ABORTED
+                goal.result = None
+                goal.lost = f"the server reported goal status {result.status}"
+                return
 
+            # The real outcome, should it arrive after this side gave up.
+            goal.lost = None
             goal.result = result.result
 
     def get_move_status(self, goal_id: str) -> Optional[dict[str, Any]]:
@@ -744,6 +817,9 @@ class RobotGateway:
             if goal.state is MoveState.ABORTED and goal.result is not None:
                 status["error_code"] = goal.result.error_code
                 status["error_msg"] = goal.result.error_msg
+            elif goal.state is MoveState.ABORTED and goal.lost:
+                # No result from the server: this side's reason, no code.
+                status["error_msg"] = goal.lost
             return status
 
     def get_move_message(self) -> str:
@@ -771,11 +847,23 @@ class RobotGateway:
         self._logger.info("[RobotGateway] Cancelling goal", goal_id=goal_id)
 
         cancel_future = goal_handle.cancel_goal_async()
-        if not _wait_for_future(cancel_future, timeout=10.0):
-            return False, "Timeout waiting for cancel response"
+        if not _wait_for_future(cancel_future, timeout=CANCEL_RESPONSE_WAIT_S):
+            # No answer to a cancel means no result is coming either: the
+            # server is gone. Land the goal here, or it is EXECUTING forever.
+            self._lose_goal(goal_id, "no answer to the cancel request")
+            return False, "Timeout waiting for cancel response; goal marked lost"
 
         response = cancel_future.result()
         if len(response.goals_canceling) == 0:
+            if (
+                getattr(response, "return_code", None)
+                == CancelGoal.Response.ERROR_UNKNOWN_GOAL_ID
+            ):
+                # A restarted server: it never heard of this goal, so there is
+                # no result to wait for. GOAL_TERMINATED, by contrast, means
+                # the result is already on its way; REJECTED that it drives on.
+                self._lose_goal(goal_id, "the navigation server does not know this goal")
+                return False, "Cancel rejected by server: unknown goal; marked lost"
             return False, "Cancel rejected by server"
 
         return True, ""

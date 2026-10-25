@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Optional
@@ -42,9 +43,19 @@ HEARTBEAT_THROTTLE_MAX = timedelta(milliseconds=500)
 # its start_to_close behind the first; few, as each holds an HTTP request open.
 IO_ACTIVITY_SLOTS = 4
 
+# How long main.py gives the worker to stop on SIGTERM / SIGINT / SIGHUP. The
+# shutdown cancels the in-flight activity at once (graceful_shutdown_timeout is
+# the SDK's zero default: the process is going away, so there is nothing to be
+# graceful about), and the budget is for the MOVE's cleanup in its `except
+# CancelledError`: cancel_move's CANCEL_RESPONSE_WAIT_S plus restoring
+# locomotion. Under docker-compose's stop_grace_period (30 s) with room for
+# rclpy's own teardown.
+WORKER_SHUTDOWN_TIMEOUT_S = 20.0
+
 
 class TemporalWorkerHandle:
-    """Cross-thread view of the worker's lifecycle for /health.
+    """Cross-thread view of the worker's lifecycle for /health, and the hook
+    main.py stops it by.
 
     Every exit path of the worker thread lands in one of these states, so a failed
     connect is visible instead of tasks silently queueing forever.
@@ -53,12 +64,18 @@ class TemporalWorkerHandle:
     STATUS_CONNECTING = "connecting"
     STATUS_RUNNING = "running"
     STATUS_DEAD = "dead"
+    STATUS_STOPPED = "stopped"
 
     def __init__(self):
         self._lock = threading.Lock()
         self._status = self.STATUS_CONNECTING
         self._last_error: Optional[str] = None
         self.thread: Optional[threading.Thread] = None
+        # Set by run_worker once the workers exist: what request_shutdown stops,
+        # and the loop (the worker thread's) it must be asked on.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._workers: tuple = ()
+        self._stop_requested = False
 
     def mark_running(self) -> None:
         with self._lock:
@@ -70,9 +87,56 @@ class TemporalWorkerHandle:
             self._status = self.STATUS_DEAD
             self._last_error = error
 
+    def mark_stopped(self) -> None:
+        """``stopped`` -- only for a stop this handle asked for. A ``run()``
+        that returned on its own is not one (the real one never does)."""
+        with self._lock:
+            if self._stop_requested:
+                self._status = self.STATUS_STOPPED
+
     def snapshot(self) -> tuple[str, Optional[str]]:
         with self._lock:
             return self._status, self._last_error
+
+    def bind_workers(self, loop: asyncio.AbstractEventLoop, workers: tuple) -> None:
+        with self._lock:
+            self._loop = loop
+            self._workers = workers
+
+    def request_shutdown(self, timeout_s: float = WORKER_SHUTDOWN_TIMEOUT_S) -> bool:
+        """Stop both workers and wait for the thread; True once it has ended.
+
+        Callable from any thread but the worker's. ``Worker.shutdown`` stops
+        polling, cancels the activities still running (the MOVE's ``except
+        CancelledError`` then cancels the nav2 goal and restores locomotion,
+        which needs the ROS executor still spinning -- so the caller keeps it
+        spinning until this returns) and waits for them to report. Without
+        this, the daemon thread died with the process and the goal drove on.
+
+        A worker that never came up, or already died, has nothing to stop:
+        answers at once.
+        """
+        with self._lock:
+            self._stop_requested = True
+            loop, workers, thread = self._loop, self._workers, self.thread
+        if thread is None or not thread.is_alive():
+            return True
+        deadline = time.monotonic() + timeout_s
+        if loop is not None and workers:
+            async def _stop_all() -> None:
+                await asyncio.gather(*(worker.shutdown() for worker in workers))
+
+            try:
+                asyncio.run_coroutine_threadsafe(_stop_all(), loop).result(
+                    timeout=timeout_s
+                )
+            except Exception:
+                # Loop already closed, or the shutdown outran the budget: the
+                # join below is what reports it.
+                pass
+        # One budget for both waits, not one each.
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not thread.is_alive()
 
 
 async def run_worker(
@@ -159,10 +223,15 @@ async def run_worker(
     )
 
     handle.mark_running()
+    handle.bind_workers(asyncio.get_running_loop(), (worker, io_worker))
     if ready is not None:
         ready.set()
 
+    # Returns once both workers have shut down (request_shutdown), or raises
+    # when one of them dies.
     await asyncio.gather(worker.run(), io_worker.run())
+    handle.mark_stopped()
+    logger.info("Temporal worker stopped")
 
 
 def start_temporal_worker(
@@ -205,6 +274,8 @@ def start_temporal_worker(
             handle.mark_dead(str(err))
             logger.error("Temporal worker thread died", exc_info=True)
 
+    # Daemon: an exit path that bypasses main.py's shutdown (an uncaught error
+    # out of spin) must not hang on it. The orderly path is request_shutdown.
     thread = threading.Thread(target=_thread_target, daemon=True)
     thread.start()
     handle.thread = thread

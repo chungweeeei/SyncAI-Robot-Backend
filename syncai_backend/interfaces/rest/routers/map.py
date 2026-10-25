@@ -1774,6 +1774,21 @@ def init_map_router(
         if name == map_catalog_repo.active_name():
 
             def _reload() -> None:
+                # Decided again now, not when the request came in: the
+                # conversion can wait on a clean and run for minutes, and a
+                # switch meanwhile is not refused (only the target map's
+                # conversion is). Reloading then would put map_server on this
+                # map's grid while the localizer, Octo3D and the INI say the
+                # other one.
+                current = map_catalog_repo.active_name()
+                if current != name:
+                    logger.warning(
+                        "Converted a map the robot switched away from meanwhile; "
+                        "map_server not reloaded",
+                        map=name,
+                        active=current,
+                    )
+                    return
                 yaml_path = map_catalog_repo.gridmap_yaml_path(name)
                 if yaml_path is None:
                     logger.error(

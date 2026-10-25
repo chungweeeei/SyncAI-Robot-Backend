@@ -221,3 +221,89 @@ def test_the_writer_can_re_read_under_its_own_lock(logger, ini):
     set_active_map("hall", logger)
 
     assert active_map_name(logger) == "hall"
+
+
+# --- The backup copy --------------------------------------------------------
+#
+# set_active_map rewrites in place: open(path, "w") truncates, then writes. A
+# process killed between the two (switch_mode kills the byobu session this
+# process is a pane of) left an empty INI -- no [map] for this process and no
+# [system] robot_id for every launch file at the next boot. The copy taken
+# first is what the reader falls back to and what gets restored by hand.
+
+
+def test_the_previous_content_is_kept_beside_the_ini(logger, ini):
+    path = ini(_REAL_INI)
+
+    set_active_map("warehouse01", logger)
+
+    backup = path.with_name("system.ini.bak")
+    assert backup.read_text() == _REAL_INI
+    assert "warehouse01" in path.read_text()
+    # The temp file of the atomic copy does not linger.
+    assert not path.with_name("system.ini.bak.tmp").exists()
+
+
+def test_the_backup_tracks_the_latest_switch(logger, ini):
+    path = ini(_REAL_INI)
+    backup = path.with_name("system.ini.bak")
+
+    set_active_map("warehouse01", logger)
+    set_active_map("dp2f", logger)
+
+    assert "name: warehouse01" in backup.read_text()
+
+
+def test_an_emptied_ini_is_answered_from_the_backup(logger, ini):
+    """What an interrupted rewrite leaves behind."""
+    path = ini(_REAL_INI)
+    set_active_map("warehouse01", logger)
+
+    path.write_text("")
+
+    assert active_map_name(logger) == "dp2f"
+
+
+def test_a_missing_ini_is_answered_from_the_backup(logger, ini):
+    path = ini(_REAL_INI)
+    set_active_map("warehouse01", logger)
+
+    path.unlink()
+
+    assert active_map_name(logger) == "dp2f"
+
+
+def test_an_intact_ini_wins_over_the_backup(logger, ini):
+    path = ini(_REAL_INI)
+    set_active_map("warehouse01", logger)
+
+    assert active_map_name(logger) == "warehouse01"
+    assert path.with_name("system.ini.bak").exists()
+
+
+def test_a_rewrite_that_fails_verification_puts_the_previous_content_back(
+    logger, ini, monkeypatch
+):
+    """A torn write this process survived: the stack must keep booting on the
+    map it had, not on an INI that names neither."""
+    path = ini(_REAL_INI)
+
+    def _torn(path, name):
+        raise ValueError("malformed after the rewrite")
+
+    monkeypatch.setattr(system_config, "_verify_written", _torn)
+
+    with pytest.raises(ValueError):
+        set_active_map("warehouse01", logger)
+
+    assert path.read_text() == _REAL_INI
+    assert active_map_name(logger) == "dp2f"
+
+
+def test_no_backup_is_written_when_there_is_nothing_to_rewrite(logger, ini):
+    path = ini("[system]\nrobot_id: robot01\n")
+
+    with pytest.raises(ValueError):
+        set_active_map("warehouse01", logger)
+
+    assert not path.with_name("system.ini.bak").exists()

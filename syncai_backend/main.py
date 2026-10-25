@@ -1,14 +1,22 @@
+import os
+import signal
 import sys
+import threading
 import dotenv
 import structlog
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 
 from syncai_backend.logger import setup_log_handler
 from syncai_backend.database.postgres import connect_to_postgres
-from syncai_backend.temporal.worker import start_temporal_worker
+from syncai_backend.temporal.worker import (
+    TemporalWorkerHandle,
+    WORKER_SHUTDOWN_TIMEOUT_S,
+    start_temporal_worker,
+)
 
 from syncai_backend.interfaces.rest.server import RestDeps, start_rest_server
 
@@ -227,6 +235,9 @@ class SyncAIBackend(Node):
             robot_repo=robot_repo,
             dock_state=dock_state_svc,
         )
+        # Kept for main()'s shutdown: the worker is stopped before the ROS
+        # context goes, so a running MOVE can still cancel its nav2 goal.
+        self.worker_handle: TemporalWorkerHandle = worker_handle
         start_rest_server(
             logger=logger,
             deps=RestDeps(
@@ -257,21 +268,98 @@ class SyncAIBackend(Node):
         )
 
 
+# How often the spin loop comes up for air to run a pending Python signal
+# handler. rcl_wait is not interrupted by a signal, and the handler only runs
+# between bytecodes on the main thread, so without a timeout an idle graph
+# could hold a SIGTERM until the next ROS event.
+_SPIN_TIMEOUT_S = 0.5
+
+# SIGTERM: docker stop / compose down. SIGINT: ros2 launch's shutdown, Ctrl-C.
+# SIGHUP: the byobu session this process is a pane of being killed
+# (switch_mode). Without a handler for the last one, a mode switch mid-MOVE
+# left the nav2 goal driving with nobody supervising it.
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+class _Shutdown:
+    """The orderly stop: the Temporal worker first, the ROS context last.
+
+    The order is the point. The worker's shutdown cancels the in-flight MOVE,
+    whose cleanup (cancel the nav2 goal, restore locomotion) is ROS service and
+    action traffic that needs the executor still spinning. rclpy's own signal
+    handler shut the context down first, so the daemon worker thread died with
+    the process and that cleanup never ran: nav2 kept the goal, and the next
+    worker re-sent it from wherever the robot had got to.
+
+    The signal handler only starts a thread: the stop itself blocks for up to
+    WORKER_SHUTDOWN_TIMEOUT_S, and a handler that blocks the main thread would
+    stall the very executor the cleanup is waiting on. A second signal while
+    the first is being honoured ends the process at once.
+    """
+
+    def __init__(self):
+        # Bound once the node is built; a stop before that has nothing to wait
+        # for (the signal may land during the Postgres retry).
+        self._worker_handle: TemporalWorkerHandle | None = None
+        self.requested = threading.Event()
+        self.done = threading.Event()
+
+    def install(self) -> None:
+        for signum in _STOP_SIGNALS:
+            signal.signal(signum, self._on_signal)
+
+    def bind(self, worker_handle: TemporalWorkerHandle) -> None:
+        self._worker_handle = worker_handle
+
+    def _on_signal(self, signum, _frame) -> None:
+        if self.requested.is_set():
+            logger.warning("Second stop signal; exiting now", signal=signum)
+            os._exit(1)
+        self.requested.set()
+        logger.info("Stop signal received; stopping the Temporal worker", signal=signum)
+        threading.Thread(target=self._run, name="shutdown", daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            handle = self._worker_handle
+            if handle is None:
+                logger.info("Stopped before start-up finished")
+            elif handle.request_shutdown(WORKER_SHUTDOWN_TIMEOUT_S):
+                logger.info("Temporal worker stopped; shutting down")
+            else:
+                logger.error(
+                    "Temporal worker did not stop in time; shutting down anyway",
+                    timeout_s=WORKER_SHUTDOWN_TIMEOUT_S,
+                )
+        finally:
+            self.done.set()
+
+
 def main():
-    rclpy.init(args=None)
+    # No rclpy signal handlers: they shut the context down on SIGINT/SIGTERM,
+    # before anything else gets a say. _Shutdown installs its own.
+    rclpy.init(args=None, signal_handler_options=SignalHandlerOptions.NO)
+    shutdown = _Shutdown()
+    shutdown.install()
 
     try:
         backend_node = SyncAIBackend(logger=logger)
+        shutdown.bind(backend_node.worker_handle)
         # Lets the point-cloud callback groups run beside robot_state/TF, so a
         # busy scan frame can't starve them.
         executor = MultiThreadedExecutor()
         executor.add_node(backend_node)
-        executor.spin()
+        # spin() with a timeout per turn, so a signal handler runs promptly;
+        # the loop keeps serving ROS until the worker's cleanup is through.
+        while rclpy.ok() and not shutdown.done.is_set():
+            executor.spin_once(timeout_sec=_SPIN_TIMEOUT_S)
     except Exception:
         logger.error("Failed to execute SyncAIBackend node", exc_info=True)
     finally:
         rclpy.shutdown()
-        sys.exit(1)
+        # A requested stop exits clean; anything else is a failure, so a
+        # restart policy keyed on it (restart: on-failure) acts.
+        sys.exit(0 if shutdown.requested.is_set() else 1)
 
 
 if __name__ == "__main__":

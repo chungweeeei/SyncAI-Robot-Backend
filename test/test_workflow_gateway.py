@@ -228,6 +228,39 @@ class TestWorkflowGateway:
         assert first is mock_client and second is mock_client
         connect.assert_called_once()
 
+    def test_concurrent_first_callers_share_one_connection(self, workflow_gw, mock_client):
+        """The console opens a page with four requests at once; after a
+        backend or Temporal restart each used to find no client and connect on
+        its own, the last assigned winning and the others leaking."""
+        connects = []
+
+        async def _slow_connect(*args, **kwargs):
+            connects.append(1)
+            await asyncio.sleep(0.01)  # long enough for the others to pile in
+            return mock_client
+
+        with patch(CONNECT, new=_slow_connect):
+
+            async def _four():
+                return await asyncio.gather(
+                    *(workflow_gw._get_client() for _ in range(4))
+                )
+
+            clients = asyncio.run(_four())
+
+        assert len(connects) == 1
+        assert all(client is mock_client for client in clients)
+
+    def test_a_failed_connect_is_retried_by_the_next_caller(self, workflow_gw, mock_client):
+        with patch(CONNECT, new_callable=AsyncMock) as connect:
+            connect.side_effect = [ConnectionError("refused"), mock_client]
+
+            with pytest.raises(ConnectionError):
+                asyncio.run(workflow_gw._get_client())
+            assert asyncio.run(workflow_gw._get_client()) is mock_client
+
+        assert connect.call_count == 2
+
     # ==================== start_task ====================
 
     def test_start_task_enqueues_on_this_robots_queue(self, workflow_gw, mock_client):

@@ -2952,6 +2952,38 @@ def test_convert_endpoint_reloads_the_active_map(
     assert map_gw.calls[0].endswith("full/gridmap.yaml")
 
 
+def test_convert_endpoint_does_not_reload_a_map_switched_away_from(
+    client, map_gw, tmp_path, monkeypatch
+):
+    """'full' is active when the convert is requested; the robot switches to
+    'rawonly' while the conversion (which can wait on a clean and run for
+    minutes) is still going. Reloading map_server onto 'full' then would leave
+    it serving one map's grid while the localizer, Octo3D and the INI name the
+    other: the decision has to be made again when the grid lands."""
+    deferred = []
+    real_thread = threading.Thread
+
+    class _DeferredThread(real_thread):
+        def start(self):
+            deferred.append(self)
+
+    monkeypatch.setattr(threading, "Thread", _DeferredThread)
+
+    response = _post_convert(client, "full")
+    assert response.status_code == 200
+    assert len(deferred) == 1
+
+    # The switch, as the fixture's INI sees it (what active_name reads).
+    (tmp_path / "system.ini").write_text(
+        "[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n"
+    )
+    real_thread.start(deferred[0])
+    deferred[0].join(10.0)
+    assert not deferred[0].is_alive()
+
+    assert map_gw.calls == []
+
+
 def test_convert_endpoint_archives_the_previous_grid(
     client, maps_dir, conversion_threads
 ):
