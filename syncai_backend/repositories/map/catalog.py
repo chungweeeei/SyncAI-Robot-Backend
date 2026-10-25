@@ -7,12 +7,13 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import structlog
 import yaml
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, NotFoundError
+from syncai_backend.helpers.disk import walk_stats
 from syncai_backend.helpers.floors import read_pose_heights
 from syncai_backend.helpers.keepout import keepout_yaml_text, rasterize_zones
 from syncai_backend.helpers.pgm import read_pgm_size, write_pgm, write_text_atomic
@@ -104,6 +105,31 @@ FLOORS_JSON_VERSION = 1
 # the one-``os.rename`` publish would become a copy. ``list_maps`` skips the
 # prefix and ``resolve_dir`` refuses it explicitly (``_NAME_RE`` admits a dot).
 IMPORT_STAGING_PREFIX = ".import-"
+
+
+# What _read_json answers for a file that is not there or cannot be read. A
+# sentinel rather than None, because a file holding JSON ``null`` is a document
+# (malformed, and each reader's shape check says so).
+_NO_DOCUMENT = object()
+
+
+def _read_json(path: str, complain: Callable[[str], None]) -> Any:
+    """Parse the JSON file at ``path``, or ``_NO_DOCUMENT``.
+
+    Absent is quiet: most maps have no keepout, floors or edits file. Unreadable
+    or unparsable (a torn write, a hand edit, a newer format) calls
+    ``complain`` with the error and answers ``_NO_DOCUMENT`` too: every reader
+    here degrades one map rather than failing a listing or locking the operator
+    out of the save that would overwrite it. How loudly is the caller's call.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return _NO_DOCUMENT
+    except (OSError, ValueError) as exc:
+        complain(str(exc))
+        return _NO_DOCUMENT
 
 
 class GridRecordStatus(str, Enum):
@@ -365,17 +391,15 @@ class MapCatalogRepo:
         entries are skipped one at a time.
         """
         path = os.path.join(self.resolve_dir(name), KEEPOUT_JSON)
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                document = json.load(handle)
-        except FileNotFoundError:
-            return []
-        except (OSError, ValueError) as exc:
-            self.logger.warning(
+        document = _read_json(
+            path,
+            lambda error: self.logger.warning(
                 "[MapCatalogRepo] Unreadable keepout.json; reporting no zones",
                 map=name,
-                error=str(exc),
-            )
+                error=error,
+            ),
+        )
+        if document is _NO_DOCUMENT:
             return []
 
         if (
@@ -409,17 +433,15 @@ class MapCatalogRepo:
         a time.
         """
         path = os.path.join(self.resolve_dir(name), OCTOMAP_EDITS_JSON)
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                document = json.load(handle)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            self.logger.warning(
+        document = _read_json(
+            path,
+            lambda error: self.logger.warning(
                 "[MapCatalogRepo] Unreadable octomap_edits.json; reporting no patches",
                 map=name,
-                error=str(exc),
-            )
+                error=error,
+            ),
+        )
+        if document is _NO_DOCUMENT:
             return None
 
         if (
@@ -512,17 +534,15 @@ class MapCatalogRepo:
         ``read_keepout_zones``'s reason. Malformed entries are skipped.
         """
         path = os.path.join(self.resolve_dir(name), FLOORS_JSON)
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                document = json.load(handle)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            self.logger.warning(
+        document = _read_json(
+            path,
+            lambda error: self.logger.warning(
                 "[MapCatalogRepo] Unreadable floors.json; using the detected floors",
                 map=name,
-                error=str(exc),
-            )
+                error=error,
+            ),
+        )
+        if document is _NO_DOCUMENT:
             return None
 
         if (
@@ -826,7 +846,7 @@ class MapCatalogRepo:
         - ``gridmap.recipe.json`` is **moved**: the new conversion overwrites it
           with ``converting`` first, losing the served grid's record on failure.
 
-        ``copy2`` keeps mtimes, so ``_walk_stats``'s modified_at does not jump.
+        ``copy2`` keeps mtimes, so ``walk_stats``'s modified_at does not jump.
         No gridmap yet is a no-op.
         """
         directory = self.resolve_dir(name)
@@ -968,7 +988,7 @@ class MapCatalogRepo:
     def _read(self, name: str, path: str) -> Optional[StoredMap]:
         """Describe one directory; None only if it disappeared mid-scan."""
         try:
-            size_bytes, newest_mtime = _walk_stats(path)
+            size_bytes, newest_mtime = walk_stats(path)
         except FileNotFoundError:
             return None
 
@@ -988,7 +1008,7 @@ class MapCatalogRepo:
 
         A tree that vanishes between the listing and the stat (a save into
         the same directory removes the old one first) is None, not an error,
-        like a patch gone mid-walk in ``_walk_stats``.
+        like a patch gone mid-walk in ``walk_stats``.
         """
         tree = os.path.join(path, OCTOMAP_BT)
         try:
@@ -1014,15 +1034,13 @@ class MapCatalogRepo:
         later, and the listing is polled meanwhile.
         """
         sidecar = os.path.join(path, MAP_CLEAN_SIDECAR)
-        try:
-            with open(sidecar, "r", encoding="utf-8") as handle:
-                document = json.load(handle)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            self.logger.debug(
-                "[MapCatalogRepo] Unreadable map clean sidecar", map=name, error=str(exc)
-            )
+        document = _read_json(
+            sidecar,
+            lambda error: self.logger.debug(
+                "[MapCatalogRepo] Unreadable map clean sidecar", map=name, error=error
+            ),
+        )
+        if document is _NO_DOCUMENT:
             return None
 
         if not isinstance(document, dict):
@@ -1058,19 +1076,15 @@ class MapCatalogRepo:
         the listing.
         """
         sidecar = os.path.join(path, GRIDMAP_RECIPE_SIDECAR)
-        try:
-            with open(sidecar, "r", encoding="utf-8") as handle:
-                document = json.load(handle)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            # Debug, not warning: a torn read is expected mid-conversion and
-            # the listing is polled every two seconds.
-            self.logger.debug(
-                "[MapCatalogRepo] Unreadable gridmap recipe sidecar",
-                map=name,
-                error=str(exc),
-            )
+        # Debug, not warning: a torn read is expected mid-conversion and the
+        # listing is polled every two seconds.
+        document = _read_json(
+            sidecar,
+            lambda error: self.logger.debug(
+                "[MapCatalogRepo] Unreadable gridmap recipe sidecar", map=name, error=error
+            ),
+        )
+        if document is _NO_DOCUMENT:
             return None
 
         if not isinstance(document, dict):
@@ -1224,27 +1238,6 @@ def _parse_floor(entry: object) -> Optional[MapFloor]:
     if not math.isfinite(level):
         return None
     return MapFloor(name=name.strip(), level=float(level))
-
-
-def _walk_stats(path: str) -> Tuple[int, float]:
-    """Return total bytes and newest mtime under ``path``, dir itself included.
-
-    A real walk: ``patches/`` holds hundreds of small files.
-    """
-    total = 0
-    newest = os.stat(path).st_mtime
-
-    for root, _dirs, files in os.walk(path):
-        for filename in files:
-            try:
-                stats = os.stat(os.path.join(root, filename))
-            except FileNotFoundError:
-                # Removed mid-walk (a save in flight).
-                continue
-            total += stats.st_size
-            newest = max(newest, stats.st_mtime)
-
-    return total, newest
 
 
 def init_map_catalog_repo(logger: structlog.stdlib.BoundLogger) -> MapCatalogRepo:
