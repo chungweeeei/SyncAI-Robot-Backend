@@ -640,20 +640,82 @@ def test_image_404_when_the_gridmap_is_unreadable(client, maps_dir):
     assert client.get("/api/v1/maps/full/image").status_code == 404
 
 
-def test_image_etag_follows_content_not_mtime(client, maps_dir, make_pgm):
+def test_image_etag_follows_a_replaced_file_of_the_same_size(client, maps_dir, make_pgm):
     """An edited gridmap keeps its dimensions, so it keeps its file size, and
-    this filesystem hands out a coarse mtime — the tag has to be content-based
-    or the editor would reload the pre-edit grid."""
+    a bind mount's mtime can be coarse — the tag still has to change, or the
+    editor would reload the pre-edit grid. It does because every writer here
+    (write_pgm) publishes through a temp file + rename: a new inode each save.
+    Written the way write_pgm writes, with the mtime pinned to the old file's
+    so neither size nor time can be what tells them apart."""
     before = client.get("/api/v1/maps/full/image").headers["etag"]
     path = maps_dir / "full" / "gridmap.pgm"
-    size_before = path.stat().st_size
+    old = path.stat()
 
-    make_pgm(path, 6, 4, fill=0)
+    tmp = make_pgm(path.with_name(".gridmap-test.tmp"), 6, 4, fill=0)
+    os.utime(tmp, ns=(old.st_atime_ns, old.st_mtime_ns))
+    os.replace(tmp, path)
     after = client.get("/api/v1/maps/full/image")
 
-    assert path.stat().st_size == size_before
+    assert path.stat().st_size == old.st_size
+    assert path.stat().st_mtime_ns == old.st_mtime_ns
     assert after.headers["etag"] != before
     assert after.status_code == 200
+
+
+def test_image_etag_follows_an_in_place_rewrite_with_a_newer_mtime(
+    client, maps_dir, make_pgm
+):
+    """The other way a file changes: same inode, same size, later mtime."""
+    before = client.get("/api/v1/maps/full/image").headers["etag"]
+    path = maps_dir / "full" / "gridmap.pgm"
+    old = path.stat()
+
+    make_pgm(path, 6, 4, fill=0)
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns + 1_000_000_000))
+    after = client.get("/api/v1/maps/full/image")
+
+    assert path.stat().st_ino == old.st_ino
+    assert path.stat().st_size == old.st_size
+    assert after.headers["etag"] != before
+
+
+def test_image_revalidation_does_not_read_the_gridmap_body(client, maps_dir, monkeypatch):
+    """The point of a stat-based tag: a 304 is answered without reading the
+    4-16 MB .pgm body, which the console asks for on a timer for every map.
+    (The catalogue still peeks at the header for the map's geometry.)"""
+    tag = client.get("/api/v1/maps/full/image").headers["etag"]
+    path = maps_dir / "full" / "gridmap.pgm"
+    real_open = builtins.open
+
+    class _HeaderOnly:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, size=-1):
+            if size < 0 or size > 4096:
+                raise AssertionError("a 304 must not read the gridmap body")
+            return self._handle.read(size)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._handle.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    def guarded_open(file, *args, **kwargs):
+        handle = real_open(file, *args, **kwargs)
+        if os.fspath(file) == str(path):
+            return _HeaderOnly(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    response = client.get("/api/v1/maps/full/image", headers={"If-None-Match": tag})
+
+    assert response.status_code == 304
 
 
 # --- PUT /api/v1/maps/{name}/grid -------------------------------------------
@@ -777,7 +839,7 @@ def test_save_grid_creates_the_raw_backup_once(client, maps_dir):
 
 
 def test_save_grid_etag_matches_the_image_etag(client):
-    """The tag hashes the whole file, header included, on both sides."""
+    """Both sides tag the file now on disk, so the console can compare them."""
     body = _put_grid(client, "full", b"\x00" * 24)
 
     assert body.headers["etag"] == body.json()["etag"]
@@ -787,8 +849,9 @@ def test_save_grid_etag_matches_the_image_etag(client):
 def test_save_grid_updates_the_thumbnail_without_an_eviction(client):
     """The write path deliberately does not touch the caches.
 
-    _png_response re-reads and re-hashes the .pgm before consulting them, so a
-    stale entry can never be served — this is the test that keeps that true.
+    _png_response stats the .pgm before consulting them, and a save is a new
+    inode, so a stale entry can never be served — this is the test that keeps
+    that true.
     """
     before = client.get("/api/v1/maps/full/thumbnail")
 

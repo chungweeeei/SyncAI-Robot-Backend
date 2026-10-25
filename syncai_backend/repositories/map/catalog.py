@@ -854,7 +854,7 @@ class MapCatalogRepo:
 
         ``data`` is one byte per cell in .pgm row order (row 0 = max y), exactly
         ``width * height`` of the existing file: this repo never resizes a map.
-        Returns the file as written, for the ETag.
+        Returns the file as written (header included).
 
         **``gridmap.yaml`` is never touched**: nothing in it depends on cell
         values, ``yaml.safe_dump`` would reformat it (``image:`` must stay

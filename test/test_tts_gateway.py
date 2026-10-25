@@ -431,3 +431,51 @@ def test_a_missing_service_url_falls_back_to_the_local_default(monkeypatch):
     gateway = init_tts_gateway(logger=structlog.get_logger())
 
     assert gateway._base_url == tts_module._DEFAULT_BASE_URL
+
+
+# --- Connect timeout ---------------------------------------------------------
+
+
+def test_every_request_bounds_connecting_separately_from_answering():
+    """httpx takes a per-request timeout *instead of* the client's, and a bare
+    float sets connect to that float too -- so the 5 s connect bound was never
+    in force and an unreachable address waited the whole 60-180 s. The
+    transport sees the resolved timeout in the request's extensions."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions["timeout"])
+        return json_response(200, {"voices": []})
+
+    make_gateway(handler).list_voices()
+
+    assert seen[0]["connect"] == tts_module._CONNECT_TIMEOUT_S
+    assert seen[0]["read"] == tts_module._REQUEST_TIMEOUT_S
+
+
+def test_speak_keeps_its_long_wait_but_not_for_connecting():
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions["timeout"])
+        return json_response(200, job())
+
+    make_gateway(handler).speak(text="hi")
+
+    assert seen[0]["connect"] == tts_module._CONNECT_TIMEOUT_S
+    assert seen[0]["read"] == tts_module._SPEAK_TIMEOUT_S
+
+
+def test_an_address_that_never_answers_the_syn_is_reported_as_unreachable():
+    """Told apart from a slow answer: the fix is the address or the container."""
+
+    def handler(request):
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    success, message, voices = make_gateway(handler).list_voices()
+
+    assert not success
+    assert "could not reach" in message
+    assert f"{tts_module._CONNECT_TIMEOUT_S:.0f}s" in message
+    assert "did not answer" not in message
+    assert failure_code(message) is None

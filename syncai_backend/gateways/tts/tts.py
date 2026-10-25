@@ -86,9 +86,33 @@ class TtsGateway:
     def _call(
         self, method: str, path: str, timeout: float, **kwargs
     ) -> Tuple[bool, str, Optional[httpx.Response]]:
-        """One request, with every failure already turned into a sentence."""
+        """One request, with every failure already turned into a sentence.
+
+        ``timeout`` bounds the whole exchange; connecting is always bounded by
+        ``_CONNECT_TIMEOUT_S``. Spelled out per request because httpx takes a
+        per-request timeout *instead of* the client's, and a bare float sets
+        connect to that float too -- which made an unreachable address (a wrong
+        IP, a host that is off, a dropped port) wait the full 60-180 s before
+        failing, holding the SPEAK activity's slot and the REST threadpool for
+        as long. A refused connection is quick either way; this is for the one
+        that never answers the SYN.
+        """
         try:
-            response = self._client.request(method, path, timeout=timeout, **kwargs)
+            response = self._client.request(
+                method,
+                path,
+                timeout=httpx.Timeout(timeout, connect=_CONNECT_TIMEOUT_S),
+                **kwargs,
+            )
+        except httpx.ConnectTimeout:
+            # Told apart from a slow answer: the operator's fix is the address
+            # or the container, not patience.
+            return (
+                False,
+                f"could not reach the speech service at {self._base_url} within "
+                f"{_CONNECT_TIMEOUT_S:.0f}s",
+                None,
+            )
         except httpx.TimeoutException:
             return (
                 False,

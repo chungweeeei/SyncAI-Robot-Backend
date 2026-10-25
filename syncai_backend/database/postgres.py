@@ -9,6 +9,12 @@ from sqlalchemy_utils import create_database, database_exists
 MAX_RETRIES = 20
 RETRY_INTERVAL = 5
 
+# libpq's connect_timeout, for every connection the pool opens after startup.
+# Without it a postgres host that does not answer holds the request for libpq's
+# own default (minutes). The startup retries above do not use it: they go
+# through sqlalchemy_utils, which opens its own connection from the URL.
+CONNECT_TIMEOUT_S = 5
+
 
 def _execute(engine: Engine, clause: str, raise_error: bool = True):
 
@@ -35,6 +41,15 @@ def connect_to_postgres(logger: structlog.stdlib.BoundLogger, robot_id: str) -> 
         f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}",
         pool_size=5,
         max_overflow=10,
+        # Pooled connections outlive a postgres restart (its own compose stack,
+        # restarted independently of this process) without knowing it: the
+        # next checkout of each dead one failed its request with "server
+        # closed the connection unexpectedly" -- a 500 per pooled connection,
+        # then fine again, which reads as a random fault. pre_ping sends a
+        # SELECT 1 on checkout and, when that fails, drops every connection
+        # older than the failure and reconnects, transparently. ~0.1 ms on lo.
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": CONNECT_TIMEOUT_S},
     )
 
     # attempt to connect to the database, retrying if it fails
