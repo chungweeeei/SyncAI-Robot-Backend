@@ -9,6 +9,7 @@ from enum import Enum
 
 from syncai_backend.exceptions import BadRequestError, ConflictError
 
+from syncai_backend.tasks.catalogue import StepCatalogue, step_catalogue
 from syncai_backend.tasks.config import (
     TASK_HISTORY_PAGE_SIZE_DEFAULT,
     TASK_HISTORY_PAGE_SIZE_MAX,
@@ -422,6 +423,17 @@ def init_task_router(
             status=TaskStatus.PENDING,
             message=f"Task {req.id} accepted and queued for execution.",
         )
+
+    # Built once: it is read off the params models, which do not change while
+    # the process runs.
+    catalogue = step_catalogue()
+
+    # Not /api/v1/tasks/steps, for the reason active_tasks gives below. No
+    # gateway or disk behind it, so the console can read it on every editor
+    # open without a cost to anything else.
+    @task_router.get("/api/v1/task_steps", response_model=StepCatalogue)
+    async def list_task_steps():
+        return catalogue
 
     # Not /api/v1/tasks/active: /api/v1/tasks/{id} would shadow it depending on
     # declaration order (see interfaces/rest/server.py).
