@@ -623,6 +623,24 @@ class TestTaskState:
         assert [step["status"] for step in body["steps"]] == ["COMPLETED", "PAUSED"]
 
 
+class TestTaskSteps:
+    def test_lists_the_steps_an_editor_builds_from_without_a_gateway(self, client, workflow_gw):
+        res = client.get("/api/v1/task_steps")
+        assert res.status_code == 200
+        steps = res.json()["steps"]
+        assert [step["type"] for step in steps] == [
+            "MOVE", "DOCK", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
+        ]
+        assert [step["while_walking"] for step in steps] == [
+            False, False, True, False, False, False,
+        ]
+        assert steps[0]["params"] == [
+            {"kind": "waypoint", "key": "target", "label": "Waypoint", "filter": None}
+        ]
+        # Not a /tasks/{id} read under another name: nothing reaches Temporal.
+        assert workflow_gw.started == [] and workflow_gw.history_calls == []
+
+
 class TestActiveTasks:
     def test_list_carries_provenance_and_as_of(self, client):
         body = client.get("/api/v1/active_tasks").json()
