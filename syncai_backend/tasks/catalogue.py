@@ -7,7 +7,8 @@ added here, or a limit moved in a params model, reaches the editor without a
 console release.
 
 Each step says whether it occupies the robot's body (the group rule,
-BODY_STEP_TYPES) and lists its parameters as one of four field kinds a client
+BODY_STEP_TYPES), whether it is offered on the walk to a stop
+(``while_walking``), and lists its parameters as one of four field kinds a client
 knows how to draw: ``waypoint`` (a pose on the job's map, which on the wire
 spreads into the params model's ``x`` / ``y`` / ``theta`` / ``z`` and a
 template's ``vertex_id``), ``text``, ``integer`` and ``number``. The limits are
@@ -84,6 +85,14 @@ class StepSpec(BaseModel):
             "holds at most one."
         ),
     )
+    while_walking: bool = Field(
+        ...,
+        description=(
+            "Offered on the walk to a stop: started with the MOVE, in its "
+            "group. Never a body step, and not WAIT either, which in a walk's "
+            "group would only hold the next stop back until it ran out."
+        ),
+    )
     params: List[StepParamField]
 
 
@@ -108,12 +117,19 @@ def _bounds(model: type[BaseModel], field: str) -> dict:
     return found
 
 
+# What an operator means by doing something on the way. A WAIT in a MOVE's
+# group is legal, and the group waits for both, so it reads as "walk for at
+# least this long" — never what was meant, so it is not offered.
+WHILE_WALKING_STEP_TYPES = frozenset({StepType.SPEAK})
+
+
 def _spec(step_type: StepType, label: str, hint: str, params: list) -> StepSpec:
     return StepSpec(
         type=step_type,
         label=label,
         hint=hint,
         occupies_body=step_type in BODY_STEP_TYPES,
+        while_walking=step_type in WHILE_WALKING_STEP_TYPES,
         params=params,
     )
 

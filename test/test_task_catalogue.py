@@ -40,6 +40,15 @@ def test_occupies_the_body_exactly_where_a_group_refuses_a_second():
         assert spec.occupies_body == (spec.type in BODY_STEP_TYPES), spec.type
 
 
+def test_offers_only_speech_on_the_walk_to_a_stop():
+    # A body step there is refused (one per group); a WAIT is legal but only
+    # makes the walk last at least that long, which no operator means.
+    offered = [spec.type for spec in step_catalogue().steps if spec.while_walking]
+    assert offered == [StepType.SPEAK]
+    for spec in step_catalogue().steps:
+        assert not (spec.while_walking and spec.occupies_body), spec.type
+
+
 def test_offers_a_waypoint_for_exactly_the_steps_that_drive_to_a_pose():
     for spec in step_catalogue().steps:
         has_waypoint = any(field.kind == "waypoint" for field in spec.params)

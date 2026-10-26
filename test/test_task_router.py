@@ -631,6 +631,9 @@ class TestTaskSteps:
         assert [step["type"] for step in steps] == [
             "MOVE", "DOCK", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
         ]
+        assert [step["while_walking"] for step in steps] == [
+            False, False, True, False, False, False,
+        ]
         assert steps[0]["params"] == [
             {"kind": "waypoint", "key": "target", "label": "Waypoint", "filter": None}
         ]
