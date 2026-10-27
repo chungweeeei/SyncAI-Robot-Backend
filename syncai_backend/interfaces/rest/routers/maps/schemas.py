@@ -46,7 +46,10 @@ class MapVertexRequest(BaseModel):
         0.0,
         allow_inf_nan=False,
         description="Height of the ground the vertex stands on (metres, map frame): "
-        "which storey it is on. 0 is the ground floor.",
+        "which storey it is on, and where on a slope. The console writes the 3D "
+        "map's ground under the vertex (on its floor, for a map with floors); 0 "
+        "is a 2D map's, or a vertex from before heights -- the planner snaps it "
+        "to the ground only within 1 m, except where the ground is one layer.",
     )
 
 
