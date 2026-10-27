@@ -776,21 +776,24 @@ class TestLocalizationConverged:
 
 
 class TestNavServicesReady:
-    """How the map router tells "wrong mode" from "nav stack is up"."""
+    """How the map switch tells "wrong mode" from "nav stack is up"."""
 
-    def test_both_services_present(self, map_gw):
+    def test_localizer_ready_is_relocalize_discoverability(self, map_gw):
         _arm(map_gw, "relocalize")
-        _arm(map_gw, "load_map")
+        _arm(map_gw, "load_map", available=False)
 
-        assert map_gw.nav_services_ready(timeout_sec=0.01) is True
+        assert map_gw.localizer_ready(timeout_sec=0.01) is True
 
-    @pytest.mark.parametrize("missing", ["relocalize", "load_map"])
-    def test_either_one_missing_is_not_ready(self, map_gw, missing):
-        _arm(map_gw, "relocalize")
-        _arm(map_gw, "load_map")
-        _arm(map_gw, missing, available=False)
+    def test_localizer_missing_is_not_ready(self, map_gw):
+        _arm(map_gw, "relocalize", available=False)
 
-        assert map_gw.nav_services_ready(timeout_sec=0.01) is False
+        assert map_gw.localizer_ready(timeout_sec=0.01) is False
+
+    @pytest.mark.parametrize("available", [True, False])
+    def test_map_server_ready_is_load_map_discoverability(self, map_gw, available):
+        _arm(map_gw, "load_map", available=available)
+
+        assert map_gw.map_server_ready(timeout_sec=0.01) is available
 
 
 class TestAutoLocalize:

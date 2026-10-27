@@ -98,6 +98,7 @@ class _StubMapGateway:
         self.swap_calls = []
         self.swap_result = (True, "")
         self.services_ready = True
+        self.map_server = True
         self.converged = True
         # The keepout mask's map_server. Recorded in `order` too: a switch has
         # to reload it *after* the INI write, the commit point.
@@ -163,8 +164,11 @@ class _StubMapGateway:
         self.start_calls.append(reset_lio)
         return self.start_result
 
-    def nav_services_ready(self, timeout_sec=2.0):
+    def localizer_ready(self, timeout_sec=2.0):
         return self.services_ready
+
+    def map_server_ready(self, timeout_sec=2.0):
+        return self.services_ready and self.map_server
 
     def swap_localizer_map(self, pcd_path, x, y, yaw):
         self.swap_calls.append((pcd_path, x, y, yaw))
@@ -3985,6 +3989,53 @@ def test_activate_loads_a_3d_map_into_the_3d_planner(
     assert body["keepout_reloaded"] is True
     assert "0 forbidden zones" in body["message"]
     assert "name: three" in ini.read_text()
+
+
+def test_activate_loads_a_3d_map_on_a_stack_without_map_server(
+    catalog_repo, client, map_gw, three_d, monkeypatch, tmp_path
+):
+    """A 3D nav session runs without map_server; it must not read as down."""
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.planner_3d = True
+    map_gw.map_server = False
+
+    response = _activate(client, "three")
+
+    assert response.status_code == 200
+    assert response.json()["map_kind"] == "3d"
+    assert [step for step, _ in map_gw.order] == ["swap_localizer_map", "reload_octomap"]
+    assert "name: three" in ini.read_text()
+
+
+def test_activate_skips_the_grid_of_a_3d_map_without_map_server(
+    catalog_repo, client, map_gw, maps_dir, make_bt, monkeypatch, tmp_path
+):
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("rawonly"))
+    make_bt(maps_dir / "full" / "octomap.bt")
+    map_gw.planner_3d = True
+    map_gw.map_server = False
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 200
+    assert response.json()["map_kind"] == "3d"
+    assert [step for step, _ in map_gw.order] == ["swap_localizer_map", "reload_octomap"]
+
+
+def test_activate_refuses_a_2d_map_without_map_server(
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
+):
+    ini = _point_ini_at(catalog_repo, monkeypatch, tmp_path, _ini_naming("rawonly"))
+    map_gw.planner_3d = True
+    map_gw.map_server = False
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stack_not_ready"
+    assert "map_server" in response.json()["detail"]
+    assert map_gw.order == []
+    assert "name: rawonly" in ini.read_text()
 
 
 def test_activate_refuses_a_3d_map_on_a_stack_without_the_3d_planner(

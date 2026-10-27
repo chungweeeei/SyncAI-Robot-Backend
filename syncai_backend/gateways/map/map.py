@@ -150,16 +150,27 @@ class MapGateway:
             }
         )
 
-    def nav_services_ready(self, timeout_sec: float = 2.0) -> bool:
-        """Are the AUTO-session map services discoverable right now?
+    def localizer_ready(self, timeout_sec: float = 2.0) -> bool:
+        """Is the AUTO-session localizer (`relocalize`) discoverable right now?
 
-        The precondition for a map switch. Not read off the cached RobotState
+        The precondition for every map switch, and how mapping mode is told
+        apart from a running nav stack. Not read off the cached RobotState
         mode, which can be stale and names the session, not whether its
         services are up.
         """
-        return all(
-            self._service_clients[key].wait_for_service(timeout_sec=timeout_sec)
-            for key in ("relocalize", "load_map")
+        return self._service_clients["relocalize"].wait_for_service(
+            timeout_sec=timeout_sec
+        )
+
+    def map_server_ready(self, timeout_sec: float = 2.0) -> bool:
+        """Is map_server (`load_map`) discoverable right now?
+
+        Asked separately from the localizer: a 3D nav session runs without
+        map_server (Octo3D plans on the octree), so only a switch to a 2D map
+        requires it. Discoverability, as ``localizer_ready``.
+        """
+        return self._service_clients["load_map"].wait_for_service(
+            timeout_sec=timeout_sec
         )
 
     def swap_localizer_map(
