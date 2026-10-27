@@ -23,17 +23,21 @@ class _RecordingMapGateway:
     """Every ROS step the switch takes, in order; each answers ``ok`` unless
     named in ``fail``."""
 
-    def __init__(self, planner_3d=False):
+    def __init__(self, planner_3d=False, map_server=True):
         self.order = []
         self.fail = set()
         self.planner_3d = planner_3d
+        self.map_server = map_server
 
     def _step(self, step, arg):
         self.order.append((step, arg))
         return (False, f"{step} refused") if step in self.fail else (True, "")
 
-    def nav_services_ready(self, timeout_sec=2.0):
+    def localizer_ready(self, timeout_sec=2.0):
         return True
+
+    def map_server_ready(self, timeout_sec=2.0):
+        return self.map_server
 
     def planner_3d_available(self, timeout_sec=2.0):
         return self.planner_3d

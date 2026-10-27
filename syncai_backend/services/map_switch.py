@@ -18,7 +18,8 @@ Order and why:
 
 1. The localizer (`relocalize`) first, because a refusal there mutates
    nothing.
-2. map_server (`load_map`), when the map has a grid.
+2. map_server (`load_map`), when the map has a grid and map_server runs
+   (a 3D session has none; a 2D map is refused without it).
 3. Octo3D (`planner_server/Octo3D/load_map`) after the grid: a 3D map's tree
    takes seconds to build, and a refusal from map_server should not have paid
    for it. For a 2D map this *unloads* the previous tree, or the robot would
@@ -178,11 +179,21 @@ class MapSwitchService:
         name, previous = plan.name, plan.previous
         map_gw = self._map_gw
 
-        if not map_gw.nav_services_ready():
+        if not map_gw.localizer_ready():
             raise ConflictError(
-                "map_server and the localizer are not reachable, so there is no "
-                "running map to switch. The robot is in mapping mode, or the "
-                "nav stack is down.",
+                "The localizer is not reachable, so there is no running map to "
+                "switch. The robot is in mapping mode, or the nav stack is down.",
+                code="stack_not_ready",
+            )
+
+        # A 3D nav session runs without map_server, so it is required for a
+        # 2D map only; a 3D map's grid is loaded when map_server is there,
+        # to keep it in step, and skipped when it is not.
+        map_server = map_gw.map_server_ready()
+        if not plan.is_3d and not map_server:
+            raise ConflictError(
+                f"'{name}' is a 2D map, but map_server is not reachable to load "
+                "its grid. The nav stack is a 3D session, or is down.",
                 code="stack_not_ready",
             )
 
@@ -209,7 +220,7 @@ class MapSwitchService:
             )
         done.append(self._localizer_undo(plan))
 
-        if plan.yaml_path is not None:
+        if plan.yaml_path is not None and map_server:
             reloaded, detail = map_gw.reload_map(plan.yaml_path)
             if not reloaded:
                 self._logger.error("Map switch failed at map_server", map=name, error=detail)

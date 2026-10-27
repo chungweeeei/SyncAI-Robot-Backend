@@ -55,7 +55,9 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
 
         All refusals come first. `stack_not_ready` (e.g. mapping mode) is
         detected by service discoverability, not the cached RobotState, which
-        is absent on a robot that lost localization.
+        is absent on a robot that lost localization: the localizer always,
+        map_server for a 2D map only (a 3D session runs without it; a 3D map's
+        grid is then not loaded).
 
         `[initial_pose]` is zeroed: an old-frame pose is meaningless here. The
         operator sets the pose; `localized` says whether registration converged
