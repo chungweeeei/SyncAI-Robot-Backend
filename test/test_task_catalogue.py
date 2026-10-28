@@ -33,7 +33,7 @@ def _field(step_type, key):
 
 def test_lists_every_step_an_operator_authors():
     listed = [spec.type for spec in step_catalogue().steps]
-    assert set(listed) == set(StepType)
+    assert set(listed) == set(StepType) - {StepType.DEMO}
     assert len(listed) == len(set(listed))
 
 

@@ -154,6 +154,7 @@ def test_body_and_io_activities_poll_separate_queues():
         activities.execute_speak,
         activities.record_task,
         activities.resolve_template,
+        activities.execute_demo,
     ]
     assert io["max_concurrent_activities"] == worker_mod.IO_ACTIVITY_SLOTS > 1
 

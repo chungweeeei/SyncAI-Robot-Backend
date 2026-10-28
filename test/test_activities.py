@@ -27,10 +27,12 @@ pytest.importorskip("temporalio")
 
 from temporalio.exceptions import ApplicationError, CancelledError  # noqa: E402
 from temporalio.testing import ActivityEnvironment  # noqa: E402
+import httpx  # noqa: E402
 
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
 from syncai_backend.tasks.schema import (  # noqa: E402
+    DemoParams,
     MoveParams,
     PatrolParams,
     SpeakParams,
@@ -982,3 +984,35 @@ class TestResolveTemplate:
 
     def test_a_template_that_is_gone_answers_none(self, resolver):
         assert resolver.resolve_template("0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55") is None
+
+
+POST = "syncai_backend.temporal.activities.httpx.post"
+
+
+class TestExecuteDemo:
+    """DEMO (demo branch only): one POST of the inspection's description."""
+
+    def test_posts_the_description_of_the_chosen_inspection(self, env, activities):
+        with patch(POST, return_value=httpx.Response(200)) as post:
+            result = env.run(
+                activities.execute_demo, DemoParams(inspection="door_open")
+            )
+
+        assert result.success is True
+        url = post.call_args.args[0]
+        assert url.endswith("/internal/capture/inspection")
+        assert post.call_args.kwargs["json"] == {"description": "門：開啟"}
+
+    def test_an_error_status_is_retryable(self, env, activities):
+        with patch(POST, return_value=httpx.Response(503, text="busy")):
+            with pytest.raises(ApplicationError, match="503") as exc_info:
+                env.run(activities.execute_demo, DemoParams(inspection="light_on"))
+
+        assert exc_info.value.non_retryable is False
+
+    def test_an_unreachable_service_is_retryable(self, env, activities):
+        with patch(POST, side_effect=httpx.ConnectError("refused")):
+            with pytest.raises(ApplicationError, match="Capture request failed") as exc_info:
+                env.run(activities.execute_demo, DemoParams(inspection="light_off"))
+
+        assert exc_info.value.non_retryable is False
