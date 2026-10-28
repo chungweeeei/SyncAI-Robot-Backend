@@ -40,6 +40,9 @@ class StepType(str, Enum):
     # takes none, since undock.xml backs out 1 m from wherever the robot stands.
     DOCK = "DOCK"
     UNDOCK = "UNDOCK"
+    # Demo branch only: tells the inspection capture service what the robot saw
+    # (RobotActivities.execute_demo). Not offered on the console (catalogue.py).
+    DEMO = "DEMO"
 
 
 class MoveParams(BaseSchema):
@@ -112,9 +115,35 @@ class WaitParams(BaseSchema):
     )
 
 
+# DEMO's choices; the description is the words the capture service receives.
+class InspectionId(str, Enum):
+    HYDRANT_OK = "hydrant_ok"
+    LIGHT_ON = "light_on"
+    LIGHT_OFF = "light_off"
+    DOOR_OPEN = "door_open"
+    DOOR_CLOSED = "door_closed"
+
+
+INSPECTION_DESCRIPTIONS: dict[InspectionId, str] = {
+    InspectionId.HYDRANT_OK: "消防栓：正常",
+    InspectionId.LIGHT_ON: "燈：開啟",
+    InspectionId.LIGHT_OFF: "燈：關閉",
+    InspectionId.DOOR_OPEN: "門：開啟",
+    InspectionId.DOOR_CLOSED: "門：關閉",
+}
+
+
+class DemoParams(BaseSchema):
+    inspection: InspectionId = Field(
+        ...,
+        description="Which inspection result to report to the capture service.",
+        examples=["door_open"],
+    )
+
+
 # Pydantic's smart union tells the members apart by their disjoint required fields,
 # so no discriminator is needed.
-StepParams = MoveParams | SpeakParams | WaitParams
+StepParams = MoveParams | SpeakParams | WaitParams | DemoParams
 
 
 # Which params model each step type expects (None: takes none). Without it a MOVE
@@ -127,6 +156,7 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.WAIT: WaitParams,
     StepType.DOCK: MoveParams,
     StepType.UNDOCK: None,
+    StepType.DEMO: DemoParams,
 }
 
 
@@ -239,7 +269,7 @@ class Step(BaseSchema):
         description=(
             "Parameters for the step, which vary based on the step type. "
             "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK (x/y/theta: "
-            "the dock pose), SPEAK and WAIT"
+            "the dock pose), SPEAK, WAIT and DEMO"
         ),
     )
     status: StepStatus = Field(

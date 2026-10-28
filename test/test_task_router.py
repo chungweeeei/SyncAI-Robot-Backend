@@ -32,6 +32,7 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     TaskKind,
     TaskSource,
     TaskState,
+    DemoParams,
     WaitParams,
 )
 from syncai_backend.interfaces.rest.routers.task import init_task_router  # noqa: E402
@@ -299,6 +300,27 @@ class TestTriggerTask:
     def test_a_bad_wait_step_is_a_422(self, client, workflow_gw, params):
         task = _move_task()
         task["steps"] = [{"id": "s1", "type": "WAIT", "params": params}]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
+    def test_a_demo_step_carries_its_inspection_through(self, client, workflow_gw):
+        task = _move_task()
+        task["steps"] = [
+            {"id": "s1", "type": "DEMO", "params": {"inspection": "door_open"}}
+        ]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 200
+        step = workflow_gw.started[0][0].definition.steps[0]
+        assert step.type is StepType.DEMO
+        assert step.params == DemoParams(inspection="door_open")
+
+    @pytest.mark.parametrize(
+        "params", [None, {"inspection": "window_open"}, {"seconds": 10}]
+    )
+    def test_a_bad_demo_step_is_a_422(self, client, workflow_gw, params):
+        task = _move_task()
+        task["steps"] = [{"id": "s1", "type": "DEMO", "params": params}]
 
         assert client.post("/api/v1/tasks", json=task).status_code == 422
         assert workflow_gw.started == []

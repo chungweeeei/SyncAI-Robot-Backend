@@ -49,7 +49,11 @@ ACTIVITY_MAP = {
     StepType.SPEAK: RobotActivities.execute_speak,
     StepType.DOCK: RobotActivities.execute_dock,
     StepType.UNDOCK: RobotActivities.execute_undock,
+    StepType.DEMO: RobotActivities.execute_demo,
 }
+
+# DEMO (demo branch only): one POST, so no heartbeat and a short ceiling.
+DEMO_START_TO_CLOSE_TIMEOUT = timedelta(seconds=30)
 
 
 def _blocks(steps: list[Step]) -> list[list[Step]]:
@@ -237,6 +241,9 @@ class RobotWorkflow:
             # Per utterance; older histories read repeat=1.
             start_to_close_timeout = timedelta(minutes=5) * step.params.repeat
             heartbeat_timeout = SPEAK_HEARTBEAT_TIMEOUT
+        elif step.type is StepType.DEMO:
+            start_to_close_timeout = DEMO_START_TO_CLOSE_TIMEOUT
+            heartbeat_timeout = None
         else:
             start_to_close_timeout = timedelta(hours=1)
             heartbeat_timeout = MOVE_HEARTBEAT_TIMEOUT
@@ -261,6 +268,9 @@ class RobotWorkflow:
         # SPEAK goes to the IO queue so a grouped SPEAK need not wait for the MOVE's
         # body slot. Unset, an activity goes to the run's own (body) queue.
         if step.type is StepType.SPEAK and workflow.patched(SPEAK_ON_IO_QUEUE_PATCH):
+            activity_options["task_queue"] = io_task_queue_for(workflow.info().task_queue)
+        # DEMO only talks to another service; new, so no older history to patch for.
+        if step.type is StepType.DEMO:
             activity_options["task_queue"] = io_task_queue_for(workflow.info().task_queue)
 
         # Only a group member gets our own id (what makes it report and what

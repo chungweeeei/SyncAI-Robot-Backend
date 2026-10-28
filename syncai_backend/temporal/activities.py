@@ -1,8 +1,10 @@
 import asyncio
 import math
+import os
 import time
 from typing import Optional
 
+import httpx
 import structlog
 from pydantic import BaseModel
 
@@ -13,7 +15,12 @@ from temporalio.exceptions import ApplicationError, CancelledError
 
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.tasks.config import STEP_STARTED_SIGNAL, reports_start
-from syncai_backend.tasks.schema import MoveParams, SpeakParams
+from syncai_backend.tasks.schema import (
+    INSPECTION_DESCRIPTIONS,
+    DemoParams,
+    MoveParams,
+    SpeakParams,
+)
 from syncai_backend.gateways.robot.robot import (
     DOCK_BEHAVIOR_TREE,
     UNDOCK_BEHAVIOR_TREE,
@@ -69,6 +76,14 @@ def _move_failure(status: dict, label: str = "move") -> str:
             "(another navigation is running, or the behavior tree failed to load)"
         )
     return f"{label} ended in aborted"
+
+
+# DEMO (demo branch only): where execute_demo reports an inspection. Host networking,
+# so 127.0.0.1 is the robot's own loopback.
+DEMO_CAPTURE_URL = os.environ.get(
+    "DEMO_CAPTURE_URL", "http://127.0.0.1:8090/internal/capture/inspection"
+)
+DEMO_CAPTURE_TIMEOUT_S = 10.0
 
 
 class ActivityResult(BaseModel):
@@ -472,3 +487,33 @@ class RobotActivities:
             )
 
         return duration
+
+    @activity.defn
+    def execute_demo(self, params: DemoParams) -> ActivityResult:
+        """Report an inspection result to the capture service (demo branch only).
+
+        One POST, no heartbeat. Any failure is retryable, bounded by the run's
+        maximum_attempts.
+        """
+        description = INSPECTION_DESCRIPTIONS[params.inspection]
+        try:
+            response = httpx.post(
+                DEMO_CAPTURE_URL,
+                json={"description": description},
+                timeout=DEMO_CAPTURE_TIMEOUT_S,
+            )
+        except httpx.HTTPError as err:
+            raise ApplicationError(f"Capture request failed: {err!r}") from err
+
+        if not response.is_success:
+            raise ApplicationError(
+                f"Capture service answered {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+
+        self._logger.info(
+            "[RobotActivity] Inspection reported",
+            inspection=params.inspection.value,
+            description=description,
+        )
+        return ActivityResult(success=True, state="succeeded")
