@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from syncai_backend.tasks.schema import (
     BODY_STEP_TYPES,
+    InspectionId,
     SpeakParams,
     StepType,
     WaitParams,
@@ -71,7 +72,20 @@ class NumberField(BaseModel):
     placeholder: Optional[str] = None
 
 
-StepParamField = Union[WaypointField, TextField, IntegerField, NumberField]
+# Demo branch only, for DEMO: one of a fixed set of values, drawn as a select.
+class ChoiceOption(BaseModel):
+    value: str
+    label: str
+
+
+class ChoiceField(BaseModel):
+    kind: Literal["choice"] = "choice"
+    key: str
+    label: str
+    options: List[ChoiceOption]
+
+
+StepParamField = Union[WaypointField, TextField, IntegerField, NumberField, ChoiceField]
 
 
 class StepSpec(BaseModel):
@@ -121,6 +135,17 @@ def _bounds(model: type[BaseModel], field: str) -> dict:
 # group is legal, and the group waits for both, so it reads as "walk for at
 # least this long" — never what was meant, so it is not offered.
 WHILE_WALKING_STEP_TYPES = frozenset({StepType.SPEAK})
+
+
+# DEMO's options in operator words; the capture service gets the Chinese
+# description (schema.INSPECTION_DESCRIPTIONS) instead.
+INSPECTION_LABELS: dict[InspectionId, str] = {
+    InspectionId.HYDRANT_OK: "Fire hydrant: OK",
+    InspectionId.LIGHT_ON: "Light: on",
+    InspectionId.LIGHT_OFF: "Light: off",
+    InspectionId.DOOR_OPEN: "Door: open",
+    InspectionId.DOOR_CLOSED: "Door: closed",
+}
 
 
 def _spec(step_type: StepType, label: str, hint: str, params: list) -> StepSpec:
@@ -200,5 +225,20 @@ def step_catalogue() -> StepCatalogue:
             ),
             _spec(StepType.STANDUP, "Stand", "Stand up. Nothing to set.", []),
             _spec(StepType.LIEDOWN, "Lie down", "Lie down. Nothing to set.", []),
+            _spec(
+                StepType.DEMO,
+                "Inspection",
+                "Report what the robot saw to the capture service.",
+                [
+                    ChoiceField(
+                        key="inspection",
+                        label="Result",
+                        options=[
+                            ChoiceOption(value=item.value, label=INSPECTION_LABELS[item])
+                            for item in InspectionId
+                        ],
+                    )
+                ],
+            ),
         ]
     )
