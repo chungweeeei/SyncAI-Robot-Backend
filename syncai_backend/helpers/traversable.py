@@ -16,10 +16,9 @@ ported from the offline ``SyncAI-Robot-Pointcloud-ProcessAndConversion`` tool:
 startup.** Import it inside the function that needs it. Stage 3 lives in
 ``pcd_to_gridmap`` to keep that module open3d-free.
 
-Runs only on request (``POST /api/v1/maps/{name}/grid/convert``); see
-``GRIDMAP_RECIPE`` in ``services/gridmap_conversion.py`` for why it is not
-picked automatically. By hand, ``debug_dir`` shows which stage rejected the
-floor:
+No route calls this since 2026-10-28, when the stack went 3D-only and the
+backend's 2D gridmap surface was removed; kept as a library. By hand,
+``debug_dir`` shows which stage rejected the floor:
 
     from syncai_backend.helpers.traversable import build_traversable_cloud
     from syncai_backend.helpers.pcd_to_gridmap import convert_traversable_to_gridmap

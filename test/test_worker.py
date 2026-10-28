@@ -208,7 +208,6 @@ def test_health_projects_worker_state():
             webrtc_gw=MagicMock(),
             recording_gw=MagicMock(),
             recording_catalog_repo=MagicMock(),
-            conversion_svc=MagicMock(),
             restart_svc=MagicMock(),
             mapping_status_repo=MagicMock(),
             safety_lock_svc=MagicMock(),

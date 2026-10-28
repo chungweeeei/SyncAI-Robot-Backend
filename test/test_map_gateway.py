@@ -4,8 +4,10 @@ Same seams as test_robot_gateway.py: the node is a MagicMock and futures are
 the hand-completed ``_Future`` below, so no ROS graph (or rclpy.init) is
 needed. Unlike RobotGateway's single mocked node, ``create_client`` here hands
 out a *distinct* mock per service name — a bare MagicMock would return the same
-object for both calls, and a test could then never prove that reload_map left
-``pgo/save_maps`` alone.
+object for both calls, and a test could then never prove that reload_octomap
+left ``pgo/save_maps`` alone. Keyed by name, the fixture also refuses the
+``map_server`` / ``filter_mask_server`` clients the 2D stack had: a gateway
+that asked for one again fails every test here with a KeyError.
 
 The timeout paths are pinned by patching ``gateways.ros.wait_for_future``
 rather than a shrunken constant: map.py inlines its 20 s / 180 s deadlines
@@ -68,8 +70,6 @@ def map_gw(logger) -> MapGateway:
     # can also implicitly pin that the gateway asks for the node-prefixed
     # relative names — a wrong srv_name raises KeyError right here.
     clients = {
-        "map_server/load_map": MagicMock(),
-        "filter_mask_server/load_map": MagicMock(),
         "planner_server/Octo3D/load_map": MagicMock(),
         "planner_server/Octo3D/load_keepout": MagicMock(),
         "pgo/save_maps": MagicMock(),
@@ -118,77 +118,6 @@ class TestWaitForFuture:
         assert wait_for_future(future, timeout=5.0) is True
 
 
-class TestReloadMap:
-    def test_success_sends_the_expanded_absolute_url(self, map_gw):
-        client = _arm(
-            map_gw,
-            "load_map",
-            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
-        )
-
-        success, message = map_gw.reload_map(yaml_path="~/map/full/gridmap.yaml")
-
-        assert (success, message) == (True, "")
-        # The request is the observable here: map_io resolves the yaml's
-        # relative `image:` key against the *unexpanded* string it is handed,
-        # so a surviving `~` would fail later as a fake corrupt-image error.
-        request = client.call_async.call_args[0][0]
-        assert request.map_url == os.path.join(
-            os.path.expanduser("~"), "map/full/gridmap.yaml"
-        )
-        assert os.path.isabs(request.map_url)
-
-    def test_service_unavailable_fails_before_calling(self, map_gw):
-        # In practice "wrong mode": map_server only exists in the AUTO session.
-        client = _arm(map_gw, "load_map", available=False)
-
-        success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
-
-        assert success is False
-        assert message == "load_map service is not available."
-        client.call_async.assert_not_called()
-
-    def test_timeout_reports_the_load_map_deadline(self, map_gw, monkeypatch):
-        client = _arm(map_gw, "load_map", completed=False)
-        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
-
-        success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
-
-        assert success is False
-        assert message == "Timeout waiting for map_server/load_map response"
-        client.call_async.assert_called_once()  # dispatched, then abandoned
-
-    @pytest.mark.parametrize(
-        "result_code,expected_fragment",
-        [
-            (LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST, "could not find the map yaml"),
-            (LoadMap.Response.RESULT_INVALID_MAP_DATA, "could not read gridmap.pgm"),
-            (LoadMap.Response.RESULT_INVALID_MAP_METADATA, "rejected gridmap.yaml"),
-            (LoadMap.Response.RESULT_UNDEFINED_FAILURE, "undefined failure"),
-        ],
-    )
-    def test_each_failure_code_gets_its_operator_message(
-        self, map_gw, result_code, expected_fragment
-    ):
-        # LoadMap.srv has no message field; these strings are the whole story
-        # an operator ever sees for a failed reload.
-        _arm(map_gw, "load_map", LoadMap.Response(result=result_code))
-
-        success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
-
-        assert success is False
-        assert expected_fragment in message
-
-    def test_an_unmapped_code_falls_back_to_the_raw_result(self, map_gw):
-        # A result outside the srv's named values (some other map_server
-        # implementation on the graph) must still produce a usable string.
-        _arm(map_gw, "load_map", SimpleNamespace(result=42))
-
-        success, message = map_gw.reload_map(yaml_path="/map/full/gridmap.yaml")
-
-        assert (success, message) == (False, "map_server returned result 42")
-
-
 class TestReloadOctomap:
     """The 3D planner's tree: the same LoadMap call, where "" means unload."""
 
@@ -206,9 +135,8 @@ class TestReloadOctomap:
         assert request.map_url == os.path.join(
             os.path.expanduser("~"), "map/three/octomap.bt"
         )
-        # Neither map_server is touched: the grid and the mask are other calls.
-        map_gw._service_clients["load_map"].call_async.assert_not_called()
-        map_gw._service_clients["load_keepout"].call_async.assert_not_called()
+        # The zones are their own call.
+        map_gw._service_clients["load_keepout_3d"].call_async.assert_not_called()
 
     def test_an_empty_path_unloads_rather_than_resolving_the_cwd(self, map_gw):
         # os.path.abspath("") is the cwd; the robot would read that as a tree.
@@ -248,85 +176,6 @@ class TestReloadOctomap:
         assert map_gw.planner_3d_available() is False
 
 
-class TestReloadKeepout:
-    """The second map_server: same LoadMap call, different node, own wording."""
-
-    def test_success_goes_to_the_mask_server_only(self, map_gw):
-        client = _arm(
-            map_gw,
-            "load_keepout",
-            LoadMap.Response(result=LoadMap.Response.RESULT_SUCCESS),
-        )
-
-        success, message = map_gw.reload_keepout(yaml_path="~/map/full/keepout.yaml")
-
-        assert (success, message) == (True, "")
-        request = client.call_async.call_args[0][0]
-        assert request.map_url == os.path.join(
-            os.path.expanduser("~"), "map/full/keepout.yaml"
-        )
-        assert os.path.isabs(request.map_url)
-        # The gridmap's map_server must not be asked to load a keepout mask:
-        # that would replace the map the localizer and costmaps run on.
-        map_gw._service_clients["load_map"].call_async.assert_not_called()
-
-    def test_service_unavailable_says_where_the_zones_apply(self, map_gw):
-        client = _arm(map_gw, "load_keepout", available=False)
-
-        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
-
-        assert success is False
-        assert "filter_mask_server/load_map is not available" in message
-        assert "AUTO" in message
-        client.call_async.assert_not_called()
-
-    def test_timeout_reports_the_mask_server_deadline(self, map_gw, monkeypatch):
-        client = _arm(map_gw, "load_keepout", completed=False)
-        monkeypatch.setattr(ros_module, "wait_for_future", lambda f, timeout: False)
-
-        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
-
-        assert success is False
-        assert message == "Timeout waiting for filter_mask_server/load_map response"
-        client.call_async.assert_called_once()
-
-    @pytest.mark.parametrize(
-        "result_code,expected",
-        [
-            (
-                LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST,
-                "filter_mask_server could not find the map yaml",
-            ),
-            (
-                LoadMap.Response.RESULT_INVALID_MAP_DATA,
-                "filter_mask_server could not read keepout.pgm",
-            ),
-            (
-                LoadMap.Response.RESULT_INVALID_MAP_METADATA,
-                "filter_mask_server rejected keepout.yaml",
-            ),
-            (
-                LoadMap.Response.RESULT_UNDEFINED_FAILURE,
-                "filter_mask_server reported an undefined failure",
-            ),
-        ],
-    )
-    def test_each_failure_code_names_the_keepout_files(self, map_gw, result_code, expected):
-        # The strings must send the operator to keepout.*, not gridmap.*.
-        _arm(map_gw, "load_keepout", LoadMap.Response(result=result_code))
-
-        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
-
-        assert (success, message) == (False, expected)
-
-    def test_an_unmapped_code_falls_back_to_the_raw_result(self, map_gw):
-        _arm(map_gw, "load_keepout", SimpleNamespace(result=42))
-
-        success, message = map_gw.reload_keepout(yaml_path="/map/full/keepout.yaml")
-
-        assert (success, message) == (False, "filter_mask_server returned result 42")
-
-
 class TestReloadKeepout3d:
     """Octo3D's forbidden zones: its own service, keepout.json, "" clears."""
 
@@ -344,7 +193,6 @@ class TestReloadKeepout3d:
         assert request.map_url == os.path.join(
             os.path.expanduser("~"), "map/full/keepout.json"
         )
-        map_gw._service_clients["load_keepout"].call_async.assert_not_called()
         map_gw._service_clients["load_octomap"].call_async.assert_not_called()
 
     def test_empty_path_clears(self, map_gw):
@@ -409,23 +257,9 @@ class TestSaveMap:
         assert isinstance(request, SaveMaps.Request)
         assert request.file_path == os.path.join(os.path.expanduser("~"), "map/newsite")
         assert request.save_patches is True
-        # No choice from the console leaves the 3D map to pgo's parameter.
-        assert request.octomap == SaveMaps.Request.OCTOMAP_DEFAULT
-
-    @pytest.mark.parametrize(
-        "octomap, wire",
-        [
-            (True, SaveMaps.Request.OCTOMAP_ON),
-            (False, SaveMaps.Request.OCTOMAP_OFF),
-            (None, SaveMaps.Request.OCTOMAP_DEFAULT),
-        ],
-    )
-    def test_the_3d_map_choice_reaches_pgo(self, map_gw, octomap, wire):
-        client = _arm(map_gw, "save_maps", SimpleNamespace(success=True, message=""))
-
-        map_gw.save_map(directory="/map/newsite", octomap=octomap)
-
-        assert client.call_async.call_args[0][0].octomap == wire
+        # Always asked for: a map is navigable only with its octomap.bt, so it
+        # is never left to pgo's map_clean_octomap default.
+        assert request.octomap == SaveMaps.Request.OCTOMAP_ON
 
     def test_pgo_refusal_passes_through_verbatim(self, map_gw):
         # e.g. "NO POSES!" — a run that never banked a keyframe. The gateway
@@ -729,7 +563,7 @@ class TestSwapLocalizerMap:
         assert message == "Timeout waiting for relocalize response"
         map_gw._initial_pose_pub.publish.assert_not_called()
 
-    def test_reload_map_is_left_alone(self, map_gw):
+    def test_the_3d_planner_is_left_alone(self, map_gw):
         _arm(
             map_gw,
             "relocalize",
@@ -740,7 +574,7 @@ class TestSwapLocalizerMap:
 
         # The router pairs these two; the gateway must not pair them itself, or
         # the router could not order them or compensate between them.
-        map_gw._service_clients["load_map"].call_async.assert_not_called()
+        map_gw._service_clients["load_octomap"].call_async.assert_not_called()
 
 
 class TestLocalizationConverged:
@@ -780,7 +614,7 @@ class TestNavServicesReady:
 
     def test_localizer_ready_is_relocalize_discoverability(self, map_gw):
         _arm(map_gw, "relocalize")
-        _arm(map_gw, "load_map", available=False)
+        _arm(map_gw, "load_octomap", available=False)
 
         assert map_gw.localizer_ready(timeout_sec=0.01) is True
 
@@ -788,12 +622,6 @@ class TestNavServicesReady:
         _arm(map_gw, "relocalize", available=False)
 
         assert map_gw.localizer_ready(timeout_sec=0.01) is False
-
-    @pytest.mark.parametrize("available", [True, False])
-    def test_map_server_ready_is_load_map_discoverability(self, map_gw, available):
-        _arm(map_gw, "load_map", available=available)
-
-        assert map_gw.map_server_ready(timeout_sec=0.01) is available
 
 
 class TestAutoLocalize:

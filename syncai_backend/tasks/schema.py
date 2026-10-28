@@ -58,7 +58,7 @@ class MoveParams(BaseSchema):
     )
     # The ground height of the goal's storey. The 3D planner snaps the goal to
     # the walkable surface nearest this height, so a fixed 0 would send every
-    # goal on an upper floor to the one below it. The 2D planners ignore it.
+    # goal on an upper floor to the one below it.
     z: float = Field(
         0.0,
         allow_inf_nan=False,

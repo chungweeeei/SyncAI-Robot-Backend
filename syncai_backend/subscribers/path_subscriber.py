@@ -48,7 +48,7 @@ class PathSubscriber:
     is only the fallback for a planner that stopped re-sending.
 
     Each point keeps its z: the ground the route stands on (OctomapPlanner3D's
-    floor surface; 0 from a 2D planner), the same height a waypoint's z is. A
+    floor surface), the same height a waypoint's z is. A
     route that climbs a stair is on two storeys, and the console draws each
     part on its own.
     """

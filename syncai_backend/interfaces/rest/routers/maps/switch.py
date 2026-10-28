@@ -14,10 +14,6 @@ from syncai_backend.exceptions import (
 from syncai_backend.interfaces.rest.routers.maps.schemas import (
     ActivateMapResponse,
     AutoLocalizeResponse,
-    GridStatus,
-)
-from syncai_backend.interfaces.rest.routers.maps.common import (
-    _grid_status,
 )
 from syncai_backend.interfaces.rest.routers.maps.context import MapRouteContext
 
@@ -27,7 +23,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_gw = ctx.map_gw
     map_switch_svc = ctx.map_switch_svc
     job_gate = ctx.job_gate
-    _require = ctx.require
+    _require_exists = ctx.require_exists
 
     @map_router.post(
         "/api/v1/maps/{name}/activate", response_model=ActivateMapResponse
@@ -35,29 +31,23 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     async def activate_map(name: str):
         """Switch the robot onto another map, live, without restarting the stack.
 
-        Four parts must agree: the localizer's cloud (`relocalize`),
-        map_server's grid (`load_map`), the 3D planner's tree
-        (`planner_server/Octo3D/load_map`) and `[map] name` in the INI (what
-        a restart reads; `active_name()` reports it once written). The
+        Three parts must agree: the localizer's cloud (`relocalize`), the 3D
+        planner's tree (`planner_server/Octo3D/load_map`) and `[map] name` in
+        the INI (what a restart reads; `active_name()` reports it once
+        written). The
         localizer goes first because a refusal there mutates nothing; each
         later step compensates the earlier ones on failure. The INI is last and preflighted for
         writability, since an unrecorded swap would leave REST naming the wrong
         map.
 
-        A map is 2D (a usable gridmap) or 3D (an ``octomap.bt``; 2026-10). A 3D
-        map is loaded into Octo3D, which is what makes the robot run its 3D
-        trees, and needs a stack that has it (409 ``planner_3d_unavailable``);
-        a 2D map *unloads* Octo3D when the stack has one, or the robot would
-        keep planning on the previous map's octree. A 3D map's forbidden zones
-        come in with its tree (Octo3D reads keepout.json beside octomap.bt), and
-        map_server keeps the previous grid when the 3D map has none (it cannot
-        unload; nothing plans on it while Octo3D has a map).
+        The stack navigates on 3D maps only (2026-10-28): a map without an
+        ``octomap.bt`` is 409 ``octomap_missing``, and a stack without Octo3D
+        409 ``planner_3d_unavailable``. A map's forbidden zones come in with
+        its tree (Octo3D reads keepout.json beside octomap.bt).
 
         All refusals come first. `stack_not_ready` (e.g. mapping mode) is
-        detected by service discoverability, not the cached RobotState, which
-        is absent on a robot that lost localization: the localizer always,
-        map_server for a 2D map only (a 3D session runs without it; a 3D map's
-        grid is then not loaded).
+        detected by service discoverability (the localizer's), not the cached
+        RobotState, which is absent on a robot that lost localization.
 
         `[initial_pose]` is zeroed: an old-frame pose is meaningless here. The
         operator sets the pose; `localized` says whether registration converged
@@ -65,15 +55,13 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         services/map_switch.py; this route owns only the Temporal question.
         """
         def _plan():
-            stored = _require(name)
-            status, grid_error = _grid_status(stored, False)
-            return map_switch_svc.plan(stored, status == GridStatus.OK, grid_error)
+            _require_exists(name)
+            return map_switch_svc.plan(name)
 
-        # Off the event loop, like the switch below: reading the map walks every
-        # file under it (hundreds under patches/, the files least likely to be
-        # in the page cache) and plan() reads the INI, and this route is async.
-        # On the loop, a slow eMMC (a bag recording, a conversion writing) froze
-        # teleop and the telemetry streams for as long as that took.
+        # Off the event loop, like the switch below: plan() stats the map's
+        # files and checks the INI, and this route is async. On the loop, a
+        # slow eMMC (a bag recording) froze teleop and the telemetry streams
+        # for as long as that took.
         plan = await asyncio.to_thread(_plan)
         if plan is None:
             return ActivateMapResponse(
@@ -94,11 +82,9 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         outcome = await asyncio.to_thread(map_switch_svc.execute, plan)
         return ActivateMapResponse(
             name=outcome.name,
-            map_kind=outcome.map_kind,
             previous=outcome.previous,
             switched=True,
             localized=outcome.localized,
-            keepout_reloaded=outcome.keepout_reloaded,
             message=outcome.message,
         )
 

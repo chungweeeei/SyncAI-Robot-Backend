@@ -5,7 +5,10 @@ history); its ``--preview`` and ``--stats`` flags were not ported.
 
 Two conversions with one output contract (``.pgm`` + ``.yaml`` under one
 basename, in the pcd's own frame), both pure numpy/scipy. Keep open3d out of
-this module: the map router imports it at startup.
+this module, so importing it stays cheap.
+
+No route calls this since 2026-10-28, when the stack went 3D-only and the
+backend's 2D gridmap surface was removed; kept as a library.
 
 * ``convert_pcd_to_gridmap`` classifies cells by height band:
 

@@ -16,10 +16,7 @@ from syncai_backend.helpers.map_archive import (
     write_archive,
 )
 
-from syncai_backend.services.gridmap_conversion import (
-    TRAVERSABLE_DEBUG_SUBDIR_NAME,
-    iso_now,
-)
+from syncai_backend.interfaces.rest.routers.maps.common import iso_now
 from syncai_backend.interfaces.rest.routers.maps.schemas import (
     ImportMapResponse,
     VertexType,
@@ -32,6 +29,11 @@ from syncai_backend.interfaces.rest.routers.maps.context import MapRouteContext
 # wrong file, refused before it fills the disk. Checked on Content-Length first,
 # and again while the body streams in, since the header is the client's word.
 MAP_IMPORT_MAX_BYTES = 4 << 30
+
+# Left out of an export: the 2D traversability recipe's tuning dumps, which a
+# map converted before 2026-10-28 may still carry. Large and of no use to a
+# robot that navigates on 3D maps only.
+_EXPORT_EXCLUDED_DIRS = ("traversable_debug",)
 
 # Spooling granularity, both directions: an upload is written to disk (off the
 # event loop) in pieces this big, and an export is sent in pieces this big.
@@ -69,12 +71,14 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
 
         Every file under ``map/<name>/`` except ``traversable_debug/``, plus
         ``syncai_map.json`` (name, vertices without ids, md5 per file); layout
-        in ``helpers/map_archive``. 409 ``conversion_running``, since the grid
-        is about to be replaced. Exporting the active map is fine.
+        in ``helpers/map_archive``. 409 ``octomap_converting`` while the
+        robot's map cleaning is still rewriting map.pcd and building the tree
+        (the archive would carry a half-built map). Exporting the active map is
+        fine.
         """
         _require_exists(name)
-        map_usage.refuse_while_converting(
-            name, "export it once the conversion has finished."
+        map_usage.refuse_while_building(
+            name, "export it once the map cleaning has finished."
         )
 
         vertices = [
@@ -95,7 +99,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
                 format,
                 exported_at=iso_now(),
                 dest=spool,
-                exclude_dirs=(TRAVERSABLE_DEBUG_SUBDIR_NAME,),
+                exclude_dirs=_EXPORT_EXCLUDED_DIRS,
             )
             size = spool.seek(0, os.SEEK_END)
             spool.seek(0)
@@ -188,13 +192,13 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         Nothing is written until the archive is judged: a missing or mismatched
         manifest, a link or escaping member is 400, as is no ``map.pcd``, an
         unknown vertex type or a bad name. Replacing an existing map has
-        delete's 409s (``map_active`` / ``conversion_running`` /
+        delete's 409s (``map_active`` / ``octomap_converting`` /
         ``template_bound``); 409 ``disk_low`` when the unpacked size exceeds
         free space (the replaced map's space does not count).
 
         The steps and their undos (staging, the one-rename publish, the vertex
         transaction, the parked map's ``rmtree`` last) are
-        services/map_import.py. No conversion is started.
+        services/map_import.py.
         """
         outcome = map_import_svc.import_archive(
             payload, name, vertex_types={member.value for member in VertexType}

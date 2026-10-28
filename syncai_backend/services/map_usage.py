@@ -3,8 +3,8 @@
 Every refusal of that kind, in one place. Two classes, split by which thread
 may ask:
 
-- ``MapUsagePolicy`` answers from disk and this process's registries alone
-  (the INI's active map, the conversion registry, the template table). Plain
+- ``MapUsagePolicy`` answers from disk and this process's state alone
+  (the INI's active map, the template table). Plain
   calls, safe from any thread: the map routes ask it, and so does
   ``RobotActivities.execute_move`` on the worker's executor.
 - ``JobGate`` answers "is a job running", which means asking Temporal, so it
@@ -12,7 +12,7 @@ may ask:
   gateway belongs to the loop; see CLAUDE.md). The worker never gets one.
 
 All of these are check-then-act, not locks: the operation's own precondition
-(pgo's, map_server's, ``execute_move``'s check before every goal) is what
+(pgo's, Octo3D's, ``execute_move``'s check before every goal) is what
 stops a request that slipped through the window. When a question cannot be
 answered -- Temporal down -- the answer is a refusal, never "idle".
 
@@ -29,34 +29,31 @@ from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.move_guard import MoveRefusal, move_refusal
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
 
 
 class MapUsagePolicy:
     def __init__(
         self,
         map_catalog_repo: MapCatalogRepo,
-        conversion_svc: GridmapConversionService,
         task_template_repo: TaskTemplateRepo,
     ):
         self._catalog = map_catalog_repo
-        self._conversion_svc = conversion_svc
         self._task_template_repo = task_template_repo
 
-    def refuse_while_converting(self, name: str, advice: str) -> None:
-        """409 ``conversion_running`` while ``name``'s grid is being rebuilt.
-
-        ``advice`` finishes the sentence after the semicolon, saying when to
-        retry and, where it matters, why (the conversion would overwrite it).
+    def refuse_while_building(self, name: str, advice: str) -> None:
+        """409 ``octomap_converting`` while the robot's map cleaning is still
+        writing into ``map/<name>/`` (map.pcd, then octomap.bt), for minutes
+        after a save. Moving or removing the directory under it would leave a
+        half-built map or fail the clean. ``advice`` finishes the sentence.
         """
-        if self._conversion_svc.is_converting(name):
+        if self._catalog.map_clean_running(name):
             raise ConflictError(
-                f"A gridmap conversion for '{name}' is running; {advice}",
-                code="conversion_running",
+                f"The robot is still building the 3D map of '{name}'; {advice}",
+                code="octomap_converting",
             )
 
     def refuse_if_active(self, name: str, verb: str) -> None:
-        """409 ``map_active``: map_server and the localizer hold ``map/<name>/``."""
+        """409 ``map_active``: the localizer and Octo3D hold ``map/<name>/``."""
         if name == self._catalog.active_name():
             raise ConflictError(
                 f"'{name}' is the map the stack is running on and cannot be "
@@ -70,17 +67,17 @@ class MapUsagePolicy:
 
         Shared by delete and by an import that replaces a map:
 
-        - ``map_active``: map_server and the localizer hold ``map/<name>/``.
-        - ``conversion_running``: the thread would write its sidecar into a
-          directory that is gone (or into the *new* one).
+        - ``map_active``: the localizer and Octo3D hold ``map/<name>/``.
+        - ``octomap_converting``: the robot's map cleaning is still writing
+          into the directory.
         - ``template_bound``: a template's MOVE steps name this map's vertex ids,
           which would dangle. The operator is told which templates to unbind;
           they are never deleted silently. Map-independent templates are
           ignored.
         """
         self.refuse_if_active(name, verb)
-        self.refuse_while_converting(
-            name, "try again once the conversion has finished."
+        self.refuse_while_building(
+            name, "try again once the map cleaning has finished."
         )
 
         bound = self._task_template_repo.list_task_templates(
@@ -108,11 +105,7 @@ class MapUsagePolicy:
         ``active_map`` is the caller's one read of the INI, so a dispatch
         stamps the very map it was checked against.
         """
-        return move_refusal(
-            expected_map,
-            active_map,
-            active_map is not None and self._conversion_svc.is_converting(active_map),
-        )
+        return move_refusal(expected_map, active_map)
 
 
 class JobGate:
@@ -151,8 +144,8 @@ class JobGate:
     async def refuse_while_a_job_holds(self, name: str) -> None:
         """409 ``task_running`` while a running job's positions are on ``name``.
 
-        Guards every route that edits what the planner, costmaps or a job's
-        waypoints read (vertices, grid, rebuild, keepout).
+        Guards every route that edits what the planner or a job's waypoints
+        read (vertices, keepout, octomap edits).
 
         A map other than the loaded one passes without asking Temporal: a run
         can only hold the loaded map, and editing an idle map should not need
@@ -190,12 +183,10 @@ class JobGate:
 
 def init_map_usage_policy(
     map_catalog_repo: MapCatalogRepo,
-    conversion_svc: GridmapConversionService,
     task_template_repo: TaskTemplateRepo,
 ) -> MapUsagePolicy:
     return MapUsagePolicy(
         map_catalog_repo=map_catalog_repo,
-        conversion_svc=conversion_svc,
         task_template_repo=task_template_repo,
     )
 

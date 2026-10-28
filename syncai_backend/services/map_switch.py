@@ -1,7 +1,7 @@
-"""A live map switch: the localizer, map_server, Octo3D and the INI, in step.
+"""A live map switch: the localizer, Octo3D and the INI, in step.
 
 POST /api/v1/maps/{name}/activate is the only caller. The switch is a small
-saga -- four parts that must agree, each later failure compensating the
+saga -- three parts that must agree, each later failure compensating the
 earlier ones -- and lives here rather than in the router so the steps and
 their undos read as one list and can be driven without HTTP.
 
@@ -18,32 +18,32 @@ Order and why:
 
 1. The localizer (`relocalize`) first, because a refusal there mutates
    nothing.
-2. map_server (`load_map`), when the map has a grid and map_server runs
-   (a 3D session has none; a 2D map is refused without it).
-3. Octo3D (`planner_server/Octo3D/load_map`) after the grid: a 3D map's tree
-   takes seconds to build, and a refusal from map_server should not have paid
-   for it. For a 2D map this *unloads* the previous tree, or the robot would
-   keep planning on it ("3D wins").
-4. `[map] name` in the INI last, preflighted for writability in ``plan``,
+2. Octo3D (`planner_server/Octo3D/load_map`), the map every goal plans on.
+   Its tree takes seconds to build, so it goes after the cheap refusal.
+3. `[map] name` in the INI last, preflighted for writability in ``plan``,
    since an unrecorded swap would leave REST naming the wrong map.
 
 Compensations run in the order the steps were done, not reversed, and each
 returns the sentence the operator reads; they are run as statements before
 the message is built, so the order is the one done, not the one the
 sentences would imply.
+
+The stack navigates on 3D maps only (2026-10-28): a map without
+``octomap.bt`` is refused, and there is no map_server grid or keepout mask to
+move along (both went with the 2D stack). A map's forbidden zones come in
+with its tree: Octo3D reads ``keepout.json`` beside it as part of the load.
 """
 
 import os
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import structlog
 
 from syncai_backend.exceptions import ConflictError, UpstreamError
 from syncai_backend.gateways.map.map import MapGateway
 from syncai_backend.helpers.system_config import system_ini_path
-from syncai_backend.repositories.map.catalog import GridInfo, MapCatalogRepo, StoredMap
-from syncai_backend.services.map_usage import MapUsagePolicy
+from syncai_backend.repositories.map.catalog import MapCatalogRepo
 
 
 @dataclass(frozen=True)
@@ -52,13 +52,8 @@ class SwitchPlan:
 
     name: str
     previous: Optional[str]
-    is_3d: bool
-    previous_is_3d: bool
     pcd_path: str
-    # None for a 3D map without a grid: map_server is not touched.
-    yaml_path: Optional[str]
-    octomap_path: Optional[str]
-    grid: Optional[GridInfo]
+    octomap_path: str
     ini_path: str
 
 
@@ -66,9 +61,7 @@ class SwitchPlan:
 class SwitchOutcome:
     name: str
     previous: Optional[str]
-    map_kind: str
     localized: Optional[bool]
-    keepout_reloaded: bool
     message: str
 
 
@@ -83,52 +76,29 @@ class MapSwitchService:
         logger: structlog.stdlib.BoundLogger,
         map_catalog_repo: MapCatalogRepo,
         map_gw: MapGateway,
-        map_usage: MapUsagePolicy,
     ):
         self._logger = logger
         self._catalog = map_catalog_repo
         self._map_gw = map_gw
-        self._map_usage = map_usage
 
     # --- Preflight ---------------------------------------------------------
 
-    def plan(
-        self,
-        stored: StoredMap,
-        grid_usable: bool,
-        grid_error: Optional[str],
-    ) -> Optional[SwitchPlan]:
-        """Every refusal that needs no ROS call, or None for the no-op.
-
-        ``grid_usable`` / ``grid_error`` are the router's reading of the
-        conversion record (``_grid_status``), which it already owns for the
-        catalogue listing.
-        """
-        name = stored.name
+    def plan(self, name: str) -> Optional[SwitchPlan]:
+        """Every refusal that needs no ROS call, or None for the no-op."""
         previous = self._catalog.active_name()
         if name == previous:
             # The no-op: reloading would only throw away a good registration.
             return None
 
-        self._map_usage.refuse_while_converting(
-            name, "switch to it once the conversion has finished."
-        )
-
-        # 2D or 3D. The robot's own rule is "3D wins": its task_runner runs the
-        # 3D trees whenever Octo3D has a map, so a map with both is a 3D map
-        # here too (its grid is loaded as well, keeping map_server in step).
         octomap_path = self._catalog.octomap_path(name)
-        is_3d = octomap_path is not None
-        if not grid_usable and not is_3d:
-            # Refuse up front, before the localizer is swapped (and an
-            # unloadable yaml would crash map_server at the next launch).
-            detail = f" ({grid_error})" if grid_error else ""
+        if octomap_path is None:
+            # Refused up front, before the localizer is swapped: Octo3D is
+            # all the robot plans on, and it would have nothing to load.
             raise ConflictError(
-                f"'{name}' has no usable gridmap{detail} and no 3D map "
-                "(octomap.bt). Build a grid from the map's Rebuild-grid control, "
-                "or let the robot's map cleaning write its 3D map, before "
-                "switching to it.",
-                code="grid_missing",
+                f"'{name}' has no 3D map (octomap.bt), so the robot could not "
+                "plan on it. Wait for the robot's map cleaning to build it, or "
+                "save the map again, before switching to it.",
+                code="octomap_missing",
             )
 
         pcd_path = self._catalog.pointcloud_path(name)
@@ -139,16 +109,6 @@ class MapSwitchService:
                 "switched to.",
                 code="pointcloud_missing",
             )
-
-        yaml_path = self._catalog.gridmap_yaml_path(name) if grid_usable else None
-        if yaml_path is None and not is_3d:
-            raise ConflictError(
-                f"'{name}' has no gridmap.yaml to hand map_server.",
-                code="grid_missing",
-            )
-        previous_is_3d = (
-            previous is not None and self._catalog.octomap_path(previous) is not None
-        )
 
         ini_path = system_ini_path()
         if not os.access(ini_path, os.W_OK):
@@ -162,12 +122,8 @@ class MapSwitchService:
         return SwitchPlan(
             name=name,
             previous=previous,
-            is_3d=is_3d,
-            previous_is_3d=previous_is_3d,
             pcd_path=pcd_path,
-            yaml_path=yaml_path,
             octomap_path=octomap_path,
-            grid=stored.grid,
             ini_path=ini_path,
         )
 
@@ -186,24 +142,12 @@ class MapSwitchService:
                 code="stack_not_ready",
             )
 
-        # A 3D nav session runs without map_server, so it is required for a
-        # 2D map only; a 3D map's grid is loaded when map_server is there,
-        # to keep it in step, and skipped when it is not.
-        map_server = map_gw.map_server_ready()
-        if not plan.is_3d and not map_server:
-            raise ConflictError(
-                f"'{name}' is a 2D map, but map_server is not reachable to load "
-                "its grid. The nav stack is a 3D session, or is down.",
-                code="stack_not_ready",
-            )
-
         # Asked before anything moves. Absent on a stack built without
-        # OctomapPlanner3D: fatal for a 3D map, nothing to unload for a 2D.
-        planner_3d = map_gw.planner_3d_available()
-        if plan.is_3d and not planner_3d:
+        # OctomapPlanner3D, which then has nothing to navigate a map with.
+        if not map_gw.planner_3d_available():
             raise ConflictError(
-                f"'{name}' is a 3D map, but the nav stack has no 3D planner "
-                "(planner_server/Octo3D/load_map) to navigate it.",
+                f"The nav stack has no 3D planner (planner_server/Octo3D/load_map) "
+                f"to navigate '{name}' with.",
                 code="planner_3d_unavailable",
             )
 
@@ -220,34 +164,16 @@ class MapSwitchService:
             )
         done.append(self._localizer_undo(plan))
 
-        if plan.yaml_path is not None and map_server:
-            reloaded, detail = map_gw.reload_map(plan.yaml_path)
-            if not reloaded:
-                self._logger.error("Map switch failed at map_server", map=name, error=detail)
-                raise UpstreamError(
-                    f"The localizer moved to '{name}' but map_server would not load "
-                    f"its gridmap: {detail}." + _undo(done, "load_map failed")
-                )
-            done.append(self._grid_undo(plan))
-
-        if planner_3d:
-            # Registered before the call: Octo3D may have dropped the previous
-            # tree on its way to failing.
-            done.append(self._octomap_undo(plan))
-            octomap_loaded, detail = map_gw.reload_octomap(
-                plan.octomap_path if plan.is_3d else ""
+        # Registered before the call: Octo3D may have dropped the previous
+        # tree on its way to failing.
+        done.append(self._octomap_undo(plan))
+        octomap_loaded, detail = map_gw.reload_octomap(plan.octomap_path)
+        if not octomap_loaded:
+            self._logger.error("Map switch failed at the 3D planner", map=name, error=detail)
+            raise UpstreamError(
+                f"The localizer moved to '{name}' but the 3D planner would not "
+                f"load its 3D map: {detail}." + _undo(done, "Octo3D load_map failed")
             )
-            if not octomap_loaded:
-                self._logger.error(
-                    "Map switch failed at the 3D planner", map=name, error=detail
-                )
-                what = (
-                    "load its 3D map" if plan.is_3d else "unload the previous 3D map"
-                )
-                raise UpstreamError(
-                    f"The localizer moved to '{name}' but the 3D planner would not "
-                    f"{what}: {detail}." + _undo(done, "Octo3D load_map failed")
-                )
 
         try:
             # The INI and the catalogue's cache of it, in that order.
@@ -261,32 +187,18 @@ class MapSwitchService:
                 f"recorded in {plan.ini_path}: {exc}." + _undo(done, "INI write failed")
             )
 
-        # The switch is recorded; nothing can fail it now. The keepout mask
-        # (still the previous map's) is carried over best-effort after this
-        # commit point: a mask problem goes in the message, not a failure.
-        # A 3D map's zones need no carrying: the 3D planner read the map's
-        # keepout.json (if any) as part of the load_map that just succeeded
-        # (2026-10-23; until then it read no zones at all).
-        if plan.is_3d:
-            count = len(self._catalog.read_keepout_zones(name))
-            keepout_reloaded, keepout_note = True, (
-                " It is a 3D map: the 3D planner navigates it, with its "
-                f"{count} forbidden zone{'s' if count != 1 else ''}."
-            )
-        else:
-            keepout_reloaded, keepout_note = self._carry_keepout(name, plan.grid)
-
+        # The switch is recorded; nothing can fail it now. The map's
+        # forbidden zones need no carrying: the 3D planner read its
+        # keepout.json (if any) as part of the load_map that just succeeded.
+        count = len(self._catalog.read_keepout_zones(name))
         localized = map_gw.localization_converged()
-        map_kind = "3d" if plan.is_3d else "2d"
 
         self._logger.info(
             "Switched the active map",
             map=name,
             previous=previous,
-            map_kind=map_kind,
-            previous_was_3d=plan.previous_is_3d,
             localized=localized,
-            keepout_reloaded=keepout_reloaded,
+            keepout_zones=count,
         )
 
         message = f"The robot is now on '{name}'"
@@ -299,13 +211,12 @@ class MapSwitchService:
                 "the dashboard, because the localizer has not converged"
             )
             message += " yet." if localized is False else " and could not be asked."
-        message += keepout_note
+        if count:
+            message += f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
         return SwitchOutcome(
             name=name,
             previous=previous,
-            map_kind=map_kind,
             localized=localized,
-            keepout_reloaded=keepout_reloaded,
             message=message,
         )
 
@@ -346,28 +257,6 @@ class MapSwitchService:
 
         return _restore
 
-    def _grid_undo(self, plan: SwitchPlan) -> _Undo:
-        name, previous = plan.name, plan.previous
-
-        def _restore(reason: str) -> str:
-            """Put map_server back on the old grid."""
-            previous_yaml = (
-                self._catalog.gridmap_yaml_path(previous) if previous else None
-            )
-            if previous_yaml is None:
-                # Say so rather than leave map_server quietly serving a grid
-                # that does not match the restored cloud.
-                where = (
-                    f"'{previous}' has no gridmap.yaml"
-                    if previous
-                    else "the INI named no previous map"
-                )
-                return f" map_server is still serving '{name}' — {where} to put back."
-            back, back_detail = self._map_gw.reload_map(previous_yaml)
-            return "" if back else f" map_server is still serving '{name}' ({back_detail})."
-
-        return _restore
-
     def _octomap_undo(self, plan: SwitchPlan) -> _Undo:
         name, previous = plan.name, plan.previous
 
@@ -391,45 +280,6 @@ class MapSwitchService:
 
         return _restore
 
-    # --- After the commit point --------------------------------------------
-
-    def _carry_keepout(self, name: str, grid: Optional[GridInfo]) -> Tuple[bool, str]:
-        """Point filter_mask_server at ``name``'s keepout mask; never raises.
-
-        A map the nav session never booted into has no ``keepout.*``, so the
-        pair is written first (from ``keepout.json`` if any, else blank) —
-        the previous map's zones must be replaced by something.
-
-        Returns ``(reloaded, note)``; the note is an operator sentence, empty
-        when there is nothing to say.
-        """
-        zones = self._catalog.read_keepout_zones(name)
-        yaml_path = self._catalog.keepout_yaml_path(name)
-        if yaml_path is None:
-            try:
-                self._catalog.write_keepout(name, zones, grid)
-            except OSError as exc:
-                self._logger.error(
-                    "Could not write the keepout mask for the new map",
-                    map=name,
-                    error=str(exc),
-                )
-                return False, f" The keepout mask could not be written: {exc}."
-            yaml_path = self._catalog.keepout_yaml_path(name)
-            if yaml_path is None:
-                return False, " The keepout mask could not be written."
-
-        reloaded, detail = self._map_gw.reload_keepout(yaml_path)
-        if not reloaded:
-            self._logger.error(
-                "Switched maps but the keepout mask did not reload", map=name, error=detail
-            )
-            return False, f" The keepout mask could not be reloaded: {detail}."
-        if zones:
-            count = len(zones)
-            return True, f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
-        return True, ""
-
 
 def _undo(done: List[_Undo], reason: str) -> str:
     """Run every compensation in the order its step was done; their sentences."""
@@ -440,11 +290,9 @@ def init_map_switch_service(
     logger: structlog.stdlib.BoundLogger,
     map_catalog_repo: MapCatalogRepo,
     map_gw: MapGateway,
-    map_usage: MapUsagePolicy,
 ) -> MapSwitchService:
     return MapSwitchService(
         logger=logger,
         map_catalog_repo=map_catalog_repo,
         map_gw=map_gw,
-        map_usage=map_usage,
     )

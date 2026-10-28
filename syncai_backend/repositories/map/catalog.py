@@ -11,13 +11,11 @@ from enum import Enum
 from typing import Any, BinaryIO, Callable, List, Optional, Tuple
 
 import structlog
-import yaml
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, NotFoundError
 from syncai_backend.helpers.disk import walk_stats
 from syncai_backend.helpers.floors import read_pose_heights
-from syncai_backend.helpers.keepout import keepout_yaml_text, rasterize_zones
-from syncai_backend.helpers.pgm import read_pgm_size, write_pgm, write_text_atomic
+from syncai_backend.helpers.pgm import write_text_atomic
 from syncai_backend.helpers.system_config import active_map_name, set_active_map
 
 
@@ -25,43 +23,30 @@ from syncai_backend.helpers.system_config import active_map_name, set_active_map
 # body) and the filesystem.
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
-# Sidecar of the last pcd -> gridmap conversion: recipe, measurements, outcome.
-# services/gridmap_conversion writes it; named here with the rest of the map
-# directory's layout.
-GRIDMAP_RECIPE_SIDECAR = "gridmap.recipe.json"
-GRIDMAP_RECIPE_SIDECAR_PREV = "gridmap_prev.recipe.json"
-
 # Sidecar of the robot's post-save map cleaning (pgo_node writes ``converting``,
-# its ``clean_map`` turns it ``ok`` / ``failed`` and swaps in a cleaned map.pcd).
-# See services/gridmap_conversion.wait_for_map_clean.
+# its ``clean_map`` turns it ``ok`` / ``failed``, swaps in a cleaned map.pcd and
+# builds octomap.bt). Read for the 3D map's status, see
+# ``_read_map_clean_record``.
 MAP_CLEAN_SIDECAR = "map_clean.recipe.json"
+# A sidecar saying ``converting`` this long after its ``started_at`` belongs to
+# a clean that died hard (the longest measured is ~5 min; cleans queue per host
+# behind a flock, and the tree is built after map.pcd is rewritten). Before
+# that, the clean is taken to be running: it is writing into the directory.
+MAP_CLEAN_STALE_AFTER_S = 30 * 60.0
 
-# The current files, then the generation ``archive_gridmap`` sets aside.
-# ``gridmap_raw.pgm`` is the pristine pre-edit snapshot.
-GRIDMAP_PGM = "gridmap.pgm"
-GRIDMAP_YAML = "gridmap.yaml"
-GRIDMAP_RAW_PGM = "gridmap_raw.pgm"
 POINTCLOUD_PCD = "map.pcd"
 
-GRIDMAP_PREV_PGM = "gridmap_prev.pgm"
-GRIDMAP_PREV_YAML = "gridmap_prev.yaml"
-GRIDMAP_PREV_RAW_PGM = "gridmap_prev_raw.pgm"
+# A map saved before 2026-10-28 may still carry a 2D gridmap (``gridmap.*``,
+# ``gridmap_prev.*``, ``gridmap.recipe.json``, ``traversable_debug/``) and a
+# keepout mask (``keepout.pgm`` + ``keepout.yaml``). Nothing reads them any
+# more: the stack navigates on 3D maps only. They are left on disk, counted in
+# a map's size and carried by its export like any other file.
 
-# Forbidden zones. ``keepout.json`` (polygons in map-frame metres) is the source
-# of truth; ``keepout.pgm`` + ``keepout.yaml`` are derived by ``write_keepout``
-# in the gridmap's geometry and served by ``filter_mask_server``. The nav
-# session writes a blank pair (no json) at boot for a map with none, so a pair
-# without a json means "no zones drawn yet".
-#
-# The same json is a 3D map's zones (2026-10-23): the robot's 3D planner
-# (Octo3D) reads it beside ``octomap.bt`` itself, so a 3D-only map has the json
-# and no pair. Each zone may carry ``name`` and a ``z_min`` / ``z_max`` band
-# naming the floor it forbids; without a band it covers every floor, which is
-# what a 2D zone means, so one file serves both. The mask ignores the bands
-# (one image has no floors). Rewrites must keep the three keys -- a 2D save
-# that dropped them would silently widen a 3D zone to every storey.
-KEEPOUT_PGM = "keepout.pgm"
-KEEPOUT_YAML = "keepout.yaml"
+# Forbidden zones: polygons in map-frame metres, which the robot's 3D planner
+# (Octo3D) reads beside ``octomap.bt`` itself (2026-10-23). Each zone may carry
+# ``name`` and a ``z_min`` / ``z_max`` band naming the floor it forbids;
+# without a band it covers every floor. Rewrites must keep the three keys -- a
+# save that dropped them would silently widen a zone to every storey.
 KEEPOUT_JSON = "keepout.json"
 KEEPOUT_JSON_VERSION = 1
 
@@ -133,15 +118,15 @@ def _read_json(path: str, complain: Callable[[str], None]) -> Any:
         return _NO_DOCUMENT
 
 
-class GridRecordStatus(str, Enum):
-    """The ``status`` values the sidecar on disk can carry.
+class MapCleanStatus(str, Enum):
+    """The ``status`` values the cleaning sidecar on disk can carry.
 
-    Only what a conversion writes; ``interrupted`` is derived by the REST layer
-    (``converting`` with no thread behind it).
+    Only what a clean writes; ``interrupted`` is derived by the REST layer
+    (``converting`` for too long).
 
-    Not ``GridStatus`` in ``interfaces/rest/routers/maps/schemas.py``, the wire contract:
-    disk and wire vocabularies may drift apart, and only that module's
-    ``_grid_status`` converts between them.
+    Not ``OctomapStatus`` in ``interfaces/rest/routers/maps/schemas.py``, the
+    wire contract: disk and wire vocabularies may drift apart, and only that
+    module's ``_octomap_status`` converts between them.
 
     ``str`` mixin (``enum.StrEnum`` is 3.11+) so members ``json.dumps`` bare.
     """
@@ -151,7 +136,7 @@ class GridRecordStatus(str, Enum):
     FAILED = "failed"
 
     @classmethod
-    def parse(cls, value: object) -> Optional["GridRecordStatus"]:
+    def parse(cls, value: object) -> Optional["MapCleanStatus"]:
         """The member ``value`` names, or None if it names nothing this build knows.
 
         Tolerant on purpose: an unknown value (torn read, newer backend after a
@@ -167,23 +152,14 @@ class GridRecordStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class GridInfo:
-    resolution: float
-    origin: Tuple[float, float, float]
-    width: int
-    height: int
-
-
-@dataclass(frozen=True)
 class KeepoutZone:
     """One forbidden zone: a closed polygon in map-frame metres.
 
     ``points`` are the corners in drawing order, not closed (the console's
-    ``ZonePolygon``). The id is the console's handle; the mask ignores it.
-    ``name`` is for display. ``z_min`` / ``z_max`` bound the floor heights the
-    zone applies to on a 3D map (the robot's 3D planner compares them with the
-    ground's height); None is unbounded on that side, so a zone without them
-    covers every floor. The 2D mask ignores all three.
+    ``ZonePolygon``). The id is the console's handle. ``name`` is for
+    display. ``z_min`` / ``z_max`` bound the floor heights the zone applies to
+    (the robot's 3D planner compares them with the ground's height); None is
+    unbounded on that side, so a zone without them covers every floor.
     """
 
     id: str
@@ -191,18 +167,6 @@ class KeepoutZone:
     name: Optional[str] = None
     z_min: Optional[float] = None
     z_max: Optional[float] = None
-
-
-@dataclass(frozen=True)
-class GridRecord:
-    """How the last conversion of this map ended, per its sidecar.
-
-    Only the fields callers act on; the rest of the sidecar is for whoever
-    reads files on the robot. ``error`` is None unless the status is failed.
-    """
-
-    status: GridRecordStatus
-    error: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -223,7 +187,7 @@ class OctomapInfo:
 
         Size and mtime, not a content hash: the tree is only ever replaced
         wholesale (tmp + rename, by the cleaning or the robot's edit tool),
-        never edited in place the way the gridmap is. The console keys its
+        never edited in place. The console keys its
         cache on it and the GET route serves it as the ETag.
         """
         return f"{self.size_bytes}-{self.mtime_ns}"
@@ -239,12 +203,38 @@ class MapCleanRecord:
     written is reported. ``error`` is the clean's own, on ``failed``.
     """
 
-    status: GridRecordStatus
+    status: MapCleanStatus
     started_at: Optional[str]
     octomap_requested: bool
     octomap_written: bool
     octomap_error: Optional[str]
     error: Optional[str]
+
+    def running(self, now: Optional[datetime] = None) -> bool:
+        """Is the clean still at work on the map directory?
+
+        ``converting`` until ``started_at`` is ``MAP_CLEAN_STALE_AFTER_S``
+        ago; past that it is a clean killed hard, which never writes its
+        outcome. No start time to age it by counts as running.
+        """
+        if self.status is not MapCleanStatus.CONVERTING:
+            return False
+        started = parse_iso_utc(self.started_at)
+        if started is None:
+            return True
+        current = now if now is not None else datetime.now(timezone.utc)
+        return (current - started).total_seconds() <= MAP_CLEAN_STALE_AFTER_S
+
+
+def parse_iso_utc(value: object) -> Optional[datetime]:
+    """``2026-10-12T05:47:05Z`` -> an aware datetime; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -267,13 +257,9 @@ class OctomapEdits:
 @dataclass(frozen=True)
 class StoredMap:
     name: str
-    grid: Optional[GridInfo]
     has_pointcloud: bool
     size_bytes: int
     modified_at: datetime
-    # None without a usable sidecar; a grid with no record counts as converted
-    # (see the REST layer's _grid_status).
-    grid_record: Optional[GridRecord]
     # The tree on disk, or None without one, and what the cleaning sidecar
     # says about it (see the REST layer's _octomap_status).
     octomap: Optional[OctomapInfo] = None
@@ -346,20 +332,6 @@ class MapCatalogRepo:
         path = os.path.join(self.resolve_dir(name), filename)
         return path if os.path.isfile(path) else None
 
-    def gridmap_path(self, name: str) -> Optional[str]:
-        """Return the path of the map's ``gridmap.pgm``, or None if absent."""
-        return self._artifact_path(name, GRIDMAP_PGM)
-
-    def gridmap_yaml_path(self, name: str) -> Optional[str]:
-        """Return the path of the map's ``gridmap.yaml``, or None if absent.
-
-        Absolute and ``~``-free by construction, as the consumer needs:
-        ``syncai_map_server`` resolves ``image:`` against the unexpanded path,
-        so a ``~`` url fails with ``RESULT_INVALID_MAP_DATA``. Do not derive it
-        from the INI's ``[map] map``, which is relative to the workspace root.
-        """
-        return self._artifact_path(name, GRIDMAP_YAML)
-
     def pointcloud_path(self, name: str) -> Optional[str]:
         """Return the path of the map's ``map.pcd``, or None if absent.
 
@@ -375,21 +347,9 @@ class MapCatalogRepo:
         """Return the path of the map's ``keepout.json``, or None if absent.
 
         What the robot's 3D planner is pointed at (``load_keepout``); absolute
-        and ``~``-free, as above.
+        and ``~``-free, as the planner needs.
         """
         return self._artifact_path(name, KEEPOUT_JSON)
-
-    def keepout_yaml_path(self, name: str) -> Optional[str]:
-        """Return the path of the map's ``keepout.yaml``, or None if unloadable.
-
-        None unless **both** the yaml and ``keepout.pgm`` exist:
-        ``filter_mask_server/load_map`` answers ``RESULT_INVALID_MAP_DATA`` for
-        a yaml whose image is missing. Absolute and ``~``-free, as above.
-        """
-        yaml_path = self._artifact_path(name, KEEPOUT_YAML)
-        if yaml_path is None or self._artifact_path(name, KEEPOUT_PGM) is None:
-            return None
-        return yaml_path
 
     def read_keepout_zones(self, name: str) -> List[KeepoutZone]:
         """Return the forbidden zones recorded in ``keepout.json``, or ``[]``.
@@ -637,6 +597,17 @@ class MapCatalogRepo:
             return None
         return self._read(name, path)
 
+    def map_clean_running(self, name: str) -> bool:
+        """Is the robot's map cleaning still writing into map ``name``?
+
+        Off its sidecar alone (one small read), not ``get_map``: the guards
+        that ask must not walk the whole map. ``clean_map`` rewrites map.pcd
+        and builds octomap.bt in place for minutes after a save.
+        """
+        path = self.resolve_dir(name)
+        record = self._read_map_clean_record(name, path)
+        return record is not None and record.running()
+
     def exists(self, name: str) -> bool:
         """Whether map ``name`` is on this robot: one ``isdir``.
 
@@ -876,158 +847,19 @@ class MapCatalogRepo:
         """
         return tempfile.TemporaryFile(dir=self.maps_dir)
 
-    def gridmap_edited(self, name: str) -> bool:
-        """Report whether this map's gridmap carries hand edits.
+    def write_keepout(self, name: str, zones: List[KeepoutZone]) -> None:
+        """Replace the map's forbidden zones in ``keepout.json``.
 
-        ``gridmap_raw.pgm`` existing **and differing** from ``gridmap.pgm``: a
-        save without changes leaves an identical raw. A full byte compare,
-        since size/mtime are unreliable here (see ``_file_tag`` in ``routers/maps/common.py``).
+        Through a temp file + rename. Empty ``zones`` is how zones are
+        cleared: the file is rewritten with none, never deleted. A zone's
+        ``name`` / ``z_min`` / ``z_max`` are written only when set. Nothing
+        written holds a path.
+
+        Until 2026-10-28 this also rasterised a ``keepout.pgm`` +
+        ``keepout.yaml`` mask for the 2D keepout filter; a map saved before
+        keeps its last pair, which nothing reads.
         """
         directory = self.resolve_dir(name)
-        raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
-        grid_path = os.path.join(directory, GRIDMAP_PGM)
-        if not os.path.isfile(raw_path) or not os.path.isfile(grid_path):
-            return False
-        try:
-            with open(raw_path, "rb") as raw, open(grid_path, "rb") as grid:
-                return raw.read() != grid.read()
-        except OSError as exc:
-            # Cannot tell: claim edits, so the caller refuses the overwrite.
-            self.logger.warning(
-                "[MapCatalogRepo] Could not compare gridmap with its raw copy",
-                map=name,
-                error=str(exc),
-            )
-            return True
-
-    def archive_gridmap(self, name: str) -> None:
-        """Set the current gridmap aside as ``gridmap_prev.*`` before a re-convert.
-
-        One undo level, not a version store:
-
-        - ``gridmap.pgm`` is *copied*, so the active map keeps a file to serve
-          until the new conversion atomically replaces it.
-        - ``gridmap.yaml`` is copied too: the extent and origin may change.
-        - ``gridmap_raw.pgm`` is **moved**: ``write_gridmap`` only snapshots
-          when absent, so a stale raw would never refresh.
-        - ``gridmap.recipe.json`` is **moved**: the new conversion overwrites it
-          with ``converting`` first, losing the served grid's record on failure.
-
-        ``copy2`` keeps mtimes, so ``walk_stats``'s modified_at does not jump.
-        No gridmap yet is a no-op.
-        """
-        directory = self.resolve_dir(name)
-        grid_path = os.path.join(directory, GRIDMAP_PGM)
-        if not os.path.isfile(grid_path):
-            return
-
-        shutil.copy2(grid_path, os.path.join(directory, GRIDMAP_PREV_PGM))
-        yaml_path = os.path.join(directory, GRIDMAP_YAML)
-        if os.path.isfile(yaml_path):
-            shutil.copy2(yaml_path, os.path.join(directory, GRIDMAP_PREV_YAML))
-        raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
-        if os.path.isfile(raw_path):
-            os.replace(raw_path, os.path.join(directory, GRIDMAP_PREV_RAW_PGM))
-        sidecar_path = os.path.join(directory, GRIDMAP_RECIPE_SIDECAR)
-        if os.path.isfile(sidecar_path):
-            os.replace(sidecar_path, os.path.join(directory, GRIDMAP_RECIPE_SIDECAR_PREV))
-        self.logger.info(
-            "[MapCatalogRepo] Archived the gridmap before re-conversion",
-            map=name,
-        )
-
-    def write_gridmap(self, name: str, data: bytes) -> bytes:
-        """Replace an existing gridmap's cells with ``data``; return the file.
-
-        ``data`` is one byte per cell in .pgm row order (row 0 = max y), exactly
-        ``width * height`` of the existing file: this repo never resizes a map.
-        Returns the file as written (header included).
-
-        **``gridmap.yaml`` is never touched**: nothing in it depends on cell
-        values, ``yaml.safe_dump`` would reformat it (``image:`` must stay
-        relative), and a torn yaml stops the map loading.
-        """
-        directory = self.resolve_dir(name)
-        path = os.path.join(directory, GRIDMAP_PGM)
-
-        # Re-checked despite the router: a race must not create a pgm without
-        # a yaml, which _read_grid would report as no grid.
-        if not os.path.isfile(path):
-            raise NotFoundError(f"Map '{name}' has no gridmap to overwrite.")
-
-        # Only when absent, so the raw stays the pristine conversion output.
-        # copy2 keeps the mtime, so modified_at does not jump.
-        raw_path = os.path.join(directory, GRIDMAP_RAW_PGM)
-        if not os.path.exists(raw_path):
-            shutil.copy2(path, raw_path)
-            self.logger.info("[MapCatalogRepo] Kept the pre-edit gridmap", map=name, path=raw_path)
-
-        try:
-            width, height = read_pgm_size(path)
-        except ValueError as exc:
-            # Only reachable on a race (the router read geometry the same way).
-            self.logger.warning(
-                "[MapCatalogRepo] Refusing to overwrite an unreadable gridmap",
-                map=name,
-                error=str(exc),
-            )
-            raise NotFoundError(f"Map '{name}' has no readable gridmap.")
-
-        if len(data) != width * height:
-            raise BadRequestError(
-                f"Gridmap body is {len(data)} bytes; '{name}' is "
-                f"{width}x{height} = {width * height} cells."
-            )
-
-        written = write_pgm(path=path, width=width, height=height, body=data)
-        self.logger.info("[MapCatalogRepo] Wrote gridmap", map=name, width=width, height=height)
-        return written
-
-    def write_keepout(
-        self, name: str, zones: List[KeepoutZone], grid: Optional[GridInfo]
-    ) -> None:
-        """Replace the map's forbidden zones: rasterise ``zones`` and record them.
-
-        Three files, in this order, each through a temp file + rename:
-
-        1. ``keepout.pgm`` -- ``zones`` painted into a mask of ``grid``'s
-           geometry (``helpers/keepout.py``; background 205 = unknown, zones 0).
-        2. ``keepout.yaml`` -- the map-server yaml naming it, relative.
-        3. ``keepout.json`` -- the polygons themselves, the source of truth.
-
-        pgm before yaml so the yaml never names a missing image; json *last*,
-        so a crash leaves the robot enforcing more than the console shows.
-
-        Empty ``zones`` writes the all-unknown mask, which is how zones are
-        cleared; the files are never deleted (a running KeepoutFilter keeps its
-        last mask anyway). ``grid`` is the gridmap's geometry, which the mask
-        must match cell for cell. Nothing written holds a path.
-
-        ``grid`` None (a 3D-only map: no gridmap, nothing to rasterise onto)
-        writes the json alone -- the robot's 3D planner reads it beside
-        ``octomap.bt``. A zone's ``name`` / ``z_min`` / ``z_max`` are written
-        only when set, so a 2D-only file keeps its old shape.
-        """
-        directory = self.resolve_dir(name)
-        if grid is not None:
-            mask = rasterize_zones(
-                [zone.points for zone in zones],
-                width=grid.width,
-                height=grid.height,
-                resolution=grid.resolution,
-                origin_xy=(grid.origin[0], grid.origin[1]),
-            )
-            write_pgm(
-                os.path.join(directory, KEEPOUT_PGM), grid.width, grid.height, mask.tobytes()
-            )
-            write_text_atomic(
-                os.path.join(directory, KEEPOUT_YAML),
-                keepout_yaml_text(
-                    resolution=grid.resolution,
-                    origin_xy=(grid.origin[0], grid.origin[1]),
-                    image=KEEPOUT_PGM,
-                ),
-            )
         document = {
             "version": KEEPOUT_JSON_VERSION,
             "zones": [_keepout_zone_document(zone) for zone in zones],
@@ -1035,20 +867,7 @@ class MapCatalogRepo:
         write_text_atomic(
             os.path.join(directory, KEEPOUT_JSON), json.dumps(document, indent=2) + "\n"
         )
-        if grid is None:
-            self.logger.info(
-                "[MapCatalogRepo] Wrote keepout zones (no gridmap: json only)",
-                map=name,
-                zones=len(zones),
-            )
-            return
-        self.logger.info(
-            "[MapCatalogRepo] Wrote keepout mask",
-            map=name,
-            zones=len(zones),
-            width=grid.width,
-            height=grid.height,
-        )
+        self.logger.info("[MapCatalogRepo] Wrote keepout zones", map=name, zones=len(zones))
 
     # --- Internals ----------------------------------------------------------
 
@@ -1061,11 +880,9 @@ class MapCatalogRepo:
 
         return StoredMap(
             name=name,
-            grid=self._read_grid(name, path),
             has_pointcloud=os.path.isfile(os.path.join(path, POINTCLOUD_PCD)),
             size_bytes=size_bytes,
             modified_at=datetime.fromtimestamp(newest_mtime, tz=timezone.utc),
-            grid_record=self._read_grid_record(name, path),
             octomap=self._read_octomap(name, path),
             map_clean_record=self._read_map_clean_record(name, path),
         )
@@ -1096,9 +913,10 @@ class MapCatalogRepo:
     def _read_map_clean_record(self, name: str, path: str) -> Optional[MapCleanRecord]:
         """Read what the cleaning sidecar says, or None; never raises.
 
-        Tolerant for ``_read_grid_record``'s reason: pgo_node writes it
-        ``converting`` before the save answers, the clean rewrites it minutes
-        later, and the listing is polled meanwhile.
+        A sidecar caught mid-write must degrade one card, not fail the
+        listing: pgo_node writes it ``converting`` before the save answers,
+        the clean rewrites it minutes later, and the listing is polled
+        meanwhile. Debug, not warning, for the same reason.
         """
         sidecar = os.path.join(path, MAP_CLEAN_SIDECAR)
         document = _read_json(
@@ -1112,7 +930,7 @@ class MapCatalogRepo:
 
         if not isinstance(document, dict):
             return None
-        status = GridRecordStatus.parse(document.get("status"))
+        status = MapCleanStatus.parse(document.get("status"))
         if status is None:
             return None
         params = document.get("params")
@@ -1131,68 +949,6 @@ class MapCatalogRepo:
                 octomap_error if isinstance(octomap_error, str) and octomap_error else None
             ),
             error=error if isinstance(error, str) and error else None,
-        )
-
-    def _read_grid_record(self, name: str, path: str) -> Optional[GridRecord]:
-        """Read how the last conversion ended off the sidecar, or None.
-
-        None for a missing, unreadable, malformed or status-less sidecar; the
-        grid on disk is then the only evidence.
-
-        Never raises: a sidecar caught mid-write must degrade one card, not fail
-        the listing.
-        """
-        sidecar = os.path.join(path, GRIDMAP_RECIPE_SIDECAR)
-        # Debug, not warning: a torn read is expected mid-conversion and the
-        # listing is polled every two seconds.
-        document = _read_json(
-            sidecar,
-            lambda error: self.logger.debug(
-                "[MapCatalogRepo] Unreadable gridmap recipe sidecar", map=name, error=error
-            ),
-        )
-        if document is _NO_DOCUMENT:
-            return None
-
-        if not isinstance(document, dict):
-            return None
-        status = GridRecordStatus.parse(document.get("status"))
-        if status is None:
-            return None
-        error = document.get("error")
-        return GridRecord(status=status, error=error if isinstance(error, str) else None)
-
-    def _read_grid(self, name: str, path: str) -> Optional[GridInfo]:
-        """Read geometry from gridmap.yaml + the .pgm header, or None.
-
-        An unreadable gridmap is reported as no grid (logged), so one map
-        mid-save cannot fail the listing.
-        """
-        yaml_path = os.path.join(path, GRIDMAP_YAML)
-        pgm_path = os.path.join(path, GRIDMAP_PGM)
-        if not os.path.isfile(yaml_path) or not os.path.isfile(pgm_path):
-            return None
-
-        try:
-            with open(yaml_path, "r", encoding="utf-8") as handle:
-                document = yaml.safe_load(handle) or {}
-
-            resolution = float(document["resolution"])
-            origin = document["origin"]
-            width, height = read_pgm_size(pgm_path)
-        except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
-            self.logger.warning(
-                "[MapCatalogRepo] Unreadable gridmap; reporting the map without one",
-                map=name,
-                error=str(exc),
-            )
-            return None
-
-        return GridInfo(
-            resolution=resolution,
-            origin=(float(origin[0]), float(origin[1]), float(origin[2])),
-            width=width,
-            height=height,
         )
 
 

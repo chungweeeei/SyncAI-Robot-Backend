@@ -58,13 +58,6 @@ def map_catalog_repo():
 
 
 @pytest.fixture
-def conversion_svc():
-    svc = MagicMock()
-    svc.is_converting.return_value = False
-    return svc
-
-
-@pytest.fixture
 def robot_repo():
     repo = MagicMock()
     # No robot_state yet: the auto-undock never fires unless a test sets one.
@@ -79,7 +72,7 @@ def dock_state():
 
 @pytest.fixture
 def activities(
-    logger, robot_gw, tts_gw, map_catalog_repo, conversion_svc, robot_repo, dock_state
+    logger, robot_gw, tts_gw, map_catalog_repo, robot_repo, dock_state
 ) -> RobotActivities:
     return RobotActivities(
         logger=logger,
@@ -89,7 +82,6 @@ def activities(
         # Real, over the mocks: execute_move's check is the policy's rule.
         map_usage=MapUsagePolicy(
             map_catalog_repo=map_catalog_repo,
-            conversion_svc=conversion_svc,
             task_template_repo=None,
         ),
         robot_repo=robot_repo,
@@ -311,10 +303,9 @@ class TestExecuteDock:
         assert kwargs == {"x": 0.0, "y": 0.0, "yaw": 0.0, "behavior_tree": "undock.xml"}
 
     def test_an_undock_drives_whatever_map_is_loaded(
-        self, env, activities, robot_gw, map_catalog_repo, conversion_svc
+        self, env, activities, robot_gw, map_catalog_repo
     ):
-        # No coordinates, so neither a map switch nor a rebuild can make them wrong.
-        conversion_svc.is_converting.return_value = True
+        # No coordinates, so a map switch cannot make them wrong.
         robot_gw.move.return_value = (True, "", "goal-1")
         robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
 
@@ -430,21 +421,6 @@ class TestMoveMapCheck:
         result = env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
 
         assert result.success is True
-
-    def test_a_rebuilding_floor_plan_stops_the_move(
-        self, env, activities, robot_gw, conversion_svc
-    ):
-        conversion_svc.is_converting.return_value = True
-
-        with pytest.raises(ApplicationError, match="being rebuilt") as exc_info:
-            env.run(
-                activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab"
-            )
-
-        assert exc_info.value.non_retryable is True
-        assert exc_info.value.type == "conversion_running"
-        conversion_svc.is_converting.assert_called_with("lab")
-        robot_gw.move.assert_not_called()
 
 
 class TestPostureActivities:
