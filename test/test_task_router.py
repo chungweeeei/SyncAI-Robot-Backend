@@ -135,14 +135,6 @@ class _StubCatalog:
         return self.active
 
 
-class _StubConversions:
-    def __init__(self):
-        self.converting = set()
-
-    def is_converting(self, name):
-        return name in self.converting
-
-
 @pytest.fixture
 def workflow_gw():
     return _StubWorkflowGateway()
@@ -171,12 +163,7 @@ def robot_gw():
 
 
 @pytest.fixture
-def conversions():
-    return _StubConversions()
-
-
-@pytest.fixture
-def client(logger, workflow_gw, catalog, conversions, robot_gw):
+def client(logger, workflow_gw, catalog, robot_gw):
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -186,7 +173,6 @@ def client(logger, workflow_gw, catalog, conversions, robot_gw):
             map_catalog_repo=catalog,
             map_usage=MapUsagePolicy(
                 map_catalog_repo=catalog,
-                conversion_svc=conversions,
                 task_template_repo=None,
             ),
             robot_gw=robot_gw,
@@ -463,31 +449,6 @@ class TestJobMap:
         assert response.json()["code"] == "map_mismatch"
         assert "'warehouse'" in response.json()["detail"]
         assert workflow_gw.started == []
-
-    def test_a_rebuilding_floor_plan_refuses_a_job_that_drives(
-        self, client, workflow_gw, conversions
-    ):
-        conversions.converting.add("lab")
-
-        response = client.post("/api/v1/tasks", json=_move_task())
-
-        assert response.status_code == 409
-        assert response.json()["code"] == "conversion_running"
-        assert workflow_gw.started == []
-
-    def test_a_rebuilding_floor_plan_still_lets_the_robot_stand(
-        self, client, workflow_gw, conversions
-    ):
-        conversions.converting.add("lab")
-
-        assert client.post("/api/v1/tasks", json=_stand_task()).status_code == 200
-
-    def test_another_maps_rebuild_does_not_matter(
-        self, client, workflow_gw, conversions
-    ):
-        conversions.converting.add("warehouse")
-
-        assert client.post("/api/v1/tasks", json=_move_task()).status_code == 200
 
 
 class TestTaskState:

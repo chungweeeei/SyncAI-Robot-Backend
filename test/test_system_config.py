@@ -22,7 +22,9 @@ from syncai_backend.helpers import system_config
 from syncai_backend.helpers.system_config import active_map_name, set_active_map
 
 
-# The real shape of config/instances/robotNN.ini, interpolation and all.
+# The shape of config/instances/robot.ini, interpolation and all (the real
+# file has no `map:` key since 2026-10-28; kept here as an unrelated line the
+# writer must preserve).
 _REAL_INI = (
     "[system]\n"
     "robot_id: robot01\n"
@@ -194,7 +196,7 @@ def test_a_reader_waits_for_a_writer_to_finish(logger, ini):
     """set_active_map rewrites the file in place, so for its duration the INI
     is truncated or half-written. A concurrent active_map_name used to read
     that and answer None -- the answer rename and delete take as "not active",
-    on the very map map_server has open."""
+    on the very map the localizer has open."""
     ini("[map]\nname = dp2f\n")
     answered = []
 

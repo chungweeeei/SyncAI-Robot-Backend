@@ -2,6 +2,9 @@
 
 numpy + OpenCV rather than a lighter image library so overlays (laser, pose,
 path) can later be drawn on the same image server-side.
+
+No route calls this since 2026-10-28, when the stack went 3D-only and the
+backend's 2D gridmap surface was removed; kept as a library.
 """
 
 import base64

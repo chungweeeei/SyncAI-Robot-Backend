@@ -1,4 +1,4 @@
-"""A map's forbidden zones: read and save keepout.json and its mask."""
+"""A map's forbidden zones: read and save keepout.json."""
 
 
 from fastapi import APIRouter
@@ -23,8 +23,6 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     logger = ctx.logger
     map_catalog_repo = ctx.map_catalog_repo
     map_gw = ctx.map_gw
-    map_usage = ctx.map_usage
-    _require = ctx.require
     _require_exists = ctx.require_exists
     job_lock = ctx.job_lock
 
@@ -32,8 +30,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     def get_map_keepout(name: str):
         """The map's forbidden zones, as polygons in map-frame metres.
 
-        Read from ``keepout.json`` (the source of truth), not the mask, so a
-        mask with no json answers ``zones: []``.
+        Read from ``keepout.json``; a map without one answers ``zones: []``.
         """
         _require_exists(name)
         zones = map_catalog_repo.read_keepout_zones(name)
@@ -51,38 +48,23 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     def save_map_keepout(name: str, request: SaveKeepoutRequest):
         """Replace the map's forbidden zones, and reload them if it is the live map.
 
-        Shaped like ``save_map_grid``: plain ``def``, 409 while converting (the
-        geometry may change), 404 with neither a gridmap nor an octomap, and
-        200 ``reloaded: false`` when the save worked but the reload did not.
+        Plain ``def``: it may park on the planner's reload. 404 without an
+        ``octomap.bt`` (nothing to plan on, so nothing to forbid), and 200
+        ``reloaded: false`` when the save worked but the reload did not.
 
-        The body is the *whole* list; ``[]`` clears the zones by rewriting the
-        mask all-unknown (deleting files would not clear the running filter).
-        Rasterised here to match ``gridmap.pgm`` cell for cell; see
-        ``helpers/keepout.py``. A 3D-only map (no gridmap) gets the json alone.
-
-        The reload follows the map's kind, as ``activate`` does ("3D wins"): an
-        active 3D map's zones go to the 3D planner
-        (``planner_server/Octo3D/load_keepout``), an active 2D map's mask to
-        ``filter_mask_server``.
+        The body is the *whole* list; ``[]`` clears the zones by rewriting
+        ``keepout.json`` with none. An active map's zones go to the 3D planner
+        (``planner_server/Octo3D/load_keepout``); any other map's are read
+        when it is next loaded.
         """
-        stored = _require(name)
-        is_3d = map_catalog_repo.octomap_path(name) is not None
-
-        map_usage.refuse_while_converting(
-            name,
-            "save the forbidden zones once it has finished, so the mask matches "
-            "the new grid.",
-        )
-
-        if stored.grid is None and not is_3d:
+        _require_exists(name)
+        if map_catalog_repo.octomap_path(name) is None:
             raise NotFoundError(
-                f"Map '{name}' has neither a gridmap nor a 3D map to draw forbidden "
-                f"zones on. Convert its map.pcd first "
-                f"(POST /api/v1/maps/{name}/grid/convert)."
+                f"Map '{name}' has no 3D map (octomap.bt) to draw forbidden zones on."
             )
 
         zones = _validate_zones(request.zones)
-        map_catalog_repo.write_keepout(name, zones, stored.grid)
+        map_catalog_repo.write_keepout(name, zones)
 
         count = len(zones)
         saved = f"Saved {count} forbidden zone{'s' if count != 1 else ''} for '{name}'"
@@ -97,26 +79,16 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
             )
 
         # None only on a race with a delete; handled as a failed reload.
-        if is_3d:
-            enforcer = "the 3D planner"
-            json_path = map_catalog_repo.keepout_json_path(name)
-            if json_path is None:
-                reloaded, detail = False, "keepout.json is missing"
-            else:
-                reloaded, detail = map_gw.reload_keepout_3d(json_path)
+        json_path = map_catalog_repo.keepout_json_path(name)
+        if json_path is None:
+            reloaded, detail = False, "keepout.json is missing"
         else:
-            enforcer = "the keepout filter"
-            yaml_path = map_catalog_repo.keepout_yaml_path(name)
-            if yaml_path is None:
-                reloaded, detail = False, "keepout.yaml is missing"
-            else:
-                reloaded, detail = map_gw.reload_keepout(yaml_path)
+            reloaded, detail = map_gw.reload_keepout_3d(json_path)
 
         if not reloaded:
             logger.error(
                 "Saved forbidden zones but the planner did not reload them",
                 map=name,
-                map_kind="3d" if is_3d else "2d",
                 error=detail,
             )
             return SaveKeepoutResponse(
@@ -124,7 +96,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
                 zones=_zone_responses(zones),
                 active=True,
                 reloaded=False,
-                message=f"{saved}, but {enforcer} did not reload: {detail}",
+                message=f"{saved}, but the 3D planner did not reload: {detail}",
             )
 
         return SaveKeepoutResponse(
@@ -132,5 +104,5 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
             zones=_zone_responses(zones),
             active=True,
             reloaded=True,
-            message=f"{saved} and reloaded {enforcer}.",
+            message=f"{saved} and reloaded the 3D planner.",
         )

@@ -248,12 +248,12 @@ def make_bt():
 
 
 @pytest.fixture
-def maps_dir(tmp_path, make_pgm, make_gridmap_yaml, make_pcd):
+def maps_dir(tmp_path, make_pcd, make_bt):
     """A maps root laid out the way the robot's ``map/`` directory is.
 
-    ``full`` is a converted map (pcd + gridmap), ``rawonly`` is one straight out
-    of pgo/save_maps with no gridmap yet, and a loose file sits at the root to
-    prove only directories are listed.
+    ``full`` is a navigable map (pcd + octomap.bt), ``rawonly`` is one straight
+    out of pgo/save_maps whose 3D map is not built yet, and a loose file sits
+    at the root to prove only directories are listed.
     """
     root = tmp_path / "map"
     root.mkdir()
@@ -261,8 +261,7 @@ def maps_dir(tmp_path, make_pgm, make_gridmap_yaml, make_pcd):
     full = root / "full"
     full.mkdir()
     make_pcd(full / "map.pcd")
-    make_pgm(full / "gridmap.pgm", 6, 4)
-    make_gridmap_yaml(full / "gridmap.yaml", origin=(-6.94, -11.09, 0.0))
+    make_bt(full / "octomap.bt")
 
     rawonly = root / "rawonly"
     rawonly.mkdir()

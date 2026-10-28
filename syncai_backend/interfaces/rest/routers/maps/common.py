@@ -2,7 +2,6 @@
 helpers and the render cache."""
 
 import math
-import os
 import threading
 import uuid
 from collections import OrderedDict
@@ -14,23 +13,15 @@ from fastapi.responses import Response
 
 from syncai_backend.exceptions import (
     BadRequestError,
-    NotFoundError,
 )
 from syncai_backend.database.models import MapPoint
 from syncai_backend.repositories.map.catalog import (
-    GridRecordStatus,
     KeepoutZone,
+    MapCleanStatus,
     StoredMap,
 )
 
-from syncai_backend.services.gridmap_conversion import (
-    GridmapConversionService,
-    parse_iso_utc,
-)
 from syncai_backend.interfaces.rest.routers.maps.schemas import (
-    GridInfoResponse,
-    GridOrigin,
-    GridStatus,
     KeepoutZoneRequest,
     KeepoutZoneResponse,
     MapSummaryResponse,
@@ -40,14 +31,12 @@ from syncai_backend.interfaces.rest.routers.maps.schemas import (
 )
 
 
-# A cleaning sidecar saying ``converting`` this long after its ``started_at``
-# belongs to a clean that died hard (the longest measured is ~5 min; cleans
-# queue per host behind a flock). Twice the conversion's own wait, since the
-# tree is built after map.pcd is rewritten.
-OCTOMAP_STALE_AFTER_S = 30 * 60.0
-
-
 # --- Helpers ----------------------------------------------------------------
+
+
+def iso_now() -> str:
+    """UTC, ISO 8601, ``Z``-suffixed, like ``MapSummaryResponse.modified_at``."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _validate_zones(zones: List[KeepoutZoneRequest]) -> List[KeepoutZone]:
@@ -120,40 +109,13 @@ def _vertex_response(vertex: MapPoint) -> MapVertexResponse:
     )
 
 
-def _grid_status(stored: StoredMap, converting: bool) -> Tuple[GridStatus, Optional[str]]:
-    """Reconcile the on-disk conversion record with the live thread registry.
-
-    Lives in the router because it needs both disk state and this process's
-    thread registry. The check order is the logic:
-
-    - A live thread wins: the sidecar write is best-effort, so the registry is
-      the authority while the process is up.
-    - A sidecar saying ``converting`` with no thread is ``interrupted`` (backend
-      restart, killed pane, ``switch_mode``); nothing will clear it.
-    - ``failed`` outranks a present grid: a failed *re*-conversion leaves the
-      previous grid on disk, and ``ok`` would report it as the requested one.
-    - Otherwise a grid is ``ok`` (including pre-status sidecars), else ``none``.
-    """
-    if converting:
-        return GridStatus.CONVERTING, None
-
-    record = stored.grid_record
-    if record is not None:
-        if record.status is GridRecordStatus.CONVERTING:
-            return GridStatus.INTERRUPTED, None
-        if record.status is GridRecordStatus.FAILED:
-            return GridStatus.FAILED, record.error
-
-    return (GridStatus.OK if stored.grid is not None else GridStatus.NONE), None
-
-
 def _octomap_status(
     stored: StoredMap, now: Optional[datetime] = None
 ) -> Tuple[OctomapStatus, Optional[str]]:
     """How the map's 3D map stands, off the tree on disk and the cleaning sidecar.
 
-    Disk only: unlike the gridmap there is no thread registry, the tree being
-    the robot's ``clean_map``'s to write. The check order is the logic:
+    Disk only: there is no registry, the tree being the robot's
+    ``clean_map``'s to write. The check order is the logic:
 
     - A tree on disk is ``ok`` whatever the sidecar says. It is written by
       tmp + rename, so a present file is a complete one, and a re-clean in
@@ -161,7 +123,8 @@ def _octomap_status(
     - No tree and no sidecar, or a clean that never asked for one, is
       ``none``: nothing was ever going to produce it.
     - A clean still ``converting`` is ``converting``, until ``started_at`` is
-      OCTOMAP_STALE_AFTER_S ago; then ``interrupted`` (a clean killed hard
+      MAP_CLEAN_STALE_AFTER_S ago (``MapCleanRecord.running``); then
+      ``interrupted`` (a clean killed hard
       never writes its outcome, and nothing will clear it).
     - A clean that ended ``ok`` without writing the tree is ``failed`` with
       the sidecar's reason (out of memory, usually): map.pcd was cleaned, the
@@ -177,14 +140,12 @@ def _octomap_status(
     if record is None or not record.octomap_requested:
         return OctomapStatus.NONE, None
 
-    if record.status is GridRecordStatus.CONVERTING:
-        started = parse_iso_utc(record.started_at)
-        current = now if now is not None else datetime.now(timezone.utc)
-        if started is not None and (current - started).total_seconds() > OCTOMAP_STALE_AFTER_S:
-            return OctomapStatus.INTERRUPTED, None
-        return OctomapStatus.CONVERTING, None
+    if record.status is MapCleanStatus.CONVERTING:
+        if record.running(now):
+            return OctomapStatus.CONVERTING, None
+        return OctomapStatus.INTERRUPTED, None
 
-    if record.status is GridRecordStatus.OK:
+    if record.status is MapCleanStatus.OK:
         if record.octomap_written:
             return OctomapStatus.NONE, None
         return (
@@ -202,39 +163,14 @@ def _summary(
     stored: StoredMap,
     active_name: Optional[str],
     vertex_count: int,
-    conversion_svc: GridmapConversionService,
 ) -> MapSummaryResponse:
-    grid = (
-        GridInfoResponse(
-            resolution=stored.grid.resolution,
-            origin=GridOrigin(
-                x=stored.grid.origin[0],
-                y=stored.grid.origin[1],
-                yaw=stored.grid.origin[2],
-            ),
-            width=stored.grid.width,
-            height=stored.grid.height,
-        )
-        if stored.grid is not None
-        else None
-    )
-
-    # Read the registry once so grid_status and its deprecated alias can never
-    # disagree.
-    converting = conversion_svc.is_converting(stored.name)
-    status, error = _grid_status(stored, converting)
     octomap_status, octomap_error = _octomap_status(stored)
     tree = stored.octomap if octomap_status is OctomapStatus.OK else None
 
     return MapSummaryResponse(
         name=stored.name,
         active=stored.name == active_name,
-        grid=grid,
-        thumbnail=(f"/api/v1/maps/{stored.name}/thumbnail" if stored.grid is not None else None),
         has_pointcloud=stored.has_pointcloud,
-        grid_status=status,
-        grid_error=error,
-        grid_converting=converting,
         size_bytes=stored.size_bytes,
         modified_at=stored.modified_at.isoformat().replace("+00:00", "Z"),
         vertex_count=vertex_count,
@@ -243,23 +179,6 @@ def _summary(
         octomap_version=tree.version if tree is not None else None,
         octomap_resolution=tree.resolution if tree is not None else None,
     )
-
-
-def _file_tag(stats: os.stat_result) -> str:
-    """Build a strong ETag for a gridmap from its stat, without reading it.
-
-    ``(inode, size, mtime_ns)``, not a content hash: the console revalidates
-    every map's image and thumbnail on a timer, and hashing meant reading the
-    whole .pgm (4-16 MB off the bind mount) per request, 304s included. The
-    inode is what makes stat safe here -- an edited gridmap keeps its size, and
-    a save inside one mtime tick would otherwise look unchanged -- because
-    every writer of ``gridmap.pgm`` in this process (``write_pgm``: the grid
-    PUT and the conversion) goes through a temp file + rename, so a save is a
-    new inode every time. The blind spot is a hand edit that rewrites the file
-    in place with its mtime preserved (``cp -p`` over it); nothing on the robot
-    does that.
-    """
-    return f'"{stats.st_ino:x}-{stats.st_size:x}-{stats.st_mtime_ns:x}"'
 
 
 def _not_modified(request: Request, tag: str) -> bool:
@@ -278,17 +197,9 @@ def _revalidate(request: Request, tag: str) -> Tuple[Dict[str, str], Optional[Re
     return headers, None
 
 
-def _no_gridmap(name: str) -> NotFoundError:
-    """The 404 for a map with no gridmap, naming the route that makes one."""
-    return NotFoundError(
-        f"Map '{name}' has no gridmap. Convert its map.pcd first "
-        f"(POST /api/v1/maps/{name}/grid/convert)."
-    )
-
-
 # What the render cache may hold, in bytes. A map costs up to ~4-5 MB (the
-# packed cloud is capped at MAP_CLOUD_MAX_POINTS x 12 B; the PNGs are far
-# smaller), so this keeps a dozen-odd maps: more than one operator looks at,
+# packed cloud is capped at MAP_CLOUD_MAX_POINTS x 12 B), so this keeps a
+# dozen-odd maps: more than one operator looks at,
 # and a ceiling where there was none.
 RENDER_CACHE_MAX_BYTES = 64 << 20
 

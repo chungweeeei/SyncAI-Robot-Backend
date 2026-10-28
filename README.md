@@ -75,9 +75,7 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; no business logi
         │                  routes are routers/maps/, one module per area, composed by
         │                  routers/map.py's init_map_router
         │
-services/                  domain work that outlives a request: gridmap_conversion (the two
-        │                  recipes, the registry of running conversions, the
-        │                  gridmap.recipe.json protocol); mode_restart (the latest
+services/                  domain work that outlives a request: mode_restart (the latest
         │                  restart_mode dispatch and how it ended); safety_lock (the driver
         │                  safety lock's rising edge → cancel every task); map_switch (the
         │                  live map switch's steps and their undos); dock_state (the last
@@ -102,13 +100,15 @@ subscribers/               ROS topics → repositories (ingest) — except the m
                            topic only names a PCD the subscriber reads from the shared /dev/shm;
                            QoS from qos.py (latched / best_effort), per the table below
 temporal/                  worker, RobotWorkflow, activities
-helpers/                   occupancy_grid (OccupancyGrid→PNG), pointcloud (read a binary PCD,
-                           downsample / transform / pack), pgm, pcd_to_gridmap (z-band
-                           recipe), keepout (forbidden-zone mask rasteriser), traversable
-                           (traversability recipe), system_config (INI reader), map_archive
-                           (checksummed zip / tar.gz of a map dir), move_guard (a run's
-                           TaskMap against the loaded map), disk (directory size + newest
-                           mtime), single_flight (concurrent callers share one slow read)
+helpers/                   pointcloud (read a binary PCD, downsample / transform / pack),
+                           system_config (INI reader), map_archive (checksummed zip / tar.gz
+                           of a map dir), move_guard (a run's TaskMap against the loaded
+                           map), disk (directory size + newest mtime), single_flight
+                           (concurrent callers share one slow read); and, called by nothing
+                           since the 2D removal, kept as a library: occupancy_grid
+                           (OccupancyGrid→PNG), pgm (whose write_text_atomic the catalogue
+                           still uses), pcd_to_gridmap (z-band recipe), keepout (2D mask
+                           rasteriser), traversable (traversability recipe)
 ```
 
 Wiring is explicit: `main.py` constructs every repo/gateway/subscriber and passes
@@ -130,108 +130,42 @@ per-request timeout instead of the client's, so the bound is re-stated on each
 call — an address that never answers the SYN fails as "could not reach" in 5 s
 rather than holding the SPEAK slot or a threadpool thread for the full wait.
 
-**Two pcd → gridmap recipes.** The default, z-band (`pcd_to_gridmap.py`), slices
-the cloud into floor / obstacle height bands (trinary occupied / free / unknown),
-then reverts free cells not connected to the keyframe trajectory to unknown.
-Since 2026-09 the bands are offsets from the **local** floor, measured around
-every keyframe in `poses.txt` (`local_floor_levels` / `flatten_to_local_floor`):
-a LIO map of a large venue can drift a metre in z (0917_TP1F_test1: keyframe z
-from -0.48 to +0.51), and one floor level for the whole cloud puts half the
-floor in the obstacle band. `floor_reference: global` on `grid/convert` restores
-the single level; `local` falls back to it — recorded as
-`floor_reference_fallback` in the sidecar — when `poses.txt` is unreadable.
-`traversable.py` segments the floor by intensity / normal / height and projects
-it, leaving **no unknown cells**; it runs only when an operator asks via
-`grid/convert`. There is deliberately no automatic pick; the workspace
-`CLAUDE.md` ("Backend architecture") records why and what each writes.
-`traversable.py` is the **only** module importing open3d, and nothing imports it
-at module scope — `GridmapConversionService.start` imports it inside the
-conversion thread's `try`, so a backend start never pays the ~100 MB import and
-an `ImportError` is a per-map failure, not a bare thread traceback. Keep
-`pcd_to_gridmap.py` open3d-free.
+**3D maps only (2026-10-28).** The stack navigates on `map/<name>/octomap.bt`
+alone (SyncAI-Robot-Workspace removed map_server, the 2D planners, the 2D RPP
+and the keepout mask), and so does this backend: there is no gridmap
+conversion, no gridmap route (`grid/convert`, `PUT …/grid`, `…/image`,
+`…/thumbnail`), no `grid` / `grid_status` in the catalogue, no `map_server` or
+`filter_mask_server` client. A map is navigable when it has an `octomap.bt`;
+`activate` refuses one without (409 `octomap_missing`), and every save asks pgo
+for the tree (`SaveMaps.OCTOMAP_ON`). A map saved before still carries its
+`gridmap.*`, `gridmap.recipe.json`, `keepout.pgm` / `.yaml` and maybe
+`traversable_debug/`: plain files now, counted in its size and carried by its
+export (bar `traversable_debug/`), read by nothing. `helpers/pcd_to_gridmap.py`,
+`traversable.py`, `keepout.py`, `pgm.py` and `occupancy_grid.py` stay as a
+library with their tests; no route calls them.
 
-The conversion lives in `services/gridmap_conversion.py`, not the map router:
-the recipes, the registry refusing a second concurrent conversion of one map,
-and the sidecar protocol are domain behaviour, not HTTP. `main.py` builds one
-instance; the router validates against it and maps its refusals to status codes.
+**Forbidden zones are `keepout.json`.** Polygons in map-frame metres, drawn by
+the console (`PUT /api/v1/maps/{name}/keepout`), which the robot's 3D planner
+(`Octo3D`) reads beside `octomap.bt` itself. Each zone may carry `name` and a
+`z_min` / `z_max` band — the ground heights (map-frame metres) of the floor it
+forbids, `floor_z ± 0.5`; without a band a zone covers every floor. Unset keys
+are left out of the file. A save on the **active** map reloads the planner's
+zones (`planner_server/Octo3D/load_keepout`, `MapGateway.reload_keepout_3d`,
+`map_url` = the json); a switch needs no keepout call, since Octo3D reads the
+new map's json as part of `load_map`. **A client must send back the `name` /
+`z_min` / `z_max` it read**, since a save replaces the whole list — dropping
+them widens a zone to every storey. Nothing in the file names the map, so
+rename and delete carry it along. Until 2026-10-28 the same save also
+rasterised a `keepout.pgm` + `keepout.yaml` mask for the 2D costmap's
+`KeepoutFilter`; that pair is gone with the filter.
 
-**A conversion's outcome lives on disk, in `gridmap.recipe.json`.** The thread
-writes it three times — `status: converting` before any work, then `ok` (recipe,
-parameters, area diagnostics) or `failed` (the pipeline's `error` and a `hint`)
-— and `MapCatalogRepo` reads it back as `grid_status` / `grid_error`. Disk,
-because the record must outlive the thread and the **process**: a conversion
-takes tens of seconds, and `switch_mode` tears down the byobu session this
-backend is a pane of, taking the in-memory registry with it. While the process is
-up the registry is still the authority; a sidecar saying `converting` with no
-registry entry is reported as `interrupted`. Before this, a failed conversion
-looked like a map nobody had converted, its reason only in
-`log/stack/<robot_id>/backend/current`.
-
-**Every conversion first waits for the robot's map cleaning.** pgo's `save_maps`
-answers as soon as the *raw* `map.pcd` is written, then spawns a detached
-`clean_map` that replaces it — seconds to minutes later, atomic rename — with a
-copy without people and one-off returns, recording its progress in
-`map_clean.recipe.json` (`converting` → `ok` / `failed`, written `converting`
-before the save answers). A grid converted straight after the save was made from
-the raw cloud: on `test` (2026-10-12) a person walking beside the robot was a
-trail of obstacles, and re-converting after the clean removed 4090 of 9932
-occupied cells. So the conversion thread polls that sidecar (2 s) before reading
-the cloud, holding the conversion slot meanwhile (`grid_status: converting`;
-rename / delete / activate get `conversion_running`), and converts once it says
-`ok`. No sidecar (no patches, cleaning off, an older map) converts at once;
-`failed`, a `converting` sidecar older than 15 min (a clean killed hard) and a
-15 min wait all convert the raw cloud, as before. Which of those it was is
-recorded as `map_clean` in `gridmap.recipe.json`. Waiting was chosen over
-"convert now, re-convert when the clean lands", which converts twice, shows a
-grid with people in it meanwhile, and collides with a hand-edit made in between.
-
-**One `keepout.json` for 2D and 3D maps (2026-10-23).** The polygons below are
-also a 3D map's forbidden zones: the robot's 3D planner (`Octo3D`) reads
-`keepout.json` beside `octomap.bt` itself, no mask involved. Each zone may carry
-`name` and a `z_min` / `z_max` band — the ground heights (map-frame metres) of
-the floor it forbids, `floor_z ± 0.5`; without a band a zone covers every floor,
-which is what a 2D zone means, so a file the 2D editor wrote applies unchanged on
-a 3D map, and the mask ignores the bands. Unset keys are left out of the file.
-`PUT …/keepout` on a 3D-only map writes the json alone (no grid to rasterise
-onto), and on the **active** map reloads by the map's kind, as `activate` does
-("3D wins"): `planner_server/Octo3D/load_keepout` (`MapGateway.reload_keepout_3d`,
-`map_url` = the json) for a 3D map, `filter_mask_server/load_map` for a 2D one. A
-3D switch needs no keepout call: Octo3D reads the new map's json as part of
-`load_map`. **A client that edits only 2D must send back the `name` / `z_min` /
-`z_max` it read**, since a save replaces the whole list — dropping them widens a
-3D zone to every storey.
-
-**Forbidden zones are a keepout mask beside the gridmap.** Since 2026-09 the
-planner's global costmap runs a nav2-style `KeepoutFilter` over the
-`OccupancyGrid` a second map_server, `filter_mask_server`, serves from
-`map/<name>/keepout.yaml` + `keepout.pgm`. The backend writes that pair from
-polygons the console draws in map-frame metres (
-`PUT /api/v1/maps/{name}/keepout`) and keeps the polygons in `keepout.json` — **the
-source of truth**; `MapCatalogRepo.write_keepout` derives the pgm/yaml from it,
-because a mask cannot be turned back into editable polygons. `helpers/keepout.py`
-rasterises (cv2, open3d-free) in the gridmap's exact geometry: row 0 is max y,
-corners are snapped to cell centres console-side and `floor`ed here, the fill is
-boundary-inclusive. **The background is 205 (unknown), never 254 (free)**: the
-filter skips unknown mask cells but lets a *free* one overwrite an *unknown*
-costmap cell, so an all-white mask would make every unexplored cell in the map's
-bounding box plannable. The nav session's `costmap_filter_info.launch.py` writes
-a blank 205 pair when it boots a map that has none (workspace `c8d2558`) and
-never touches an existing one — so a booted map always has the pair, and a pair
-without a json means "no zones drawn yet" (or a GIMP-drawn mask, which the next
-save overwrites). Write order is pgm → yaml → json: whoever sees the yaml finds
-its image, and a crash mid-write leaves the robot enforcing more than the console
-shows, not less. None of the three files names the map, so rename and delete
-carry them along. Not done yet: re-rasterising when `grid/convert` changes the
-gridmap's geometry — the filter looks cells up by world coordinate, so the old
-mask still applies where it has cells, and the next save rewrites it.
-
-**The 3D map is served as the robot wrote it.** With `map_clean_octomap` on,
+**The 3D map is served as the robot wrote it.** Every save asks for it, so
 the same `clean_map` that rewrites `map.pcd` also writes `map/<name>/octomap.bt`
 — the `octomap::OcTree` (0.1 m, free *and* occupied) the 3D planner plans on —
 and says so in `map_clean.recipe.json` (`params.octomap`,
 `measurements.octomap_written` / `octomap_error`). The catalogue reads that
-sidecar and the tree's text header only, and reports `octomap_status` the way it
-reports `grid_status` (`none` / `converting` / `ok` / `failed` / `interrupted`,
+sidecar and the tree's text header only, and reports `octomap_status` (`none` /
+`converting` / `ok` / `failed` / `interrupted`,
 derived in `_octomap_status`; a tree on disk is `ok` whatever the sidecar says,
 since it is written by tmp + rename), with `octomap_version` — `size-mtime_ns`,
 the file's ETag unquoted — and `octomap_resolution`. `GET /api/v1/maps/{name}/octomap`
@@ -278,7 +212,7 @@ of a map, recoverable by renaming it back.
 
 The launch file reads `[system] robot_id` from the system INI — by default the
 **absolute** `~/robot_ws/config/system.ini` (bind-mounted per robot from
-`config/instances/robotNN.ini`), overridable with `system_config:=` — and uses it
+`config/instances/robot.ini`), overridable with `system_config:=` — and uses it
 as the **node namespace**. The node reads it back:
 
 ```python
@@ -499,12 +433,12 @@ the robot side keeps its trees stateless. Consequences:
   (`std_srvs/SetBool`, replacing the C++ driver's release-only `reset_safety`),
   all three `syncai_driver_manager`.
 - `MapGateway`:
-  - `map_server/load_map` (`syncai_map_server`) — an edited or re-converted
-    gridmap reaches the running map_server.
-  - `filter_mask_server/load_map` (the same executable, run as the keepout pane)
-    — a saved mask reaches the planner's `KeepoutFilter` without a restart. The
-    mask topic is latched, and a map *switch* must call it too because the
-    launch derives the mask path once at boot.
+  - `planner_server/Octo3D/load_map` and `planner_server/Octo3D/load_keepout`
+    (`nav2_msgs/LoadMap`, the robot's 3D planner) — a switch points Octo3D at
+    the map's `octomap.bt` (`""` unloads, only ever a failed switch's undo onto
+    a map without one); a keepout save on the active map re-reads its
+    `keepout.json`. No `map_server` / `filter_mask_server` clients since the 2D
+    removal (2026-10-28).
   - `pgo/save_maps`, `pgo/reset_mapping`, `pgo/start_mapping` (`syncai_mapping`'s
     `pgo_node`) — the only things that serialise a run, undo one, and move pgo
     from idle to mapping (a mapping session comes up banking nothing; a
@@ -541,7 +475,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
-| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / DOCK is checked against the loaded map — 409 `map_mismatch` / `conversion_running`, see *A job's map is checked twice*; stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time |
+| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / DOCK is checked against the loaded map — 409 `map_mismatch`, see *A job's map is checked twice*; stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time |
 | GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), empty otherwise. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
 | DELETE | `/api/v1/tasks/{id}` | Request cancellation; answers `CANCELING` — the final state (possibly still `COMPLETED`) comes from GET |
 | POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` / `DOCK` / `UNDOCK` is interrupted at once and re-sent on resume, a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see *Task orchestration*. 409 `task_not_running` once closed; 404 for another robot's id |
@@ -573,29 +507,26 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/robot/set_policy_mode` | Gait-controller policy index; only `0` (PPO) and `1` (HIMLOCO) |
 | GET | `/api/v1/network/wifi/scan` | Scan networks (blocks up to 45 s). A scan requested while one runs joins it and gets its answer, instead of holding a second thread and queueing a second scan in driver_manager |
 | POST | `/api/v1/network/wifi/connect` | Connect via `nmcli` (blocks up to 70 s). Connect, activate and delete of a saved network change NetworkManager's state, so one runs at a time: the others are 409 `wifi_busy` |
-| GET | `/api/v1/maps` | Map directories on disk with geometry, vertex counts and `grid_status` — **the conversion-status surface**; there is no job resource. `none` / `converting` / `ok` / `failed` (reason in `grid_error`) / `interrupted` (backend restarted mid-conversion). `grid_converting` is the deprecated boolean it replaces. The 3D map's twin: `octomap_status` (same five words, off `octomap.bt` and the cleaning sidecar), `octomap_error`, `octomap_version` (changes when the file does) and `octomap_resolution` |
+| GET | `/api/v1/maps` | Map directories on disk with vertex counts and the 3D map's state — **the build-status surface**; there is no job resource. `octomap_status` `none` / `converting` (the robot's map cleaning is building it) / `ok` / `failed` (reason in `octomap_error`) / `interrupted` (the cleaning never finished), read off `octomap.bt` and the cleaning sidecar; `octomap_version` (changes when the file does) and `octomap_resolution`. No `grid` / `thumbnail` / `grid_status` since the 2D removal (2026-10-28) |
 | GET | `/api/v1/maps/{name}` | One map's summary |
-| POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, then (unless `grid: false`) z-band conversion in a background thread, after the robot's map cleaning (`grid_pending` only means started — poll `grid_status`, which stays `converting` through the cleaning too). On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. `octomap: true / false` has the map cleaning build `octomap.bt` or not for this save (omitted or null: pgo's `map_clean_octomap`); watch `octomap_status`. 400 `nothing_to_build` for `grid: false, octomap: false`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
+| POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, always with `octomap: OCTOMAP_ON` (a map is navigable only with its `octomap.bt`); the tree lands minutes later, after the robot's map cleaning — watch `octomap_status`. Body `{name}`; the 2D-era `grid` / `octomap` keys are ignored. On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
 | POST | `/api/v1/mapping/start` | Begin a run: `pgo/start_mapping`, idle → mapping (the drive to the start point is not part of any map). No body; always resets the LIO front end (map origin = odometry origin), so the robot must be **stationary** until it returns. 409 `mapping_running` / `mapping_busy`; 502 with pgo's sentence. Touches no file |
 | GET | `/api/v1/mapping` | pgo's last-reported run state: `state` `idle` / `mapping` / `resetting` / `unknown`, `key_poses`, `loop_closures`. `unknown` is a real answer — every navigating robot, or pgo silent for 5 s. Latched, so it survives a console reload |
 | POST | `/api/v1/mapping/reset` | Discard the in-memory run and start a new map, restarting nothing: `pgo/reset_mapping` pauses intake, resets the LIO front end, rebuilds the pose graph; pgo stays mapping. No body and **no save** (saving stays a separate act — the usual case is abandoning a run gone wrong). Touches no file, hence `/mapping/`. 409 `mapping_idle` / `mapping_busy`; 502 with pgo's sentence, graph untouched. Robot must be **stationary** (static, gravity-aligning re-init) |
-| PATCH | `/api/v1/maps/{name}` | Rename: moves `map/<old>/` to `map/<new>/`, re-keys `map_vertices` and `task_templates` rows. 409 `map_active` (the stack opened those files at launch — switch maps first), `conversion_running`, `name_taken`. Schedule memos keep the old `map_name` label (display-only) |
+| PATCH | `/api/v1/maps/{name}` | Rename: moves `map/<old>/` to `map/<new>/`, re-keys `map_vertices` and `task_templates` rows. 409 `map_active` (the stack opened those files at launch — switch maps first), `octomap_converting` (the robot's map cleaning is still writing map.pcd / octomap.bt into it, for minutes after a save; a sidecar `converting` for over 30 min is taken as a dead clean and does not hold it), `name_taken`. Schedule memos keep the old `map_name` label (display-only) |
 | DELETE | `/api/v1/maps/{name}` | `rmtree` of `map/<name>/` plus its `map_vertices` rows, no undo. The rename's first two refusals plus 409 `template_bound` while a template names the map (listed). Rows go **before** the directory — the irreversible step goes last. Registered schedules keep firing their frozen steps |
-| GET | `/api/v1/maps/{name}/export?format=zip\|tar.gz` | The map dir as one archive (default `zip`; `Content-Disposition: attachment; filename="<name>.<ext>"`), built into an anonymous temp file on the maps' disk and streamed with its `Content-Length`, never held in memory: files relative to the root — no top-level folder, no `traversable_debug/` — plus `syncai_map.json` `{format, version: 1, name, exported_at, files: {relpath: md5}, vertices: [...]}`. Vertex **ids are not exported** (regenerated on import); templates are not included (their steps bind vertex ids). 409 `conversion_running`; the active map may be exported |
-| POST | `/api/v1/maps/import?name=` | Create or **replace** a map from such an archive; raw `application/octet-stream`, zip / tar.gz by magic bytes. **Nothing is written until the archive is judged**: manifest required (version 1; newer refused), every file md5-verified; an unlisted or missing member, a link/device member, an absolute or `..` path, no `map.pcd`, or an unknown vertex type is 400. Name is `?name=` else the manifest's. Replacing takes the delete's refusals (`map_active` / `conversion_running` / `template_bound`) plus 409 `disk_low`. The body is streamed to an anonymous temp file on the maps' disk as it arrives (1 MB held at most); **413 `archive_too_large`** past 4 GiB (`MAP_IMPORT_MAX_BYTES`), on `Content-Length` before reading and on the bytes received while reading. 201 `{name, replaced, files, bytes, vertices_created, vertices_deleted, message}`. Starts no conversion; an imported `gridmap.recipe.json` is kept as-is. Staging: see *Layering* |
-| POST | `/api/v1/maps/{name}/activate` | Switch maps live, no session restart: `relocalize` first (its refusals precede any mutation), then map_server `load_map`, then `[map] name` into the instance INI so it survives a restart (`[initial_pose]` zeroed — re-seed). `switched: false` is the no-op. `localized` is a best-effort `relocalize_check` poll: `false` = not yet (registration retries forever), `null` = could not ask; **not** `RobotState.localization_valid`, which is TF-presence only. Refusals, all before mutating: 409 `grid_missing`, `pointcloud_missing`, `conversion_running`, `ini_not_writable`, `task_running` (any job), `tasks_unknown` (refuse rather than assume idle), `stack_not_ready` (service discoverability — how mapping mode is detected, not the cached mode: the localizer's `relocalize` always, map_server's `load_map` for a 2D map only, since a 3D session runs without map_server). Lifts `map_active` on rename and delete. Also hands `filter_mask_server` this map's `keepout.yaml` (blank if never booted), since `load_map` leaves the *previous* zones in force; best-effort and after the commit point, so `keepout_reloaded: false` = switched, old zones may still apply (`null` on the no-op). **3D maps (2026-10):** a map with an `octomap.bt` is 3D (with a grid too, still 3D — the robot's own rule), otherwise it needs a usable grid (`grid_missing` names both). After `load_map` (skipped when a 3D map has no grid or the stack has no map_server; map_server, if any, then keeps the previous grid, which nothing plans on), the robot's 3D planner is pointed at the map: `planner_server/Octo3D/load_map` with the `octomap.bt` for a 3D map, **with an empty `map_url` for a 2D one** — that unload is what moves the robot off its 3D trees, which it runs whenever Octo3D has a map. It blocks until the tree is built (120 s bound) and its success is a result; a failure rolls back the localizer, the grid and Octo3D (onto the previous map's tree, or none). 409 `planner_3d_unavailable` refuses a 3D map on a stack without Octo3D; on such a stack a 2D switch skips the unload. A 3D map's forbidden zones come in with its tree (Octo3D reads `keepout.json` in `load_map`), so `keepout_reloaded` is `true` and no mask is touched. `map_kind` is `2d` / `3d` (`null` on the no-op) |
-| POST | `/api/v1/maps/{name}/grid/convert` | (Re)build the gridmap from `map.pcd`: recipe `z-band` (default; optional `z_band_offsets`, `floor_reference` `local` default / `global`) or `traversability` (`gap_fill_size`), `debug` for intermediate clouds. `started: true` only means the thread launched — outcome in `grid_status`. 409 `conversion_running`, or `gridmap_hand_edited` (confirm with `overwrite_edits`; the edit survives as `gridmap_prev.pgm` + `gridmap_prev.recipe.json`). Reloads map_server when active — decided when the grid lands, not at the request: a switch away during the (minutes-long) conversion is not refused, and reloading then would put map_server on this grid while the localizer, Octo3D and the INI name the other map |
-| GET | `/api/v1/maps/{name}/image` · `/thumbnail` | Gridmap as full-size / downscaled PNG, ETag'd on the `.pgm`'s `(inode, size, mtime)` — a save is a new inode (`write_pgm` renames), so the tag changes without the request reading the file; a 304 costs the existence check (one `isdir`) and one `stat`. The encoded PNGs (and the packed cloud) are kept in an LRU of `RENDER_CACHE_MAX_BYTES` (64 MB, about a dozen maps), not for every map ever opened |
-| PUT | `/api/v1/maps/{name}/grid` | Write edited cells (raw `application/octet-stream`); reloads map_server when active. 409 `conversion_running` (it would overwrite the edit) |
-| GET | `/api/v1/maps/{name}/keepout` | Forbidden zones as saved through this API: `zones: [{id, points: [{x, y}, …], name, z_min, z_max}]` in map-frame metres (the last three `null` when unset; the band is the floor on a 3D map), plus `active`. Read from `keepout.json`, so a boot-time blank or hand-drawn mask answers `[]` |
-| PUT | `/api/v1/maps/{name}/keepout` | Replace the zones with the **whole** body list (`{zones: [{id?, points: [{x, y}, …], name?, z_min?, z_max?}]}`; ids kept when given, generated when not). Rasterises into `keepout.pgm` + `keepout.yaml` (not on a 3D-only map, which has no grid), records `keepout.json`, then (map active) reloads by kind: `planner_server/Octo3D/load_keepout` for a 3D map, `filter_mask_server/load_map` for a 2D one — `reloaded: true` means enforced now. `[]` **clears**: mask rewritten all-unknown and reloaded, files kept (deleting them changes nothing in the running filter). A failed reload is still **200** with `reloaded: false` and the reason — zones apply at the next boot of this map. 400 for a zone under three points, a non-finite coordinate or height, `z_min` above `z_max`, an empty or duplicate id; 404 with neither a gridmap nor an `octomap.bt`; 409 `conversion_running` |
-| GET | `/api/v1/maps/{name}/pointcloud` | The saved `map.pcd`, packed binary |
+| GET | `/api/v1/maps/{name}/export?format=zip\|tar.gz` | The map dir as one archive (default `zip`; `Content-Disposition: attachment; filename="<name>.<ext>"`), built into an anonymous temp file on the maps' disk and streamed with its `Content-Length`, never held in memory: files relative to the root — no top-level folder, no `traversable_debug/` (a 2D-era map's tuning dumps) — plus `syncai_map.json` `{format, version: 1, name, exported_at, files: {relpath: md5}, vertices: [...]}`. Vertex **ids are not exported** (regenerated on import); templates are not included (their steps bind vertex ids). 409 `octomap_converting` while the robot's map cleaning is still writing into it. The active map may be exported |
+| POST | `/api/v1/maps/import?name=` | Create or **replace** a map from such an archive; raw `application/octet-stream`, zip / tar.gz by magic bytes. **Nothing is written until the archive is judged**: manifest required (version 1; newer refused), every file md5-verified; an unlisted or missing member, a link/device member, an absolute or `..` path, no `map.pcd`, or an unknown vertex type is 400. Name is `?name=` else the manifest's. Replacing takes the delete's refusals (`map_active` / `octomap_converting` / `template_bound`) plus 409 `disk_low`. The body is streamed to an anonymous temp file on the maps' disk as it arrives (1 MB held at most); **413 `archive_too_large`** past 4 GiB (`MAP_IMPORT_MAX_BYTES`), on `Content-Length` before reading and on the bytes received while reading. 201 `{name, replaced, files, bytes, vertices_created, vertices_deleted, message}`. Starts no conversion; an imported `gridmap.recipe.json` is kept as-is. Staging: see *Layering* |
+| POST | `/api/v1/maps/{name}/activate` | Switch maps live, no session restart: `relocalize` first (its refusals precede any mutation), then the robot's 3D planner (`planner_server/Octo3D/load_map` with the map's `octomap.bt`, which every goal plans on; it blocks until the tree is built, 120 s bound, and its success is a result), then `[map] name` into the instance INI so it survives a restart (`[initial_pose]` zeroed — re-seed). A later failure rolls back the earlier steps in the order done (Octo3D onto the previous map's tree, or none). `switched: false` is the no-op. `localized` is a best-effort `relocalize_check` poll: `false` = not yet (registration retries forever), `null` = could not ask; **not** `RobotState.localization_valid`, which is TF-presence only. Refusals, all before mutating: 409 `octomap_missing` (no `octomap.bt`), `pointcloud_missing`, `ini_not_writable`, `task_running` (any job), `tasks_unknown` (refuse rather than assume idle), `stack_not_ready` (the localizer's `relocalize` is not discoverable — how mapping mode is detected, not the cached mode), `planner_3d_unavailable` (a stack without Octo3D). Lifts `map_active` on rename and delete. The map's forbidden zones come in with its tree (Octo3D reads `keepout.json` in `load_map`), so no keepout call is made. No `map_kind` / `keepout_reloaded` since 2026-10-28 |
+| GET | `/api/v1/maps/{name}/keepout` | Forbidden zones as saved through this API: `zones: [{id, points: [{x, y}, …], name, z_min, z_max}]` in map-frame metres (the last three `null` when unset; the band is the floor it forbids), plus `active`. Read from `keepout.json`; none answers `[]` |
+| PUT | `/api/v1/maps/{name}/keepout` | Replace the zones with the **whole** body list (`{zones: [{id?, points: [{x, y}, …], name?, z_min?, z_max?}]}`; ids kept when given, generated when not). Writes `keepout.json`, then (map active) reloads the 3D planner's zones (`planner_server/Octo3D/load_keepout`) — `reloaded: true` means enforced now. `[]` **clears**: the json rewritten with none and reloaded. A failed reload is still **200** with `reloaded: false` and the reason — zones apply at the next load of this map. 400 for a zone under three points, a non-finite coordinate or height, `z_min` above `z_max`, an empty or duplicate id; 404 without an `octomap.bt` |
+| GET | `/api/v1/maps/{name}/pointcloud` | The saved `map.pcd`, packed binary. The packed clouds are kept in an LRU of `RENDER_CACHE_MAX_BYTES` (64 MB, about a dozen maps), not for every map ever opened |
 | GET | `/api/v1/maps/{name}/octomap` | The saved `octomap.bt` byte for byte (`application/octet-stream`), ETag = `"<octomap_version>"`, 304 on `If-None-Match`. 409 `octomap_converting` while the map cleaning is still building it; 404 with the reason otherwise (never built, `failed` with the cleaning's sentence, `interrupted`) |
 | GET | `/api/v1/maps/{name}/octomap/edits` | The ground patches saved for the 3D map: `{name, res, fill_key: [[kx, ky, kz], …], created_at}`, absolute OcTree keys of the voxels to mark as floor. `fill_key: []` (and null `res` / `created_at`) when none are saved |
 | GET | `/api/v1/maps/{name}/floors` | The storeys the map spans, lowest first: `{name, floors: [{name, level}], detected: [...], saved}`. `level` is the body height walked on that floor (the z of `poses.txt`), metres. `floors` is the saved list if there is one, else `detected`; `[]` is one storey |
 | PUT | `/api/v1/maps/{name}/floors` | Replace the floors with the **whole** body list (`{floors: [{name, level}, …]}`); `[]` saves one storey. Writes `floors.json`, sorted by level. 400 with a sentence for an empty or over-long name (16), a repeated name, more than 16 floors, or two levels under 1 m apart. Not held by a running job: nothing on the robot reads it |
 | PUT | `/api/v1/maps/{name}/octomap/edits` | Replace the patches with the **whole** body list (`{fill_key: [[kx, ky, kz], …]}`, 0–65535 each, one per `[kx, ky]` column); `[]` clears. Writes `octomap_edits.json` (tmp + rename, `res` from the tree's header) and **nothing else** — the tree is patched on the robot by `apply_octomap_edits`, the message says so. 400 with a sentence for an out-of-range key or a column named twice; 404 with no tree; 409 `octomap_converting`, `octomap_unreadable` (a tree without a readable header), `task_running` / `tasks_unknown` (held by a running job like every map write) |
-| POST · GET | `/api/v1/maps/{name}/vertices` | Batch-create (one transaction) / list with optional `?type=`. Create is held by a running job (below). `z` is the ground the vertex stands on, map frame, stored and sent with a MOVE as given: the console reads it off the 3D map under the vertex (on the floor picked; on a map with no floors, the ground there, so a stop on a slope carries its own height), and a 2D map's is 0. The robot's planner looks for the ground only 1 m either side of it, except where the ground under the stop is one layer |
+| POST · GET | `/api/v1/maps/{name}/vertices` | Batch-create (one transaction) / list with optional `?type=`. Create is held by a running job (below). `z` is the ground the vertex stands on, map frame, stored and sent with a MOVE as given: the console reads it off the 3D map under the vertex (on the floor picked; on a map with no floors, the ground there, so a stop on a slope carries its own height), and a vertex from before heights is 0. The robot's planner looks for the ground only 1 m either side of it, except where the ground under the stop is one layer |
 | GET · PUT · DELETE | `/api/v1/maps/{name}/vertices/{id}` | Read / partial update / delete; update and delete held by a running job |
 | GET | `/api/v1/tts/voices` | Voice ids the speech service's model carries |
 | POST | `/api/v1/tts/synthesize` | Render `{text, voice, speed}` to WAV (`audio/wav`) without playing |
@@ -615,7 +546,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (1 Hz), `dock_path` (2 Hz), and while a navigation runs `local_costmap` (2 Hz) and `local_plan` (5 Hz) |
 
 **A job's map is read-only while it runs.** Vertex create / update / delete,
-`PUT …/grid`, `PUT …/keepout`, `PUT …/octomap/edits` and `POST …/grid/convert` answer 409 `task_running`
+`PUT …/keepout` and `PUT …/octomap/edits` answer 409 `task_running`
 while a running job holds the map (its `map_name` in `GET /api/v1/active_tasks`;
 `ActiveTask.map_in_use`), and 409 `tasks_unknown` when running jobs cannot be
 listed — refuse rather than assume idle. Each of those reloads into the running
@@ -633,7 +564,7 @@ delete and import-replace already refuse the loaded map (`map_active`).
 It is its own socket so a 360 kB cloud frame cannot head-of-line block pose;
 `path` rides it because a thinned route is ~8 kB every 3 s. Its `points` are
 `[x, y, z]` in map metres, z the ground each one stands on (OctomapPlanner3D's
-floor surface, 0 from a 2D planner) — a waypoint's z — so a route that climbs a
+floor surface) — a waypoint's z — so a route that climbs a
 stair can be drawn storey by storey. `pose.z` is base_link's height, not the
 ground: in AUTO x, y and yaw are lio_bridge's, but its chain is projected onto
 the plane (z = 0 on every storey), so the height is taken from the
@@ -644,8 +575,8 @@ mapping run reports. An **empty**
 silence from here).
 
 **The local picture rides the same socket, only while a navigation runs**
-(2026-10-20): `local_costmap`, the controller's 4 × 4 m rolling costmap (on a
-2D map the obstacle layer's, on a 3D map the terrain layer's, inflated), and
+(2026-10-20): `local_costmap`, the controller's 4 × 4 m rolling costmap (the
+terrain layer's, inflated), and
 `local_plan`, the 2 s trajectory MPPI is following. "Runs" is a MOVE, DOCK or
 UNDOCK goal this process sent that has not ended (`RobotGateway.navigation_active`)
 — not a route on `plan`, which the planner keeps re-sending after a success and
@@ -667,7 +598,7 @@ maps them:
 |---|---|
 | `NotFoundError` | 404 |
 | `BadRequestError` | 400, with an optional `code` and `step_id` beside `detail` when the refusal is about one step of a task body (`invalid_step_group`; see Groups) |
-| `ConflictError` | **409**, with an optional machine-readable `code` beside `detail` (e.g. `conversion_running`, `gridmap_hand_edited`, `map_active`, `restart_refused` / `restart_running`, `recording_running`, `tts_queue_full`, `whep_session_pending`; each route's row lists its own). Clients branch on the code — e.g. re-convert's confirm-and-retry is only for `gridmap_hand_edited` — never on prose, which exists to be reworded |
+| `ConflictError` | **409**, with an optional machine-readable `code` beside `detail` (e.g. `octomap_missing`, `map_active`, `restart_refused` / `restart_running`, `recording_running`, `tts_queue_full`, `whep_session_pending`; each route's row lists its own). Clients branch on the code — e.g. re-convert's confirm-and-retry is only for `gridmap_hand_edited` — never on prose, which exists to be reworded |
 | `UnauthorizedError` | 401 |
 | `UpstreamError` | **502** — a downstream (Temporal or a ROS service) failed |
 
@@ -716,7 +647,7 @@ the same treatment; a robot workspace's install space already has the real drive
 
 `interrupted` is derived, never stored: a directory with no `metadata.yaml` and
 no live process — a bag whose backend went away mid-recording. The same
-disk-outlives-the-process split as the conversion sidecar.
+disk-outlives-the-process split as the map cleaning's sidecar.
 
 ### WebRTC
 
@@ -1006,8 +937,7 @@ Details that matter when editing this path:
 - **A job's map is checked twice.** MOVE / DOCK coordinates are a place in one map's
   frame; on another map they are a real place, just the wrong one. The rule is
   `helpers/move_guard.py`: refuse positions planned on another map
-  (`map_mismatch`) or while the loaded map's floor plan is rebuilt
-  (`conversion_running`); an unknown map is never refused. `POST /api/v1/tasks`
+  (`map_mismatch`); an unknown map is never refused. `POST /api/v1/tasks`
   asks before starting a run, and `execute_move` (and `execute_dock`) asks
   again before every goal with the run's own `TaskMap` (read off
   `workflow.info()`, passed as their optional second argument). An UNDOCK has
@@ -1137,7 +1067,7 @@ Run it:
 
 ```bash
 ros2 launch syncai_backend backend.launch.py                     # namespaced from config/system.ini
-ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot01.ini
+ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot.ini
 ros2 run syncai_backend backend                                  # no namespace -> default_robot
 ```
 
@@ -1218,7 +1148,7 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | variable | default | what it moves |
 |---|---|---|
 | `ROBOT_WS` | `~/SyncAI-Robot-Workspace` | where `config/` and `map/` come from |
-| `ROBOT_INSTANCE` | `robot01` | which `config/instances/<name>.ini` is mounted as `system.ini` |
+| `ROBOT_INSTANCE` | `robot` | which `config/instances/<name>.ini` is mounted as `system.ini` (the workspace's file is `robot.ini` since 2026-10-28, `robot01.ini` before; a name with no file mounts an empty directory, silently) |
 | `RECORD_DIR` | `./record` | where bags land on the host |
 | `WEBRTC_LIB` | `./lib/libsyncai_worker.so` | the WebRTC worker `.so` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `postgres` / `postgres` | the infra stack's credentials |
@@ -1226,7 +1156,7 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | `PIP_INDEX_URL` | `https://pypi.org/simple` | build only: the PyPI index the base stage installs from (a mirror when PyPI is slow) |
 
 ```bash
-ROBOT_INSTANCE=robot02 RECORD_DIR=/mnt/ssd/record docker compose up -d
+ROBOT_INSTANCE=other RECORD_DIR=/mnt/ssd/record docker compose up -d
 ```
 
 **4. Check it.** `/health` is always 200; the body says `ok` or `degraded`
@@ -1270,7 +1200,7 @@ docker run -d --name syncai_backend --restart unless-stopped \
     --device /dev/video0 --device /dev/video1 --device /dev/video2 --device /dev/video3 \
     -v /dev/syncai:/dev/syncai:ro \
     -v $WS/config:$R/config \
-    -v $WS/config/instances/robot01.ini:$R/config/system.ini \
+    -v $WS/config/instances/robot.ini:$R/config/system.ini \
     -v $WS/map:$R/map \
     -v "$PWD/record":$R/record \
     -v "$PWD/lib/libsyncai_worker.so":$R/lib/libsyncai_worker.so:ro \
@@ -1281,7 +1211,7 @@ docker run -d --name syncai_backend --restart unless-stopped \
 Drop `--device` lines for unplugged cameras (`docker run` refuses a missing
 device), and `--runtime nvidia` off a Jetson.
 
-The per-robot `config/instances/robotNN.ini` is mounted **over**
+The robot's `config/instances/robot.ini` is mounted **over**
 `config/system.ini` as a single file (the checked-out `system.ini` is an empty
 placeholder), as the workspace's compose does. Miss it and there is no `[system]
 robot_id`: namespace, database and task queue all become `default_robot`.
@@ -1298,8 +1228,8 @@ The compose file comments every piece of the service; the ones that bite:
   one topic.
 - **Three bind mounts from `ROBOT_WS`** carry what this package shares with the
   stack: `config/` (read-write — activating a map rewrites `system.ini` in place;
-  `instances/robotNN.ini` goes over `config/system.ini` as one file) and `map/`
-  (must be the directory the nav stack's `map_server` reads). **`record/` and
+  `instances/robot.ini` goes over `config/system.ini` as one file) and `map/`
+  (must be the directory the nav stack's localizer and Octo3D read). **`record/` and
   `lib/libsyncai_worker.so` are not among them**: nothing else reads a bag or
   dlopens the worker, so both default beside the compose file — moved with
   `RECORD_DIR` and `WEBRTC_LIB`. Both are tracked as empty directories
@@ -1357,8 +1287,8 @@ commands. Before reading a result from it:
 helper (`ls src/syncai_backend/test/` is the index), and needs `rclpy` /
 `nav_msgs` / `syncai_common` / OpenCV importable. The database layer runs
 against **in-memory SQLite** (`StaticPool`, one shared connection), so no
-PostgreSQL. The conversion tests also need scipy (`test_pcd_to_gridmap.py` →
-`scipy.ndimage`) and open3d (`test_traversable.py` `importorskip`s
+PostgreSQL. The kept 2D helpers' tests also need scipy (`test_pcd_to_gridmap.py`
+→ `scipy.ndimage`) and open3d (`test_traversable.py` `importorskip`s
 `helpers.traversable` per test, so it skips without open3d). The standard ament
 linters (`test_copyright`, `test_flake8`, `test_pep257`) run alongside.
 
@@ -1395,17 +1325,11 @@ linters (`test_copyright`, `test_flake8`, `test_pep257`) run alongside.
   check. Until it exists the live cloud stream is silent; the subscriber logs
   once on the first drop and once on recovery, so check the log if the 3D view
   is empty.
-- **Deleting `keepout.*` clears nothing.** The running `KeepoutFilter` keeps the
-  last mask, and the nav session writes a blank pair at the next boot anyway.
-  Clear with `PUT .../keepout` and `[]` — an all-unknown (205, not free 254) mask,
-  reloaded; a free cell would make unexplored space plannable.
-- **A 2D-only editor that drops `name` / `z_min` / `z_max` widens 3D zones.**
+- **Deleting `keepout.json` clears nothing now.** The running 3D planner keeps
+  the zones it last read. Clear with `PUT .../keepout` and `[]`, which rewrites
+  the file with none and reloads it.
+- **A client that drops `name` / `z_min` / `z_max` widens zones.**
   `PUT …/keepout` replaces the whole list, and a zone sent without a band
   covers every floor. Send back what `GET` returned.
-- **A map switch does not move the keepout mask along.** `filter_mask_server`
-  serves what it was last told; `activate` reloads the new map's mask itself,
-  writing a blank one first for a never-booted map. A "not available"
-  `filter_mask_server/load_map` means MANUAL mode or a dead keepout pane — since
-  workspace `c8d2558` the launch starts it on every map, blank mask included.
 - The `sqlalchemy` session convention is per-repo: `init_map_repo` creates the
   schema and builds its own `sessionmaker` from the injected engine.

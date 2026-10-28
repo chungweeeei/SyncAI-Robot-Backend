@@ -1,10 +1,10 @@
-"""The map routes: catalogue, archives, mapping run, the loaded map, gridmap,
-vertices, forbidden zones, point cloud, 3D map and floors.
+"""The map routes: catalogue, archives, mapping run, the loaded map, vertices,
+forbidden zones, point cloud, 3D map and floors.
 
 The routes live in ``routers/maps/``, one module per area; this composes them
 under the one ``init_map_router`` that ``server.py`` calls. Plain (non-async)
-handlers throughout, unless a route awaits Temporal: they block on disk, PNG
-encoding and psycopg2, so FastAPI must run them in its thread pool.
+handlers throughout, unless a route awaits Temporal: they block on disk, ROS
+services and psycopg2, so FastAPI must run them in its thread pool.
 
 The saved map is read from disk on request, never subscribed: every route here
 reads ``map/<name>/`` when it is asked. ``map`` and ``localizer/map_cloud`` used
@@ -20,7 +20,6 @@ from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.map.map import MapRepo
 from syncai_backend.repositories.mapping.mapping import MappingStatusRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
 from syncai_backend.services.map_import import MapImportService
 from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
@@ -30,7 +29,6 @@ from syncai_backend.interfaces.rest.routers.maps import (
     catalog,
     cloud,
     floors,
-    grid,
     keepout,
     mapping,
     octomap,
@@ -41,7 +39,7 @@ from syncai_backend.interfaces.rest.routers.maps.context import MapRouteContext
 
 # Registration order. Paths do not overlap across areas, so this only orders
 # the OpenAPI listing.
-_AREAS = (catalog, archive, mapping, switch, grid, vertices, keepout, cloud, octomap, floors)
+_AREAS = (catalog, archive, mapping, switch, vertices, keepout, cloud, octomap, floors)
 
 
 def init_map_router(
@@ -50,7 +48,6 @@ def init_map_router(
     map_catalog_repo: MapCatalogRepo,
     map_gw: MapGateway,
     task_template_repo: TaskTemplateRepo,
-    conversion_svc: GridmapConversionService,
     mapping_status_repo: MappingStatusRepo,
     map_switch_svc: MapSwitchService,
     map_usage: MapUsagePolicy,
@@ -63,7 +60,6 @@ def init_map_router(
         map_catalog_repo=map_catalog_repo,
         map_gw=map_gw,
         task_template_repo=task_template_repo,
-        conversion_svc=conversion_svc,
         mapping_status_repo=mapping_status_repo,
         map_switch_svc=map_switch_svc,
         map_usage=map_usage,

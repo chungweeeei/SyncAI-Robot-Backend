@@ -14,8 +14,6 @@ step live here, beside each other, rather than inside the route:
 3. One transaction deletes every row naming the map (orphans too) and inserts
    the manifest's vertices. A failure swaps the directories back.
 4. ``rmtree`` the parked map: the irreversible step last.
-
-No conversion is started.
 """
 
 import time

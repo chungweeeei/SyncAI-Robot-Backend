@@ -1,4 +1,7 @@
-"""Rasterise forbidden zones into the keepout mask ``filter_mask_server`` serves.
+"""Rasterise forbidden zones into a 2D keepout mask (for nav2's KeepoutFilter).
+
+No route calls this since 2026-10-28, when the stack went 3D-only and the
+backend's 2D gridmap surface was removed; kept as a library.
 
 The mask is a map-server yaml + PGM pair (``keepout.yaml`` + ``keepout.pgm``)
 beside ``gridmap.*``, in the same pixel geometry so the two line up cell for

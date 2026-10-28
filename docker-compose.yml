@@ -83,7 +83,7 @@ services:
     runtime: nvidia
 
     # The container user must own what it writes: `ros2 bag record` into
-    # record/, gridmap conversions into map/, and the in-place rewrite of
+    # record/, keepout / floors / edits / imports into map/, and the in-place rewrite of
     # system.ini into config/. Same pattern as the workspace's robot services —
     # note that bash does not export UID/GID, so either export them or rely on
     # the 1000 default, which is correct on this Jetson.
@@ -202,7 +202,7 @@ services:
       # Today that is the workspace checkout — these three paths are the
       # entirety of what this package needs *shared* with the rest of the stack,
       # and `map/` in particular MUST be the same directory the nav stack's
-      # map_server reads, or an activated map exists for one of them only.
+      # localizer and Octo3D read, or an activated map exists for one of them only.
       # (record/ and lib/ are deliberately NOT among them; see below.)
       #
       #   export ROBOT_WS=/some/other/place   # to point it elsewhere
@@ -223,7 +223,13 @@ services:
       # [map] name in place rather than through a temp file and a rename,
       # because a rename would give the content a new inode that this mount
       # would never resolve (helpers/system_config.py says so at length).
-      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config/instances/${ROBOT_INSTANCE:-robot01}.ini:/home/syncrobotic/robot_ws/config/system.ini
+      #
+      # The workspace's file is config/instances/robot.ini (robot01.ini until
+      # 2026-10-28). A name that does not exist on the host is not an error:
+      # docker creates an empty DIRECTORY there and mounts it, the INI reads as
+      # missing, and everything above happens silently -- keep this default in
+      # step with the workspace.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config/instances/${ROBOT_INSTANCE:-robot}.ini:/home/syncrobotic/robot_ws/config/system.ini
       - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/map:/home/syncrobotic/robot_ws/map
       # Recordings, and the one directory that is NOT shared with the workspace.
       # Nothing else in the stack reads a bag — the recorder writes them, this

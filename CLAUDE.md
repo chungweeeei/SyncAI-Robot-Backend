@@ -29,6 +29,14 @@ HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
 `syncai_common` lives in `SyncAI-Robot-Interface` (split out of the workspace
 2026-09) — edit the messages there, never in a materialised `src/syncai_common`.
 
+**3D maps only (2026-10-28).** SyncAI-Robot-Workspace removed 2D navigation
+(map_server, the 2D planners, the 2D keepout mask), and this repo followed: no
+gridmap conversion, no `grid` / `image` / `thumbnail` routes, no `grid_status`, no
+`map_server` / `filter_mask_server` clients. A map is navigable with an `octomap.bt`;
+every save asks pgo for one. The 2D helpers (`pcd_to_gridmap`, `traversable`,
+`keepout`, `pgm`, `occupancy_grid`) are kept as a library with their tests — no route
+calls them; do not wire them back in without the robot side to serve the result.
+
 The map srvs used to come from FAST-LIO2's `interface` package (the whole
 `SyncAI-Fast-LIO2` fork was cloned to build it); they moved into `syncai_common`
 2026-09 and FAST-LIO2's `dev` no longer carries `interface`. Do not import
@@ -63,7 +71,7 @@ colcon build --packages-select syncai_backend --symlink-install
 
 # Run
 ros2 launch syncai_backend backend.launch.py                                   # robot_id from ~/robot_ws/config/system.ini
-ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot01.ini
+ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot.ini
 ros2 run syncai_backend backend                                                # no namespace -> default_robot
 
 # Tests (from src/syncai_backend/)
@@ -117,7 +125,7 @@ thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotW
 
 Consequences:
 - **Blocking REST handlers are plain `def`, not `async def`** (ROS service calls up to
-  ~70 s, psycopg2, PNG encoding) so FastAPI runs them in its thread pool. Keep that
+  ~70 s, psycopg2, disk walks) so FastAPI runs them in its thread pool. Keep that
   distinction when adding endpoints. A route that must be `async def` (it awaits
   Temporal) runs its disk reads in `asyncio.to_thread`, as `activate_map` does —
   even a "small" read: the map walk shares the loop with teleop and the telemetry
@@ -160,18 +168,17 @@ Consequences:
 ```
 interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain exceptions.
         │                  The map routes are a package, routers/maps/: one module per area
-        │                  (catalog, archive, mapping, switch, grid, vertices, keepout, cloud,
+        │                  (catalog, archive, mapping, switch, vertices, keepout, cloud,
         │                  octomap, floors) with register(map_router, ctx), sharing schemas.py,
         │                  common.py and a MapRouteContext; routers/map.py composes them.
         │                  ctx.require_exists (one isdir) for a 404 on an unknown map;
         │                  ctx.require only where the route uses the StoredMap, since
         │                  get_map walks every file of the map (patches/: hundreds)
         │
-services/                  domain work that outlives a request: gridmap_conversion (recipes,
-        │                  the registry of running threads, the gridmap.recipe.json protocol),
-        │                  mode_restart (the latest restart_mode dispatch and its outcome),
+services/                  domain work that outlives a request: mode_restart (the latest
+        │                  restart_mode dispatch and its outcome),
         │                  safety_lock (the driver lock's rising edge -> cancel every task),
-        │                  map_switch (activate's saga: localizer, map_server, Octo3D, INI and
+        │                  map_switch (activate's saga: localizer, Octo3D, INI and
         │                  the undo for each), dock_state (the last DOCK's pose), map_usage
         │                  (every "may this map change / be driven on" refusal: MapUsagePolicy
         │                  from disk, safe in the worker; JobGate asks Temporal, loop only),
@@ -195,12 +202,12 @@ subscribers/               ROS topics → repositories (ingest side; the map clo
                            names the PCD, which the subscriber reads from the shared /dev/shm);
                            qos.py names the two subscription shapes (latched, best_effort)
 temporal/                  worker, RobotWorkflow, activities
-helpers/                   occupancy_grid, pointcloud, pgm, pcd_to_gridmap (z-band), keepout
-                           (forbidden-zone mask rasteriser), traversable, system_config,
-                           map_archive (checksummed zip / tar.gz of a map dir),
-                           move_guard (a run's TaskMap against the loaded map),
+helpers/                   pointcloud, system_config, map_archive (checksummed zip /
+                           tar.gz of a map dir), move_guard (a run's TaskMap against the loaded map),
                            disk (a tree's bytes + newest mtime, for both catalogues and the
-                           recording gateway), single_flight (join a slow read in progress)
+                           recording gateway), single_flight (join a slow read in progress);
+                           kept, called by nothing: occupancy_grid, pgm (write_text_atomic is
+                           still used), pcd_to_gridmap, keepout (2D mask), traversable
 ```
 
 **Wiring is explicit constructor injection.** `main.py` builds every repo/gateway/
@@ -209,10 +216,9 @@ as one frozen `RestDeps` (`server.py`), which hands each `init_<x>_router(...)` 
 fields it names. No DI container, no module-level singletons. Adding a dependency to a
 router means a `RestDeps` field, its value in `main.py`, and the router's call in `server.py`.
 
-That rule is why the gridmap conversion is a `services/` object rather than the
-module-level `_ACTIVE_CONVERSIONS` set it used to be inside `routers/map.py`: it is
-built in `main.py` like everything else, so tests get a fresh registry per test and
-nothing reaches into another module's globals to say "a conversion is running".
+That rule is why stateful map work (the switch saga, the import, the usage policy) is
+a `services/` object built in `main.py` rather than module state inside a router:
+tests get a fresh one per test, and nothing reaches into another module's globals.
 
 **Imports are grouped by layer, with blank lines carrying meaning** (see `main.py`).
 That is why `ruff.toml` excludes isort — do not "organize imports".
@@ -222,7 +228,7 @@ That is why `ruff.toml` excludes isort — do not "organize imports".
 Routers raise from `exceptions.py`; `server.py:register_exception_handlers` maps them:
 `NotFoundError`→404, `BadRequestError`→400 (optional `code` and `step_id` beside
 `detail`, for a refusal about one step of a task body), `ConflictError`→409 (optional
-machine-readable `code` beside `detail`, e.g. `conversion_running`, `map_active`),
+machine-readable `code` beside `detail`, e.g. `octomap_missing`, `map_active`),
 `UnauthorizedError`→401, `PayloadTooLargeError`→413 (optional `code`; the import's
 `archive_too_large`), `UpstreamError`→502 (a downstream — Temporal or a ROS service —
 failed). Cross-field validation errors answer 400 with a sentence, not 422.
@@ -285,7 +291,7 @@ the only caller that passes anything else.
   because it is a bind mount (a sibling path is another filesystem). `.import-*` is refused
   by `resolve_dir` and skipped by `list_maps`; the manifest `syncai_map.json` is archive
   metadata and never lands in the map directory. Replacing is refused for the same reasons
-  delete is (`map_active` / `conversion_running` / `template_bound`, shared in
+  delete is (`map_active` / `octomap_converting` / `template_bound`, shared in
   `MapUsagePolicy.refuse_destroy`, `services/map_usage.py`). **Neither direction holds
   an archive in memory**: the upload is streamed into an anonymous temp file on the maps'
   disk (`MapCatalogRepo.scratch_file`, unlinked at once, so nothing is left in `map/`),
@@ -293,30 +299,31 @@ the only caller that passes anything else.
   again on the bytes received), and the export is written to one and streamed out. Do not
   go back to `bytes = Body(...)` or a `Response(content=...)` of the archive: either holds
   a map's size (`map.pcd` does not compress) in the process that supervises the job.
-- **A running job locks the map it is on.** Every route that edits what the planner,
-  the costmaps or a job's waypoints read — vertex create/update/delete, `PUT …/grid`,
-  `PUT …/keepout`, `PUT …/octomap/edits`, `POST …/grid/convert` — sits behind `JobGate.refuse_while_a_job_holds`
+- **A running job locks the map it is on.** Every route that edits what the planner
+  or a job's waypoints read — vertex create/update/delete, `PUT …/keepout`,
+  `PUT …/octomap/edits` — sits behind `JobGate.refuse_while_a_job_holds`
   (`services/map_usage.py`; an **async** dependency in front of plain `def` routes, so the Temporal call runs on
   the event loop and the route still runs in the threadpool): 409 `task_running` while a
   run's `TaskMap` is the loaded map, 409 `tasks_unknown` when Temporal cannot be asked —
   refuse, never assume idle. A map other than the loaded one is let through without
   asking. Check-then-act, not a lock; `execute_move`'s own check is what stops a run
   that slipped through the window.
-- **Forbidden zones:** `map/<name>/keepout.json` (polygons in metres) is the source of
-  truth; `keepout.pgm` + `keepout.yaml` are derived from it by `write_keepout`, in the
-  gridmap's geometry, background **205 (unknown), never 254** — a free mask cell frees
-  unknown costmap cells. Written pgm → yaml → json. The nav session writes a blank pair
-  (no json) at boot for a map that has none and never overwrites an existing one; a map
-  switch must reload the mask itself (`filter_mask_server/load_map`), which `activate` does.
-  **The same json is a 3D map's zones** (2026-10-23): the robot's 3D planner reads it
-  beside `octomap.bt`, and each zone may carry `name` + a `z_min` / `z_max` floor band
-  (absent = every floor, what a 2D zone means; unset keys are omitted on disk; the mask
-  ignores them). A 3D-only map gets the json alone; a save on the active map reloads by
-  kind ("3D wins": `planner_server/Octo3D/load_keepout` via `reload_keepout_3d`, else
-  the mask); a 3D switch needs no keepout call (`load_map` reads it). Every rewrite must
-  keep the three keys — a dropped band widens a 3D zone to every storey.
+- **Forbidden zones:** `map/<name>/keepout.json` (polygons in metres), which the robot's
+  3D planner reads beside `octomap.bt`. Each zone may carry `name` + a `z_min` / `z_max`
+  floor band (absent = every floor; unset keys are omitted on disk). `PUT …/keepout` is
+  404 without an `octomap.bt`; a save on the active map reloads the planner's zones
+  (`planner_server/Octo3D/load_keepout` via `reload_keepout_3d`); a switch needs no
+  keepout call (`load_map` reads it). Every rewrite must keep the three keys — a dropped
+  band widens a zone to every storey. The 2D `keepout.pgm` + `keepout.yaml` mask is no
+  longer written (2026-10-28); an older map's pair is a plain file nothing reads.
+- **The robot's map cleaning holds its directory.** For minutes after a save `clean_map`
+  rewrites map.pcd and builds octomap.bt in place; rename, delete, export and an
+  import that replaces the map answer 409 `octomap_converting` while
+  `map_clean.recipe.json` says `converting` (`MapCatalogRepo.map_clean_running`, one
+  sidecar read; past `MAP_CLEAN_STALE_AFTER_S`, 30 min, it is a dead clean and holds
+  nothing). This replaced the gridmap's `conversion_running` guard of the same window.
 - **The 3D map (`map/<name>/octomap.bt`) is read, never parsed, never written.** The
-  robot's `clean_map` writes it (with `map_clean_octomap`) and reports it in
+  robot's `clean_map` writes it (every save asks for it, `SaveMaps.OCTOMAP_ON`) and reports it in
   `map_clean.recipe.json`'s `params.octomap` / `measurements.octomap_written` /
   `octomap_error`; `MapCatalogRepo` reads that sidecar (`MapCleanRecord`) and the tree's
   text header (`OctomapInfo`: `res`, plus `size-mtime_ns` as `version`), and the router's
@@ -329,17 +336,14 @@ the only caller that passes anything else.
   names the map. `GET/PUT …/floors` splits a multi-storey map for the console:
   detected from `poses.txt` heights (`helpers/floors.py`) unless `floors.json` is
   saved; display-only, so not behind the job lock.
-- **A map is 2D or 3D, and `activate` loads it where the robot looks for it** (2026-10).
-  An `octomap.bt` makes it 3D (with a grid too: the robot's rule, "3D wins"). The switch
-  calls the robot's `planner_server/Octo3D/load_map` (`MapGateway.reload_octomap`) with the
-  tree for a 3D map and with **`""` for a 2D one** — the unload is not optional: the robot
-  runs its 3D trees for as long as Octo3D has a map, so skipping it leaves a 2D map
-  navigated on the previous map's octree. The call blocks until the tree is built and
-  each later failure rolls Octo3D back to the previous map's state; 409
-  `planner_3d_unavailable` when the stack has no Octo3D and the map is 3D. A 3D map's
-  zones come in with its tree, so its switch reloads no mask (`keepout_reloaded: true`).
+- **`activate` loads the map where the robot plans on it.** The switch is localizer
+  (`relocalize`) → Octo3D (`planner_server/Octo3D/load_map`, `MapGateway.reload_octomap`,
+  the map's `octomap.bt`) → the INI; 409 `octomap_missing` for a map without a tree,
+  `planner_3d_unavailable` for a stack without Octo3D. The Octo3D call blocks until the
+  tree is built, and each later failure rolls it back to the previous map's tree (`""`,
+  an unload, only when the previous map had none). The map's zones come in with its tree.
 - Long-running outcomes that must outlive the process live **on disk**, not in memory:
-  gridmap conversion status in `<map>/gridmap.recipe.json`; a bag with no `metadata.yaml`
+  the 3D map's build in `<map>/map_clean.recipe.json` (the robot's); a bag with no `metadata.yaml`
   and no live process is `interrupted`. `switch_mode` kills the byobu session this
   process runs in, so in-memory registries die with it. The one deliberate exception is
   `ModeRestartService`'s record behind `GET /api/v1/robot/restart`: it describes a rebuild
@@ -440,9 +444,9 @@ process deletes nothing there. Its run state is latched on `pgo/mapping_status`
 
 ### Heavy imports
 
-`helpers/traversable.py` is the **only** module that imports open3d (~100 MB), and only
-inside `GridmapConversionService.start`'s conversion thread, in its `try`. Keep
-`pcd_to_gridmap.py` and `keepout.py` open3d-free. The WebRTC Go worker is lazy-loaded on
+`helpers/traversable.py` is the **only** module that imports open3d (~100 MB), inside the
+function that needs it, and nothing in the running process calls it since the 2D removal.
+Keep `pcd_to_gridmap.py` and `keepout.py` open3d-free. The WebRTC Go worker is lazy-loaded on
 first use (it can never be unloaded), owned by exactly one gateway instance that keeps one
 slot per session kind and preempts by device (camera, speaker); REST is its only caller,
 and neither of its locks is held across a call into the worker.
@@ -452,7 +456,8 @@ syncai_tts container now and `gateways/tts` is an httpx client.
 ## Dependency pins that are not negotiable without reading `requirements.txt`
 
 `scipy>=1.8,<1.11` and `open3d>=0.18,<0.20` (both exist to stop pip dragging numpy past
-1.26, which the ROS ecosystem tolerates). `temporalio>=1.33` is a floor, not a comfort:
+1.26, which the ROS ecosystem tolerates; only the kept 2D helpers and their tests use them
+now). `temporalio>=1.33` is a floor, not a comfort:
 `RobotWorkflow`'s hold leans on the SDK's cancellation semantics and `test_workflows.py`
 pins them on 1.34. `onnxruntime==1.18.1` and the `--no-deps`
 `kokoro-onnx` install are **gone from this repo** — they moved to SyncAI-TTS with the

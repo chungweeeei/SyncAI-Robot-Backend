@@ -6,7 +6,6 @@ from typing import List
 from fastapi import APIRouter
 
 from syncai_backend.exceptions import (
-    BadRequestError,
     UpstreamError,
 )
 
@@ -30,7 +29,6 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     map_catalog_repo = ctx.map_catalog_repo
     map_gw = ctx.map_gw
     task_template_repo = ctx.task_template_repo
-    conversion_svc = ctx.conversion_svc
     map_usage = ctx.map_usage
     _refuse_while_idle = ctx.refuse_while_idle
     renders = ctx.renders
@@ -49,19 +47,14 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         # One GROUP BY for the whole listing, not a count per map.
         counts = map_repo.count_vertices_by_map()
         return [
-            _summary(stored, active_name, counts.get(stored.name, 0), conversion_svc)
+            _summary(stored, active_name, counts.get(stored.name, 0))
             for stored in map_catalog_repo.list_maps()
         ]
 
     @map_router.get("/api/v1/maps/{name}", response_model=MapSummaryResponse)
     def get_map(name: str):
         stored = _require(name)
-        return _summary(
-            stored,
-            map_catalog_repo.active_name(),
-            _vertex_count(name),
-            conversion_svc,
-        )
+        return _summary(stored, map_catalog_repo.active_name(), _vertex_count(name))
 
     @map_router.post("/api/v1/maps", response_model=CreateMapResponse)
     def create_map(request: CreateMapRequest):
@@ -72,49 +65,29 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         409 ``mapping_idle`` while pgo is IDLE, before any directory is made,
         instead of pgo's ``NO POSES!`` as a 502.
 
-        The conversion first waits for pgo to clean people out of map.pcd
-        (``gridmap_conversion.wait_for_map_clean``), so ``grid_status`` stays
-        ``converting`` for seconds to minutes.
+        The robot always builds the 3D map (``octomap.bt``) after the save,
+        once its map cleaning has removed people from map.pcd: the catalogue's
+        ``octomap_status`` stays ``converting`` for minutes. Until 2026-10-28
+        the body also chose a 2D gridmap (``grid``) and could skip the 3D map
+        (``octomap``); both keys are now ignored.
         """
-        # Before the directory and before pgo: a save that builds nothing would
-        # end the run into a map that cannot be loaded.
-        if not request.grid and request.octomap is False:
-            raise BadRequestError(
-                "Choose at least one of the floor plan and the 3D map to build.",
-                code="nothing_to_build",
-            )
         _refuse_while_idle("save")
 
         directory = map_catalog_repo.create_map_dir(request.name)
 
-        saved, detail = map_gw.save_map(directory, octomap=request.octomap)
+        saved, detail = map_gw.save_map(directory)
         if not saved:
             map_catalog_repo.discard_empty_map_dir(request.name)
             logger.error("Failed to save map", map=request.name, error=detail)
             raise UpstreamError(detail)
 
-        grid_pending = request.grid and conversion_svc.start(request.name, directory)
-
-        # Operator copy: what is being built in the background, never a route.
-        if grid_pending:
-            follow_up = (
-                " Building the floor plan in the background, once the robot "
-                "has removed people from the scan."
-            )
-        elif request.grid:
-            follow_up = " The floor plan could not be started; rebuild it from the map library."
-        else:
-            follow_up = ""
-        if request.octomap:
-            follow_up += " The 3D map is built after that and can take several minutes."
-
         return CreateMapResponse(
             name=request.name,
             has_pointcloud=True,
-            grid_pending=grid_pending,
             message=(
                 f"Saved '{request.name}'. Mapping has stopped — start it again "
-                "for another map." + follow_up
+                "for another map. The 3D map is built in the background and "
+                "can take several minutes."
             ),
         )
 
@@ -122,10 +95,10 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     def rename_map(name: str, request: RenameMapRequest):
         """Rename a map: move its directory and re-key the rows that name it.
 
-        Refusals, before any mutation: 404; 409 ``map_active`` (map_server and
-        the localizer hold the path — switch away with ``…/activate`` first);
-        409 ``conversion_running`` (the thread holds the old path); 400 / 409
-        ``name_taken`` from ``rename_map_dir``.
+        Refusals, before any mutation: 404; 409 ``map_active`` (the localizer
+        and Octo3D hold the path — switch away with ``…/activate`` first);
+        409 ``octomap_converting`` (the robot's map cleaning is writing into
+        it); 400 / 409 ``name_taken`` from ``rename_map_dir``.
 
         Filesystem first, database second: the move is the likeliest failure and
         needs no compensation. Vertices and template bindings are re-keyed in
@@ -133,8 +106,8 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         """
         _require_exists(name)
         map_usage.refuse_if_active(name, "renamed")
-        map_usage.refuse_while_converting(
-            name, "rename it once the conversion has finished."
+        map_usage.refuse_while_building(
+            name, "rename it once the map cleaning has finished."
         )
 
         new_dir = map_catalog_repo.rename_map_dir(name, request.name)
@@ -210,7 +183,7 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         """Delete a map: remove its directory and the vertices that name it.
 
         404, then ``MapUsagePolicy.refuse_destroy``'s 409s (``map_active``,
-        ``conversion_running``, ``template_bound``) before any mutation.
+        ``octomap_converting``, ``template_bound``) before any mutation.
 
         **Database first, filesystem last** (the inverse of rename): ``rmtree``
         cannot be undone, so it goes last. A failed ``rmtree`` after the rows

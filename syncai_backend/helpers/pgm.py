@@ -9,6 +9,10 @@ of I/O. Pixel decoding is left to OpenCV.
 
 A legacy ``gridmap_preview.png`` is ignored: it is optional, full resolution,
 and nothing produces it any more.
+
+Only ``write_text_atomic`` is still used (the map catalogue's json writes).
+No route calls the rest since 2026-10-28, when the stack went 3D-only and the
+backend's 2D gridmap surface was removed; kept as a library.
 """
 
 import os

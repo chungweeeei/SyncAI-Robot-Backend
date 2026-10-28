@@ -1,16 +1,17 @@
-"""The map router's ROS surface: map_server reloads, localizer swaps, pgo saves.
+"""The map router's ROS surface: 3D planner loads, localizer swaps, pgo saves.
 
 Separate from ``RobotGateway`` so the map router holds no handle that can
 command the robot to move. Its ``initialpose`` publisher only re-seeds where
 the robot thinks it is; a second publisher on RobotGateway's topic is fine.
 
-The clients split by session: ``map_server/load_map``,
-``filter_mask_server/load_map``, ``relocalize``, ``relocalize_check`` and
-``reset_odometry`` exist only in the nav (AUTO) session; ``pgo/start_mapping``,
-``pgo/save_maps`` and ``pgo/reset_mapping`` only in the mapping (MANUAL) one.
-"Service is not available" usually means "wrong mode", which activate turns
-into ``stack_not_ready``. The nav launch writes a blank keepout mask for a map
-without one, so ``filter_mask_server`` is up on every map.
+The clients split by session: ``planner_server/Octo3D/*``, ``relocalize``,
+``relocalize_check`` and ``reset_odometry`` exist only in the nav (AUTO)
+session; ``pgo/start_mapping``, ``pgo/save_maps`` and ``pgo/reset_mapping``
+only in the mapping (MANUAL) one. "Service is not available" usually means
+"wrong mode", which activate turns into ``stack_not_ready``.
+
+There is no ``map_server`` or ``filter_mask_server`` client: the stack
+navigates on 3D maps only (2026-10-28), and both went with the 2D gridmap.
 
 ``planner_server/Octo3D/load_map`` (the 3D planner's map) exists only on a
 workspace that carries OctomapPlanner3D (``feature/octomap-planner-3d``); its
@@ -39,9 +40,8 @@ def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
     """The operator's sentence for a failed ``LoadMap`` call.
 
     LoadMap.srv has no `message` field, so the prose is written here,
-    parameterised because two servers answer it (``map_server`` for
-    ``gridmap.*``, ``filter_mask_server`` for ``keepout.*``).
-    RESULT_UNDEFINED_FAILURE is kept for a stock nav2 map_server.
+    parameterised because two Octo3D services answer it (``load_map`` for
+    ``octomap.bt``, ``load_keepout`` for ``keepout.json``).
     """
     messages = {
         LoadMap.Response.RESULT_MAP_DOES_NOT_EXIST: f"{server} could not find the map yaml",
@@ -67,21 +67,9 @@ class MapGateway:
 
     def register_service_clients(self):
 
-        load_map_client = self._node.create_client(
-            srv_type=LoadMap,
-            srv_name="map_server/load_map",
-        )
-
-        # The keepout mask's map_server (costmap_filter_info.launch.py); its
-        # service carries the node name, like load_map's.
-        load_keepout_client = self._node.create_client(
-            srv_type=LoadMap,
-            srv_name="filter_mask_server/load_map",
-        )
-
         # OctomapPlanner3D's tree (2026-10). Under planner_server's node name
-        # plus the plugin id, the way map_server's carries its node name. Same
-        # LoadMap type: map_url is the octomap.bt, and an empty one unloads.
+        # plus the plugin id. nav2's LoadMap type: map_url is the octomap.bt,
+        # and an empty one unloads.
         load_octomap_client = self._node.create_client(
             srv_type=LoadMap,
             srv_name="planner_server/Octo3D/load_map",
@@ -137,8 +125,6 @@ class MapGateway:
 
         self._service_clients.update(
             {
-                "load_map": load_map_client,
-                "load_keepout": load_keepout_client,
                 "load_octomap": load_octomap_client,
                 "load_keepout_3d": load_keepout_3d_client,
                 "save_maps": save_maps_client,
@@ -159,17 +145,6 @@ class MapGateway:
         services are up.
         """
         return self._service_clients["relocalize"].wait_for_service(
-            timeout_sec=timeout_sec
-        )
-
-    def map_server_ready(self, timeout_sec: float = 2.0) -> bool:
-        """Is map_server (`load_map`) discoverable right now?
-
-        Asked separately from the localizer: a 3D nav session runs without
-        map_server (Octo3D plans on the octree), so only a switch to a 2D map
-        requires it. Discoverability, as ``localizer_ready``.
-        """
-        return self._service_clients["load_map"].wait_for_service(
             timeout_sec=timeout_sec
         )
 
@@ -316,84 +291,11 @@ class MapGateway:
         )
         return response.success, response.message, response
 
-    def reload_map(self, yaml_path: str) -> tuple[bool, str]:
-        """Make the running map_server re-read a map and re-publish it.
-
-        Re-reads yaml + pgm (no caching) and republishes on the transient_local
-        topic, so late joiners get the edit. A failed reload keeps the old grid.
-
-        map_server holds one grid: this call *is* the running map. Passing a
-        non-active map is only valid paired with `swap_localizer_map` and the
-        INI write, as activate does; alone it swaps the grid out from under the
-        localizer.
-        """
-        load_map_client = self._service_clients.get("load_map")
-        if not load_map_client.wait_for_service(timeout_sec=5.0):
-            return False, "load_map service is not available."
-
-        map_url = os.path.abspath(os.path.expanduser(yaml_path))
-
-        self._logger.info("[MapGateway] Reloading map", map_url=map_url)
-
-        # Under a second in practice; 20 s is headroom yet short enough that a
-        # wedged map_server does not hold a worker thread for long.
-        response = ros.call_service(
-            load_map_client, LoadMap.Request(map_url=map_url), timeout_s=20.0
-        )
-        if response is None:
-            return False, "Timeout waiting for map_server/load_map response"
-
-        if response.result != LoadMap.Response.RESULT_SUCCESS:
-            return False, _load_map_failure(
-                response.result, "map_server", "gridmap.pgm", "gridmap.yaml"
-            )
-
-        return True, ""
-
-    def reload_keepout(self, yaml_path: str) -> tuple[bool, str]:
-        """Make ``filter_mask_server`` re-read a keepout mask and re-publish it.
-
-        The same ``LoadMap`` call as ``reload_map``, against the KeepoutFilter's
-        map_server. The transient_local topic reaches the running filter and
-        any later one.
-
-        - **A map switch does not move the mask along**: the old map's zones
-          stay in force, so activate calls this too.
-        - **Clearing zones is a reload, not a delete**: the caller writes an
-          all-unknown mask and reloads it.
-
-        "Not available" means mapping mode or a down keepout pane.
-        """
-        client = self._service_clients.get("load_keepout")
-        if not client.wait_for_service(timeout_sec=5.0):
-            return False, (
-                "filter_mask_server/load_map is not available — the keepout filter "
-                "only runs in AUTO mode; the forbidden zones apply when the nav stack "
-                "next starts on this map."
-            )
-
-        map_url = os.path.abspath(os.path.expanduser(yaml_path))
-
-        self._logger.info("[MapGateway] Reloading keepout mask", map_url=map_url)
-
-        # Same as reload_map.
-        response = ros.call_service(client, LoadMap.Request(map_url=map_url), timeout_s=20.0)
-        if response is None:
-            return False, "Timeout waiting for filter_mask_server/load_map response"
-
-        if response.result != LoadMap.Response.RESULT_SUCCESS:
-            return False, _load_map_failure(
-                response.result, "filter_mask_server", "keepout.pgm", "keepout.yaml"
-            )
-
-        return True, ""
-
     def reload_keepout_3d(self, json_path: str) -> tuple[bool, str]:
         """Make the 3D planner (Octo3D) re-read a map's ``keepout.json``.
 
-        The 3D twin of ``reload_keepout``: Octo3D does not read the mask, it
-        rasterises the json's polygons (with their floor bands) onto its own
-        surface map, and ``planner_server/Octo3D/load_keepout`` swaps them in
+        Octo3D rasterises the json's polygons (with their floor bands) onto its
+        own surface map, and ``planner_server/Octo3D/load_keepout`` swaps them in
         without rebuilding the tree. A refused file keeps the zones in force;
         the robot's running path is re-judged against the new ones within a
         second. ``json_path=""`` clears them.
@@ -433,8 +335,8 @@ class MapGateway:
         """Does the running nav stack have the 3D planner (Octo3D) at all?
 
         Asked before a switch touches anything: a stack built without
-        OctomapPlanner3D cannot navigate a 3D map, and has no 3D map to unload
-        when switching to a 2D one. Discoverability, as ``nav_services_ready``.
+        OctomapPlanner3D cannot navigate any map. Discoverability, as
+        ``localizer_ready``.
         """
         return self._service_clients["load_octomap"].wait_for_service(
             timeout_sec=timeout_sec
@@ -443,11 +345,10 @@ class MapGateway:
     def reload_octomap(self, bt_path: str) -> tuple[bool, str]:
         """Point Octo3D at a map's ``octomap.bt``, or unload it with ``""``.
 
-        The 3D counterpart of ``reload_map``, and what makes the robot's
-        task_runner pick the 3D trees: Octo3D latches whether it has a map,
-        and every goal runs move_3d.xml / dock_3d.xml while it does. So a
-        switch to a 2D map must unload (``bt_path=""``) — otherwise the 3D
-        trees keep planning on the previous site's octree.
+        The running map, as far as planning goes: every goal plans on the tree
+        Octo3D holds. ``""`` unloads, which leaves every goal failing
+        PLAN_FAILED; only a failed switch's undo sends it, when the previous
+        map has no tree to put back.
 
         Unlike ``relocalize``, success is a result: the call answers once the
         surface map is built (seconds; the 120 s bound covers a large site).
@@ -479,11 +380,12 @@ class MapGateway:
 
         return True, ""
 
-    def save_map(self, directory: str, octomap: Optional[bool] = None) -> tuple[bool, str]:
+    def save_map(self, directory: str) -> tuple[bool, str]:
         """Have pgo write the run into ``directory`` and end it.
 
-        ``octomap`` is the save's 3D map choice; None sends OCTOMAP_DEFAULT,
-        which leaves it to pgo's map_clean_octomap.
+        Always with ``OCTOMAP_ON``: a map is navigable only with its
+        ``octomap.bt``, so the save never leaves the 3D map to pgo's
+        ``map_clean_octomap`` default.
         """
         save_maps_client = self._service_clients.get("save_maps")
         if not save_maps_client.wait_for_service(timeout_sec=5.0):
@@ -501,13 +403,7 @@ class MapGateway:
             SaveMaps.Request(
                 file_path=file_path,
                 save_patches=True,
-                octomap=(
-                    SaveMaps.Request.OCTOMAP_DEFAULT
-                    if octomap is None
-                    else SaveMaps.Request.OCTOMAP_ON
-                    if octomap
-                    else SaveMaps.Request.OCTOMAP_OFF
-                ),
+                octomap=SaveMaps.Request.OCTOMAP_ON,
             ),
             timeout_s=180.0,
         )

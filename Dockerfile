@@ -143,12 +143,9 @@ COPY requirements.txt /tmp/requirements.txt
 # open3d is installed separately and is allowed to fail, which is a deliberate
 # choice rather than sloppiness. It ships no aarch64 Linux wheel for every
 # version in the pinned range, and this image is built on Apple Silicon as often
-# as not. The package already treats it as optional at runtime -- helpers/
-# traversable.py is imported inside the conversion thread's try and an
-# ImportError is recorded as a per-map failure -- so the cost of not having it
-# is test_traversable.py skipping and the traversability recipe being
-# unavailable. The z-band recipe, which is what every save actually uses, is
-# open3d-free by design. Read the warning; do not let it become invisible.
+# as not. Since the 2D removal (2026-10-28) only the kept helpers/traversable.py
+# library uses it, and no route calls that, so the cost of not having it is
+# test_traversable.py skipping. Read the warning; do not let it become invisible.
 #
 # There is no kokoro-onnx step any more, and no alsa-utils above: the speech
 # engine and the speaker moved to the syncai_tts container, so this image holds
@@ -176,7 +173,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && grep -v '^open3d' /tmp/requirements.txt > /tmp/requirements.core.txt \
     && python3 -m pip install -r /tmp/requirements.core.txt \
     && { python3 -m pip install "$(grep '^open3d' /tmp/requirements.txt)" \
-         || echo "WARNING: open3d unavailable for this platform — test_traversable.py will skip and the traversability recipe is disabled"; }
+         || echo "WARNING: open3d unavailable for this platform — test_traversable.py will skip"; }
 
 # =============================================================================
 # builder — colcon install space. Nothing but /ros2_ws/install leaves here.
@@ -240,7 +237,7 @@ ENV HOME=/home/${USER_NAME}
 # The four mount points are created HERE, owned by the runtime user, rather
 # than left to compose. Docker creates a missing bind-mount target as root:root,
 # and this process writes to three of them — `ros2 bag record` into record/,
-# the gridmap conversion into map/, and the in-place rewrite of system.ini into
+# keepout / floors / edits / imports into map/, and the in-place rewrite of system.ini into
 # config/. A root-owned mount point turns those into EACCES at the worst moment
 # (mid-recording, mid-save) instead of at startup.
 RUN useradd --create-home --uid ${USER_UID} ${USER_NAME} \

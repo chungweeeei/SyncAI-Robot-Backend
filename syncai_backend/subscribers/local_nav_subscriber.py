@@ -49,9 +49,8 @@ class LocalNavSubscriber:
       OccupancyGrid only when the rolling window's origin moves, and only
       ``costmap_updates`` while the robot stands, so a reader that joins with
       the robot stopped would get nothing. The raw message is the whole map on
-      every publish (2 Hz), with the costmap's own 0-255 values. On a 2D map it
-      is the obstacle layer's, on a 3D one the terrain layer's (the robot picks
-      by map type), inflated either way.
+      every publish (2 Hz), with the costmap's own 0-255 values: the terrain
+      layer's, inflated.
     * ``local_plan`` (``nav_msgs/Path``), MPPI's optimal trajectory for the
       next 2 s, published only while something subscribes and only on the
       cycles its optimizer runs (not on a stair, nor in the final rotation).

@@ -29,8 +29,8 @@ class ConflictError(Exception):
     """A request that contradicts current state (HTTP 409).
 
     ``code`` is an optional machine-readable discriminator for callers that
-    must tell two 409s on one route apart (e.g. re-convert: "conversion
-    running" vs "grid holds hand edits"), so the UI never matches on prose.
+    must tell two 409s on one route apart (e.g. activate: "no 3D map" vs
+    "stack not ready"), so the UI never matches on prose.
     """
 
     def __init__(self, message: str, code: "str | None" = None):

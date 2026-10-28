@@ -20,7 +20,6 @@ from syncai_backend.repositories.mapping.mapping import (
     MappingStatusRepo,
 )
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
 from syncai_backend.services.map_import import MapImportService
 from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
@@ -35,15 +34,13 @@ class MapRouteContext:
     map_catalog_repo: MapCatalogRepo
     map_gw: MapGateway
     task_template_repo: TaskTemplateRepo
-    conversion_svc: GridmapConversionService
     mapping_status_repo: MappingStatusRepo
     map_switch_svc: MapSwitchService
     map_usage: MapUsagePolicy
     job_gate: JobGate
     map_import_svc: MapImportService
 
-    # The image, thumbnail and packed cloud of each map, re-encoded only when
-    # their source changes.
+    # The packed cloud of each map, re-encoded only when its source changes.
     renders: _RenderCache = field(default_factory=_RenderCache)
 
     # Async so the Temporal call runs on the event loop while the plain

@@ -93,8 +93,7 @@ class RobotActivities:
         self._tts_gw = tts_gw
         # Read-only: the loaded map, for the auto-undock.
         self._map_catalog_repo = map_catalog_repo
-        # execute_move's check, the same rule POST /api/v1/tasks applies; over
-        # the conversion registry the map routes write (shared process).
+        # execute_move's check, the same rule POST /api/v1/tasks applies.
         self._map_usage = map_usage
         # The latest RobotState (pose, motion state), for the auto-undock's checks.
         self._robot_repo = robot_repo
@@ -264,8 +263,7 @@ class RobotActivities:
 
     def _refuse_wrong_map(self, expected_map: Optional[str]) -> None:
         """Raise move_guard's refusal (non-retryable) for a goal planned on
-        ``expected_map`` when another map is loaded or its floor plan is being
-        rebuilt."""
+        ``expected_map`` when another map is loaded."""
         refusal = self._map_usage.move_refusal(
             expected_map, self._map_catalog_repo.active_name()
         )
@@ -283,8 +281,8 @@ class RobotActivities:
 
         ``expected_map`` is the run's ``TaskMap``. A goal with a pose is first
         checked against the loaded map (helpers/move_guard.py, as POST
-        /api/v1/tasks does): another map's coordinates, or a floor plan being
-        rebuilt. Both refusals are non-retryable; this is the check that catches a
+        /api/v1/tasks does): another map's coordinates are refused,
+        non-retryable; this is the check that catches a
         schedule firing after a map switch. ``params`` None (an UNDOCK) skips it and
         sends an empty pose: the tree works from the robot's own frame.
 

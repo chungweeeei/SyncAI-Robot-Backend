@@ -17,8 +17,6 @@ import pytest
 pytest.importorskip("cv2")
 pytest.importorskip("nav_msgs")
 pytest.importorskip("httpx")
-# The merged router pulls in the catalogue repo, which parses gridmap.yaml.
-pytest.importorskip("yaml")
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -35,9 +33,6 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
 from syncai_backend.interfaces.rest.routers.map import init_map_router  # noqa: E402
 from syncai_backend.repositories.mapping.mapping import (  # noqa: E402
     init_mapping_status_repo,
-)
-from syncai_backend.services.gridmap_conversion import (  # noqa: E402
-    GridmapConversionService,
 )
 from syncai_backend.services.map_import import MapImportService  # noqa: E402
 from syncai_backend.services.map_switch import MapSwitchService  # noqa: E402
@@ -63,14 +58,14 @@ _MISSING_ID = "00000000-0000-0000-0000-000000000000"
 
 
 class _StubMapGateway:
-    """Stands in for the LoadMap client, which needs a live map_server.
+    """Stands in for the ROS clients, which need a live nav stack.
 
     Only the vertex routes are exercised here, so it is never called; the lines
     are duplicated from test_maps_router.py rather than shared because the two
     files are deliberately independent by fixture.
     """
 
-    def reload_map(self, yaml_path):
+    def reload_octomap(self, bt_path):
         raise AssertionError("the vertex routes must not reload a map")
 
     def swap_localizer_map(self, pcd_path, x, y, yaw):
@@ -104,10 +99,8 @@ def workflow_gw():
 @pytest.fixture
 def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
     map_gw = _StubMapGateway()
-    conversion_svc = GridmapConversionService(logger=logger)
     map_usage = MapUsagePolicy(
         map_catalog_repo=catalog_repo,
-        conversion_svc=conversion_svc,
         task_template_repo=task_template_repo,
     )
     app = FastAPI()
@@ -119,16 +112,12 @@ def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
             map_catalog_repo=catalog_repo,
             map_gw=map_gw,
             task_template_repo=task_template_repo,
-            # A real one: the vertex routes never start a conversion, but the
-            # catalogue projection asks it whether one is running.
-            conversion_svc=conversion_svc,
             # Real and empty: the vertex routes never read the run state.
             mapping_status_repo=init_mapping_status_repo(logger=logger),
             map_switch_svc=MapSwitchService(
                 logger=logger,
                 map_catalog_repo=catalog_repo,
                 map_gw=map_gw,
-                map_usage=map_usage,
             ),
             map_usage=map_usage,
             job_gate=JobGate(

@@ -46,7 +46,6 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
 
-from syncai_backend.services.gridmap_conversion import GridmapConversionService
 from syncai_backend.services.map_import import MapImportService
 from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
@@ -116,7 +115,6 @@ class RestDeps:
     webrtc_gw: WebRtcGateway
     recording_gw: RecordingGateway
     recording_catalog_repo: RecordingCatalogRepo
-    conversion_svc: GridmapConversionService
     restart_svc: ModeRestartService
     mapping_status_repo: MappingStatusRepo
     safety_lock_svc: SafetyLockService
@@ -216,7 +214,6 @@ def init_rest_server(
             map_catalog_repo=deps.map_catalog_repo,
             map_gw=deps.map_gw,
             task_template_repo=deps.task_template_repo,
-            conversion_svc=deps.conversion_svc,
             mapping_status_repo=deps.mapping_status_repo,
             map_switch_svc=deps.map_switch_svc,
             map_usage=deps.map_usage,
