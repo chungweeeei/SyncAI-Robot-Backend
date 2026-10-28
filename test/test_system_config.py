@@ -22,7 +22,9 @@ from syncai_backend.helpers import system_config
 from syncai_backend.helpers.system_config import active_map_name, set_active_map
 
 
-# The real shape of config/instances/robotNN.ini, interpolation and all.
+# The shape of config/instances/robot.ini, interpolation and all (the real
+# file has no `map:` key since 2026-10-28; kept here as an unrelated line the
+# writer must preserve).
 _REAL_INI = (
     "[system]\n"
     "robot_id: robot01\n"

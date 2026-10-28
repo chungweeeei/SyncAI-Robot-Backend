@@ -2,7 +2,7 @@
 
 ``config/system.ini`` carries ``[system] robot_id`` (read by every launch file)
 and ``[map]`` (which map the stack loads); docker-compose bind-mounts
-``config/instances/robotNN.ini`` over it.
+``config/instances/robot.ini`` over it.
 
 This is the only INI reader and `set_active_map` the only writer; keep it that
 way, since reader and writer must agree about the interpolation in ``[map]``.

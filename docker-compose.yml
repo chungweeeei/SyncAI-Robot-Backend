@@ -223,7 +223,13 @@ services:
       # [map] name in place rather than through a temp file and a rename,
       # because a rename would give the content a new inode that this mount
       # would never resolve (helpers/system_config.py says so at length).
-      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config/instances/${ROBOT_INSTANCE:-robot01}.ini:/home/syncrobotic/robot_ws/config/system.ini
+      #
+      # The workspace's file is config/instances/robot.ini (robot01.ini until
+      # 2026-10-28). A name that does not exist on the host is not an error:
+      # docker creates an empty DIRECTORY there and mounts it, the INI reads as
+      # missing, and everything above happens silently -- keep this default in
+      # step with the workspace.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config/instances/${ROBOT_INSTANCE:-robot}.ini:/home/syncrobotic/robot_ws/config/system.ini
       - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/map:/home/syncrobotic/robot_ws/map
       # Recordings, and the one directory that is NOT shared with the workspace.
       # Nothing else in the stack reads a bag — the recorder writes them, this

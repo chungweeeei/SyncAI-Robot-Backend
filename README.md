@@ -278,7 +278,7 @@ of a map, recoverable by renaming it back.
 
 The launch file reads `[system] robot_id` from the system INI — by default the
 **absolute** `~/robot_ws/config/system.ini` (bind-mounted per robot from
-`config/instances/robotNN.ini`), overridable with `system_config:=` — and uses it
+`config/instances/robot.ini`), overridable with `system_config:=` — and uses it
 as the **node namespace**. The node reads it back:
 
 ```python
@@ -1137,7 +1137,7 @@ Run it:
 
 ```bash
 ros2 launch syncai_backend backend.launch.py                     # namespaced from config/system.ini
-ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot01.ini
+ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot.ini
 ros2 run syncai_backend backend                                  # no namespace -> default_robot
 ```
 
@@ -1218,7 +1218,7 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | variable | default | what it moves |
 |---|---|---|
 | `ROBOT_WS` | `~/SyncAI-Robot-Workspace` | where `config/` and `map/` come from |
-| `ROBOT_INSTANCE` | `robot01` | which `config/instances/<name>.ini` is mounted as `system.ini` |
+| `ROBOT_INSTANCE` | `robot` | which `config/instances/<name>.ini` is mounted as `system.ini` (the workspace's file is `robot.ini` since 2026-10-28, `robot01.ini` before; a name with no file mounts an empty directory, silently) |
 | `RECORD_DIR` | `./record` | where bags land on the host |
 | `WEBRTC_LIB` | `./lib/libsyncai_worker.so` | the WebRTC worker `.so` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `postgres` / `postgres` | the infra stack's credentials |
@@ -1226,7 +1226,7 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | `PIP_INDEX_URL` | `https://pypi.org/simple` | build only: the PyPI index the base stage installs from (a mirror when PyPI is slow) |
 
 ```bash
-ROBOT_INSTANCE=robot02 RECORD_DIR=/mnt/ssd/record docker compose up -d
+ROBOT_INSTANCE=other RECORD_DIR=/mnt/ssd/record docker compose up -d
 ```
 
 **4. Check it.** `/health` is always 200; the body says `ok` or `degraded`
@@ -1270,7 +1270,7 @@ docker run -d --name syncai_backend --restart unless-stopped \
     --device /dev/video0 --device /dev/video1 --device /dev/video2 --device /dev/video3 \
     -v /dev/syncai:/dev/syncai:ro \
     -v $WS/config:$R/config \
-    -v $WS/config/instances/robot01.ini:$R/config/system.ini \
+    -v $WS/config/instances/robot.ini:$R/config/system.ini \
     -v $WS/map:$R/map \
     -v "$PWD/record":$R/record \
     -v "$PWD/lib/libsyncai_worker.so":$R/lib/libsyncai_worker.so:ro \
@@ -1281,7 +1281,7 @@ docker run -d --name syncai_backend --restart unless-stopped \
 Drop `--device` lines for unplugged cameras (`docker run` refuses a missing
 device), and `--runtime nvidia` off a Jetson.
 
-The per-robot `config/instances/robotNN.ini` is mounted **over**
+The robot's `config/instances/robot.ini` is mounted **over**
 `config/system.ini` as a single file (the checked-out `system.ini` is an empty
 placeholder), as the workspace's compose does. Miss it and there is no `[system]
 robot_id`: namespace, database and task queue all become `default_robot`.
@@ -1298,7 +1298,7 @@ The compose file comments every piece of the service; the ones that bite:
   one topic.
 - **Three bind mounts from `ROBOT_WS`** carry what this package shares with the
   stack: `config/` (read-write — activating a map rewrites `system.ini` in place;
-  `instances/robotNN.ini` goes over `config/system.ini` as one file) and `map/`
+  `instances/robot.ini` goes over `config/system.ini` as one file) and `map/`
   (must be the directory the nav stack's `map_server` reads). **`record/` and
   `lib/libsyncai_worker.so` are not among them**: nothing else reads a bag or
   dlopens the worker, so both default beside the compose file — moved with

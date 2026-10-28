@@ -63,7 +63,7 @@ colcon build --packages-select syncai_backend --symlink-install
 
 # Run
 ros2 launch syncai_backend backend.launch.py                                   # robot_id from ~/robot_ws/config/system.ini
-ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot01.ini
+ros2 launch syncai_backend backend.launch.py system_config:=config/instances/robot.ini
 ros2 run syncai_backend backend                                                # no namespace -> default_robot
 
 # Tests (from src/syncai_backend/)
