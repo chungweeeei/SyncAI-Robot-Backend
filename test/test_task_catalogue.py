@@ -14,6 +14,8 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     BODY_STEP_TYPES,
     PATROL_MIN_WAYPOINTS,
     POSE_STEP_TYPES,
+    DemoParams,
+    InspectionId,
     SPEAK_REPEAT_MAX,
     MoveParams,
     PatrolParams,
@@ -33,7 +35,7 @@ def _field(step_type, key):
 
 def test_lists_every_step_an_operator_authors():
     listed = [spec.type for spec in step_catalogue().steps]
-    assert set(listed) == set(StepType) - {StepType.DEMO}
+    assert set(listed) == set(StepType)
     assert len(listed) == len(set(listed))
 
 
@@ -120,3 +122,10 @@ def test_serialises_in_the_shape_the_console_reads():
     assert patrol["params"] == [
         {"kind": "waypoints", "key": "waypoints", "label": "Waypoints", "min_items": 2}
     ]
+
+
+def test_offers_every_inspection_result_a_demo_step_takes():
+    (field,) = _spec(StepType.DEMO).params
+    assert field.kind == "choice"
+    assert field.key in DemoParams.model_fields
+    assert [option.value for option in field.options] == [item.value for item in InspectionId]

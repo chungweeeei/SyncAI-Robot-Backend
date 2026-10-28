@@ -761,10 +761,10 @@ class TestTaskSteps:
         assert res.status_code == 200
         steps = res.json()["steps"]
         assert [step["type"] for step in steps] == [
-            "MOVE", "PATROL", "CHARGE", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
+            "MOVE", "PATROL", "CHARGE", "SPEAK", "WAIT", "STANDUP", "LIEDOWN", "DEMO",
         ]
         assert [step["while_walking"] for step in steps] == [
-            False, False, False, True, False, False, False,
+            False, False, False, True, False, False, False, False,
         ]
         assert steps[0]["params"] == [
             {"kind": "waypoint", "key": "target", "label": "Waypoint", "filter": None}
