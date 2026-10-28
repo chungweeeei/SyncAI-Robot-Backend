@@ -213,7 +213,11 @@ async def run_worker(
     io_worker = Worker(
         client,
         task_queue=io_task_queue(robot_id),
-        activities=[activities.execute_speak, activities.record_task],
+        activities=[
+            activities.execute_speak,
+            activities.record_task,
+            activities.execute_demo,
+        ],
         activity_executor=ThreadPoolExecutor(max_workers=IO_ACTIVITY_SLOTS),
         max_concurrent_activities=IO_ACTIVITY_SLOTS,
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,

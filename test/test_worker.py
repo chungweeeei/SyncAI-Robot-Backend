@@ -136,7 +136,11 @@ def test_body_and_io_activities_poll_separate_queues():
     assert activities.execute_patrol in body["activities"]
     assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
     assert "workflows" not in io
-    assert io["activities"] == [activities.execute_speak, activities.record_task]
+    assert io["activities"] == [
+        activities.execute_speak,
+        activities.record_task,
+        activities.execute_demo,
+    ]
     assert io["max_concurrent_activities"] == worker_mod.IO_ACTIVITY_SLOTS > 1
 
 
