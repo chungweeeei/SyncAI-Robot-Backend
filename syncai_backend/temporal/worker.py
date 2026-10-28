@@ -233,6 +233,7 @@ async def run_worker(
             activities.resolve_template,
             activities.begin_task,
             activities.end_task,
+            activities.execute_demo,
         ],
         activity_executor=ThreadPoolExecutor(max_workers=IO_ACTIVITY_SLOTS),
         max_concurrent_activities=IO_ACTIVITY_SLOTS,

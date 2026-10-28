@@ -157,6 +157,7 @@ def test_body_and_io_activities_poll_separate_queues():
         activities.resolve_template,
         activities.begin_task,
         activities.end_task,
+        activities.execute_demo,
     ]
     # begin_task above all: on the one-slot body queue a schedule firing during
     # another run's MOVE would wait out that MOVE for the robot's answer
