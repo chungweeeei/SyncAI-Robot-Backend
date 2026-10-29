@@ -8,7 +8,7 @@ from fastapi import APIRouter
 from syncai_backend.exceptions import (
     BadRequestError,
 )
-from syncai_backend.helpers.floors import detect_floor_levels, floor_name
+from syncai_backend.helpers.floors import detect_floors, floor_name
 from syncai_backend.repositories.map.catalog import (
     MapFloor,
 )
@@ -37,15 +37,21 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
     _require_exists = ctx.require_exists
 
     def _floor_models(floors: List[MapFloor]) -> List[MapFloorModel]:
-        return [MapFloorModel(name=floor.name, level=floor.level) for floor in floors]
+        return [
+            MapFloorModel(name=floor.name, level=floor.level, low=floor.low, high=floor.high)
+            for floor in floors
+        ]
 
     def _detected_floors(name: str) -> List[MapFloor]:
-        heights = map_catalog_repo.read_pose_heights(name)
-        levels = detect_floor_levels(heights) if heights else []
-        # One level is one storey, which needs no split.
-        if len(levels) < 2:
+        poses = map_catalog_repo.read_poses(name)
+        found = detect_floors(poses) if poses else []
+        # One storey needs no split.
+        if len(found) < 2:
             return []
-        return [MapFloor(name=floor_name(i), level=level) for i, level in enumerate(levels)]
+        return [
+            MapFloor(name=floor_name(i), level=floor.level, low=floor.low, high=floor.high)
+            for i, floor in enumerate(found)
+        ]
 
     @map_router.get("/api/v1/maps/{name}/floors", response_model=MapFloorsResponse)
     def get_map_floors(name: str):
@@ -83,7 +89,18 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
             if not math.isfinite(entry.level):
                 raise BadRequestError(f"Floor '{label}' has no height.")
             names.add(label.casefold())
-            floors.append(MapFloor(name=label, level=float(entry.level)))
+            # A walked range rides along when the console sends one back
+            # (a detected list saved under new names); one that does not
+            # hold the level is no range, and the floor keeps a fixed band.
+            low, high = entry.low, entry.high
+            if (
+                low is None
+                or high is None
+                or not (math.isfinite(low) and math.isfinite(high))
+                or not low <= entry.level <= high
+            ):
+                low = high = None
+            floors.append(MapFloor(name=label, level=float(entry.level), low=low, high=high))
         floors.sort(key=lambda floor: floor.level)
         for lower, upper in zip(floors, floors[1:]):
             if upper.level - lower.level < FLOOR_MIN_SEPARATION_M:

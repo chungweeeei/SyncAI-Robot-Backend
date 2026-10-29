@@ -334,7 +334,8 @@ the only caller that passes anything else.
   only**: applying them to the tree is the robot's `apply_octomap_edits` (which keeps
   `octomap.raw.bt`), and the planner reads the tree at session start. Nothing written
   names the map. `GET/PUT …/floors` splits a multi-storey map for the console:
-  detected from `poses.txt` heights (`helpers/floors.py`) unless `floors.json` is
+  detected from `poses.txt` (`helpers/floors.py`: heights, and only levels walked one
+  over the other split) unless `floors.json` is
   saved; display-only, so not behind the job lock.
 - **`activate` loads the map where the robot plans on it.** The switch is localizer
   (`relocalize`) → Octo3D (`planner_server/Octo3D/load_map`, `MapGateway.reload_octomap`,
