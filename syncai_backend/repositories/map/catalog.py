@@ -14,7 +14,7 @@ import structlog
 
 from syncai_backend.exceptions import BadRequestError, ConflictError, NotFoundError
 from syncai_backend.helpers.disk import walk_stats
-from syncai_backend.helpers.floors import read_pose_heights
+from syncai_backend.helpers.floors import Pose, read_poses
 from syncai_backend.helpers.pgm import write_text_atomic
 from syncai_backend.helpers.system_config import active_map_name, set_active_map
 
@@ -239,10 +239,17 @@ def parse_iso_utc(value: object) -> Optional[datetime]:
 
 @dataclass(frozen=True)
 class MapFloor:
-    """One storey: what it is called and the body height walked on it, metres."""
+    """One storey: what it is called and the body height walked on it, metres.
+
+    ``low`` and ``high`` are the body heights the robot walked on it, lowest
+    and highest, so a floor that is not flat is drawn whole; None for a floor
+    named by hand, which the console draws a fixed band around.
+    """
 
     name: str
     level: float
+    low: Optional[float] = None
+    high: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -480,11 +487,11 @@ class MapCatalogRepo:
         self.logger.info("[MapCatalogRepo] Wrote ground patches", map=name, cells=len(keys))
         return OctomapEdits(res=res, fill_key=tuple(keys), created_at=created_at)
 
-    def read_pose_heights(self, name: str) -> Optional[List[float]]:
-        """The z of every keyframe in the map's ``poses.txt``, or None without one."""
+    def read_poses(self, name: str) -> Optional[List[Pose]]:
+        """The x, y, z of every keyframe in the map's ``poses.txt``, or None without one."""
         path = os.path.join(self.resolve_dir(name), POSES_TXT)
         try:
-            return read_pose_heights(path)
+            return read_poses(path)
         except FileNotFoundError:
             return None
         except (OSError, UnicodeDecodeError) as exc:
@@ -548,10 +555,7 @@ class MapCatalogRepo:
         document = {
             "format": FLOORS_JSON_FORMAT,
             "version": FLOORS_JSON_VERSION,
-            "floors": [
-                {"name": floor.name, "level": round(float(floor.level), 3)}
-                for floor in ordered
-            ],
+            "floors": [_floor_entry(floor) for floor in ordered],
         }
         write_text_atomic(
             os.path.join(self.resolve_dir(name), FLOORS_JSON),
@@ -1048,19 +1052,46 @@ def _parse_octomap_key(entry: object) -> Optional[Tuple[int, int, int]]:
     return (entry[0], entry[1], entry[2])
 
 
+def _floor_entry(floor: MapFloor) -> dict:
+    """One ``floors`` entry; the walked range only when the floor has one."""
+    entry = {"name": floor.name, "level": round(float(floor.level), 3)}
+    if floor.low is not None and floor.high is not None:
+        entry["low"] = round(float(floor.low), 3)
+        entry["high"] = round(float(floor.high), 3)
+    return entry
+
+
+def _finite(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 def _parse_floor(entry: object) -> Optional[MapFloor]:
-    """One ``floors`` entry as a named, finite level, or None."""
+    """One ``floors`` entry as a named, finite level, or None.
+
+    A walked range that is missing or does not hold the level is dropped
+    rather than the floor: the level alone still draws it.
+    """
     if not isinstance(entry, dict):
         return None
     name = entry.get("name")
     level = entry.get("level")
     if not isinstance(name, str) or not name.strip():
         return None
-    if isinstance(level, bool) or not isinstance(level, (int, float)):
+    if not _finite(level):
         return None
-    if not math.isfinite(level):
-        return None
-    return MapFloor(name=name.strip(), level=float(level))
+    low, high = entry.get("low"), entry.get("high")
+    if not (_finite(low) and _finite(high) and low <= level <= high):
+        low = high = None
+    return MapFloor(
+        name=name.strip(),
+        level=float(level),
+        low=None if low is None else float(low),
+        high=None if high is None else float(high),
+    )
 
 
 def init_map_catalog_repo(logger: structlog.stdlib.BoundLogger) -> MapCatalogRepo:

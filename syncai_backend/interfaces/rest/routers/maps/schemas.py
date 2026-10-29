@@ -191,6 +191,17 @@ class MapFloorModel(BaseModel):
             "frame (the z of poses.txt, about half a metre above the ground)."
         ),
     )
+    low: Optional[float] = Field(
+        None,
+        description=(
+            "Lowest body height walked on this floor, metres; with `high`, the "
+            "heights a floor that is not flat (a slope, a ramp) spans. Null "
+            "for a floor named by hand."
+        ),
+    )
+    high: Optional[float] = Field(
+        None, description="Highest body height walked on this floor, metres; see `low`."
+    )
 
 
 class MapFloorsResponse(BaseModel):

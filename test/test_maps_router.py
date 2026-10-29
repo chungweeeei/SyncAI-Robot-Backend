@@ -2777,9 +2777,16 @@ def test_auto_localize_releases_the_lock_after_a_failure(client, map_gw):
 
 
 def _plant_poses(directory, *segments):
+    """``(level, count)`` segments, each walked along the same 20 m of x, so
+    the storeys are one over the other; ``(level, count, x)`` starts a
+    segment's walk at ``x`` instead."""
     lines = []
-    for level, count in segments:
-        lines.extend(f"{len(lines) + i}.pcd 0 0 {level} 1 0 0 0" for i in range(count))
+    for level, count, *at in segments:
+        x0 = at[0] if at else 0
+        lines.extend(
+            f"{len(lines) + i}.pcd {x0 + (i % 100) * 0.2:.1f} 0 {level} 1 0 0 0"
+            for i in range(count)
+        )
     (directory / "poses.txt").write_text("\n".join(lines) + "\n")
 
 
@@ -2790,8 +2797,14 @@ def test_floors_are_detected_from_the_trajectory(client, maps_dir):
 
     assert body == {
         "name": "full",
-        "floors": [{"name": "1F", "level": 0.0}, {"name": "2F", "level": 5.3}],
-        "detected": [{"name": "1F", "level": 0.0}, {"name": "2F", "level": 5.3}],
+        "floors": [
+            {"name": "1F", "level": 0.0, "low": 0.0, "high": 0.0},
+            {"name": "2F", "level": 5.3, "low": 5.3, "high": 5.3},
+        ],
+        "detected": [
+            {"name": "1F", "level": 0.0, "low": 0.0, "high": 0.0},
+            {"name": "2F", "level": 5.3, "low": 5.3, "high": 5.3},
+        ],
         "saved": False,
     }
 
@@ -2800,6 +2813,13 @@ def test_floors_are_empty_for_one_storey_or_no_trajectory(client, maps_dir):
     assert client.get("/api/v1/maps/rawonly/floors").json()["floors"] == []
 
     _plant_poses(maps_dir / "full", (0.0, 400))
+    assert client.get("/api/v1/maps/full/floors").json()["floors"] == []
+
+
+def test_two_heights_walked_in_different_places_are_one_floor(client, maps_dir):
+    # The foot and the top of a long slope: a storey apart, over nothing.
+    _plant_poses(maps_dir / "full", (0.0, 400, 0), (-3.0, 300, 60))
+
     assert client.get("/api/v1/maps/full/floors").json()["floors"] == []
 
 
@@ -2818,8 +2838,8 @@ def test_saved_floors_replace_the_detected_ones(client, maps_dir):
     assert response.status_code == 200
     # Sorted lowest first, names trimmed.
     assert response.json()["floors"] == [
-        {"name": "B1", "level": -0.1},
-        {"name": "Lobby", "level": 5.3},
+        {"name": "B1", "level": -0.1, "low": None, "high": None},
+        {"name": "Lobby", "level": 5.3, "low": None, "high": None},
     ]
     body = client.get("/api/v1/maps/full/floors").json()
     assert body["saved"] is True
@@ -2828,6 +2848,26 @@ def test_saved_floors_replace_the_detected_ones(client, maps_dir):
     document = json.loads((maps_dir / "full" / "floors.json").read_text())
     assert document["format"] == "syncai-map-floors"
     assert document["version"] == 1
+
+
+def test_a_saved_floor_keeps_the_heights_walked_on_it(client, maps_dir):
+    # A detected list saved under new names keeps its ranges; a range that
+    # does not hold its level is dropped, and that floor keeps its level.
+    response = client.put(
+        "/api/v1/maps/full/floors",
+        json={
+            "floors": [
+                {"name": "G", "level": -0.2, "low": -3.0, "high": 0.4},
+                {"name": "Deck", "level": 3.9, "low": 4.0, "high": 4.5},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.get("/api/v1/maps/full/floors").json()["floors"] == [
+        {"name": "G", "level": -0.2, "low": -3.0, "high": 0.4},
+        {"name": "Deck", "level": 3.9, "low": None, "high": None},
+    ]
 
 
 def test_an_empty_save_is_one_floor_and_still_saved(client, maps_dir):
