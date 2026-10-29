@@ -53,7 +53,8 @@ class MapPoint(Base):
 class TaskTemplate(Base):
     """An operator-authored step list, kept so it can be re-dispatched.
 
-    Temporal keeps closed workflows for one day, so saved step lists live here.
+    Temporal keeps closed workflows only for the namespace retention (5 days
+    with the workspace compose), so saved step lists live here.
 
     ``steps`` is a JSON array, not a child table, because:
 

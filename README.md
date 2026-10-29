@@ -688,8 +688,8 @@ REST boundary and stored as a plain string.
 ### Task templates
 
 `POST /api/v1/tasks` creates *and dispatches* and persists nothing, and Temporal
-keeps closed workflows only for the namespace retention (a day on a fresh
-install — see *Task orchestration*), with no archival. `task_templates` is where
+keeps closed workflows only for the namespace retention (5 days with the
+workspace compose — see *Task orchestration*), with no archival. `task_templates` is where
 re-dispatchable step lists live. The prefix is `/api/v1/task_templates`, not
 `/api/v1/tasks/templates`, which would collide with `/api/v1/tasks/{id}` (see
 the include-order note in `server.py`).
@@ -899,14 +899,16 @@ Details that matter when editing this path:
   `WorkflowType` + `TaskQueue` scope as `active_tasks`); rows carry no steps —
   detail is `GET /api/v1/tasks/{id}`, which works on a closed run while a worker
   is polling.
-  - **Bounded by namespace retention.** The auto-setup default is one day, left
-    on purpose until 2026-10, when the history dashboard's time-range filter made
-    a longer window worthwhile. The Temporal container sets it, not this repo. On
-    a running stack (the namespace exists, so an env var does nothing):
-    `docker exec temporal sh -c 'temporal operator namespace update --address $(hostname -i):7233 --namespace default --retention 30d'`
-    — applies to runs closing from then on; closed runs keep their expiry. For a
-    fresh install, `DEFAULT_NAMESPACE_RETENTION` on the workspace compose's
-    `temporal` service. The backend needs no change.
+  - **Bounded by namespace retention: 5 days.** The Temporal container sets it,
+    not this repo: the workspace compose's `temporal` service passes
+    `DEFAULT_NAMESPACE_RETENTION=${TEMPORAL_NAMESPACE_RETENTION:-5d}` (since
+    2026-10-29; auto-setup's own default is one day, too short for the history
+    dashboard's time-range filter). That variable is read only when the
+    namespace is created, so a stack whose namespace already exists keeps its
+    old retention until it is updated by hand:
+    `docker exec temporal sh -c 'temporal operator namespace update --address $(hostname -i):7233 --namespace default --retention 5d'`
+    — applies to runs closing from then on; closed runs keep their expiry. The
+    backend needs no change for another value: nothing here caps `since`.
   - **Provenance is three Keyword search attributes**, `TaskKind`, `TaskName`,
     `TaskMap`, stamped by `start_task` from the request's `kind` / `name` and the
     map loaded at dispatch, and by every schedule's action (`kind = schedule`,
