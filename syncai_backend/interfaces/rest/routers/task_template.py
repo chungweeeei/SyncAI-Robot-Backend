@@ -1,7 +1,8 @@
 """REST surface for the operator's library of re-dispatchable task templates.
 
-``POST /api/v1/tasks`` persists nothing, and Temporal keeps closed workflows for
-one day, so templates are what lets an operator run a step list again.
+``POST /api/v1/tasks`` persists nothing, and Temporal keeps closed workflows only
+for the namespace retention (5 days with the workspace compose), so templates
+are what lets an operator run a step list again.
 
 **Vertex resolution happens on the read.** A MOVE step stores a ``vertex_id``
 and a ``params`` snapshot; every read reports ``resolved_params`` -- the
