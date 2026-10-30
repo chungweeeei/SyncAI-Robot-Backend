@@ -200,8 +200,9 @@ services/                  domain work that outlives a request: mode_restart (th
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), parameters (one
         │                  node's get/set_parameters; controller_server, planner_server), workflow (Temporal),
-        │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
-        │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
+        │                  tts (HTTP → syncai_tts container), internal_api (HTTP → the
+        │                  robot's /internal service, told of a map switch), webrtc (dlopen'd Go worker), recording
+        │                  (supervised `ros2 bag record` child). tts/internal_api/webrtc/recording hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
         │                  mapping — pgo's latched run state, aged out after 5 s),
         │                  PostgreSQL CRUD (map vertices, task_templates, task_record), on-disk catalogues (map/, record/),
@@ -271,7 +272,7 @@ TF frame names are not namespaced.
 ### Configuration
 
 Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
-`TTS_SERVICE_URL`, `SYNCAI_WEBRTC_LIB`, `LOG_LEVEL` (default `info`), `LOG_FORMAT`
+`TTS_SERVICE_URL`, `INTERNAL_API_URL`, `SYNCAI_WEBRTC_LIB`, `LOG_LEVEL` (default `info`), `LOG_FORMAT`
 (`console` / `json`); the WebRTC worker's own `*_RTP_PORT` /
 `STUN_SERVERS` / `TURN_*` are only `setdefault`ed before `InitWorker`), loaded from the cwd `.env` via python-dotenv at import time — see
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
@@ -372,7 +373,9 @@ the only caller that passes anything else.
   saved; display-only, so not behind the job lock.
 - **`activate` loads the map where the robot plans on it.** The switch is localizer
   (`relocalize`) → Octo3D (`planner_server/Octo3D/load_map`, `MapGateway.reload_octomap`,
-  the map's `octomap.bt`) → the INI; 409 `octomap_missing` for a map without a tree,
+  the map's `octomap.bt`) → the INI → the internal service
+  (`POST /internal/maps/{id}/activate`, uuid looked up by name before anything moves,
+  409 `map_not_registered`; its own failure is reported, never undone); 409 `octomap_missing` for a map without a tree,
   `planner_3d_unavailable` for a stack without Octo3D. The Octo3D call blocks until the
   tree is built, and each later failure rolls it back to the previous map's tree (`""`,
   an unload, only when the previous map had none). The map's zones come in with its tree.
