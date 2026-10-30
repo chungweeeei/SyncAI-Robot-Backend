@@ -102,6 +102,35 @@ def logger():
     return structlog.get_logger()
 
 
+class StubInternalApiGateway:
+    """The internal service the map switch tells: knows every map as
+    ``id-<name>`` unless ``maps`` says otherwise; records each activate."""
+
+    def __init__(self):
+        self.maps = None  # None: every name is known
+        self.lookup_error = None
+        self.activate_error = None
+        self.activated = []
+
+    def find_map_id(self, name):
+        if self.lookup_error is not None:
+            return False, self.lookup_error, None
+        if self.maps is not None and name not in self.maps:
+            return True, "", None
+        return True, "", f"id-{name}"
+
+    def activate_map(self, map_id):
+        self.activated.append(map_id)
+        if self.activate_error is not None:
+            return False, self.activate_error, None
+        return True, "", {"id": map_id, "switched": True}
+
+
+@pytest.fixture
+def internal_api_gw():
+    return StubInternalApiGateway()
+
+
 @pytest.fixture
 def engine():
     """An SQLAlchemy engine bound to a shared in-memory SQLite database.
