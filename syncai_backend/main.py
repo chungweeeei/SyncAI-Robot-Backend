@@ -33,6 +33,7 @@ from syncai_backend.gateways.robot.robot import init_robot_gateway
 from syncai_backend.gateways.map.map import init_map_gateway
 from syncai_backend.gateways.workflow.workflow import init_workflow_gateway
 from syncai_backend.gateways.tts.tts import init_tts_gateway
+from syncai_backend.gateways.internal_api.internal_api import init_internal_api_gateway
 from syncai_backend.gateways.webrtc.webrtc import init_webrtc_gateway
 from syncai_backend.gateways.recording.recording import init_recording_gateway
 
@@ -115,6 +116,8 @@ class SyncAIBackend(Node):
         # Speech out, over HTTP to the syncai_tts container. The speaker lock
         # lives in that service now, so this is just a pooled httpx.Client.
         tts_gw = init_tts_gateway(logger=logger)
+        # The robot's internal REST service; told of a map switch once it is done.
+        internal_api_gw = init_internal_api_gateway(logger=logger)
         # WHEP signalling for the camera stream. One instance: the worker's
         # sync.Once InitWorker and the single-viewer slot need a single owner.
         # The dlopen (Go runtime + signal handlers, never unloaded) happens on
@@ -142,11 +145,12 @@ class SyncAIBackend(Node):
         )
 
         # The live map switch: localizer, Octo3D and the INI moved together,
-        # each later failure undoing the earlier ones.
+        # each later failure undoing the earlier ones; then the internal service.
         map_switch_svc = init_map_switch_service(
             logger=logger,
             map_catalog_repo=map_catalog_repo,
             map_gw=map_gw,
+            internal_api_gw=internal_api_gw,
         )
 
         # POST /api/v1/maps/import: the directory and its vertex rows published

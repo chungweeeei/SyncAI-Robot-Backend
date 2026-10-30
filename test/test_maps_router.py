@@ -215,6 +215,7 @@ def client(
     map_repo,
     map_gw,
     workflow_gw,
+    internal_api_gw,
     task_template_repo,
     mapping_status_repo,
     tmp_path,
@@ -244,6 +245,7 @@ def client(
                 logger=logger,
                 map_catalog_repo=catalog_repo,
                 map_gw=map_gw,
+                internal_api_gw=internal_api_gw,
             ),
             map_usage=map_usage,
             job_gate=JobGate(
@@ -1870,6 +1872,62 @@ def test_activate_moves_the_localizer_before_the_3d_planner(
     # A pose measured in rawonly's frame means nothing in full's.
     assert "x: 0.0" in written and "yaw: 0.0" in written
     assert "3.25" not in written
+
+
+def test_activate_tells_the_internal_service_after_the_switch(
+    catalog_repo, client, internal_api_gw, monkeypatch, tmp_path
+):
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 200
+    assert internal_api_gw.activated == ["id-full"]
+
+
+def test_activate_refuses_a_map_the_internal_service_does_not_know(
+    catalog_repo, client, map_gw, internal_api_gw, monkeypatch, tmp_path
+):
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
+    internal_api_gw.maps = {"rawonly"}
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "map_not_registered"
+    assert map_gw.order == []
+    assert internal_api_gw.activated == []
+    assert catalog_repo.active_name() == "rawonly"
+
+
+def test_activate_is_a_502_when_the_internal_service_cannot_be_asked(
+    catalog_repo, client, map_gw, internal_api_gw, monkeypatch, tmp_path
+):
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
+    internal_api_gw.lookup_error = "connection refused"
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 502
+    assert "connection refused" in response.json()["detail"]
+    assert map_gw.order == []
+
+
+def test_activate_keeps_the_switch_when_the_internal_activate_fails(
+    catalog_repo, client, map_gw, internal_api_gw, monkeypatch, tmp_path
+):
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
+    internal_api_gw.activate_error = "the internal service answered 500"
+
+    response = _activate(client, "full")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["switched"] is True
+    assert "internal service was not switched" in body["message"]
+    # Nothing undone: no second localizer or Octo3D call.
+    assert [step for step, _ in map_gw.order] == ["swap_localizer_map", "reload_octomap"]
+    assert catalog_repo.active_name() == "full"
 
 
 def test_activate_rolls_back_both_steps_when_the_ini_cannot_be_written(

@@ -97,7 +97,9 @@ def workflow_gw():
 
 
 @pytest.fixture
-def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
+def client(
+    logger, map_repo, catalog_repo, task_template_repo, workflow_gw, internal_api_gw
+):
     map_gw = _StubMapGateway()
     map_usage = MapUsagePolicy(
         map_catalog_repo=catalog_repo,
@@ -118,6 +120,7 @@ def client(logger, map_repo, catalog_repo, task_template_repo, workflow_gw):
                 logger=logger,
                 map_catalog_repo=catalog_repo,
                 map_gw=map_gw,
+                internal_api_gw=internal_api_gw,
             ),
             map_usage=map_usage,
             job_gate=JobGate(
