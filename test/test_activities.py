@@ -876,16 +876,74 @@ class TestExecuteDemo:
         assert url.endswith("/internal/capture/inspection")
         assert post.call_args.kwargs["json"] == {"description": "門：開啟"}
 
-    def test_an_error_status_is_retryable(self, env, activities):
-        with patch(POST, return_value=httpx.Response(503, text="busy")):
-            with pytest.raises(ApplicationError, match="503") as exc_info:
+    @pytest.mark.parametrize(
+        "status, code, label",
+        [
+            (503, "CAMERA_UNAVAILABLE", "Camera unavailable"),
+            (503, "MEDIA_UNAVAILABLE", "Media store unavailable"),
+            (408, "SYSTEM_REQUEST_TIMEOUT", "Capture timed out"),
+            (422, "SYSTEM_VALIDATION_FAILED", "Capture request rejected"),
+            (404, "RESOURCE_NOT_FOUND", "Capture endpoint not found"),
+            (500, "SYSTEM_INTERNAL_ERROR", "Capture service error"),
+        ],
+    )
+    def test_every_error_code_fails_the_step_at_once(
+        self, env, activities, status, code, label
+    ):
+        body = {"error": {"code": code, "message": "no photo within 3 s"}}
+        with patch(POST, return_value=httpx.Response(status, json=body)):
+            with pytest.raises(ApplicationError) as exc_info:
                 env.run(activities.execute_demo, DemoParams(inspection="light_on"))
 
-        assert exc_info.value.non_retryable is False
+        err = exc_info.value
+        assert err.non_retryable is True
+        assert err.type == code
+        assert str(err) == f"{code}: {label} ({status}): no photo within 3 s"
 
-    def test_an_unreachable_service_is_retryable(self, env, activities):
+    def test_validation_details_are_kept(self, env, activities):
+        body = {
+            "error": {
+                "code": "SYSTEM_VALIDATION_FAILED",
+                "message": "invalid body",
+                "details": [{"field": "description"}],
+            }
+        }
+        with patch(POST, return_value=httpx.Response(422, json=body)):
+            with pytest.raises(ApplicationError, match="description") as exc_info:
+                env.run(activities.execute_demo, DemoParams(inspection="light_on"))
+
+        assert exc_info.value.non_retryable is True
+
+    def test_an_unknown_body_still_fails_with_the_status(self, env, activities):
+        with patch(POST, return_value=httpx.Response(502, text="Bad Gateway")):
+            with pytest.raises(ApplicationError) as exc_info:
+                env.run(activities.execute_demo, DemoParams(inspection="light_on"))
+
+        err = exc_info.value
+        assert err.non_retryable is True
+        assert err.type == "CAPTURE_HTTP_502"
+        assert str(err) == "CAPTURE_HTTP_502: Capture failed (502): Bad Gateway"
+
+    def test_an_unreachable_service_fails_the_step_at_once(self, env, activities):
         with patch(POST, side_effect=httpx.ConnectError("refused")):
-            with pytest.raises(ApplicationError, match="Capture request failed") as exc_info:
+            with pytest.raises(
+                ApplicationError, match="Capture service unreachable"
+            ) as exc_info:
                 env.run(activities.execute_demo, DemoParams(inspection="light_off"))
 
-        assert exc_info.value.non_retryable is False
+        assert exc_info.value.non_retryable is True
+        assert exc_info.value.type == "CAPTURE_UNREACHABLE"
+
+    def test_no_answer_fails_the_step_at_once(self, env, activities):
+        with patch(POST, side_effect=httpx.ReadTimeout("slow")):
+            with pytest.raises(ApplicationError, match="did not answer") as exc_info:
+                env.run(activities.execute_demo, DemoParams(inspection="light_off"))
+
+        assert exc_info.value.non_retryable is True
+
+    def test_the_client_outwaits_the_services_own_timeout(self):
+        from syncai_backend.temporal.activities import DEMO_CAPTURE_TIMEOUT_S
+        from syncai_backend.temporal.workflows import DEMO_START_TO_CLOSE_TIMEOUT
+
+        # The service answers 408 at 30 s; that answer must reach the step.
+        assert 30 < DEMO_CAPTURE_TIMEOUT_S < DEMO_START_TO_CLOSE_TIMEOUT.total_seconds()

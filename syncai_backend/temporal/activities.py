@@ -83,7 +83,51 @@ def _move_failure(status: dict, label: str = "move") -> str:
 DEMO_CAPTURE_URL = os.environ.get(
     "DEMO_CAPTURE_URL", "http://127.0.0.1:8090/internal/capture/inspection"
 )
-DEMO_CAPTURE_TIMEOUT_S = 10.0
+# The service answers 408 SYSTEM_REQUEST_TIMEOUT itself at 30 s; wait past that so
+# its own answer, not ours, is what the step shows.
+DEMO_CAPTURE_TIMEOUT_S = 35.0
+
+# The capture service's error.code values, in the words a step's error_msg shows.
+DEMO_CAPTURE_ERRORS = {
+    "CAMERA_UNAVAILABLE": "Camera unavailable",
+    "MEDIA_UNAVAILABLE": "Media store unavailable",
+    "SYSTEM_REQUEST_TIMEOUT": "Capture timed out",
+    "SYSTEM_VALIDATION_FAILED": "Capture request rejected",
+    "RESOURCE_NOT_FOUND": "Capture endpoint not found",
+    "SYSTEM_INTERNAL_ERROR": "Capture service error",
+}
+
+
+def _capture_failure(response: httpx.Response) -> ApplicationError:
+    """A non-2xx capture answer as a non-retryable failure named by its error.code.
+
+    The body is ``{"error": {"code", "message", "details"?}}``; anything else (a
+    proxy's page, no body) still fails, under ``CAPTURE_HTTP_<status>``.
+    """
+    code = message = None
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        error = None
+    if isinstance(error, dict):
+        code = error.get("code") if isinstance(error.get("code"), str) else None
+        message = error.get("message") if isinstance(error.get("message"), str) else None
+        if error.get("details"):
+            message = f"{message or ''} {error['details']}".strip()
+    if message is None:
+        message = response.text[:200]
+
+    # ApplicationError's str() is "<type>: <message>", which is the step's error_msg,
+    # so the code is said once, as the type.
+    label = DEMO_CAPTURE_ERRORS.get(code, "Capture failed")
+    text = f"{label} ({response.status_code})"
+    if message:
+        text = f"{text}: {message}"
+    return ApplicationError(
+        text,
+        type=code or f"CAPTURE_HTTP_{response.status_code}",
+        non_retryable=True,
+    )
 
 
 class ActivityResult(BaseModel):
@@ -492,8 +536,9 @@ class RobotActivities:
     def execute_demo(self, params: DemoParams) -> ActivityResult:
         """Report an inspection result to the capture service (demo branch only).
 
-        One POST, no heartbeat. Any failure is retryable, bounded by the run's
-        maximum_attempts.
+        One POST, no heartbeat. Every failure is non-retryable: the step fails at
+        once with the service's error.code in its error_msg, and a retry could
+        capture twice when only the answer was lost.
         """
         description = INSPECTION_DESCRIPTIONS[params.inspection]
         try:
@@ -502,14 +547,21 @@ class RobotActivities:
                 json={"description": description},
                 timeout=DEMO_CAPTURE_TIMEOUT_S,
             )
+        except httpx.TimeoutException as err:
+            raise ApplicationError(
+                f"Capture service did not answer within {DEMO_CAPTURE_TIMEOUT_S:g} s",
+                type="CAPTURE_UNREACHABLE",
+                non_retryable=True,
+            ) from err
         except httpx.HTTPError as err:
-            raise ApplicationError(f"Capture request failed: {err!r}") from err
+            raise ApplicationError(
+                f"Capture service unreachable: {err}",
+                type="CAPTURE_UNREACHABLE",
+                non_retryable=True,
+            ) from err
 
         if not response.is_success:
-            raise ApplicationError(
-                f"Capture service answered {response.status_code}: "
-                f"{response.text[:200]}"
-            )
+            raise _capture_failure(response)
 
         self._logger.info(
             "[RobotActivity] Inspection reported",

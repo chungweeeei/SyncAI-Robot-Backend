@@ -52,8 +52,9 @@ ACTIVITY_MAP = {
     StepType.DEMO: RobotActivities.execute_demo,
 }
 
-# DEMO (demo branch only): one POST, so no heartbeat and a short ceiling.
-DEMO_START_TO_CLOSE_TIMEOUT = timedelta(seconds=30)
+# DEMO (demo branch only): one POST, so no heartbeat and a short ceiling, past the
+# activity's own DEMO_CAPTURE_TIMEOUT_S so its error_msg is the one a step shows.
+DEMO_START_TO_CLOSE_TIMEOUT = timedelta(seconds=45)
 
 
 def _blocks(steps: list[Step]) -> list[list[Step]]:
