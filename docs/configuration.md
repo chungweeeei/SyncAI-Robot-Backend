@@ -10,6 +10,7 @@
 | `POSTGRES_USER` | `syncrobotic` | ditto |
 | `POSTGRES_PASSWORD` | `syncrobotic` | ditto |
 | `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads, e.g. `[map]`) |
+| `INTERNAL_API_URL` | `http://127.0.0.1:8090` | `gateways/internal_api` — the robot's internal REST service (`/internal/maps`), told of every map switch |
 | `TTS_SERVICE_URL` | `http://syncai_tts:8080` | `gateways/tts` — the syncai_tts container by compose service name; `http://127.0.0.1:8080` with the backend on the host (the compose service uses `http://127.0.0.1:9090`, the port syncai_tts publishes) |
 | `LOG_LEVEL` | `info` | `logger.py`. Any stdlib level name; an unknown one logs a warning and keeps `info`. It was unfiltered (`NOTSET`) until 2026-10 |
 | `LOG_FORMAT` | `console` | `logger.py`. `json` for one object per line (ISO UTC timestamps, tracebacks as text) for a log collector; `console` is the coloured human one |
