@@ -20,8 +20,13 @@ Order and why:
    nothing.
 2. Octo3D (`planner_server/Octo3D/load_map`), the map every goal plans on.
    Its tree takes seconds to build, so it goes after the cheap refusal.
-3. `[map] name` in the INI last, preflighted for writability in ``plan``,
+3. `[map] name` in the INI, preflighted for writability in ``plan``,
    since an unrecorded swap would leave REST naming the wrong map.
+4. The internal service (``POST /internal/maps/{id}/activate``), told once
+   the switch is recorded. Not a step of the saga: its failure undoes
+   nothing and is only reported. The uuid it knows the map by is looked up
+   (``GET /internal/maps``) before anything moves, so a map it has no record
+   of is refused up front.
 
 Compensations run in the order the steps were done, not reversed, and each
 returns the sentence the operator reads; they are run as statements before
@@ -41,6 +46,7 @@ from typing import Callable, List, Optional
 import structlog
 
 from syncai_backend.exceptions import ConflictError, UpstreamError
+from syncai_backend.gateways.internal_api.internal_api import InternalApiGateway
 from syncai_backend.gateways.map.map import MapGateway
 from syncai_backend.helpers.system_config import system_ini_path
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
@@ -76,10 +82,12 @@ class MapSwitchService:
         logger: structlog.stdlib.BoundLogger,
         map_catalog_repo: MapCatalogRepo,
         map_gw: MapGateway,
+        internal_api_gw: InternalApiGateway,
     ):
         self._logger = logger
         self._catalog = map_catalog_repo
         self._map_gw = map_gw
+        self._internal_api_gw = internal_api_gw
 
     # --- Preflight ---------------------------------------------------------
 
@@ -151,6 +159,21 @@ class MapSwitchService:
                 code="planner_3d_unavailable",
             )
 
+        # The uuid the internal service will be told, asked before anything
+        # moves: a map it has no record of could not be activated there.
+        asked, detail, map_id = self._internal_api_gw.find_map_id(name)
+        if not asked:
+            raise UpstreamError(
+                f"Could not look '{name}' up in the internal service: {detail}. "
+                f"Nothing was changed; the robot is still on '{previous}'."
+            )
+        if map_id is None:
+            raise ConflictError(
+                f"The internal service has no map named '{name}', so the switch "
+                "could not be recorded there. Nothing was changed.",
+                code="map_not_registered",
+            )
+
         # What has been done, as the undo for each step, in the order done.
         done: List[_Undo] = []
 
@@ -193,6 +216,17 @@ class MapSwitchService:
         count = len(self._catalog.read_keepout_zones(name))
         localized = map_gw.localization_converged()
 
+        # Last, and outside the saga: the robot already runs on the new map,
+        # so a refusal here is reported, not undone.
+        activated, activate_detail, _ = self._internal_api_gw.activate_map(map_id)
+        if not activated:
+            self._logger.warning(
+                "The internal service did not take the map switch",
+                map=name,
+                map_id=map_id,
+                error=activate_detail,
+            )
+
         self._logger.info(
             "Switched the active map",
             map=name,
@@ -213,6 +247,11 @@ class MapSwitchService:
             message += " yet." if localized is False else " and could not be asked."
         if count:
             message += f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
+        if not activated:
+            message += (
+                f" The internal service was not switched ({activate_detail}); "
+                "it still names the previous map."
+            )
         return SwitchOutcome(
             name=name,
             previous=previous,
@@ -290,9 +329,11 @@ def init_map_switch_service(
     logger: structlog.stdlib.BoundLogger,
     map_catalog_repo: MapCatalogRepo,
     map_gw: MapGateway,
+    internal_api_gw: InternalApiGateway,
 ) -> MapSwitchService:
     return MapSwitchService(
         logger=logger,
         map_catalog_repo=map_catalog_repo,
         map_gw=map_gw,
+        internal_api_gw=internal_api_gw,
     )
