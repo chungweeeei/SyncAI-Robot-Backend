@@ -81,7 +81,9 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  live map switch's steps and their undos); dock_state (the last
         │                  DOCK's pose, for the auto-undock); map_usage (whether a map may
         │                  be edited, destroyed, switched to or driven on); map_import (an
-        │                  archive's directory and vertex rows, published together)
+        │                  archive's directory and vertex rows, published together);
+        │                  task_record_retention (task_record's daily partitions: made
+        │                  ahead, dropped after 30 days)
         │
 gateways/                  outbound: ROS (robot, map), Temporal (workflow), speech (tts: HTTP
         │                  to the syncai_tts container), camera/speaker (webrtc: a dlopen'd Go
@@ -479,12 +481,13 @@ Interactive docs: `http://<robot>:3000/docs`.
 |---|---|---|
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
 | POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / DOCK is checked against the loaded map — 409 `map_mismatch`, see *A job's map is checked twice*; stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time |
-| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), empty otherwise. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
+| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), empty otherwise — plus `started_at` / `ended_at` (UTC, `null` until then and for runs older than the fields) and `paused_seconds` (a hold while the step was under way; the step's own time is `ended_at − started_at − paused_seconds`). A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
 | DELETE | `/api/v1/tasks/{id}` | Request cancellation; answers `CANCELING` — the final state (possibly still `COMPLETED`) comes from GET |
 | POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` / `DOCK` / `UNDOCK` is interrupted at once and re-sent on resume, a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see *Task orchestration*. 409 `task_not_running` once closed; 404 for another robot's id |
 | GET | `/api/v1/active_tasks` | What runs on this robot's queue now, *whoever* started it, with `source` / `schedule_id` / `kind` / `name` / `map_name` (the run's `TaskMap`; for a run older than the attribute, the loaded map unless it is a stand / lie down; `null` for a run that drives nowhere). A held run is still listed as `IN_PROGRESS`. Not `/tasks/active`, which would shadow `/tasks/{id}` |
 | GET | `/api/v1/task_history` | **Finished** runs, newest close first, one visibility page per call. Query: `page_size` (1–100, default 20), `page_token` (previous `next_page_token`), `status` (`COMPLETED` / `FAILED` / `CANCELED`), `since` / `until` (close time; naive is UTC; `until` before `since` is 400), `kind` (`goal` / `standup` / `liedown` / `task` / `schedule`), `name` (exact template name). `kind` / `name` / `map_name` are `null` for runs dispatched without them or predating the attribute — no fallback. Bounded by namespace retention |
 | GET | `/api/v1/task_history/stats` | The same runs counted: `total`, `by_status`, `success_rate` (`COMPLETED` / `total`, `null` when nothing finished). Same filters as `task_history`; one count RPC |
+| GET | `/api/v1/task_history/export` | The report: every finished run in the filter as CSV (UTF-8 with BOM, for Excel), **one row per step**, oldest close first. Same filters as `task_history` (no paging) plus `tz` (IANA, e.g. `Asia/Taipei`; times are written in it, UTC when omitted; 400 for an unknown one). Read from PostgreSQL's `task_record`, not Temporal, so it reaches back 30 days — see *The run record* |
 | GET | `/api/v1/task_steps` | The steps an operator builds a job from, for a client to draw its editor with: each step's `type`, operator `label` and `hint`, `occupies_body` (`BODY_STEP_TYPES`: a group takes at most one), `while_walking` (offered on the walk to a stop: SPEAK alone — a WAIT in a MOVE's group only stretches the walk) and `params`, a list of fields of four kinds — `waypoint` (a pose on the job's map, spread into `x` / `y` / `theta` / `z` and the template's `vertex_id` on the wire; `filter: "charger"` on a DOCK), `text`, `integer`, `number` — whose limits are read off `SpeakParams` / `WaitParams`, so they cannot drift from the validators. UNDOCK is not listed: a MOVE backs off the dock by itself. No gateway behind it (`tasks/catalogue.py`). Not `/tasks/steps`, for the reason `active_tasks` gives |
 | POST | `/api/v1/schedules` | Create a schedule (cron **or** interval). A cron with its own `#`, a `CRON_TZ=`/`TZ=` prefix (use `timezone`) or `@every` (use `interval_seconds`) is 400 — see *Task orchestration* |
 | GET | `/api/v1/schedules` | List with next run times. This robot's only, filtered by the server on the schedule's `RobotId` (see *Provenance* under task history) |
@@ -717,6 +720,42 @@ the include-order note in `server.py`).
 - **Cross-field rules answer 400 with a sentence**, not 422 with a validation
   array: the array is unreadable to an operator, and a `PUT` may conflict with
   the *stored* row, which no request-schema validator can see.
+
+### The run record (`task_record`)
+
+Temporal forgets a closed run after the namespace retention (5 days), too short for
+a soak test's report. So every run, as it closes, also leaves one row in
+PostgreSQL's `task_record` (`TaskRecordRow`): task id, run id, status
+(`COMPLETED` / `FAILED` / `CANCELED`), start / close time, `kind` / `name` /
+`map_name` / `schedule_id`, and `steps` — every `Step` as it ended, timing
+included (JSON, so only ever add optional keys). `GET /api/v1/task_history/export`
+reads it.
+
+- **Written by the run itself**: `RobotWorkflow.run` ends with the `record_task`
+  activity (IO queue, behind the `task-record` patch) on every way out —
+  completed, failed, or cancelled (the run's cancel is consumed by the time it
+  gets there, so the activity is not cancelled with it). Its insert is
+  `ON CONFLICT DO NOTHING` on `(run_id, closed_at)`, and `closed_at` is
+  `workflow.now()`, so a retry is a no-op. Failing three times is logged by the
+  workflow and dropped: the record never changes how the run ends.
+- **Not recorded**: a run *terminated* (or timed out) server-side runs no code;
+  runs that closed before the table existed.
+- **Partitioned by UTC day** on `closed_at` (`PARTITION BY RANGE`, created by
+  `create_all` from the model's `postgresql_partition_by`; SQLite in the tests
+  gets a plain table). Partitions are `task_record_pYYYYMMDD`; an insert creates
+  its own if it is missing.
+- **30 days, enforced by a routine** (`services/task_record_retention.py`): a
+  daemon thread, every 30 minutes and once at start-up, creates today's and the
+  next 3 days' partitions, then `DETACH`es and `DROP`s every partition older than
+  today and the 29 days before it. A whole day goes at once, so the table never
+  bloats the way a `DELETE` would. A thread rather than a Temporal schedule:
+  PostgreSQL is a hard dependency, Temporal a soft one. Constants in
+  `tasks/config.py` (`TASK_RECORD_*`).
+- **Step timing** is set by the workflow on `workflow.now()` (no new commands,
+  so no patch): `started_at` once the step is past the hold that may precede it,
+  `ended_at` in every terminal branch (`_end`), and `paused_seconds` summed by
+  `_hold` only while `started_at` is set — a hold before a step starts belongs
+  to no step. The export's `step_active_s` is wall time less that.
 
 ## Task orchestration (Temporal)
 

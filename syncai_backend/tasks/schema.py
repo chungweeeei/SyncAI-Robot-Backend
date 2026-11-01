@@ -256,6 +256,24 @@ class Step(BaseSchema):
         default=None,
         description=GROUP_DESCRIPTION,
     )
+    # Timing, set by RobotWorkflow on workflow.now(), never by a caller (StepRequest
+    # has none of them). Optional keys, so a step stored or frozen before them reads
+    # as never run.
+    started_at: Optional[datetime] = Field(
+        default=None,
+        description="When the step started (UTC); null until it has",
+    )
+    ended_at: Optional[datetime] = Field(
+        default=None,
+        description="When the step ended, however it ended (UTC); null until it has",
+    )
+    paused_seconds: float = Field(
+        default=0.0,
+        description=(
+            "How long the run was held while this step was under way, in seconds; "
+            "a hold before the step started is not counted"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_params(self) -> "Step":
@@ -326,6 +344,27 @@ class TaskProvenance(BaseSchema):
     # Stamped as ``TaskMap``: the map loaded at dispatch, set by the task router,
     # never taken from the caller. None for a run with no MOVE.
     map_name: Optional[str] = Field(default=None)
+
+
+class TaskRecord(BaseSchema):
+    """What a finished run leaves in the ``task_record`` table, for the report export.
+
+    Sent by RobotWorkflow to the ``record_task`` activity as the run closes, so it
+    outlives Temporal's retention. ``closed_at`` is the workflow's clock, the same on
+    every attempt, which is what makes a retried insert a no-op.
+    """
+
+    task_id: str
+    run_id: str
+    # COMPLETED / FAILED / CANCELED, as the history reports them.
+    status: str
+    started_at: datetime
+    closed_at: datetime
+    kind: Optional[TaskKind] = None
+    name: Optional[str] = None
+    map_name: Optional[str] = None
+    schedule_id: Optional[str] = None
+    steps: List[Step]
 
 
 # Kinds that never drive, so hold no map; only for runs predating ``TaskMap``.

@@ -134,7 +134,7 @@ def test_body_and_io_activities_poll_separate_queues():
     assert activities.execute_undock in body["activities"]
     assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
     assert "workflows" not in io
-    assert io["activities"] == [activities.execute_speak]
+    assert io["activities"] == [activities.execute_speak, activities.record_task]
     assert io["max_concurrent_activities"] == worker_mod.IO_ACTIVITY_SLOTS > 1
 
 
@@ -174,6 +174,7 @@ def test_worker_run_dying_marks_dead():
         map_usage=MagicMock(),
         robot_repo=MagicMock(),
         dock_state=MagicMock(),
+        task_record_repo=MagicMock(),
     )
     handle.thread.join(timeout=10)
 
@@ -203,6 +204,7 @@ def test_health_projects_worker_state():
             map_cloud_repo=MagicMock(),
             telemetry_repo=MagicMock(),
             task_template_repo=MagicMock(),
+            task_record_repo=MagicMock(),
             worker_handle=handle,
             tts_gw=MagicMock(),
             webrtc_gw=MagicMock(),
@@ -278,6 +280,7 @@ def _start(monkeypatch):
         map_usage=MagicMock(),
         robot_repo=MagicMock(),
         dock_state=MagicMock(),
+        task_record_repo=MagicMock(),
     )
 
 
@@ -316,6 +319,7 @@ def test_request_shutdown_after_the_worker_died_answers_at_once():
         map_usage=MagicMock(),
         robot_repo=MagicMock(),
         dock_state=MagicMock(),
+        task_record_repo=MagicMock(),
     )
     handle.thread.join(timeout=10)
 
@@ -338,6 +342,7 @@ def test_request_shutdown_reports_a_worker_that_will_not_stop(monkeypatch):
         map_usage=MagicMock(),
         robot_repo=MagicMock(),
         dock_state=MagicMock(),
+        task_record_repo=MagicMock(),
     )
 
     # False, not a hang: main.py shuts down anyway and says so.

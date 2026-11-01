@@ -182,15 +182,17 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  the undo for each), dock_state (the last DOCK's pose), map_usage
         │                  (every "may this map change / be driven on" refusal: MapUsagePolicy
         │                  from disk, safe in the worker; JobGate asks Temporal, loop only),
-        │                  map_import (the archive import's publish + vertex transaction + undo)
+        │                  map_import (the archive import's publish + vertex transaction + undo),
+        │                  task_record_retention (a daemon thread: task_record's day
+        │                  partitions made ahead, DETACH + DROP past 30 days, every 30 min)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
         │                  mapping — pgo's latched run state, aged out after 5 s),
-        │                  PostgreSQL CRUD (map vertices, task_templates), on-disk catalogues (map/, record/)
-database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate); session.py
+        │                  PostgreSQL CRUD (map vertices, task_templates, task_record), on-disk catalogues (map/, record/)
+database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate, TaskRecordRow); session.py
                            is the one session factory + log-and-reraise every repo uses
 
 tasks/                     the task model and its Temporal contract (schema: Step, groups,
@@ -276,6 +278,17 @@ the only caller that passes anything else.
   grow it into one, and do not delete it while a robot may still carry a table from
   before the column (every waypoint read would fail).
 - JSON columns are not mutation-tracked: assign a fresh list, never mutate in place.
+- **`task_record`** (`TaskRecordRow`) is every finished run, kept past Temporal's 5-day
+  retention for `GET /api/v1/task_history/export` (CSV, one row per step). Written by
+  the run itself: `RobotWorkflow.run` ends with the `record_task` activity (IO queue,
+  `task-record` patch) however it ends, and a failure there never changes the run's
+  outcome. **Range-partitioned by UTC day** on `closed_at` via the model's
+  `postgresql_partition_by` (SQLite gets a plain table); the PK is `(run_id,
+  closed_at)` because PostgreSQL requires the partition key in it, and makes the
+  insert's `ON CONFLICT DO NOTHING` idempotent. The partitions are not in the
+  metadata: `TaskRecordRepo` creates them, and `TaskRecordRetention` drops whole days
+  past 30 — never `DELETE` from it. Step timing (`Step.started_at` / `ended_at` /
+  `paused_seconds`) is set in the workflow on `workflow.now()`.
 - `Base.metadata` is shared: adding a model changes what every `init_*_repo`'s
   `create_all` does.
 - REST says **vertex** (`VertexType`), ORM/repo say `MapPoint` (table `map_vertices`).

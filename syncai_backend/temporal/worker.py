@@ -23,6 +23,7 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.map_usage import MapUsagePolicy
 
@@ -39,8 +40,9 @@ RETRY_INTERVAL = 5
 # MOVE_HEARTBEAT_TIMEOUT (pinned in test_activities.py).
 HEARTBEAT_THROTTLE_MAX = timedelta(milliseconds=500)
 
-# Concurrent IO activities (SPEAK): more than one so a second run's SPEAK does not tick
-# its start_to_close behind the first; few, as each holds an HTTP request open.
+# Concurrent IO activities (SPEAK, record_task): more than one so a second run's SPEAK
+# does not tick its start_to_close behind the first; few, as each holds an HTTP request
+# (or a database connection) open.
 IO_ACTIVITY_SLOTS = 4
 
 # How long main.py gives the worker to stop on SIGTERM / SIGINT / SIGHUP. The
@@ -204,12 +206,13 @@ async def run_worker(
         max_concurrent_activities=1,
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
     )
-    # SPEAK on its own queue so a run can speak while its MOVE holds the body slot.
-    # Executor and cap equal for the same reason as above.
+    # SPEAK on its own queue so a run can speak while its MOVE holds the body slot;
+    # record_task beside it, as it only talks to the database. Executor and cap equal
+    # for the same reason as above.
     io_worker = Worker(
         client,
         task_queue=io_task_queue(robot_id),
-        activities=[activities.execute_speak],
+        activities=[activities.execute_speak, activities.record_task],
         activity_executor=ThreadPoolExecutor(max_workers=IO_ACTIVITY_SLOTS),
         max_concurrent_activities=IO_ACTIVITY_SLOTS,
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
@@ -243,6 +246,7 @@ def start_temporal_worker(
     map_usage: MapUsagePolicy,
     robot_repo: RobotRepo,
     dock_state: DockStateService,
+    task_record_repo: TaskRecordRepo,
 ) -> TemporalWorkerHandle:
 
     ready = threading.Event()
@@ -260,6 +264,7 @@ def start_temporal_worker(
                 map_usage=map_usage,
                 robot_repo=robot_repo,
                 dock_state=dock_state,
+                task_record_repo=task_record_repo,
             )
             asyncio.run(
                 run_worker(

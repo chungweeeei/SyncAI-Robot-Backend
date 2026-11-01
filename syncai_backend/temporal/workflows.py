@@ -19,10 +19,17 @@ with workflow.unsafe.imports_passed_through():
         Step,
         StepStatus,
         StepType,
+        TaskKind,
+        TaskRecord,
         WaitParams,
         WorkflowTask,
     )
-    from syncai_backend.tasks.search_attributes import TASK_MAP_KEY
+    from syncai_backend.tasks.search_attributes import (
+        SCHEDULED_BY_KEY,
+        TASK_KIND_KEY,
+        TASK_MAP_KEY,
+        TASK_NAME_KEY,
+    )
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
 
 
@@ -41,6 +48,14 @@ SPEAK_ON_IO_QUEUE_PATCH = "speak-on-io-queue"
 # Group members used to be scheduled all at once; now in list order (_run_group).
 # Patched so older runs replay.
 GROUP_START_IN_ORDER_PATCH = "group-start-in-order"
+
+# Every run writes a task_record row as it closes (record_task); patched so runs from
+# before it replay.
+TASK_RECORD_PATCH = "task-record"
+
+# record_task is one insert. Bounded from scheduling, not only from start: with no IO
+# worker polling it would otherwise hold the run open, and the report is not worth that.
+RECORD_TASK_TIMEOUT = timedelta(minutes=2)
 
 ACTIVITY_MAP = {
     StepType.MOVE: RobotActivities.execute_move,
@@ -67,16 +82,53 @@ def _ended_badly(task: asyncio.Future) -> bool:
     return task.done() and (task.cancelled() or task.exception() is not None)
 
 
+def _is_cancel(err: BaseException) -> bool:
+    """Whether ``err`` is the run's cancel, in either shape it reaches ``run`` in.
+
+    A MOVE or WAIT re-raises asyncio.CancelledError; a posture or SPEAK hands back
+    the activity's ActivityError(cause=CancelledError) (see _run_step).
+    """
+    return isinstance(err, asyncio.CancelledError) or (
+        isinstance(err, ActivityError) and isinstance(err.cause, CancelledError)
+    )
+
+
+def _end(step: Step, status: StepStatus, error_msg: str | None = None) -> None:
+    """Close ``step`` as ``status``, stamping when it ended."""
+    step.status = status
+    if error_msg is not None:
+        step.error_msg = error_msg
+    step.ended_at = workflow.now()
+
+
+def _attribute(key):
+    """One of this run's own search attributes, or None. Never fatal."""
+    try:
+        return workflow.info().typed_search_attributes.get(key) or None
+    except Exception:
+        return None
+
+
 def _own_map() -> str | None:
     """The map this run's coordinates are in, off its own ``TaskMap``.
 
     Not from the argument: a scheduled run's argument was frozen at registration
     and carries no map. A run without the attribute skips the map check.
     """
+    return _attribute(TASK_MAP_KEY)
+
+
+def _own_kind() -> TaskKind | None:
+    """How this run was started; a scheduled run without ``TaskKind`` is SCHEDULE,
+    as the history reads it (WorkflowGateway's _provenance_of)."""
+    raw_kind = _attribute(TASK_KIND_KEY)
     try:
-        return workflow.info().typed_search_attributes.get(TASK_MAP_KEY) or None
-    except Exception:
-        return None
+        kind = TaskKind(raw_kind) if raw_kind else None
+    except ValueError:
+        kind = None
+    if kind is None and _attribute(SCHEDULED_BY_KEY):
+        kind = TaskKind.SCHEDULE
+    return kind
 
 
 @workflow.defn
@@ -137,7 +189,14 @@ class RobotWorkflow:
         if not self._pause_requested:
             return
         step.status = StepStatus.PAUSED
-        await workflow.wait_condition(lambda: not self._pause_requested)
+        held_from = workflow.now()
+        try:
+            await workflow.wait_condition(lambda: not self._pause_requested)
+        finally:
+            # Only a hold the step was under way for is its own; one before it
+            # started is the run's, not this step's.
+            if step.started_at is not None:
+                step.paused_seconds += (workflow.now() - held_from).total_seconds()
         step.status = StepStatus.IN_PROGRESS
 
     @workflow.run
@@ -145,12 +204,59 @@ class RobotWorkflow:
         self._steps = task.definition.steps
         own_map = _own_map()
 
-        # A lone step is awaited directly, so pre-group histories replay unchanged.
-        for block in _blocks(self._steps):
-            if len(block) == 1:
-                await self._run_step(block[0], own_map)
-            else:
-                await self._run_group(block, own_map)
+        # Not BaseException: the SDK evicts a cached run by raising one through it,
+        # and that must not schedule anything.
+        try:
+            # A lone step is awaited directly, so pre-group histories replay unchanged.
+            for block in _blocks(self._steps):
+                if len(block) == 1:
+                    await self._run_step(block[0], own_map)
+                else:
+                    await self._run_group(block, own_map)
+        except (asyncio.CancelledError, Exception) as err:
+            await self._record("CANCELED" if _is_cancel(err) else "FAILED", own_map)
+            raise
+        await self._record("COMPLETED", own_map)
+
+    async def _record(self, status: str, own_map: str | None) -> None:
+        """Leave the run's ``task_record`` row (the report export's source).
+
+        On the IO queue: one insert, nothing to do with the body. Runs after a
+        cancel too: the run's cancel has been consumed by the time it arrives here,
+        so this activity is not cancelled with it. Never changes how the run ends:
+        a failure is logged and dropped.
+        """
+        if not workflow.patched(TASK_RECORD_PATCH):
+            return
+        info = workflow.info()
+        record = TaskRecord(
+            task_id=info.workflow_id,
+            run_id=info.run_id,
+            status=status,
+            started_at=info.start_time,
+            closed_at=workflow.now(),
+            kind=_own_kind(),
+            name=_attribute(TASK_NAME_KEY),
+            map_name=own_map,
+            schedule_id=_attribute(SCHEDULED_BY_KEY),
+            steps=self._steps,
+        )
+        try:
+            await workflow.execute_activity(
+                RobotActivities.record_task,
+                record,
+                task_queue=io_task_queue_for(info.task_queue),
+                schedule_to_close_timeout=RECORD_TASK_TIMEOUT,
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=5),
+                    maximum_attempts=3,
+                ),
+            )
+        except ActivityError as err:
+            workflow.logger.warning(
+                "Could not record the run; it is missing from the report export: %s",
+                err.cause or err,
+            )
 
     async def _run_group(self, steps: list[Step], own_map: str | None) -> None:
         """Run ``steps`` side by side and return when all have finished.
@@ -216,8 +322,7 @@ class RobotWorkflow:
         # WAIT is a workflow timer (_run_wait), not an activity.
         activity_fn = ACTIVITY_MAP.get(step.type)
         if activity_fn is None and step.type is not StepType.WAIT:
-            step.status = StepStatus.FAILED
-            step.error_msg = f"Unknown step type: {step.type}"
+            _end(step, StepStatus.FAILED, f"Unknown step type: {step.type}")
             raise ApplicationError(
                 f"Unknown step type: {step.type}", non_retryable=True
             )
@@ -274,11 +379,11 @@ class RobotWorkflow:
         try:
             await self._hold(step)
         except asyncio.CancelledError:
-            step.status = StepStatus.CANCELED
-            step.error_msg = "Task canceled"
+            _end(step, StepStatus.CANCELED, "Task canceled")
             raise
 
         step.status = StepStatus.IN_PROGRESS
+        step.started_at = workflow.now()
         try:
             if step.type is StepType.WAIT:
                 await self._run_wait(step, step.params)
@@ -292,27 +397,23 @@ class RobotWorkflow:
                     activity_options["activity_id"] = new_activity_id()
                 result = await workflow.execute_activity(activity_fn, **activity_options)
         except asyncio.CancelledError:
-            step.status = StepStatus.CANCELED
-            step.error_msg = "Task canceled"
+            _end(step, StepStatus.CANCELED, "Task canceled")
             raise
         except ActivityError as err:
             if isinstance(err.cause, CancelledError):
                 # A run cancel arriving through execute_activity, which hands back
                 # the activity's resolution instead of the run's CancelledError.
                 # Only a cancel has this cause (timeouts are TimeoutError).
-                step.status = StepStatus.CANCELED
-                step.error_msg = "Task canceled"
+                _end(step, StepStatus.CANCELED, "Task canceled")
                 raise
-            step.status = StepStatus.FAILED
-            step.error_msg = str(err.cause or err)
+            _end(step, StepStatus.FAILED, str(err.cause or err))
             raise
 
         if result is not None and not result.success:
-            step.status = StepStatus.FAILED
-            step.error_msg = "activity failed"
+            _end(step, StepStatus.FAILED, "activity failed")
             raise ApplicationError("activity failed", non_retryable=True)
 
-        step.status = StepStatus.COMPLETED
+        _end(step, StepStatus.COMPLETED)
 
     async def _run_move(
         self, step: Step, activity_fn, activity_options: dict, new_activity_id=None

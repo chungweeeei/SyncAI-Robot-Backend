@@ -154,6 +154,15 @@ def task_template_repo(logger, engine):
 
 
 @pytest.fixture
+def task_record_repo(logger, engine):
+    """A TaskRecordRepo on the in-memory SQLite engine: no partitions, and the
+    retention is a DELETE (see TaskRecordRepo)."""
+    from syncai_backend.repositories.task.task_record import init_task_record_repo
+
+    return init_task_record_repo(logger=logger, engine=engine)
+
+
+@pytest.fixture
 def make_pgm():
     """Factory writing a binary PGM, with hooks for the malformed cases.
 

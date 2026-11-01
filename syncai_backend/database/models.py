@@ -97,3 +97,43 @@ class TaskTemplate(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
+
+
+class TaskRecordRow(Base):
+    """One finished run, as RobotWorkflow left it: the source of the report export.
+
+    Temporal forgets a closed run after the namespace retention (5 days); a soak test
+    runs longer than that, so each run writes its row here as it closes
+    (``record_task``). Pydantic's ``TaskRecord`` (tasks/schema.py) is the shape sent;
+    this is the row.
+
+    **Range-partitioned by day** on ``closed_at`` (UTC) on PostgreSQL, so a day ages
+    out as one ``DETACH`` + ``DROP`` instead of a ``DELETE`` that bloats the table
+    (TaskRecordRetention keeps 30 days). The partitions themselves are not in the
+    metadata: TaskRecordRepo creates them. SQLite (the tests) ignores the dialect
+    kwarg and gets a plain table.
+
+    The primary key carries ``closed_at`` because PostgreSQL requires every unique
+    constraint of a partitioned table to contain the partition key; ``run_id`` alone
+    is what identifies the run. ``steps`` holds ``Step`` dumps, timing included;
+    like ``TaskTemplate.steps``, only ever add optional keys to it.
+    """
+
+    __tablename__ = "task_record"
+    __table_args__ = {"postgresql_partition_by": "RANGE (closed_at)"}
+
+    run_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    closed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True, index=True
+    )
+    task_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # COMPLETED / FAILED / CANCELED.
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    map_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    schedule_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    steps: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=False
+    )

@@ -24,7 +24,6 @@ from temporalio.client import (
 )
 from temporalio.api.common.v1 import Payload
 from temporalio.common import (
-    SearchAttributeKey,
     SearchAttributePair,
     TypedSearchAttributes,
 )
@@ -55,6 +54,7 @@ from syncai_backend.tasks.schema import (
 )
 from syncai_backend.tasks.search_attributes import (
     ROBOT_ID_KEY,
+    SCHEDULED_BY_KEY,
     TASK_KIND_KEY,
     TASK_MAP_KEY,
     TASK_NAME_KEY,
@@ -86,14 +86,6 @@ _WORKFLOW_STATUS_MAP = {
     WorkflowExecutionStatus.CANCELED: "CANCELED",
     WorkflowExecutionStatus.TERMINATED: "CANCELED",
 }
-
-
-# The schedule that started a run: a predefined attribute Temporal's schedule machinery
-# writes on every triggered run. The only way to recover that provenance (a scheduled
-# run's id embeds a nominal time the backend cannot reconstruct, and the memo is the
-# schedule's), and the authority for "a schedule started it", since schedules
-# registered before TaskKind/TaskName fire without them.
-_SCHEDULED_BY_KEY = SearchAttributeKey.for_keyword("TemporalScheduledById")
 
 
 _TASK_STATE_RPC = timedelta(seconds=TASK_STATE_RPC_TIMEOUT_S)
@@ -203,7 +195,7 @@ def _history_query(
 def _schedule_id_of(execution) -> Optional[str]:
     """The schedule that started this run, or None for a direct dispatch."""
     try:
-        return execution.typed_search_attributes.get(_SCHEDULED_BY_KEY)
+        return execution.typed_search_attributes.get(SCHEDULED_BY_KEY)
     except Exception:
         # Never fatal: provenance is decoration, presence is the safety fact.
         return None

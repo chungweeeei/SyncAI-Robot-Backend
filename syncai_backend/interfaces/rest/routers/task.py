@@ -1,9 +1,14 @@
 import base64
 import binascii
+import csv
+import io
 import structlog
-from datetime import datetime, timezone
-from typing import List, Optional, Protocol
+from collections.abc import Iterable, Iterator
+from datetime import datetime, timezone, tzinfo
+from typing import Any, List, Optional, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
@@ -32,6 +37,8 @@ from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.interfaces.rest.schemas import StepRequest
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
+from syncai_backend.repositories.task.task_record import TaskRecordRepo, as_utc
+from syncai_backend.database.models import TaskRecordRow
 from syncai_backend.services.map_usage import MapUsagePolicy
 
 
@@ -153,6 +160,24 @@ class StepState(BaseModel):
             "The dock pose a DOCK step drives onto, as dispatched (map frame); "
             "null for every other step. A console derives the staging pose "
             "from it to draw the approach of a running dock"
+        ),
+    )
+    started_at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "When the step started (UTC); null until it has, and for a run "
+            "older than the field"
+        ),
+    )
+    ended_at: Optional[datetime] = Field(
+        default=None,
+        description="When the step ended, however it ended (UTC); null until it has",
+    )
+    paused_seconds: float = Field(
+        default=0.0,
+        description=(
+            "How long the run was held while this step was under way. The time "
+            "the step itself took is ended_at - started_at - paused_seconds"
         ),
     )
 
@@ -292,6 +317,140 @@ class TaskHistoryStatsResponse(BaseModel):
     )
 
 
+# One row per step, so a spreadsheet can filter and pivot on either level; the
+# run's columns repeat on each of its steps. Only ever append a column: a
+# customer's sheet reads them by position.
+EXPORT_COLUMNS = (
+    "task_id",
+    "run_id",
+    "task_name",
+    "kind",
+    "schedule_id",
+    "map_name",
+    "task_status",
+    "task_started_at",
+    "task_closed_at",
+    "task_duration_s",
+    "step_index",
+    "step_id",
+    "step_type",
+    "step_group",
+    "step_status",
+    "step_started_at",
+    "step_ended_at",
+    "step_wall_s",
+    "step_paused_s",
+    "step_active_s",
+    "error_msg",
+    "timezone",
+)
+
+# Rows per chunk written to the response.
+_EXPORT_CHUNK_ROWS = 200
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    """A stored step's timestamp (pydantic's JSON: ISO 8601, ``Z`` for UTC).
+
+    Python 3.10's fromisoformat does not take ``Z``.
+    """
+    if not value:
+        return None
+    return as_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+
+
+def _format_time(moment: Optional[datetime], zone: tzinfo) -> str:
+    # Not isoformat: Excel reads "2026-11-01 08:00:00" as a date, not the T/offset form.
+    if moment is None:
+        return ""
+    return moment.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_seconds(seconds: Optional[float]) -> str:
+    return "" if seconds is None else f"{seconds:.1f}"
+
+
+def _export_rows(records: Iterable[TaskRecordRow], zone: tzinfo) -> Iterator[list]:
+    """EXPORT_COLUMNS' rows for ``records``: one per step, in step order."""
+    zone_name = str(zone)
+    for record in records:
+        started, closed = as_utc(record.started_at), as_utc(record.closed_at)
+        task = [
+            record.task_id,
+            record.run_id,
+            record.name or "",
+            record.kind or "",
+            record.schedule_id or "",
+            record.map_name or "",
+            record.status,
+            _format_time(started, zone),
+            _format_time(closed, zone),
+            _format_seconds((closed - started).total_seconds()),
+        ]
+        for index, step in enumerate(record.steps, start=1):
+            step_started = _parse_time(step.get("started_at"))
+            step_ended = _parse_time(step.get("ended_at"))
+            paused = float(step.get("paused_seconds") or 0.0)
+            wall = (
+                (step_ended - step_started).total_seconds()
+                if step_started is not None and step_ended is not None
+                else None
+            )
+            yield task + [
+                index,
+                step.get("id", ""),
+                step.get("type", ""),
+                step.get("group") or "",
+                step.get("status", ""),
+                _format_time(step_started, zone),
+                _format_time(step_ended, zone),
+                _format_seconds(wall),
+                # Blank for a step that never ran, rather than a measured zero.
+                _format_seconds(paused if step_started is not None else None),
+                _format_seconds(max(0.0, wall - paused) if wall is not None else None),
+                step.get("error_msg") or "",
+                zone_name,
+            ]
+
+
+def _csv_chunks(rows: Iterable[list]) -> Iterator[str]:
+    """``rows`` as CSV text, a header first, a few hundred rows per chunk.
+
+    Starts with a UTF-8 BOM: without it Excel reads the file as the system's
+    code page and garbles any non-ASCII (an error message, a template name).
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+
+    def drain() -> str:
+        text = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return text
+
+    buffer.write("\ufeff")
+    writer.writerow(EXPORT_COLUMNS)
+    for count, row in enumerate(rows, start=1):
+        writer.writerow(row)
+        if count % _EXPORT_CHUNK_ROWS == 0:
+            yield drain()
+    yield drain()
+
+
+def _export_zone(tz: Optional[str]) -> tzinfo:
+    if not tz:
+        return timezone.utc
+    try:
+        return ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise BadRequestError(f"Unknown time zone: {tz}")
+
+
+def _export_filename(since: Optional[datetime], until: Optional[datetime]) -> str:
+    parts = [f"{moment:%Y%m%d}" for moment in (since, until) if moment is not None]
+    return "-".join(["task-report", *parts]) + ".csv"
+
+
 def _utc(moment: Optional[datetime]) -> Optional[datetime]:
     """A naive query datetime is UTC, not the server's local time."""
     if moment is not None and moment.tzinfo is None:
@@ -384,6 +543,7 @@ def init_task_router(
     map_catalog_repo: MapCatalogRepo,
     map_usage: MapUsagePolicy,
     robot_gw: MoveMessageSource,
+    task_record_repo: TaskRecordRepo,
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
 
@@ -526,6 +686,38 @@ def init_task_router(
             success_rate=stats.completed / stats.total if stats.total else None,
         )
 
+    # The report: every finished run in the filter, one CSV row per step. From
+    # task_record, not Temporal, so it reaches back TASK_RECORD_RETENTION_DAYS
+    # (30) rather than the namespace's 5 -- and holds only runs that closed
+    # since the table existed. Plain def: the rows come off psycopg2, streamed
+    # in batches from the threadpool so a month of soak test is never in memory.
+    @task_router.get(
+        "/api/v1/task_history/export",
+        response_class=StreamingResponse,
+        responses={200: {"content": {"text/csv": {}}}},
+    )
+    def export_task_history(
+        filters: _HistoryFilter = Depends(),
+        tz: Optional[str] = Query(
+            None,
+            description=(
+                "IANA time zone the times are written in, e.g. Asia/Taipei; "
+                "UTC when omitted. The filter's since/until are unaffected"
+            ),
+        ),
+    ):
+        zone = _export_zone(tz)
+        records = task_record_repo.iter_records(**filters.as_kwargs())
+        return StreamingResponse(
+            _csv_chunks(_export_rows(records, zone)),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{_export_filename(filters.since, filters.until)}"'
+                )
+            },
+        )
+
     def _step_message(step: Step) -> str:
         # Read live from the gateway: the workflow cannot see an activity's
         # progress. Only a running MOVE / DOCK / UNDOCK has a goal; between retry
@@ -557,6 +749,9 @@ def init_task_router(
                     message=_step_message(step),
                     group=step.group,
                     dock=_step_dock(step),
+                    started_at=step.started_at,
+                    ended_at=step.ended_at,
+                    paused_seconds=step.paused_seconds,
                 )
                 for step in state.steps
             ],

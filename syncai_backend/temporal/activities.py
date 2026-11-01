@@ -13,7 +13,7 @@ from temporalio.exceptions import ApplicationError, CancelledError
 
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.tasks.config import STEP_STARTED_SIGNAL, reports_start
-from syncai_backend.tasks.schema import MoveParams, SpeakParams
+from syncai_backend.tasks.schema import MoveParams, SpeakParams, TaskRecord
 from syncai_backend.gateways.robot.robot import (
     DOCK_BEHAVIOR_TREE,
     UNDOCK_BEHAVIOR_TREE,
@@ -24,6 +24,7 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.map_usage import MapUsagePolicy
 
@@ -87,6 +88,7 @@ class RobotActivities:
         map_usage: MapUsagePolicy,
         robot_repo: RobotRepo,
         dock_state: DockStateService,
+        task_record_repo: TaskRecordRepo,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
@@ -100,6 +102,8 @@ class RobotActivities:
         # Where the last DOCK ended; see services/dock_state.py. One per process,
         # built in main.py like every other collaborator.
         self._dock_state = dock_state
+        # Where record_task leaves each finished run (the report export's source).
+        self._task_record_repo = task_record_repo
         # Bound by run_worker, for _report_started: a sync activity cannot use the
         # async-only activity.client().
         self._client: Optional[Client] = None
@@ -472,3 +476,17 @@ class RobotActivities:
             )
 
         return duration
+
+    @activity.defn
+    def record_task(self, record: TaskRecord) -> None:
+        """Write a finished run's ``task_record`` row (RobotWorkflow._record).
+
+        On the IO queue. Idempotent, so a retry after a lost completion is safe. A
+        database error raises and is retried; the workflow drops it after that.
+        """
+        self._task_record_repo.insert(record)
+        self._logger.info(
+            "[RobotActivity] Task recorded",
+            task_id=record.task_id,
+            status=record.status,
+        )

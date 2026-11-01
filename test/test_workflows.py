@@ -46,6 +46,11 @@ What is pinned:
 * WAIT is a workflow timer, not an activity: a pause freezes it and the
   resume starts a second timer for only the remainder (read off the run's
   history), and a cancel during it is CANCELED / "Task canceled".
+* Timing and the record: every step that ran carries ``started_at`` /
+  ``ended_at``, a hold while it was under way lands in its ``paused_seconds``
+  (one before it started does not), and every run, however it ends, hands
+  ``record_task`` its TaskRecord as it closes -- without that activity ever
+  changing how the run ends.
 
 Deliberately not covered: the unknown-step-type guard in the dispatch table.
 ``Step`` validation rejects anything outside ``StepType`` before a task can
@@ -85,7 +90,7 @@ from temporalio.exceptions import (  # noqa: E402
     CancelledError,
 )
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
-from temporalio.worker import Worker  # noqa: E402
+from temporalio.worker import Replayer, Worker  # noqa: E402
 
 from syncai_backend.tasks.config import (  # noqa: E402
     STEP_STARTED_SIGNAL,
@@ -97,11 +102,14 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     Step,
     StepStatus,
     StepType,
+    TaskKind,
+    TaskRecord,
     WaitParams,
     WorkflowTask,
     WorkflowTaskDefinition,
 )
 from syncai_backend.tasks.search_attributes import (  # noqa: E402
+    TASK_KIND_KEY,
     TASK_MAP_KEY,
 )
 from syncai_backend.temporal.activities import ActivityResult  # noqa: E402
@@ -201,16 +209,28 @@ def _gated_move(started: asyncio.Event, release: asyncio.Event):
     return execute_move
 
 
+def _recorder(records: list):
+    """A ``record_task`` that keeps what every run hands it."""
+
+    @activity.defn(name="record_task")
+    async def record_task(record: TaskRecord) -> None:
+        records.append(record)
+
+    return record_task
+
+
 @asynccontextmanager
-async def _worker(activities, io_activities=None):
+async def _worker(activities, io_activities=None, record_task=None):
     """A time-skipping environment with a worker polling TASK_QUEUE.
 
     The client is built with ``pydantic_data_converter`` to mirror
     ``run_worker`` — the default converter cannot serialize WorkflowTask.
     ``io_activities`` (SPEAK) get a second worker on IO_TASK_QUEUE, the way
-    run_worker splits them. Both cap the heartbeat throttle as run_worker
-    does: a cancel rides a heartbeat's reply, and left at the SDK default
-    (0.8 x heartbeat_timeout) SPEAK's 75 s window would hold one for a minute.
+    run_worker splits them, always beside a ``record_task`` (a discarding
+    one unless given): every run ends with it. Both cap the heartbeat
+    throttle as run_worker does: a cancel rides a heartbeat's reply, and left
+    at the SDK default (0.8 x heartbeat_timeout) SPEAK's 75 s window would
+    hold one for a minute.
     """
     env = await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -223,15 +243,12 @@ async def _worker(activities, io_activities=None):
             activities=activities,
             max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
         ):
-            if io_activities:
-                async with Worker(
-                    env.client,
-                    task_queue=IO_TASK_QUEUE,
-                    activities=io_activities,
-                    max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
-                ):
-                    yield env.client
-            else:
+            async with Worker(
+                env.client,
+                task_queue=IO_TASK_QUEUE,
+                activities=list(io_activities or []) + [record_task or _recorder([])],
+                max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
+            ):
                 yield env.client
     finally:
         await env.shutdown()
@@ -1395,3 +1412,239 @@ def test_a_cancel_before_the_first_member_starts_leaves_the_rest_pending():
     assert (steps[0].status, steps[0].error_msg) == (StepStatus.CANCELED, "Task canceled")
     assert steps[1].status is StepStatus.PENDING
     assert calls == []
+
+
+# --- Timing and the record --------------------------------------------------
+
+
+def _seconds(start, end) -> float:
+    return (end - start).total_seconds()
+
+
+def test_a_run_records_every_step_with_its_times():
+    async def scenario():
+        records: list = []
+        task = _task("task-record", StepType.STANDUP, StepType.WAIT, StepType.LIEDOWN)
+
+        async with _worker(_instant_activities([]), record_task=_recorder(records)) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return records, await handle.query(RobotWorkflow.get_step_states), handle
+
+    records, steps, handle = asyncio.run(scenario())
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.task_id == "task-record"
+    assert record.run_id == handle.result_run_id
+    assert record.status == "COMPLETED"
+    # Unlabelled dispatch: no kind, name, map or schedule.
+    assert (record.kind, record.name, record.map_name, record.schedule_id) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert record.started_at <= record.closed_at
+    # The record carries the same steps the query does, timing included.
+    assert [step.model_dump() for step in record.steps] == [
+        step.model_dump() for step in steps
+    ]
+    for step in steps:
+        assert step.started_at is not None and step.ended_at is not None
+        assert step.started_at <= step.ended_at
+        assert step.paused_seconds == 0.0
+    # The WAIT's wall time is its timer (skipped, but on the workflow's clock),
+    # and the steps follow one another.
+    assert _seconds(steps[1].started_at, steps[1].ended_at) == pytest.approx(
+        WAIT_SECONDS, abs=1.0
+    )
+    assert steps[0].ended_at <= steps[1].started_at <= steps[1].ended_at <= steps[2].started_at
+
+
+def test_a_records_kind_comes_off_the_runs_own_attribute():
+    async def scenario():
+        records: list = []
+        task = _task("task-record-kind", StepType.STANDUP)
+
+        async with _worker(_instant_activities([]), record_task=_recorder(records)) as client:
+            await client.operator_service.add_search_attributes(
+                AddSearchAttributesRequest(
+                    namespace=client.namespace,
+                    search_attributes={
+                        TASK_KIND_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD
+                    },
+                )
+            )
+            handle = await client.start_workflow(
+                RobotWorkflow.run,
+                task,
+                id=task.id,
+                task_queue=TASK_QUEUE,
+                search_attributes=TypedSearchAttributes(
+                    [SearchAttributePair(TASK_KIND_KEY, TaskKind.STANDUP.value)]
+                ),
+            )
+            await handle.result()
+            return records
+
+    records = asyncio.run(scenario())
+
+    assert records[0].kind is TaskKind.STANDUP
+
+
+def test_a_hold_counts_on_the_step_under_way_and_not_on_one_not_started():
+    async def scenario():
+        records: list = []
+        calls: list = []
+        task = _task("task-record-pause", StepType.WAIT, StepType.STANDUP)
+
+        async with _worker(_instant_activities(calls), record_task=_recorder(records)) as client:
+            handle = await _start(client, task)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.IN_PROGRESS)
+
+            await handle.signal(RobotWorkflow.pause)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            # Real time, while nothing awaits the result: the hold's length.
+            await asyncio.sleep(1.0)
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return records
+
+    records = asyncio.run(scenario())
+
+    wait, stand = records[0].steps
+    assert wait.paused_seconds >= 0.9
+    # What the step itself took is its wall time less the hold: the timer.
+    active = _seconds(wait.started_at, wait.ended_at) - wait.paused_seconds
+    assert active == pytest.approx(WAIT_SECONDS, abs=2.0)
+    assert stand.paused_seconds == 0.0
+
+
+def test_a_hold_before_a_step_starts_is_not_that_steps():
+    async def scenario():
+        records: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        activities = [_gated_stand(started, release)] + [_instant_activities([])[0]]
+        task = _task("task-record-hold-before", StepType.STANDUP, StepType.MOVE)
+
+        async with _worker(activities, record_task=_recorder(records)) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await handle.signal(RobotWorkflow.pause)
+            release.set()
+            # The run holds before the MOVE, which has not started.
+            await _statuses_until(handle, lambda s: s[1] is StepStatus.PAUSED)
+            await asyncio.sleep(0.5)
+            await handle.signal(RobotWorkflow.resume)
+            await handle.result()
+            return records
+
+    records = asyncio.run(scenario())
+
+    stand, move = records[0].steps
+    assert move.paused_seconds == 0.0
+    # The MOVE's clock starts at the resume, so the hold is in neither step.
+    assert _seconds(stand.ended_at, move.started_at) >= 0.4
+
+
+def test_a_failed_run_is_recorded_failed():
+    async def scenario():
+        records: list = []
+
+        @activity.defn(name="execute_stand")
+        async def execute_stand() -> ActivityResult:
+            raise ApplicationError("motor fault", non_retryable=True)
+
+        task = _task("task-record-failed", StepType.STANDUP, StepType.LIEDOWN)
+        async with _worker([execute_stand], record_task=_recorder(records)) as client:
+            handle = await _start(client, task)
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+            return records
+
+    records = asyncio.run(scenario())
+
+    record = records[0]
+    assert record.status == "FAILED"
+    failed, never = record.steps
+    assert failed.status is StepStatus.FAILED
+    assert failed.started_at is not None and failed.ended_at is not None
+    assert "motor fault" in failed.error_msg
+    assert never.status is StepStatus.PENDING
+    assert never.started_at is None and never.ended_at is None
+
+
+@pytest.mark.parametrize("step_type", [StepType.MOVE, StepType.STANDUP])
+def test_a_canceled_run_is_recorded_canceled(step_type):
+    """Both shapes a cancel reaches the run in: asyncio.CancelledError from a
+    MOVE, and the activity's ActivityError(cause=CancelledError) from a posture."""
+
+    async def scenario():
+        records: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        gated = (
+            _gated_move(started, release)
+            if step_type is StepType.MOVE
+            else _gated_stand(started, release)
+        )
+        task = _task(f"task-record-canceled-{step_type.value}", step_type)
+
+        async with _worker([gated], record_task=_recorder(records)) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+            return records, exc_info.value
+
+    records, err = asyncio.run(scenario())
+
+    # Recording does not change how the run ends.
+    assert isinstance(err.cause, CancelledError)
+    assert records[0].status == "CANCELED"
+    assert records[0].steps[0].status is StepStatus.CANCELED
+    assert records[0].steps[0].ended_at is not None
+
+
+def test_a_failing_record_does_not_fail_the_run():
+    async def scenario():
+        attempts: list = []
+
+        @activity.defn(name="record_task")
+        async def record_task(record: TaskRecord) -> None:
+            attempts.append(record)
+            raise ApplicationError("database down", non_retryable=True)
+
+        task = _task("task-record-broken", StepType.STANDUP)
+        async with _worker(_instant_activities([]), record_task=record_task) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return attempts, await handle.describe()
+
+    attempts, description = asyncio.run(scenario())
+
+    assert len(attempts) == 1
+    assert description.status.name == "COMPLETED"
+
+
+def test_a_recorded_run_replays_deterministically():
+    """The timing reads workflow.now() and the record is behind a patch: a
+    replay of the run's own history must issue the same commands."""
+
+    async def scenario():
+        task = _task("task-record-replay", StepType.WAIT, StepType.STANDUP)
+        async with _worker(_instant_activities([])) as client:
+            handle = await _start(client, task)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.IN_PROGRESS)
+            await handle.signal(RobotWorkflow.pause)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(handle.result(), timeout=10)
+            history = await handle.fetch_history()
+
+        await Replayer(
+            workflows=[RobotWorkflow], data_converter=pydantic_data_converter
+        ).replay_workflow(history)
+
+    asyncio.run(scenario())

@@ -163,7 +163,7 @@ def robot_gw():
 
 
 @pytest.fixture
-def client(logger, workflow_gw, catalog, robot_gw):
+def client(logger, workflow_gw, catalog, robot_gw, task_record_repo):
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -176,6 +176,7 @@ def client(logger, workflow_gw, catalog, robot_gw):
                 task_template_repo=None,
             ),
             robot_gw=robot_gw,
+            task_record_repo=task_record_repo,
         )
     )
     return TestClient(app)
@@ -456,10 +457,11 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-task-001").json()
 
         assert body["status"] == "IN_PROGRESS"
-        # StepState is status/error/message (and the group it ran in) — the
-        # definition (params) stays out, but for a DOCK's pose. No feedback
-        # from the robot yet reads as an empty message; an ungrouped step
-        # reads group null, and a step that is not a DOCK reads dock null.
+        # StepState is status/error/message (and the group it ran in, and
+        # its times) — the definition (params) stays out, but for a DOCK's
+        # pose. No feedback from the robot yet reads as an empty message; an
+        # ungrouped step reads group null, a step that is not a DOCK reads
+        # dock null, and one without times reads them null.
         assert body["steps"] == [
             {
                 "id": "step1",
@@ -468,6 +470,9 @@ class TestTaskState:
                 "message": "",
                 "group": None,
                 "dock": None,
+                "started_at": None,
+                "ended_at": None,
+                "paused_seconds": 0.0,
             }
         ]
 
@@ -528,6 +533,38 @@ class TestTaskState:
             None,
             {"x": 3.0, "y": -1.5, "theta": 180.0},
         ]
+
+    def test_a_step_carries_its_times(self, client, workflow_gw):
+        started = datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
+        ended = datetime(2026, 11, 1, 8, 1, 30, tzinfo=timezone.utc)
+        workflow_gw.state = TaskState(
+            id="robot01-task-003",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="1-wait",
+                    type=StepType.WAIT,
+                    params=WaitParams(seconds=60),
+                    status=StepStatus.COMPLETED,
+                    started_at=started,
+                    ended_at=ended,
+                    paused_seconds=30.0,
+                ),
+                Step(id="2-stand", type=StepType.STANDUP),
+            ],
+        )
+
+        steps = client.get("/api/v1/tasks/robot01-task-003").json()["steps"]
+
+        assert steps[0]["started_at"] == "2026-11-01T08:00:00Z"
+        assert steps[0]["ended_at"] == "2026-11-01T08:01:30Z"
+        assert steps[0]["paused_seconds"] == 30.0
+        # Not started: no times, nothing held.
+        assert (steps[1]["started_at"], steps[1]["ended_at"], steps[1]["paused_seconds"]) == (
+            None,
+            None,
+            0.0,
+        )
 
     def test_only_a_running_move_asks_the_robot(self, client, workflow_gw, robot_gw):
         # A paused MOVE has cancelled its goal, and a STANDUP never had one:
@@ -845,3 +882,129 @@ class TestHoldTask:
 
         assert response.status_code == 409
         assert response.json()["code"] == "task_not_running"
+
+
+class TestTaskHistoryExport:
+    """GET /api/v1/task_history/export: task_record as CSV, one row per step."""
+
+    @staticmethod
+    def _record(task_repo, run_id="run-1", status="COMPLETED", closed_minute=10, **extra):
+        from syncai_backend.tasks.schema import TaskRecord
+
+        start = datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
+        task_repo.insert(
+            TaskRecord(
+                task_id=f"robot01-task-{run_id}",
+                run_id=run_id,
+                status=status,
+                started_at=start,
+                closed_at=start.replace(minute=closed_minute),
+                steps=[
+                    Step(
+                        id="1-wait",
+                        type=StepType.WAIT,
+                        params=WaitParams(seconds=60),
+                        status=StepStatus.COMPLETED,
+                        started_at=start,
+                        ended_at=start.replace(minute=2),
+                        paused_seconds=30.0,
+                    ),
+                    Step(
+                        id="2-stand",
+                        type=StepType.STANDUP,
+                        status=StepStatus.FAILED,
+                        error_msg="馬達異常",
+                        started_at=start.replace(minute=2),
+                        ended_at=start.replace(minute=3),
+                    ),
+                    Step(id="3-lie", type=StepType.LIEDOWN),
+                ],
+                **extra,
+            )
+        )
+
+    @staticmethod
+    def _rows(response):
+        import csv
+        import io
+
+        return list(csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"))))
+
+    def test_one_row_per_step_with_its_times(self, client, task_record_repo):
+        self._record(task_record_repo, kind=TaskKind.TASK, name="Patrol", map_name="lab")
+
+        response = client.get("/api/v1/task_history/export")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/csv")
+        assert response.headers["content-disposition"] == (
+            'attachment; filename="task-report.csv"'
+        )
+        # The BOM, so Excel reads the file as UTF-8.
+        assert response.content.startswith("\ufeff".encode("utf-8"))
+        rows = self._rows(response)
+        assert [row["step_id"] for row in rows] == ["1-wait", "2-stand", "3-lie"]
+        wait, stand, lie = rows
+        assert (wait["task_name"], wait["kind"], wait["map_name"]) == ("Patrol", "task", "lab")
+        assert wait["task_started_at"] == "2026-11-01 08:00:00"
+        assert wait["task_closed_at"] == "2026-11-01 08:10:00"
+        assert wait["task_duration_s"] == "600.0"
+        assert wait["step_index"] == "1"
+        assert wait["step_wall_s"] == "120.0"
+        assert wait["step_paused_s"] == "30.0"
+        assert wait["step_active_s"] == "90.0"
+        assert wait["timezone"] == "UTC"
+        assert stand["error_msg"] == "馬達異常"
+        assert stand["step_active_s"] == "60.0"
+        # Never ran: blanks, not zeroes.
+        assert lie["step_status"] == "PENDING"
+        assert (lie["step_started_at"], lie["step_wall_s"], lie["step_paused_s"]) == ("", "", "")
+
+    def test_times_are_written_in_the_asked_zone(self, client, task_record_repo):
+        self._record(task_record_repo)
+
+        rows = self._rows(client.get("/api/v1/task_history/export?tz=Asia/Taipei"))
+
+        assert rows[0]["task_started_at"] == "2026-11-01 16:00:00"
+        assert rows[0]["step_ended_at"] == "2026-11-01 16:02:00"
+        assert rows[0]["timezone"] == "Asia/Taipei"
+
+    def test_an_unknown_zone_is_a_400(self, client):
+        response = client.get("/api/v1/task_history/export?tz=Mars/Olympus")
+
+        assert response.status_code == 400
+        assert "Mars/Olympus" in response.json()["detail"]
+
+    def test_the_history_filters_apply(self, client, task_record_repo):
+        self._record(task_record_repo, run_id="a", closed_minute=5)
+        self._record(task_record_repo, run_id="b", status="FAILED", closed_minute=20)
+        self._record(task_record_repo, run_id="c", closed_minute=40)
+
+        def runs(query):
+            response = client.get(f"/api/v1/task_history/export?{query}")
+            return sorted({row["run_id"] for row in self._rows(response)})
+
+        assert runs("status=COMPLETED") == ["a", "c"]
+        assert runs("since=2026-11-01T08:10:00Z&until=2026-11-01T08:30:00Z") == ["b"]
+        assert runs("") == ["a", "b", "c"]
+
+    def test_the_file_is_named_for_the_window(self, client):
+        response = client.get(
+            "/api/v1/task_history/export?since=2026-10-01T00:00:00Z&until=2026-10-31T00:00:00Z"
+        )
+
+        assert response.headers["content-disposition"] == (
+            'attachment; filename="task-report-20261001-20261031.csv"'
+        )
+
+    def test_an_inverted_window_is_a_400(self, client):
+        response = client.get(
+            "/api/v1/task_history/export?since=2026-11-02T00:00:00Z&until=2026-11-01T00:00:00Z"
+        )
+
+        assert response.status_code == 400
+
+    def test_nothing_recorded_is_a_header_only(self, client):
+        rows = self._rows(client.get("/api/v1/task_history/export"))
+
+        assert rows == []

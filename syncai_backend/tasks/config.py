@@ -113,3 +113,18 @@ TASK_HISTORY_RPC_TIMEOUT_S = 5.0
 # One `count_workflows ... GROUP BY ExecutionStatus` (the one GROUP BY the server
 # allows) per call, uncached like the history page.
 TASK_STATS_RPC_TIMEOUT_S = 5.0
+
+
+# --- The report's own record (task_record, GET /api/v1/task_history/export) ---
+#
+# Temporal forgets a closed run after the namespace retention; each run also leaves a
+# row in PostgreSQL's task_record, partitioned by UTC day. TaskRecordRetention keeps
+# this many days of them, dropping whole older partitions.
+TASK_RECORD_RETENTION_DAYS = 30
+
+# How often it creates the coming days' partitions and drops the expired ones.
+TASK_RECORD_MAINTENANCE_INTERVAL_S = 1800.0
+
+# How many days past today it keeps a partition ready, so an insert around midnight
+# never waits on (or races) the DDL; an insert still creates its own if missing.
+TASK_RECORD_PARTITIONS_AHEAD = 3

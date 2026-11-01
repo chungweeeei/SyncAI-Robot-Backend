@@ -39,6 +39,13 @@ TASK_NAME_KEY = SearchAttributeKey.for_keyword("TaskName")
 TASK_MAP_KEY = SearchAttributeKey.for_keyword("TaskMap")
 ROBOT_ID_KEY = SearchAttributeKey.for_keyword("RobotId")
 
+# The schedule that started a run: a predefined attribute Temporal's schedule machinery
+# writes on every triggered run, so never registered here. The only way to recover that
+# provenance (a scheduled run's id embeds a nominal time the backend cannot reconstruct,
+# and the memo is the schedule's), and the authority for "a schedule started it", since
+# schedules registered before TaskKind/TaskName fire without them.
+SCHEDULED_BY_KEY = SearchAttributeKey.for_keyword("TemporalScheduledById")
+
 # Name -> type, the shape AddSearchAttributesRequest takes.
 CUSTOM_SEARCH_ATTRIBUTES: Dict[str, "IndexedValueType.ValueType"] = {
     TASK_KIND_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
