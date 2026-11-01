@@ -37,6 +37,7 @@ from syncai_backend.repositories.pointcloud.pointcloud import PointCloudRepo
 from syncai_backend.repositories.mapping.mapping import MappingStatusRepo
 from syncai_backend.repositories.telemetry.telemetry import TelemetryRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
+from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.repositories.recording.catalog import RecordingCatalogRepo
 
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
@@ -110,6 +111,7 @@ class RestDeps:
     map_cloud_repo: PointCloudRepo
     telemetry_repo: TelemetryRepo
     task_template_repo: TaskTemplateRepo
+    task_record_repo: TaskRecordRepo
     worker_handle: TemporalWorkerHandle
     tts_gw: TtsGateway
     webrtc_gw: WebRtcGateway
@@ -156,7 +158,8 @@ def init_rest_server(
         # Location is not CORS-safelisted; without this JS cannot read it, a
         # WHEP client never learns its session URL to DELETE, and every page
         # load leaks a camera session while video still plays fine.
-        expose_headers=["Location"],
+        # Content-Disposition, likewise, carries the report export's file name.
+        expose_headers=["Location", "Content-Disposition"],
     )
 
     register_exception_handlers(app=app)
@@ -181,7 +184,8 @@ def init_rest_server(
         }
 
     # The catalogue answers which map a dispatched job is stamped with, and
-    # map_usage whether it may drive on it at all.
+    # map_usage whether it may drive on it at all. task_record_repo is the
+    # report export's source.
     app.include_router(
         init_task_router(
             logger=logger,
@@ -189,6 +193,7 @@ def init_rest_server(
             map_catalog_repo=deps.map_catalog_repo,
             map_usage=deps.map_usage,
             robot_gw=deps.robot_gw,
+            task_record_repo=deps.task_record_repo,
         )
     )
     app.include_router(init_schedule_router(logger=logger, workflow_gw=deps.workflow_gw))

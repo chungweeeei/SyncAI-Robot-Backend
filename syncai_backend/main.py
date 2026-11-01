@@ -23,6 +23,7 @@ from syncai_backend.interfaces.rest.server import RestDeps, start_rest_server
 from syncai_backend.repositories.robot.robot import init_robot_repo
 from syncai_backend.repositories.map.map import init_map_repo
 from syncai_backend.repositories.task.task_template import init_task_template_repo
+from syncai_backend.repositories.task.task_record import init_task_record_repo
 from syncai_backend.repositories.map.catalog import init_map_catalog_repo
 from syncai_backend.repositories.pointcloud.pointcloud import init_pointcloud_repo
 from syncai_backend.repositories.mapping.mapping import init_mapping_status_repo
@@ -42,6 +43,7 @@ from syncai_backend.services.map_switch import init_map_switch_service
 from syncai_backend.services.map_usage import init_job_gate, init_map_usage_policy
 from syncai_backend.services.mode_restart import init_mode_restart_service
 from syncai_backend.services.safety_lock import init_safety_lock_service
+from syncai_backend.services.task_record_retention import init_task_record_retention
 
 from syncai_backend.subscribers.robot_state_subscriber import (
     init_robot_state_subscriber,
@@ -91,6 +93,11 @@ class SyncAIBackend(Node):
 
         # The operator's library of re-dispatchable step lists.
         task_template_repo = init_task_template_repo(logger=logger, engine=engine)
+        # Every finished run, kept past Temporal's retention for the report export.
+        task_record_repo = init_task_record_repo(logger=logger, engine=engine)
+        # Its daily partitions: the coming days' made, those past 30 days dropped,
+        # every 30 minutes on a daemon thread.
+        init_task_record_retention(logger=logger, repo=task_record_repo)
         # The maps on disk, as opposed to the one that is loaded. Filesystem only.
         map_catalog_repo = init_map_catalog_repo(logger=logger)
         # Single-slot cache for the live body_cloud, drained by the WS stream.
@@ -224,6 +231,7 @@ class SyncAIBackend(Node):
             map_usage=map_usage,
             robot_repo=robot_repo,
             dock_state=dock_state_svc,
+            task_record_repo=task_record_repo,
         )
         # Kept for main()'s shutdown: the worker is stopped before the ROS
         # context goes, so a running MOVE can still cancel its nav2 goal.
@@ -241,6 +249,7 @@ class SyncAIBackend(Node):
                 map_cloud_repo=map_cloud_repo,
                 telemetry_repo=telemetry_repo,
                 task_template_repo=task_template_repo,
+                task_record_repo=task_record_repo,
                 worker_handle=worker_handle,
                 tts_gw=tts_gw,
                 webrtc_gw=webrtc_gw,

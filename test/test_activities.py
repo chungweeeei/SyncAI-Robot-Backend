@@ -86,6 +86,7 @@ def activities(
         ),
         robot_repo=robot_repo,
         dock_state=dock_state,
+        task_record_repo=MagicMock(),
     )
 
 
