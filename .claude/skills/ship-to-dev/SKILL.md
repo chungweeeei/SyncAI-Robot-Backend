@@ -1,22 +1,22 @@
 ---
-name: ship-to-sim
+name: ship-to-dev
 description: >
   Ship the work on the current branch end to end: run the gates (ruff, the
   compose check, the suite in the dev image), commit, push, open a PR to dev,
-  watch CI, merge it, delete the branch, then rebuild the syncai_backend
-  container where one runs. User invoked (/ship-to-sim); invoking it is the
-  go-ahead to merge into dev.
+  watch CI, merge it, then delete the branch locally and on the remote. User
+  invoked (/ship-to-dev); invoking it is the go-ahead to merge into dev.
 metadata:
   origin: project
 ---
 
-# Ship to the Sim
+# Ship to dev
 
 The loop this repo's day-to-day work runs: a change on a branch ends up
-merged into `dev` and, on a host that runs this package as a container,
-rebuilt into `syncai_backend`. This skill is the order the steps run in,
-with the commands that actually work on this machine (no ROS, no ruff, no
-pytest on the host — every gate runs in a container or through `uvx`).
+merged into `dev`, and the branch is deleted locally and on the remote.
+Rebuilding the `syncai_backend` container is not part of it. This skill
+is the order the steps run in, with the commands that actually work on
+this machine (no ROS, no ruff, no pytest on the host — every gate runs in
+a container or through `uvx`).
 
 **Invoking it is the authorization to merge into `dev`.** Nothing else in
 it asks. It still *stops and reports* rather than pushing through on any of
@@ -160,58 +160,8 @@ git branch -d <branch>                             # -d, never -D
 
 `--merge`, matching the merge commits `dev` already has.
 
-## 6. Rebuild and restart the backend container
-
-This package runs as the `backend` service of `docker-compose.yml`
-(container `syncai_backend`, the `runtime` stage, host networking) on a
-host that also runs the robot container and the infra stack. **This Mac is
-not that host**: it has no `syncai_backend` container, and the sim's
-backend is on another machine. So first find out where you are:
-
-```bash
-docker ps -a --filter name=syncai_backend --format '{{.Names}}\t{{.Image}}\t{{.Status}}'
-```
-
-**Nothing listed:** the step cannot run here. Report that, and give the
-host's commands verbatim so whoever is on it can do it:
-
-```bash
-git pull --ff-only origin dev
-docker compose up -d --build
-docker compose logs -f
-```
-
-with the one rule that matters there (README *One backend at a time*):
-the byobu-pane backend inside the robot container must be stopped first,
-or two Temporal workers poll the same `<robot_id>.ROBOT_TASK_QUEUE` and a
-task goes to whichever grabs it.
-
-**A container is listed:** it must be `syncai-backend` from this compose
-file. If it runs something else, the setup changed — ask instead of
-rebuilding. Otherwise:
-
-```bash
-docker compose up -d --build backend
-```
-
-Then check, and report each:
-
-```bash
-docker inspect syncai_backend --format '{{.State.Health.Status}}'   # healthy, within 120 s (postgres is retried 20 x 5 s)
-curl -s http://127.0.0.1:3000/health                                 # 200 always; the body says ok or degraded
-docker compose logs --since 5m backend | grep -c "<a log line the change added>"
-```
-
-`/health` is 200 by design; `degraded` means Temporal is down, which the
-body names — say which it was. The image ships bytecode only
-(`InstallNoSource`), so prove the change is in it by what it *does* — a
-log line, a route's new answer, a startup message — not by grepping
-source.
-
-## 7. Report
+## 6. Report
 
 Short, to the operator: the PR link and that it merged (with the merge
-commit), the branch deleted, the gate and CI results, the container
-healthy with the change in it — or that the container step was not run on
-this machine and what to run on the host — and anything that could not be
-verified.
+commit), the branch deleted locally and on the remote, the gate and CI
+results, and anything that could not be verified.
