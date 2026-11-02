@@ -7,6 +7,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, CancelledErro
 
 with workflow.unsafe.imports_passed_through():
     from syncai_backend.tasks.config import (
+        PATROL_PROGRESS_SIGNAL,
         PAUSE_SIGNAL,
         RESUME_SIGNAL,
         STEP_STARTED_SIGNAL,
@@ -64,6 +65,7 @@ ACTIVITY_MAP = {
     StepType.SPEAK: RobotActivities.execute_speak,
     StepType.DOCK: RobotActivities.execute_dock,
     StepType.UNDOCK: RobotActivities.execute_undock,
+    StepType.PATROL: RobotActivities.execute_patrol,
 }
 
 
@@ -143,6 +145,9 @@ class RobotWorkflow:
         self._dispatches: int = 0
         self._dispatch_ids: dict[str, str] = {}
         self._started: set[str] = set()
+        # Per PATROL step, how many of its waypoints the robot has passed
+        # (PATROL_PROGRESS_SIGNAL); a re-dispatch after a pause starts past them.
+        self._patrol_passed: dict[str, int] = {}
 
     @workflow.query
     def get_step_states(self) -> list[Step]:
@@ -161,6 +166,11 @@ class RobotWorkflow:
     @workflow.signal(name=STEP_STARTED_SIGNAL)
     def step_started(self, activity_id: str) -> None:
         self._started.add(activity_id)
+
+    @workflow.signal(name=PATROL_PROGRESS_SIGNAL)
+    def patrol_progress(self, step_id: str, passed: int) -> None:
+        # Only ever forward: a late report from a cancelled dispatch is no news.
+        self._patrol_passed[step_id] = max(self._patrol_passed.get(step_id, 0), passed)
 
     def _new_dispatch_id(self, step: Step) -> str:
         self._dispatches += 1
@@ -334,6 +344,11 @@ class RobotWorkflow:
         # has no pose to check against it and takes no argument at all.
         if step.type in POSE_STEP_TYPES and own_map is not None:
             args.append(own_map)
+        # PATROL is new, so no old history constrains it: always the map (None
+        # for a run without one), its step id, and the waypoints already passed,
+        # which _run_move refreshes on every dispatch.
+        if step.type is StepType.PATROL:
+            args = [step.params, own_map, step.id, 0]
 
         # SPEAK: wider heartbeat window (SPEAK_HEARTBEAT_TIMEOUT) and a much shorter
         # start_to_close than the hour others get; the gateway gives up on a backed-up
@@ -430,11 +445,19 @@ class RobotWorkflow:
         did, so older histories replay unchanged.
 
         On resume the step is re-sent from scratch, and in a group under a fresh
-        activity id so the members behind wait for the new goal's acceptance.
+        activity id so the members behind wait for the new goal's acceptance --
+        except a PATROL, which is re-sent past the waypoints it reported passed
+        (patrol_progress), so a pause does not drive it round from the first.
         """
         while True:
             if new_activity_id is not None:
                 activity_options["activity_id"] = new_activity_id()
+            if step.type is StepType.PATROL:
+                args = activity_options["args"]
+                activity_options["args"] = [
+                    *args[:3],
+                    self._patrol_passed.get(step.id, 0),
+                ]
             handle = workflow.start_activity(activity_fn, **activity_options)
             interrupted = False
             try:

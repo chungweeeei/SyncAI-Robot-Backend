@@ -31,7 +31,11 @@ from temporalio.testing import ActivityEnvironment  # noqa: E402
 
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
-from syncai_backend.tasks.schema import MoveParams, SpeakParams  # noqa: E402
+from syncai_backend.tasks.schema import (  # noqa: E402
+    MoveParams,
+    PatrolParams,
+    SpeakParams,
+)
 from syncai_backend.services.dock_state import DockStateService  # noqa: E402
 from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.temporal.activities import RobotActivities  # noqa: E402
@@ -853,3 +857,222 @@ class TestAutoUndock:
 
         assert self._trees(robot_gw) == ["undock.xml"]
         assert dock_state.current() is not None
+
+
+def _patrol_params(count=4):
+    # Waypoint i at x = i, on alternate storeys, the last facing -90 deg.
+    return PatrolParams(
+        waypoints=[
+            MoveParams(x=float(i), y=0.0, theta=-90.0 if i == count - 1 else 0.0,
+                       z=3.1 * (i % 2))
+            for i in range(count)
+        ]
+    )
+
+
+def _patrol_status(state, remaining=None):
+    status = {"goal_id": "p", "state": state}
+    if remaining is not None:
+        status["poses_remaining"] = remaining
+    return status
+
+
+class TestExecutePatrol:
+    def test_sends_every_waypoint_with_its_height_and_the_last_heading(
+        self, env, activities, robot_gw
+    ):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = _patrol_status("succeeded")
+
+        result = env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert (result.success, result.goal_id) == (True, "p")
+        waypoints = robot_gw.patrol.call_args.args[0]
+        assert [(w["x"], w["z"]) for w in waypoints] == [
+            (0.0, 0.0), (1.0, 3.1), (2.0, 0.0), (3.0, 3.1)
+        ]
+        # Degrees on the wire, radians at the gateway, for every waypoint.
+        assert waypoints[-1]["yaw"] == pytest.approx(-math.pi / 2)
+        assert robot_gw.patrol.call_args.kwargs["total"] == 4
+        robot_gw.move.assert_not_called()
+
+    def test_an_abort_says_the_robot_gave_no_reason(self, env, activities, robot_gw):
+        # Not MOVE's "navigation did not start": that is NavigateToGoal's code 0,
+        # and NavigateThroughPoses has no code.
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = _patrol_status("aborted")
+
+        with pytest.raises(ApplicationError) as raised:
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert str(raised.value) == (
+            "patrol aborted (the robot reports no reason for a patrol yet)"
+        )
+        assert raised.value.non_retryable is False
+
+    def test_a_lost_patrol_keeps_this_sides_reason(self, env, activities, robot_gw):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = {
+            **_patrol_status("aborted"), "error_msg": "no answer to the cancel request"
+        }
+
+        with pytest.raises(ApplicationError, match="no answer to the cancel request"):
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+    def test_a_rejected_patrol_is_retryable(self, env, activities, robot_gw):
+        robot_gw.patrol.return_value = (False, "Goal rejected by task runner node", None)
+
+        with pytest.raises(ApplicationError, match="Patrol rejected") as raised:
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert raised.value.non_retryable is False
+
+    def test_heartbeats_carry_the_waypoints_passed(self, env, activities, robot_gw):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.side_effect = [
+            _patrol_status("executing"),
+            _patrol_status("executing", remaining=4),
+            _patrol_status("executing", remaining=2),
+            # The robot may say 0 at the end; the last waypoint is never "passed".
+            _patrol_status("succeeded", remaining=0),
+        ]
+        beats = []
+        env.on_heartbeat = lambda *details: beats.append(details)
+
+        with patch(SLEEP):
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert beats == [
+            ("sending", 0),
+            ("executing", 0),
+            ("executing", 0),
+            ("executing", 2),
+            ("succeeded", 3),
+        ]
+
+    def test_a_retry_resumes_from_its_heartbeat(self, env, activities, robot_gw):
+        env.info = dataclasses.replace(env.info, heartbeat_details=["executing", 2])
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.side_effect = [
+            _patrol_status("executing", remaining=2),
+            _patrol_status("executing", remaining=1),
+            _patrol_status("succeeded", remaining=1),
+        ]
+        beats = []
+        env.on_heartbeat = lambda *details: beats.append(details)
+
+        with patch(SLEEP):
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        waypoints = robot_gw.patrol.call_args.args[0]
+        assert [w["x"] for w in waypoints] == [2.0, 3.0]
+        # Still counted against the whole step, and from where it resumed.
+        assert robot_gw.patrol.call_args.kwargs["total"] == 4
+        assert beats[0] == ("sending", 2)
+        assert beats[-1] == ("succeeded", 3)
+
+    def test_a_redispatch_starts_past_what_the_run_was_told(
+        self, env, activities, robot_gw
+    ):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = _patrol_status("succeeded")
+
+        env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 1)
+
+        assert [w["x"] for w in robot_gw.patrol.call_args.args[0]] == [1.0, 2.0, 3.0]
+
+    def test_the_last_waypoint_is_always_sent(self, env, activities, robot_gw):
+        # Its heading is the step's end, so even "all passed" drives to it.
+        env.info = dataclasses.replace(env.info, heartbeat_details=["executing", 9])
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = _patrol_status("succeeded")
+
+        env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 7)
+
+        assert [w["x"] for w in robot_gw.patrol.call_args.args[0]] == [3.0]
+
+    def test_an_old_heartbeat_without_a_count_starts_from_the_dispatch(
+        self, env, activities, robot_gw
+    ):
+        env.info = dataclasses.replace(env.info, heartbeat_details=["executing"])
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = _patrol_status("succeeded")
+
+        env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 1)
+
+        assert len(robot_gw.patrol.call_args.args[0]) == 3
+
+    def test_progress_is_reported_to_the_run_as_it_grows(
+        self, env, activities, robot_gw, client
+    ):
+        from syncai_backend.tasks.config import PATROL_PROGRESS_SIGNAL
+
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.side_effect = [
+            _patrol_status("executing", remaining=4),
+            _patrol_status("executing", remaining=3),
+            _patrol_status("executing", remaining=3),
+            _patrol_status("succeeded", remaining=1),
+        ]
+        signals = []
+        client.get_workflow_handle.return_value.signal.side_effect = (
+            lambda name, **kw: signals.append((name, kw["args"]))
+        )
+
+        with patch(SLEEP):
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        # Lone step or not: a pause interrupts both. Once per waypoint passed.
+        assert signals == [
+            (PATROL_PROGRESS_SIGNAL, ["s1", 1]),
+            (PATROL_PROGRESS_SIGNAL, ["s1", 3]),
+        ]
+
+    def test_a_report_that_cannot_be_sent_does_not_fail_the_patrol(
+        self, env, activities, robot_gw, client
+    ):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.side_effect = [
+            _patrol_status("executing", remaining=2),
+            _patrol_status("succeeded", remaining=1),
+        ]
+        client.get_workflow_handle.return_value.signal.side_effect = RuntimeError(
+            "temporal unreachable"
+        )
+
+        with patch(SLEEP):
+            result = env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert result.success is True
+
+    def test_a_cancel_while_polling_cancels_the_goal(self, env, activities, robot_gw):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.side_effect = CancelledError()
+
+        with pytest.raises(CancelledError):
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        robot_gw.cancel_active_moves.assert_called_once()
+        # No dock tree ran, so no gait to put back.
+        robot_gw.set_motion_key.assert_not_called()
+
+    def test_a_patrol_planned_on_another_map_is_refused(self, env, activities, robot_gw):
+        with pytest.raises(ApplicationError) as raised:
+            env.run(activities.execute_patrol, _patrol_params(), "warehouse", "s1", 0)
+
+        assert raised.value.non_retryable is True
+        robot_gw.patrol.assert_not_called()
+
+    def test_a_patrol_takes_the_robot_off_the_dock_first(
+        self, env, activities, robot_gw, robot_repo, dock_state
+    ):
+        dock_state.record("lab", 0.0, 0.0, 0.0)
+        robot_repo.get_robot_state.return_value = _robot_state()
+        robot_gw.move.return_value = (True, "", "undock")
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = _patrol_status("succeeded")
+
+        env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert robot_gw.move.call_args.kwargs["behavior_tree"] == "undock.xml"
+        robot_gw.patrol.assert_called_once()

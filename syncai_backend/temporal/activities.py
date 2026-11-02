@@ -12,8 +12,12 @@ from temporalio.exceptions import ApplicationError, CancelledError
 
 
 from syncai_backend.gateways.failure import Failure, failure_code
-from syncai_backend.tasks.config import STEP_STARTED_SIGNAL, reports_start
-from syncai_backend.tasks.schema import MoveParams, SpeakParams, TaskRecord
+from syncai_backend.tasks.config import (
+    PATROL_PROGRESS_SIGNAL,
+    STEP_STARTED_SIGNAL,
+    reports_start,
+)
+from syncai_backend.tasks.schema import MoveParams, PatrolParams, SpeakParams, TaskRecord
 from syncai_backend.gateways.robot.robot import (
     DOCK_BEHAVIOR_TREE,
     UNDOCK_BEHAVIOR_TREE,
@@ -70,6 +74,36 @@ def _move_failure(status: dict, label: str = "move") -> str:
             "(another navigation is running, or the behavior tree failed to load)"
         )
     return f"{label} ended in aborted"
+
+
+# A PATROL's error_msg on an abort the robot reported. Fixed, because
+# NavigateThroughPoses' result is Empty: no code, no sentence. Not _move_failure's
+# "navigation did not start" either -- that reading is NavigateToGoal's error_code 0,
+# and a patrol abort has no code to read it from. Until syncai_common has a
+# NavigateThroughGoals with NavigateToGoal's error fields, this is all there is.
+PATROL_ABORTED_MSG = "patrol aborted (the robot reports no reason for a patrol yet)"
+
+
+def _patrol_failure(status: dict) -> str:
+    """The step's error_msg for a PATROL that did not succeed.
+
+    A goal this side lost (server gone, cancel unanswered) keeps its own reason;
+    an abort from the robot says it gave none.
+    """
+    state = status["state"]
+    if state != "aborted":
+        return f"patrol ended in {state}"
+    if status.get("error_msg"):
+        return f"patrol ended in aborted: {status['error_msg']}"
+    return PATROL_ABORTED_MSG
+
+
+def _patrol_passed(details) -> int:
+    """How many waypoints the previous attempt left behind it, off its heartbeat
+    details (``(state, passed)``); 0 when it beat none or something older."""
+    if len(details) > 1 and isinstance(details[1], int) and details[1] >= 0:
+        return details[1]
+    return 0
 
 
 class ActivityResult(BaseModel):
@@ -145,6 +179,71 @@ class RobotActivities:
                 error=str(err),
             )
 
+    def _report_patrol_progress(self, step_id: str, passed: int) -> None:
+        """Tell the run how many of ``step_id``'s waypoints are behind the robot
+        (PATROL_PROGRESS_SIGNAL), for a resume to start past them.
+
+        Every patrol reports, lone or grouped: a pause interrupts both. Same
+        loop hand-off and bound as _report_started, and never fatal: a lost
+        report only makes a resume drive through waypoints it already passed.
+        """
+        if self._client is None:
+            return
+        info = activity.info()
+        handle = self._client.get_workflow_handle(
+            info.workflow_id, run_id=info.workflow_run_id
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                handle.signal(PATROL_PROGRESS_SIGNAL, args=[step_id, passed]),
+                self._loop,
+            ).result(timeout=STARTED_REPORT_TIMEOUT_S)
+        except CancelledError:
+            raise
+        except Exception as err:
+            self._logger.warning(
+                "[RobotActivity] Could not report patrol progress",
+                step_id=step_id,
+                passed=passed,
+                error=str(err),
+            )
+
+    def _wait_for_patrol(
+        self, goal_id: str, step_id: str, passed: int, sent: int, total: int
+    ) -> dict:
+        """_wait_for_nav_goal for a patrol, also tracking the waypoints passed.
+
+        ``passed`` waypoints were behind the robot when ``sent`` were sent;
+        number_of_poses_remaining counts the goal's still ahead, so passed +
+        (sent - remaining) are behind it now. Capped below ``total``: the last
+        waypoint is never skipped, since its heading is the step's end. Beaten
+        in the details on every poll, so a retry starts from it, and reported
+        to the run when it grows, so a resume does.
+        """
+        # Counted from what this goal skipped, never from the running count: the
+        # same remaining count arrives on poll after poll, and each would add again.
+        skipped = passed
+        while True:
+            status = self._robot_gw.get_move_status(goal_id=goal_id)
+            state = status["state"] if status else None
+
+            remaining = status.get("poses_remaining") if status else None
+            grew = False
+            if remaining is not None:
+                now = min(total - 1, skipped + max(0, sent - remaining))
+                grew = now > passed
+                passed = max(passed, now)
+
+            # Beat before the report: it can take up to STARTED_REPORT_TIMEOUT_S.
+            activity.heartbeat(state, passed)
+            if grew:
+                self._report_patrol_progress(step_id, passed)
+
+            if state in ["succeeded", "aborted", "canceled"]:
+                return status
+
+            time.sleep(NAV_POLL_INTERVAL_S)
+
     def _wait_for_nav_goal(self, goal_id: str) -> dict:
         """Poll a navigation goal to a terminal state, heartbeating each round.
 
@@ -216,6 +315,77 @@ class RobotActivities:
         )
         self._dock_state.clear()
         return result
+
+    @activity.defn
+    def execute_patrol(
+        self,
+        params: PatrolParams,
+        expected_map: Optional[str] = None,
+        step_id: str = "",
+        start: int = 0,
+    ) -> ActivityResult:
+        """Drive through ``params.waypoints`` in order: one NavigateThroughPoses.
+
+        ``start`` is how many waypoints a dispatch before this one had passed
+        (RobotWorkflow keeps the count from PATROL_PROGRESS_SIGNAL), and a retry
+        of this dispatch reads its own from the last attempt's heartbeat
+        details; the goal carries only the waypoints past the larger of the two,
+        the last one always. ``step_id`` names the step in those reports.
+
+        The map check and the auto-undock are a MOVE's (execute_move). The
+        cleanup on a cancel is too: whatever is executing is cancelled. A patrol
+        never runs a dock tree, so there is no gait to restore.
+        """
+        self._refuse_wrong_map(expected_map)
+        self._undock_if_docked()
+
+        total = len(params.waypoints)
+        passed = max(start, _patrol_passed(activity.info().heartbeat_details))
+        passed = min(passed, total - 1)
+        rest = params.waypoints[passed:]
+
+        # patrol() can block up to NAV_GOAL_SEND_BUDGET_S; beat first, as _navigate.
+        activity.heartbeat("sending", passed)
+
+        try:
+            accepted, msg, goal_id = self._robot_gw.patrol(
+                [
+                    {
+                        "x": waypoint.x,
+                        "y": waypoint.y,
+                        "z": waypoint.z,
+                        "yaw": math.radians(waypoint.theta),
+                    }
+                    for waypoint in rest
+                ],
+                total=total,
+            )
+            if not accepted:
+                raise ApplicationError(f"Patrol rejected: {msg}", non_retryable=False)
+
+            self._logger.info(
+                "[RobotActivity] Patrol accepted",
+                goal_id=goal_id,
+                waypoints=len(rest),
+                skipped=passed,
+            )
+            self._report_started(beat=("accepted", passed))
+
+            status = self._wait_for_patrol(
+                goal_id, step_id, passed=passed, sent=len(rest), total=total
+            )
+            state = status["state"]
+
+        except CancelledError:
+            with activity.shield_thread_cancel_exception():
+                self._robot_gw.cancel_active_moves()
+            self._logger.warning("[RobotActivity] Patrol activity has been cancelled")
+            raise
+
+        if state != "succeeded":
+            raise ApplicationError(_patrol_failure(status), non_retryable=False)
+
+        return ActivityResult(success=True, goal_id=goal_id, state=state)
 
     def _undock_if_docked(self) -> None:
         """Get the robot off the recorded dock, if it is still on it.

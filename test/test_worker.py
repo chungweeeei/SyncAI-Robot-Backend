@@ -132,6 +132,8 @@ def test_body_and_io_activities_poll_separate_queues():
     assert activities.execute_move in body["activities"]
     assert activities.execute_dock in body["activities"]
     assert activities.execute_undock in body["activities"]
+    # PATROL drives: the body slot, never the IO queue.
+    assert activities.execute_patrol in body["activities"]
     assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
     assert "workflows" not in io
     assert io["activities"] == [activities.execute_speak, activities.record_task]

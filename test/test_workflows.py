@@ -43,6 +43,11 @@ What is pinned:
   a pause interrupts the group's MOVE while its SPEAK plays on.
   SPEAK is dispatched to the IO queue, so a stand-in registered only there
   is what runs it.
+* PATROL is dispatched with its map, its step id and how many waypoints it
+  has already passed: 0 at first, and after a pause whatever its activity
+  reported on ``patrol_progress`` (never less), so a resume does not start the
+  round over; a retry carries its count in the heartbeat details, which reach
+  the next attempt; a cancel ends it CANCELED like a MOVE.
 * WAIT is a workflow timer, not an activity: a pause freezes it and the
   resume starts a second timer for only the remainder (read off the run's
   history), and a cancel during it is CANCELED / "Task canceled".
@@ -93,11 +98,13 @@ from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
 
 from syncai_backend.tasks.config import (  # noqa: E402
+    PATROL_PROGRESS_SIGNAL,
     STEP_STARTED_SIGNAL,
     reports_start,
 )
 from syncai_backend.tasks.schema import (  # noqa: E402
     MoveParams,
+    PatrolParams,
     SpeakParams,
     Step,
     StepStatus,
@@ -138,6 +145,11 @@ def _task(task_id: str, *step_types: StepType) -> WorkflowTask:
                 StepType.MOVE: MoveParams(x=1.5, y=-2.5, theta=90.0),
                 StepType.DOCK: MoveParams(x=3.0, y=1.0, theta=180.0),
                 StepType.WAIT: WaitParams(seconds=WAIT_SECONDS),
+                StepType.PATROL: PatrolParams(
+                    waypoints=[
+                        MoveParams(x=float(n), y=0.0, theta=0.0) for n in range(4)
+                    ]
+                ),
             }.get(step_type),
         )
         for i, step_type in enumerate(step_types)
@@ -1648,3 +1660,200 @@ def test_a_recorded_run_replays_deterministically():
         ).replay_workflow(history)
 
     asyncio.run(scenario())
+
+
+# --- PATROL --------------------------------------------------------------------
+
+
+def _patrol(dispatches: list, started: asyncio.Event, release: asyncio.Event,
+            report=None, cancels: Optional[list] = None):
+    """A PATROL stand-in: records each dispatch's (step_id, start), reports
+    ``report`` waypoints passed (and, if given as a pair, a stale lower one
+    after it), then parks heartbeating until released or cancelled."""
+
+    @activity.defn(name="execute_patrol")
+    async def execute_patrol(
+        params: PatrolParams, expected_map=None, step_id: str = "", start: int = 0
+    ) -> ActivityResult:
+        dispatches.append((step_id, start, len(params.waypoints), expected_map))
+        info = activity.info()
+        handle = activity.client().get_workflow_handle(
+            info.workflow_id, run_id=info.workflow_run_id
+        )
+        for passed in report or ():
+            await handle.signal(PATROL_PROGRESS_SIGNAL, args=[step_id, passed])
+        started.set()
+        try:
+            while not release.is_set():
+                activity.heartbeat("executing", start)
+                try:
+                    await asyncio.wait_for(release.wait(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            if cancels is not None:
+                cancels.append(True)
+            raise
+        return ActivityResult(success=True, state="succeeded")
+
+    return execute_patrol
+
+
+def test_a_patrol_is_dispatched_with_its_step_id_and_nothing_skipped():
+    async def scenario():
+        dispatches: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        release.set()
+        task = _task("task-patrol", StepType.PATROL)
+
+        async with _worker([_patrol(dispatches, started, release)]) as client:
+            handle = await _start(client, task)
+            await handle.result()
+            return dispatches, await handle.query(RobotWorkflow.get_step_states)
+
+    dispatches, steps = asyncio.run(scenario())
+
+    # Every waypoint (the step's params are never trimmed), no map stamped.
+    assert dispatches == [("step-0", 0, 4, None)]
+    assert steps[0].status is StepStatus.COMPLETED
+
+
+def test_pause_interrupts_a_patrol_and_resume_sends_only_the_rest():
+    async def scenario():
+        dispatches: list = []
+        cancels: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        # Two passed, then a late lower report: the count only goes forward.
+        activity_fn = _patrol(dispatches, started, release, report=(2, 1), cancels=cancels)
+        task = _task("task-pause-patrol", StepType.PATROL, StepType.STANDUP)
+        calls: list = []
+
+        async with _worker([activity_fn] + _instant_activities(calls)[1:]) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            started.clear()
+
+            await handle.signal(RobotWorkflow.pause)
+            held = await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            release.set()
+            await handle.result()
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return dispatches, cancels, held, steps, calls
+
+    dispatches, cancels, held, steps, calls = asyncio.run(scenario())
+
+    assert cancels == [True]
+    assert held == [StepStatus.PAUSED, StepStatus.PENDING]
+    # Re-sent past the two waypoints behind it, not from the first.
+    assert [(step_id, start) for step_id, start, _, _ in dispatches] == [
+        ("step-0", 0), ("step-0", 2)
+    ]
+    # The step still carries every waypoint: the activity skips, the run does not trim.
+    assert len(steps[0].params.waypoints) == 4
+    assert calls == [("execute_stand", None)]
+
+
+def test_a_retried_patrol_reads_its_count_from_the_heartbeat():
+    """The retry is the same dispatch (same args), so what it starts past has
+    to come through Temporal's heartbeat details, beaten just before failing."""
+
+    async def scenario():
+        seen: list = []
+
+        @activity.defn(name="execute_patrol")
+        async def execute_patrol(
+            params: PatrolParams, expected_map=None, step_id: str = "", start: int = 0
+        ) -> ActivityResult:
+            seen.append((activity.info().attempt, list(activity.info().heartbeat_details)))
+            if activity.info().attempt == 1:
+                activity.heartbeat("executing", 2)
+                raise ApplicationError(
+                    "patrol aborted (the robot reports no reason for a patrol yet)"
+                )
+            return ActivityResult(success=True, state="succeeded")
+
+        async with _worker([execute_patrol]) as client:
+            handle = await _start(client, _task("task-retry-patrol", StepType.PATROL))
+            await handle.result()
+        return seen
+
+    assert asyncio.run(scenario()) == [(1, []), (2, ["executing", 2])]
+
+
+def test_a_patrol_that_aborts_three_times_fails_with_the_robots_silence():
+    async def scenario():
+        @activity.defn(name="execute_patrol")
+        async def execute_patrol(
+            params: PatrolParams, expected_map=None, step_id: str = "", start: int = 0
+        ) -> ActivityResult:
+            raise ApplicationError(
+                "patrol aborted (the robot reports no reason for a patrol yet)"
+            )
+
+        async with _worker([execute_patrol]) as client:
+            handle = await _start(client, _task("task-fail-patrol", StepType.PATROL))
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+            return await handle.query(RobotWorkflow.get_step_states)
+
+    steps = asyncio.run(scenario())
+
+    assert steps[0].status is StepStatus.FAILED
+    assert steps[0].error_msg == (
+        "patrol aborted (the robot reports no reason for a patrol yet)"
+    )
+
+
+def test_cancellation_mid_patrol_ends_the_run_and_the_step_canceled():
+    async def scenario():
+        dispatches: list = []
+        cancels: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        activity_fn = _patrol(dispatches, started, release, cancels=cancels)
+
+        async with _worker([activity_fn]) as client:
+            handle = await _start(client, _task("task-cancel-patrol", StepType.PATROL))
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+            return cancels, await handle.query(RobotWorkflow.get_step_states)
+
+    cancels, steps = asyncio.run(scenario())
+
+    assert cancels == [True]
+    assert steps[0].status is StepStatus.CANCELED
+    assert steps[0].error_msg == "Task canceled"
+
+
+def test_a_runs_map_is_handed_to_a_patrol():
+    async def scenario():
+        dispatches: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        release.set()
+        task = _task("task-patrol-map", StepType.PATROL)
+
+        async with _worker([_patrol(dispatches, started, release)]) as client:
+            await client.operator_service.add_search_attributes(
+                AddSearchAttributesRequest(
+                    namespace=client.namespace,
+                    search_attributes={
+                        TASK_MAP_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD
+                    },
+                )
+            )
+            handle = await client.start_workflow(
+                RobotWorkflow.run,
+                task,
+                id=task.id,
+                task_queue=TASK_QUEUE,
+                search_attributes=TypedSearchAttributes(
+                    [SearchAttributePair(TASK_MAP_KEY, "lab")]
+                ),
+            )
+            await handle.result()
+        return dispatches
+
+    assert asyncio.run(scenario()) == [("step-0", 0, 4, "lab")]

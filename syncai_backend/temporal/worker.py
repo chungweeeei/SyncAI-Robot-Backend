@@ -192,6 +192,7 @@ async def run_worker(
             activities.execute_move,
             activities.execute_dock,
             activities.execute_undock,
+            activities.execute_patrol,
             activities.execute_stand,
             activities.execute_lie_down,
             # For runs from before SPEAK_ON_IO_QUEUE_PATCH.

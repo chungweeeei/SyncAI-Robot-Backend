@@ -54,6 +54,14 @@ STEP_STARTED_SIGNAL = "step_started"
 _GROUP_ACTIVITY_ID_MARK = "#"
 
 
+# Sent by a PATROL activity each time the robot passes a waypoint: the step id and how
+# many of its waypoints are behind the robot. A pause cancels the activity and a resume
+# dispatches it again (RobotWorkflow._run_move); the count is what the new dispatch
+# skips, so a resumed patrol does not start over from the first waypoint. A retry of
+# the same dispatch reads it from its own heartbeat details instead.
+PATROL_PROGRESS_SIGNAL = "patrol_progress"
+
+
 def group_activity_id(step_id: str, dispatch: int) -> str:
     """A group member's activity id: step id plus a per-run dispatch count, so a MOVE
     re-sent after a pause gets a fresh one."""
