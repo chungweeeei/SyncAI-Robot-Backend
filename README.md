@@ -1220,6 +1220,20 @@ docker build --target runtime --build-arg USER_UID=$(id -u) -t syncai-backend .
 `USER_UID` must own the host's `config/`, `map/` and `record/`, or the container
 user cannot write them.
 
+Or skip the build: every push to `dev` publishes the runtime image (arm64 only,
+`USER_UID=1000`) through `.github/workflows/cd-dev.yml` as
+`ghcr.io/chungweeeei/syncai-backend:dev` and an immutable `:<short-sha>-dev`
+to roll back to. Compose still names `syncai-backend`, so retag it:
+
+```bash
+docker pull ghcr.io/chungweeeei/syncai-backend:dev
+docker tag  ghcr.io/chungweeeei/syncai-backend:dev syncai-backend
+docker compose up -d                # without --build, or compose rebuilds it
+```
+
+The GHCR package starts private: make it public in its settings, or
+`docker login ghcr.io` on the robot with a token that has `read:packages`.
+
 **3. Run it.** Compose is the supported way — host networking, `ipc: host`, the
 nvidia runtime, camera devices, mounts and environment, each commented in
 `docker-compose.yml`.
