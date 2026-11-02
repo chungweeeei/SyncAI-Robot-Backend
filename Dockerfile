@@ -87,8 +87,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #
 #   * ROS interfaces this package imports that ros-base does not carry.
 #     nav2_msgs is the one that actually matters (the map gateway's LoadMap
-#     service; the robot gateway's MOVE action is syncai_common's
-#     NavigateToGoal since 2026-10, no longer nav2's NavigateToPose); the others
+#     service, and the PATROL step's NavigateThroughPoses action, 2026-11; the
+#     robot gateway's MOVE action is syncai_common's NavigateToGoal since
+#     2026-10, no longer nav2's NavigateToPose); the others
 #     are cheap and explicit rather than relied on transitively.
 #   * rmw_cyclonedds_cpp, which is not optional on this fleet. The rest of the
 #     stack runs `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` with a lo-only,

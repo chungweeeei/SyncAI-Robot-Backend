@@ -19,8 +19,13 @@ map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `R
 2026-10-15 a MOVE runs undock.xml itself first when the robot is still on the last DOCK's
 pose (`services/dock_state.py`, in memory; README *Auto-undock*); this package never
 calls `DockToPose`) — plus `rclpy`,
-`nav2_msgs`, `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
-those imports as they are. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
+`nav2_msgs` (`LoadMap`, and since 2026-11 the PATROL step's `NavigateThroughPoses` on
+`navigate_through_poses`), `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
+those imports as they are. **A PATROL failure has no reason code** until
+SyncAI-Robot-Interface grows a `NavigateThroughGoals` (NavigateToGoal's error fields on a
+list of poses): NavigateThroughPoses' result is Empty, so an aborted patrol fails its step
+with the fixed `PATROL_ABORTED_MSG` (activities.py) — never route it through `_move_failure`,
+whose "navigation did not start" is NavigateToGoal's `error_code` 0. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `ResetOdometry` with `skip_seed` (behind `POST /api/v1/localization/auto`,
 2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; the dock trees and `DOCK_FAILED` at or after `bbcc958`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
@@ -120,7 +125,7 @@ ament linters (`test_copyright`, `test_flake8`, `test_pep257`) are part of the s
 two daemon threads. Main thread: `MultiThreadedExecutor.spin()` (all ROS callbacks, TF,
 service/action clients). uvicorn thread: FastAPI on `0.0.0.0:3000`. Temporal worker
 thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotWorkflow`
-+ the body activities (MOVE, postures) in a single-worker `ThreadPoolExecutor`,
++ the body activities (MOVE, PATROL, DOCK / UNDOCK, postures) in a single-worker `ThreadPoolExecutor`,
 `max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time.
 
 Consequences:
@@ -271,6 +276,8 @@ the only caller that passes anything else.
 - **No migrations.** Schema is whatever `create_all` produced on a robot. Adding a column
   or constraint has no path to existing deployments; `TaskTemplate.steps` is a JSON column
   for this reason. Only ever *add optional keys* to a stored step — never rename/retype.
+  (A PATROL step's `vertex_ids` / `vertex_names`, index-aligned with its waypoints, are
+  such keys; a PATROL never stores the single `vertex_id`.)
   The one exception is `map_vertices.z` (2026-10): `init_map_repo` runs `_add_vertex_z`
   after `create_all`, which inspects the table and `ALTER TABLE … ADD COLUMN z FLOAT NOT
   NULL DEFAULT 0` when it is missing. Additive and defaulted, so an older backend still
@@ -369,11 +376,11 @@ the only caller that passes anything else.
 optional key — no migration): a group's members run side by side, the next step waits
 for all of them, and the first failure cancels the rest and fails the run
 (`RobotWorkflow._run_group`). They **start in list order**, each once the one before
-has *started* (MOVE: goal accepted; SPEAK: utterance queued; postures: ended; WAIT:
+has *started* (MOVE / PATROL: goal accepted; SPEAK: utterance queued; postures: ended; WAIT:
 timer running) — a member is scheduled under activity id `<step id>#<n>`
 (`group_activity_id`) and `MOVE`/`SPEAK` report through the `step_started` signal
 (`STEP_STARTED_SIGNAL`, sent by `RobotActivities._report_started` on the worker's
-client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/STANDUP/LIEDOWN per group, members
+client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/PATROL/DOCK/UNDOCK/STANDUP/LIEDOWN per group, members
 adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
 router that also names the offending step (`code: invalid_step_group`, `step_id`: the
 step rejoining a closed group, or the second body step), so the console marks that row.
@@ -400,7 +407,12 @@ step as `PAUSED` in a `wait_condition`, and `get_task_state` reads the hold off 
 step rather than asking a second time. A held run stays *running* to everything else
 (`active_tasks`, `_require_idle`, the map activation gate). Only a `MOVE` is cut short —
 `_run_move` cancels the in-flight activity handle, which lands in `execute_move`'s
-`except CancelledError` and cancels the nav2 goal — and is re-sent from scratch on resume.
+`except CancelledError` and cancels the nav2 goal — and is re-sent from scratch on resume
+(DOCK / UNDOCK / PATROL alike, through the same `_run_move`; a PATROL is re-sent **past the
+waypoints it had passed**: `execute_patrol` signals the count on `PATROL_PROGRESS_SIGNAL`,
+forward only, and `_run_move` passes it as the next dispatch's `start`. A retry of the same
+dispatch reads it from its own heartbeat details instead. The last waypoint is always sent,
+and the step's `params` keep every waypoint).
 The MOVE wait is `workflow.wait_condition` on `handle.done() or paused`, **never a direct
 `await handle`**: that is what keeps a task cancel arriving as `asyncio.CancelledError`
 instead of being swallowed into the activity's `ActivityError`, so a cancel is never
@@ -432,7 +444,7 @@ is unregistered falls back to the whole namespace). All four are registered
 idempotently by the worker at connect; the history
 list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
 `TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`
-is the map a run's MOVE positions are in: stamped by the backend (the loaded map at
+is the map a run's MOVE / PATROL / DOCK positions are in: stamped by the backend (the loaded map at
 dispatch, a schedule's `map_name`), never taken from the caller, and an attribute rather
 than memo because a scheduled run inherits only its action's attributes. Dispatch and
 `execute_move` both check it against the loaded map through `helpers/move_guard.py`.
