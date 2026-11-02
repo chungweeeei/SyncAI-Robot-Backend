@@ -26,6 +26,7 @@ from action_msgs.msg import GoalStatus  # noqa: E402
 from builtin_interfaces.msg import Time  # noqa: E402
 
 from geometry_msgs.msg import Twist  # noqa: E402
+from nav2_msgs.action import NavigateThroughPoses  # noqa: E402
 from syncai_common.action import NavigateToGoal  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
@@ -83,14 +84,23 @@ def move_client():
 
 
 @pytest.fixture
-def robot_gw(logger, move_client) -> RobotGateway:
+def patrol_client():
+    client = MagicMock()
+    client.wait_for_server.return_value = True
+    return client
+
+
+@pytest.fixture
+def robot_gw(logger, move_client, patrol_client) -> RobotGateway:
     node = MagicMock()
     # _make_pose_stamped stamps headers from the node's clock, and the real
     # Header message asserts its stamp is a builtin_interfaces/Time — a bare
     # MagicMock does not pass, so the mocked clock must answer a real one.
     node.get_clock.return_value.now.return_value.to_msg.return_value = Time()
+    clients = {"navigate_to_goal": move_client, "navigate_through_poses": patrol_client}
     with patch(
-        "syncai_backend.gateways.robot.robot.ActionClient", return_value=move_client
+        "syncai_backend.gateways.robot.robot.ActionClient",
+        side_effect=lambda **kwargs: clients[kwargs["action_name"]],
     ):
         return RobotGateway(logger=logger, node=node)
 
@@ -938,3 +948,140 @@ class TestLostGoals:
         status = robot_gw.get_move_status(goal_id=goal_id)
         assert status["state"] == MoveState.CANCELED.value
         assert "error_msg" not in status
+
+
+# --- PATROL: NavigateThroughPoses on the same goal book ----------------------------
+
+WAYPOINTS = [
+    {"x": 1.0, "y": 2.0, "yaw": 0.0, "z": 0.0},
+    {"x": 4.0, "y": 2.0, "yaw": 1.0, "z": 3.1},
+    {"x": 4.0, "y": 6.0, "yaw": -math.pi / 2, "z": 3.1},
+]
+
+
+def _send_patrol(robot_gw, patrol_client, waypoints=WAYPOINTS, total=None):
+    handle = _goal_handle()
+    result_future = _Future(completed=False)
+    handle.get_result_async.return_value = result_future
+    patrol_client.send_goal_async.return_value = _Future(result=handle)
+
+    accepted, message, goal_id = robot_gw.patrol(waypoints, total=total)
+    assert (accepted, message) == (True, "")
+    return goal_id, result_future
+
+
+def _feed_patrol(patrol_client, remaining: int, distance: float):
+    callback = patrol_client.send_goal_async.call_args[1]["feedback_callback"]
+    callback(
+        SimpleNamespace(
+            goal_id=SimpleNamespace(uuid=GOAL_UUID.bytes),
+            feedback=NavigateThroughPoses.Feedback(
+                number_of_poses_remaining=remaining, distance_remaining=distance
+            ),
+        )
+    )
+
+
+class TestPatrol:
+    def test_every_waypoint_goes_out_with_its_own_height_in_order(
+        self, robot_gw, move_client, patrol_client
+    ):
+        _send_patrol(robot_gw, patrol_client)
+
+        goal = patrol_client.send_goal_async.call_args.kwargs["goal"]
+        assert isinstance(goal, NavigateThroughPoses.Goal)
+        # patrol.xml, the task runner's default for this action.
+        assert goal.behavior_tree == ""
+        assert [p.header.frame_id for p in goal.poses] == ["map"] * 3
+        assert [(p.pose.position.x, p.pose.position.y, p.pose.position.z)
+                for p in goal.poses] == [(1.0, 2.0, 0.0), (4.0, 2.0, 3.1), (4.0, 6.0, 3.1)]
+        # The last pose's heading is the one the robot turns to: yaw-only.
+        last = goal.poses[-1].pose.orientation
+        assert (last.x, last.y) == (0.0, 0.0)
+        assert last.z == pytest.approx(math.sin(-math.pi / 4))
+        assert last.w == pytest.approx(math.cos(-math.pi / 4))
+        # Not on the NavigateToGoal client.
+        move_client.send_goal_async.assert_not_called()
+
+    def test_a_patrol_is_a_navigation_like_any_other(self, robot_gw, patrol_client):
+        # Same book: teleop refused, the telemetry gate open, cancel by state.
+        goal_id, result_future = _send_patrol(robot_gw, patrol_client)
+
+        assert robot_gw.navigation_active() is True
+        assert robot_gw.teleop_cmd_vel(0.1, 0.0, 0.0) == (
+            False, "autonomous move in progress"
+        )
+        assert robot_gw.get_move_status(goal_id) == {
+            "goal_id": goal_id, "state": MoveState.EXECUTING.value
+        }
+
+        result_future.complete(SimpleNamespace(
+            status=GoalStatus.STATUS_SUCCEEDED, result=NavigateThroughPoses.Result()
+        ))
+        assert robot_gw.navigation_active() is False
+
+    def test_cancel_active_moves_cancels_a_patrol(self, robot_gw, patrol_client, monkeypatch):
+        monkeypatch.setattr(ros_module, "wait_for_future", lambda future, timeout: True)
+        _, _ = _send_patrol(robot_gw, patrol_client)
+        handle = patrol_client.send_goal_async.return_value.result()
+        handle.cancel_goal_async.return_value = _Future(
+            result=SimpleNamespace(goals_canceling=[object()])
+        )
+
+        assert robot_gw.cancel_active_moves() == (True, "")
+        handle.cancel_goal_async.assert_called_once()
+
+    def test_feedback_becomes_the_progress_sentence(self, robot_gw, patrol_client):
+        _send_patrol(robot_gw, patrol_client)
+        assert robot_gw.get_move_message() == ""
+
+        _feed_patrol(patrol_client, remaining=2, distance=12.44)
+
+        assert robot_gw.get_move_message() == "Patrolling: 2 of 3 waypoints left, 12.4 m to go"
+
+    def test_a_resumed_patrol_counts_against_the_whole_step(self, robot_gw, patrol_client):
+        # The goal carries the last two of five; the line still reads of five.
+        _send_patrol(robot_gw, patrol_client, waypoints=WAYPOINTS[1:], total=5)
+
+        _feed_patrol(patrol_client, remaining=2, distance=0.0)
+
+        # No distance yet (no route planned): said nothing rather than "0.0 m".
+        assert robot_gw.get_move_message() == "Patrolling: 2 of 5 waypoints left"
+
+    def test_status_carries_the_poses_remaining(self, robot_gw, patrol_client):
+        goal_id, _ = _send_patrol(robot_gw, patrol_client)
+
+        _feed_patrol(patrol_client, remaining=1, distance=3.0)
+
+        assert robot_gw.get_move_status(goal_id)["poses_remaining"] == 1
+
+    def test_an_abort_carries_no_reason(self, robot_gw, patrol_client):
+        # NavigateThroughPoses' result is Empty: nothing to read a code from,
+        # and NavigateToGoal's "error_code 0 = never started" must not apply.
+        goal_id, result_future = _send_patrol(robot_gw, patrol_client)
+
+        result_future.complete(SimpleNamespace(
+            status=GoalStatus.STATUS_ABORTED, result=NavigateThroughPoses.Result()
+        ))
+
+        status = robot_gw.get_move_status(goal_id)
+        assert status["state"] == MoveState.ABORTED.value
+        assert "error_code" not in status and "error_msg" not in status
+
+    def test_a_lost_patrol_carries_this_sides_reason(self, robot_gw, patrol_client):
+        goal_id, result_future = _send_patrol(robot_gw, patrol_client)
+
+        result_future.complete(SimpleNamespace(status=GoalStatus.STATUS_UNKNOWN, result=None))
+
+        status = robot_gw.get_move_status(goal_id)
+        assert status["state"] == MoveState.ABORTED.value
+        assert "goal status" in status["error_msg"]
+
+    def test_unavailable_server_fails_fast(self, robot_gw, patrol_client):
+        patrol_client.wait_for_server.return_value = False
+
+        accepted, message, goal_id = robot_gw.patrol(WAYPOINTS)
+
+        assert (accepted, goal_id) == (False, None)
+        assert message == "Action server is not available"
+        patrol_client.send_goal_async.assert_not_called()
