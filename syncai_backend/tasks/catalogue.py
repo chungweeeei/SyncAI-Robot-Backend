@@ -8,10 +8,13 @@ console release.
 
 Each step says whether it occupies the robot's body (the group rule,
 BODY_STEP_TYPES), whether it is offered on the walk to a stop
-(``while_walking``), and lists its parameters as one of four field kinds a client
+(``while_walking``), and lists its parameters as one of five field kinds a client
 knows how to draw: ``waypoint`` (a pose on the job's map, which on the wire
 spreads into the params model's ``x`` / ``y`` / ``theta`` / ``z`` and a
-template's ``vertex_id``), ``text``, ``integer`` and ``number``. The limits are
+template's ``vertex_id``), ``waypoints`` (an ordered list of such poses, sent as
+the params' ``waypoints`` list of ``x`` / ``y`` / ``theta`` / ``z`` and, in a
+template, the index-aligned ``vertex_ids``), ``text``, ``integer`` and
+``number``. The limits are
 read off the params models' own constraints, so the two cannot drift; the
 validators stay the gate, and a client's own check only spares the operator a
 422.
@@ -22,11 +25,12 @@ copy is: what the robot does, never a node or a vendor name.
 
 from typing import List, Literal, Optional, Union
 
-from annotated_types import Ge, Gt, Le, Lt, MaxLen
+from annotated_types import Ge, Gt, Le, Lt, MaxLen, MinLen
 from pydantic import BaseModel, Field
 
 from syncai_backend.tasks.schema import (
     BODY_STEP_TYPES,
+    PatrolParams,
     SpeakParams,
     StepType,
     WaitParams,
@@ -40,6 +44,13 @@ class WaypointField(BaseModel):
     filter: Optional[Literal["charger"]] = Field(
         None, description="`charger`: only charging waypoints are offered."
     )
+
+
+class WaypointsField(BaseModel):
+    kind: Literal["waypoints"] = "waypoints"
+    key: str
+    label: str
+    min_items: int = Field(..., description="The fewest waypoints the step takes.")
 
 
 class TextField(BaseModel):
@@ -71,7 +82,7 @@ class NumberField(BaseModel):
     placeholder: Optional[str] = None
 
 
-StepParamField = Union[WaypointField, TextField, IntegerField, NumberField]
+StepParamField = Union[WaypointField, WaypointsField, TextField, IntegerField, NumberField]
 
 
 class StepSpec(BaseModel):
@@ -106,6 +117,8 @@ def _bounds(model: type[BaseModel], field: str) -> dict:
     for item in model.model_fields[field].metadata:
         if isinstance(item, MaxLen):
             found["max_length"] = item.max_length
+        elif isinstance(item, MinLen):
+            found["min_length"] = item.min_length
         elif isinstance(item, Ge):
             found["min"], found["min_exclusive"] = item.ge, False
         elif isinstance(item, Gt):
@@ -144,6 +157,7 @@ def step_catalogue() -> StepCatalogue:
     text = _bounds(SpeakParams, "text")
     repeat = _bounds(SpeakParams, "repeat")
     wait = _bounds(WaitParams, "seconds")
+    waypoints = _bounds(PatrolParams, "waypoints")
     return StepCatalogue(
         steps=[
             _spec(
@@ -151,6 +165,19 @@ def step_catalogue() -> StepCatalogue:
                 "Move",
                 "Walk to a waypoint.",
                 [WaypointField(key="target", label="Waypoint")],
+            ),
+            _spec(
+                StepType.PATROL,
+                "Patrol",
+                "Drive through the waypoints in order without stopping; face the "
+                "last one’s heading.",
+                [
+                    WaypointsField(
+                        key="waypoints",
+                        label="Waypoints",
+                        min_items=waypoints["min_length"],
+                    )
+                ],
             ),
             _spec(
                 StepType.DOCK,

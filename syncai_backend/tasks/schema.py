@@ -40,6 +40,9 @@ class StepType(str, Enum):
     # takes none, since undock.xml backs out 1 m from wherever the robot stands.
     DOCK = "DOCK"
     UNDOCK = "UNDOCK"
+    # A NavigateThroughPoses on the task runner's patrol.xml: through every waypoint in
+    # order without stopping, the last one reached with its heading as a MOVE's is.
+    PATROL = "PATROL"
 
 
 class MoveParams(BaseSchema):
@@ -64,6 +67,26 @@ class MoveParams(BaseSchema):
         allow_inf_nan=False,
         description="Ground height (metres, map frame) of the storey the goal is on",
         examples=[0.0],
+    )
+
+
+# A patrol of one waypoint is a MOVE; the console offers MOVE for that.
+PATROL_MIN_WAYPOINTS = 2
+
+
+class PatrolParams(BaseSchema):
+    # MoveParams per waypoint, not a new pose model: the same x / y / theta / z
+    # bounds and meaning (z picks the storey of *that* waypoint, so a patrol may
+    # cross floors). Only the last theta reaches the robot as a heading the robot
+    # turns to; patrol.xml ignores the orientation of the ones before it.
+    waypoints: List[MoveParams] = Field(
+        ...,
+        min_length=PATROL_MIN_WAYPOINTS,
+        description=(
+            "The poses to drive through, in order, without stopping (at least "
+            "two). Only the last waypoint's theta is turned to; the others' are "
+            "sent and ignored"
+        ),
     )
 
 
@@ -113,8 +136,8 @@ class WaitParams(BaseSchema):
 
 
 # Pydantic's smart union tells the members apart by their disjoint required fields,
-# so no discriminator is needed.
-StepParams = MoveParams | SpeakParams | WaitParams
+# so no discriminator is needed (PatrolParams' is ``waypoints``).
+StepParams = MoveParams | PatrolParams | SpeakParams | WaitParams
 
 
 # Which params model each step type expects (None: takes none). Without it a MOVE
@@ -127,16 +150,19 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.WAIT: WaitParams,
     StepType.DOCK: MoveParams,
     StepType.UNDOCK: None,
+    StepType.PATROL: PatrolParams,
 }
 
 
-# Steps whose params are a pose on the loaded map: they share MOVE's map stamping /
-# check and its template vertex refs. UNDOCK is not one -- its goal carries no pose,
-# so a job that only backs off the dock holds no map.
-POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK})
+# Steps whose params are poses on the loaded map: they share MOVE's map stamping /
+# check and its template vertex refs (a PATROL's one per waypoint, ``vertex_ids``).
+# UNDOCK is not one -- its goal carries no pose, so a job that only backs off the
+# dock holds no map.
+POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK, StepType.PATROL})
 
-# Steps that send a NavigateToGoal: they share MOVE's pause interrupt and its live
-# status sentence, pose or not.
+# Steps that send a navigation goal (NavigateToGoal, or a PATROL's
+# NavigateThroughPoses): they share MOVE's pause interrupt and its live status
+# sentence, pose or not.
 NAV_STEP_TYPES = POSE_STEP_TYPES | {StepType.UNDOCK}
 
 
@@ -196,7 +222,8 @@ def step_group_problem(steps) -> Optional[StepGroupProblem]:
             body.append(step.id)
             if len(body) > 1:
                 return StepGroupProblem(
-                    f"Group '{group}' has more than one MOVE/DOCK/UNDOCK/STANDUP/LIEDOWN step "
+                    f"Group '{group}' has more than one "
+                    "MOVE/PATROL/DOCK/UNDOCK/STANDUP/LIEDOWN step "
                     f"({', '.join(body)}); the robot can do only one at a time",
                     step.id,
                 )
@@ -224,7 +251,7 @@ GROUP_DESCRIPTION = (
     "Adjacent steps with the same group run at the same time, started in "
     "list order (each once the one before it has started), and the next "
     "step starts once all of them have finished; if one fails the others are "
-    "canceled. At most one MOVE/DOCK/UNDOCK/STANDUP/LIEDOWN per group. Omitted: the step "
+    "canceled. At most one MOVE/PATROL/DOCK/UNDOCK/STANDUP/LIEDOWN per group. Omitted: the step "
     "runs on its own, after the one before it"
 )
 
@@ -239,7 +266,7 @@ class Step(BaseSchema):
         description=(
             "Parameters for the step, which vary based on the step type. "
             "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK (x/y/theta: "
-            "the dock pose), SPEAK and WAIT"
+            "the dock pose), PATROL (waypoints), SPEAK and WAIT"
         ),
     )
     status: StepStatus = Field(

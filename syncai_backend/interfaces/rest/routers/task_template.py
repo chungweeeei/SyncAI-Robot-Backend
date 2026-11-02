@@ -9,7 +9,10 @@ and a ``params`` snapshot; every read reports ``resolved_params`` -- the
 vertex's current pose, or the snapshot once it is deleted -- and a client
 dispatches by sending that through ``POST /api/v1/tasks``, the single dispatch
 path (no server-side ``/dispatch``: the operator sees the resolved numbers and
-the "vertex was deleted" warning first). Temporal gets **a label, not a
+the "vertex was deleted" warning first). A PATROL does the same per waypoint:
+``vertex_ids`` / ``vertex_names`` / ``vertex_statuses`` are index-aligned with
+its ``params.waypoints`` (null where a waypoint is a free point on the map), and
+each CURRENT vertex's pose is swapped into its waypoint. Temporal gets **a label, not a
 reference**: the template's name (``TaskName``) and, for a schedule, its id in
 the memo, never a ``vertex_id``, so nothing there goes stale on a vertex edit.
 
@@ -34,6 +37,7 @@ from syncai_backend.exceptions import BadRequestError, NotFoundError
 from syncai_backend.tasks.schema import (
     POSE_STEP_TYPES,
     MoveParams,
+    PatrolParams,
     ScheduleTask,
     Step,
     StepParams,
@@ -72,13 +76,55 @@ class TemplateStepRequest(StepRequest):
         ),
     )
 
+    # A list, not one id: a PATROL's waypoints each come from a vertex or not.
+    # Index-aligned with params.waypoints. An optional key, so templates stored
+    # before PATROL read as they did.
+    vertex_ids: Optional[List[Optional[uuid.UUID]]] = Field(
+        default=None,
+        description=(
+            "PATROL only: the map vertex each waypoint was taken from, aligned "
+            "index for index with `params.waypoints` (null: a point picked on the "
+            "map). Omitted: every waypoint is a free point. Each one behaves like a "
+            "MOVE's `vertex_id`."
+        ),
+    )
+
     # Not named _check_params: that would override the inherited validator and
     # silently drop the params check.
     @model_validator(mode="after")
     def _check_vertex_ref(self) -> "TemplateStepRequest":
+        if self.type is StepType.PATROL:
+            # The plural only: a single vertex_id would name no waypoint.
+            if self.vertex_id is not None:
+                raise ValueError(
+                    "PATROL step references its vertices through vertex_ids, "
+                    "one per waypoint, not vertex_id"
+                )
+            waypoints = self.params.waypoints if self.params is not None else []
+            if self.vertex_ids is not None and len(self.vertex_ids) != len(waypoints):
+                raise ValueError(
+                    f"PATROL step has {len(waypoints)} waypoints but "
+                    f"{len(self.vertex_ids)} vertex_ids; send one per waypoint "
+                    "(null for a point picked on the map)"
+                )
+            return self
+        if self.vertex_ids is not None:
+            raise ValueError(f"{self.type.value} step cannot reference vertices by vertex_ids")
         if self.vertex_id is not None and self.type not in POSE_STEP_TYPES:
             raise ValueError(f"{self.type.value} step cannot reference a vertex")
         return self
+
+    def waypoint_vertex_ids(self) -> List[Optional[uuid.UUID]]:
+        """A PATROL's vertex ids, one per waypoint, nulls filled in when omitted."""
+        if self.vertex_ids is not None:
+            return list(self.vertex_ids)
+        return [None] * len(self.params.waypoints)
+
+    def referenced_ids(self) -> List[uuid.UUID]:
+        """Every vertex this step names, singular or per waypoint."""
+        if self.type is StepType.PATROL:
+            return [vid for vid in self.waypoint_vertex_ids() if vid is not None]
+        return [self.vertex_id] if self.vertex_id is not None else []
 
 
 class _StoredStep(TemplateStepRequest):
@@ -91,6 +137,8 @@ class _StoredStep(TemplateStepRequest):
     """
 
     vertex_name: Optional[str] = Field(default=None)
+    # A PATROL's labels, index-aligned with vertex_ids, for the same reason.
+    vertex_names: Optional[List[Optional[str]]] = Field(default=None)
 
 
 class TaskTemplateRequest(BaseModel):
@@ -176,13 +224,24 @@ class TemplateStepResponse(BaseModel):
         ),
     )
     group: Optional[str] = None
-    vertex_status: VertexRefStatus
+    vertex_status: VertexRefStatus = Field(
+        ...,
+        description=(
+            "For a PATROL, the worst of its vertex_statuses: MISSING if any "
+            "waypoint's vertex is gone, else CURRENT if any is a vertex, else NONE."
+        ),
+    )
+    # PATROL only (null for every other step): the plural mirrors of vertex_id /
+    # vertex_name / vertex_status, index-aligned with params.waypoints.
+    vertex_ids: Optional[List[Optional[uuid.UUID]]] = None
+    vertex_names: Optional[List[Optional[str]]] = None
+    vertex_statuses: Optional[List[VertexRefStatus]] = None
     resolved_params: Optional[StepParams] = Field(
         default=None,
         description=(
             "What a dispatch should send right now. Equal to `params` for a "
             "non-MOVE step, a hand-typed MOVE, or a MISSING vertex; the vertex's "
-            "live pose when CURRENT."
+            "live pose when CURRENT. A PATROL's waypoints each resolve that way."
         ),
     )
 
@@ -246,7 +305,7 @@ def _check_step_groups(steps: List[TemplateStepRequest]) -> None:
 
 
 def _check_map_scope(map_name: Optional[str], steps: List[TemplateStepRequest]) -> None:
-    """Any MOVE / DOCK step means a map name is required; none means it is
+    """Any MOVE / PATROL / DOCK step means a map name is required; none means it is
     forbidden.
 
     Any such step, not just a vertex reference: hand-typed coordinates are in a
@@ -255,12 +314,12 @@ def _check_map_scope(map_name: Optional[str], steps: List[TemplateStepRequest]) 
     has_move = any(step.type in POSE_STEP_TYPES for step in steps)
     if has_move and not map_name:
         raise ValueError(
-            "a template with MOVE/DOCK steps must name the map its "
+            "a template with MOVE/PATROL/DOCK steps must name the map its "
             "coordinates are in"
         )
     if not has_move and map_name:
         raise ValueError(
-            "a template with no MOVE/DOCK step is map-independent; "
+            "a template with no MOVE/PATROL/DOCK step is map-independent; "
             "omit map_name"
         )
 
@@ -298,8 +357,8 @@ def init_task_template_router(
         """The distinct vertex ids of request or stored steps, first-seen order."""
         seen: Dict[uuid.UUID, None] = {}
         for step in steps:
-            if step.vertex_id is not None:
-                seen.setdefault(step.vertex_id, None)
+            for vertex_id in step.referenced_ids():
+                seen.setdefault(vertex_id, None)
         return list(seen)
 
     def _vertices(
@@ -327,20 +386,25 @@ def init_task_template_router(
         URL scope to protect, and the specific sentence is what makes it fixable.
         """
         for step in steps:
-            if step.vertex_id is None:
-                continue
-            if step.vertex_id in vertices:
-                continue
-            other = map_repo.get_vertex(vertex_id=step.vertex_id)
-            if other is None:
+            if step.type is StepType.PATROL:
+                refs = [
+                    (f"Step '{step.id}' waypoint {index + 1}", vertex_id)
+                    for index, vertex_id in enumerate(step.waypoint_vertex_ids())
+                ]
+            else:
+                refs = [(f"Step '{step.id}'", step.vertex_id)]
+            for who, vertex_id in refs:
+                if vertex_id is None or vertex_id in vertices:
+                    continue
+                other = map_repo.get_vertex(vertex_id=vertex_id)
+                if other is None:
+                    raise BadRequestError(
+                        f"{who} references vertex {vertex_id}, which does not exist."
+                    )
                 raise BadRequestError(
-                    f"Step '{step.id}' references vertex {step.vertex_id}, "
-                    "which does not exist."
+                    f"{who} references vertex {vertex_id}, which is "
+                    f"on map '{other.map}', not '{map_name}'."
                 )
-            raise BadRequestError(
-                f"Step '{step.id}' references vertex {step.vertex_id}, which is "
-                f"on map '{other.map}', not '{map_name}'."
-            )
 
     def _check(map_name: Optional[str], steps: List[TemplateStepRequest]) -> None:
         try:
@@ -365,6 +429,15 @@ def init_task_template_router(
         stored: list[dict] = []
         for step in steps:
             vertex = vertices.get(step.vertex_id) if step.vertex_id else None
+            vertex_ids = vertex_names = None
+            if step.type is StepType.PATROL:
+                # Always the full aligned list on disk, nulls included, so a
+                # read never has to guess what an omitted list meant.
+                vertex_ids = step.waypoint_vertex_ids()
+                vertex_names = [
+                    vertices[vid].name if vid in vertices else None
+                    for vid in vertex_ids
+                ]
             stored.append(
                 _StoredStep(
                     id=step.id,
@@ -373,6 +446,8 @@ def init_task_template_router(
                     group=step.group,
                     vertex_id=step.vertex_id,
                     vertex_name=vertex.name if vertex else None,
+                    vertex_ids=vertex_ids,
+                    vertex_names=vertex_names,
                 ).model_dump(mode="json")
             )
         return stored
@@ -380,9 +455,56 @@ def init_task_template_router(
     def _read_steps(row: TaskTemplate) -> List[_StoredStep]:
         return [_StoredStep.model_validate(entry) for entry in row.steps]
 
+    def _patrol_response(
+        stored: _StoredStep, vertices: Dict[uuid.UUID, MapPoint]
+    ) -> TemplateStepResponse:
+        """A PATROL's step: MOVE's resolution, once per waypoint."""
+        vertex_ids = stored.waypoint_vertex_ids()
+        snapshot_names = stored.vertex_names or [None] * len(vertex_ids)
+        names: List[Optional[str]] = []
+        statuses: List[VertexRefStatus] = []
+        waypoints: List[MoveParams] = []
+        for vertex_id, snapshot_name, waypoint in zip(
+            vertex_ids, snapshot_names, stored.params.waypoints
+        ):
+            vertex = vertices.get(vertex_id) if vertex_id is not None else None
+            if vertex_id is None:
+                names.append(None)
+                statuses.append(VertexRefStatus.NONE)
+                waypoints.append(waypoint)
+            elif vertex is None:
+                names.append(snapshot_name)
+                statuses.append(VertexRefStatus.MISSING)
+                waypoints.append(waypoint)
+            else:
+                names.append(vertex.name)
+                statuses.append(VertexRefStatus.CURRENT)
+                waypoints.append(
+                    MoveParams(x=vertex.x, y=vertex.y, theta=vertex.theta, z=vertex.z)
+                )
+        if VertexRefStatus.MISSING in statuses:
+            overall = VertexRefStatus.MISSING
+        elif VertexRefStatus.CURRENT in statuses:
+            overall = VertexRefStatus.CURRENT
+        else:
+            overall = VertexRefStatus.NONE
+        return TemplateStepResponse(
+            id=stored.id,
+            type=stored.type,
+            params=stored.params,
+            group=stored.group,
+            vertex_status=overall,
+            vertex_ids=vertex_ids,
+            vertex_names=names,
+            vertex_statuses=statuses,
+            resolved_params=PatrolParams(waypoints=waypoints),
+        )
+
     def _step_response(
         stored: _StoredStep, vertices: Dict[uuid.UUID, MapPoint]
     ) -> TemplateStepResponse:
+        if stored.type is StepType.PATROL:
+            return _patrol_response(stored, vertices)
         if stored.vertex_id is None:
             return TemplateStepResponse(
                 id=stored.id,
@@ -594,6 +716,16 @@ def init_task_template_router(
             steps: List[Step] = []
             for stored in stored_steps:
                 resolved = _step_response(stored, vertices)
+                for index, status in enumerate(resolved.vertex_statuses or []):
+                    if status is VertexRefStatus.MISSING:
+                        label = resolved.vertex_names[index] or resolved.vertex_ids[index]
+                        raise BadRequestError(
+                            f"Step '{stored.id}' waypoint {index + 1} references "
+                            f"vertex '{label}', "
+                            "which no longer exists. A scheduled run is unattended, so "
+                            "it will not be registered against a stale snapshot — "
+                            "re-point or remove the waypoint first."
+                        )
                 if resolved.vertex_status is VertexRefStatus.MISSING:
                     raise BadRequestError(
                         f"Step '{stored.id}' references vertex "

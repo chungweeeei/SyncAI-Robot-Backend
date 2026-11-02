@@ -29,7 +29,8 @@ class StepRequest(BaseModel):
         description=(
             "Parameters for the step, which vary based on the step type. "
             "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK "
-            "(x/y/theta: the dock pose), SPEAK and WAIT"
+            "(x/y/theta: the dock pose), PATROL (waypoints, at least two), SPEAK "
+            "and WAIT"
         ),
     )
     group: Optional[str] = Field(default=None, description=GROUP_DESCRIPTION)

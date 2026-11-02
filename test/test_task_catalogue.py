@@ -13,8 +13,11 @@ pytest.importorskip("pydantic")
 from syncai_backend.tasks.catalogue import step_catalogue  # noqa: E402
 from syncai_backend.tasks.schema import (  # noqa: E402
     BODY_STEP_TYPES,
+    PATROL_MIN_WAYPOINTS,
     POSE_STEP_TYPES,
     SPEAK_REPEAT_MAX,
+    MoveParams,
+    PatrolParams,
     SpeakParams,
     StepType,
     WaitParams,
@@ -51,9 +54,26 @@ def test_offers_only_speech_on_the_walk_to_a_stop():
 
 def test_offers_a_waypoint_for_exactly_the_steps_that_drive_to_a_pose():
     for spec in step_catalogue().steps:
-        has_waypoint = any(field.kind == "waypoint" for field in spec.params)
+        has_waypoint = any(
+            field.kind in ("waypoint", "waypoints") for field in spec.params
+        )
         assert has_waypoint == (spec.type in POSE_STEP_TYPES), spec.type
     assert _field(StepType.DOCK, "target").filter == "charger"
+
+
+def test_patrol_takes_an_ordered_list_of_at_least_two_waypoints():
+    spec = _spec(StepType.PATROL)
+    assert (spec.label, spec.occupies_body, spec.while_walking) == ("Patrol", True, False)
+    field = _field(StepType.PATROL, "waypoints")
+    assert field.kind == "waypoints"
+    assert field.min_items == PATROL_MIN_WAYPOINTS == 2
+    # The key is the params model's own field, so the form posts what validates.
+    assert field.key in PatrolParams.model_fields
+
+    pose = MoveParams(x=0.0, y=0.0, theta=0.0)
+    PatrolParams(waypoints=[pose] * field.min_items)
+    with pytest.raises(ValueError):
+        PatrolParams(waypoints=[pose] * (field.min_items - 1))
 
 
 def test_reads_its_limits_off_the_params_models():
@@ -76,7 +96,11 @@ def test_reads_its_limits_off_the_params_models():
 
 def test_names_only_fields_the_params_models_take():
     # `target` is the waypoint, spread into x / y / theta / z on the wire.
-    for step_type, model in ((StepType.SPEAK, SpeakParams), (StepType.WAIT, WaitParams)):
+    for step_type, model in (
+        (StepType.SPEAK, SpeakParams),
+        (StepType.WAIT, WaitParams),
+        (StepType.PATROL, PatrolParams),
+    ):
         for field in _spec(step_type).params:
             assert field.key in model.model_fields, (step_type, field.key)
 
@@ -92,3 +116,8 @@ def test_serialises_in_the_shape_the_console_reads():
         "max_length": 1000,
         "placeholder": "Delivery arrived — please take your items.",
     }
+    patrol = next(spec for spec in body["steps"] if spec["type"] == "PATROL")
+    assert patrol["occupies_body"] is True
+    assert patrol["params"] == [
+        {"kind": "waypoints", "key": "waypoints", "label": "Waypoints", "min_items": 2}
+    ]

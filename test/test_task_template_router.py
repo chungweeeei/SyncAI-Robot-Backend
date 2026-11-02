@@ -463,3 +463,138 @@ def test_schedule_on_a_map_independent_task_is_allowed(client, workflow_gw):
                       json={"id": "sched-1", "trigger": {"interval_seconds": 900}})
     assert res.status_code == 200
     assert workflow_gw.schedules[-1].map_name is None
+
+
+# --- PATROL: MOVE's vertex resolution, once per waypoint ------------------------
+
+
+@pytest.fixture
+def lobby(map_repo):
+    """A second vertex on the active map, with a height (an upper storey)."""
+    return map_repo.create_vertices(
+        map="full",
+        vertices=[{"name": "lobby", "type": "MOVE",
+                   "x": -2.0, "y": 4.0, "theta": -45.0, "z": 3.1}],
+    )[0]
+
+
+# A free point between the vertices, picked on the map rather than from one.
+FREE_POINT = {"x": 1.0, "y": 1.0, "theta": 0.0, "z": 0.0}
+
+
+def _patrol(vertex_ids=None, step_id="1-patrol", waypoints=None):
+    waypoints = waypoints or [dict(SNAPSHOT), dict(FREE_POINT), dict(SNAPSHOT)]
+    step = {"id": step_id, "type": "PATROL", "params": {"waypoints": waypoints}}
+    if vertex_ids is not None:
+        step["vertex_ids"] = [None if v is None else str(v) for v in vertex_ids]
+    return step
+
+
+def test_patrol_resolves_each_waypoint_like_a_move(client, map_repo, dock, lobby):
+    created = _create(client, steps=[_patrol([dock.id, None, lobby.id])])
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+
+    # A move of one vertex reaches only its own waypoint.
+    map_repo.update_vertex(dock.id, x=9.0)
+
+    step = client.get(f"/api/v1/task_templates/{task_id}").json()["steps"][0]
+    assert step["vertex_ids"] == [str(dock.id), None, str(lobby.id)]
+    assert step["vertex_names"] == ["dock", None, "lobby"]
+    assert step["vertex_statuses"] == ["CURRENT", "NONE", "CURRENT"]
+    assert step["vertex_status"] == "CURRENT"
+    # The plural replaces the singular: a PATROL never carries vertex_id.
+    assert step["vertex_id"] is None and step["vertex_name"] is None
+    assert step["resolved_params"] == {
+        "waypoints": [
+            {"x": 9.0, "y": -1.5, "theta": 90.0, "z": 0.0},
+            FREE_POINT,
+            {"x": -2.0, "y": 4.0, "theta": -45.0, "z": 3.1},
+        ]
+    }
+    # The snapshot is kept verbatim.
+    assert step["params"]["waypoints"][0] == SNAPSHOT
+
+
+def test_patrol_without_vertex_ids_is_all_free_points(client):
+    step = _create(client, steps=[_patrol()]).json()["steps"][0]
+    assert step["vertex_ids"] == [None, None, None]
+    assert step["vertex_statuses"] == ["NONE", "NONE", "NONE"]
+    assert step["vertex_status"] == "NONE"
+    assert step["resolved_params"] == step["params"]
+
+
+def test_patrol_a_missing_vertex_falls_back_per_waypoint(client, map_repo, dock, lobby):
+    task_id = _create(client, steps=[_patrol([dock.id, None, lobby.id])]).json()["id"]
+    map_repo.delete_vertex(lobby.id)
+
+    body = client.get(f"/api/v1/task_templates/{task_id}").json()
+    step = body["steps"][0]
+    assert step["vertex_statuses"] == ["CURRENT", "NONE", "MISSING"]
+    # The snapshot label names what is gone.
+    assert step["vertex_names"] == ["dock", None, "lobby"]
+    assert step["vertex_status"] == "MISSING"
+    assert step["resolved_params"]["waypoints"][2] == SNAPSHOT
+    assert body["missing_vertex_count"] == 1
+
+
+def test_patrol_vertex_ids_must_align_with_the_waypoints(client, dock):
+    res = _create(client, steps=[_patrol([dock.id, None])])
+    assert res.status_code == 422
+    assert "vertex_ids" in res.text
+
+
+def test_patrol_refuses_a_single_vertex_id(client, dock):
+    step = _patrol()
+    step["vertex_id"] = str(dock.id)
+    res = _create(client, steps=[step])
+    assert res.status_code == 422
+
+
+def test_only_a_patrol_takes_vertex_ids(client, dock):
+    step = _move()
+    step["vertex_ids"] = [str(dock.id)]
+    assert _create(client, steps=[step]).status_code == 422
+
+
+def test_patrol_needs_two_waypoints(client):
+    res = _create(client, steps=[_patrol(waypoints=[dict(SNAPSHOT)])])
+    assert res.status_code == 422
+
+
+def test_patrol_requires_a_map_name(client):
+    assert _create(client, map_name=None, steps=[_patrol()]).status_code == 400
+
+
+def test_patrol_unknown_vertex_names_the_waypoint(client):
+    res = _create(client, steps=[_patrol([None, uuid.uuid4(), None])])
+    assert res.status_code == 400
+    assert "waypoint 2" in res.json()["detail"]
+
+
+def test_schedule_freezes_a_patrols_resolution(client, workflow_gw, dock, lobby):
+    task_id = _create(client, steps=[_patrol([dock.id, None, lobby.id])]).json()["id"]
+
+    res = client.post(f"/api/v1/task_templates/{task_id}/schedule",
+                      json={"id": "sched-1", "trigger": {"cron": "0 9 * * 1-5"}})
+    assert res.status_code == 200, res.text
+
+    patrol = workflow_gw.schedules[-1].definition.steps[0]
+    assert [(w.x, w.y, w.z) for w in patrol.params.waypoints] == [
+        (3.0, -1.5, 0.0), (1.0, 1.0, 0.0), (-2.0, 4.0, 3.1)
+    ]
+    assert not hasattr(patrol, "vertex_ids")
+
+
+def test_schedule_refuses_a_patrol_with_a_missing_vertex_naming_its_waypoint(
+    client, workflow_gw, map_repo, dock, lobby
+):
+    task_id = _create(client, steps=[_patrol([dock.id, None, lobby.id])]).json()["id"]
+    map_repo.delete_vertex(lobby.id)
+
+    res = client.post(f"/api/v1/task_templates/{task_id}/schedule",
+                      json={"id": "sched-1", "trigger": {"cron": "0 9 * * 1-5"}})
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert "waypoint 3" in detail and "'lobby'" in detail and "1-patrol" in detail
+    assert workflow_gw.schedules == []

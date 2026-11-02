@@ -24,6 +24,7 @@ from syncai_backend.exceptions import (  # noqa: E402
 from syncai_backend.tasks.schema import (  # noqa: E402
     ActiveTask,
     MoveParams,
+    PatrolParams,
     Step,
     StepStatus,
     StepType,
@@ -204,6 +205,24 @@ def _dock_task(task_id="robot01-dock-001"):
         "id": task_id,
         "steps": [
             {"id": "s1", "type": "DOCK", "params": {"x": 3.0, "y": 1.0, "theta": 180.0}}
+        ],
+    }
+
+
+def _patrol_task(task_id="robot01-patrol-001"):
+    return {
+        "id": task_id,
+        "steps": [
+            {
+                "id": "s1",
+                "type": "PATROL",
+                "params": {
+                    "waypoints": [
+                        {"x": 1.0, "y": 2.0, "theta": 0.0},
+                        {"x": 4.0, "y": 2.0, "theta": 90.0, "z": 3.1},
+                    ]
+                },
+            }
         ],
     }
 
@@ -396,6 +415,44 @@ class TestJobMap:
         assert client.post("/api/v1/tasks", json=_dock_task()).status_code == 200
         assert workflow_gw.started[0][1].map_name == "lab"
 
+    def test_a_patrol_job_is_stamped_like_a_move(self, client, workflow_gw):
+        response = client.post("/api/v1/tasks", json=_patrol_task())
+        assert response.status_code == 200, response.text
+
+        task, provenance = workflow_gw.started[0]
+        assert provenance.map_name == "lab"
+        waypoints = task.definition.steps[0].params.waypoints
+        assert [(w.x, w.z) for w in waypoints] == [(1.0, 0.0), (4.0, 3.1)]
+
+    def test_a_patrol_from_another_map_is_refused(self, client, workflow_gw):
+        task = {**_patrol_task(), "map_name": "warehouse"}
+
+        response = client.post("/api/v1/tasks", json=task)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "map_mismatch"
+        assert workflow_gw.started == []
+
+    def test_a_patrol_of_one_waypoint_is_refused(self, client, workflow_gw):
+        task = _patrol_task()
+        del task["steps"][0]["params"]["waypoints"][1]
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
+    def test_a_patrol_in_a_group_with_a_move_is_refused(self, client, workflow_gw):
+        task = _patrol_task()
+        task["steps"][0]["group"] = "g"
+        task["steps"].append(
+            {"id": "s2", "type": "MOVE", "group": "g",
+             "params": {"x": 1.0, "y": 2.0, "theta": 90.0}}
+        )
+
+        response = client.post("/api/v1/tasks", json=task)
+
+        assert response.status_code == 400
+        assert response.json()["step_id"] == "s2"
+
     def test_an_undock_job_holds_no_map(self, client, workflow_gw):
         # It backs out from wherever the robot stands: no coordinates to be on a map.
         task = {**_undock_task(), "map_name": "warehouse"}
@@ -503,6 +560,34 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-dock-001").json()
 
         assert body["steps"][0]["message"] == "Docking: 0.42 m from the dock"
+
+    def test_a_running_patrol_carries_the_progress_sentence(
+        self, client, workflow_gw, robot_gw
+    ):
+        robot_gw.message = "Patrolling: 1 of 2 waypoints left, 3.0 m to go"
+        workflow_gw.state = TaskState(
+            id="robot01-patrol-001",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="s1",
+                    type=StepType.PATROL,
+                    params=PatrolParams(
+                        waypoints=[
+                            MoveParams(x=1.0, y=2.0, theta=0.0),
+                            MoveParams(x=4.0, y=2.0, theta=90.0),
+                        ]
+                    ),
+                    status=StepStatus.IN_PROGRESS,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-patrol-001").json()
+
+        assert body["steps"][0]["message"] == robot_gw.message
+        # Not a dock: no dock pose for a patrol's waypoints.
+        assert body["steps"][0]["dock"] is None
 
     def test_a_dock_step_carries_its_dock_pose(self, client, workflow_gw):
         # The console derives the staging pose from it to draw the approach,
@@ -627,10 +712,10 @@ class TestTaskSteps:
         assert res.status_code == 200
         steps = res.json()["steps"]
         assert [step["type"] for step in steps] == [
-            "MOVE", "DOCK", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
+            "MOVE", "PATROL", "DOCK", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
         ]
         assert [step["while_walking"] for step in steps] == [
-            False, False, True, False, False, False,
+            False, False, False, True, False, False, False,
         ]
         assert steps[0]["params"] == [
             {"kind": "waypoint", "key": "target", "label": "Waypoint", "filter": None}
