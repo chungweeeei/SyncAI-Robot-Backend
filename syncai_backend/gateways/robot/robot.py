@@ -4,7 +4,7 @@ import threading
 import structlog
 from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 from rclpy import qos
 from rclpy.node import Node
 from rclpy.publisher import Publisher
@@ -13,6 +13,7 @@ from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
+from nav2_msgs.action import NavigateThroughPoses
 
 from syncai_common.action import NavigateToGoal
 from syncai_common.msg import WifiConnection, WifiNetwork
@@ -67,10 +68,14 @@ class MoveState(str, Enum):
     REJECTED = "rejected"
 
 
-# One NavigateToGoal goal. `feedback` is the latest Feedback (status_msg shows
-# beside a running MOVE step); `result` the Result (error_code / error_msg).
-# `lost` is set when this gateway gave up on the goal with no result from the
-# server (see _lose_goal): the goal reads ABORTED with `lost` as its reason.
+# One navigation goal: a NavigateToGoal (MOVE / DOCK / UNDOCK) or a PATROL's
+# NavigateThroughPoses, told apart by `patrol_total`. `feedback` is the latest
+# Feedback (what get_move_message reads beside a running step); `result` the
+# Result (NavigateToGoal's error_code / error_msg; NavigateThroughPoses' is
+# empty). `lost` is set when this gateway gave up on the goal with no result
+# from the server (see _lose_goal): the goal reads ABORTED with `lost` as its
+# reason. One book for both actions, so the teleop gate, navigation_active and
+# cancel_active_moves cover a patrol without knowing about it.
 @dataclass
 class MoveGoal:
     goal_id: str
@@ -79,6 +84,10 @@ class MoveGoal:
     feedback: Optional[Any] = None
     result: Optional[Any] = None
     lost: Optional[str] = None
+    # A patrol's waypoint count for the step as a whole, which is more than the
+    # goal carries when a resumed or retried patrol sends only the rest; None
+    # for a NavigateToGoal.
+    patrol_total: Optional[int] = None
 
 
 # How long cancel_move waits for the action server's answer. Past it the goal
@@ -116,6 +125,11 @@ NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 DOCK_BEHAVIOR_TREE = "dock.xml"
 UNDOCK_BEHAVIOR_TREE = "undock.xml"
 
+# NavigateThroughPoses.behavior_tree for a PATROL: "" is the task runner's
+# default for that action, patrol.xml (through every pose without stopping, the
+# last one reached with its heading).
+PATROL_BEHAVIOR_TREE = ""
+
 # What tells syncai_localizer that an initialpose's z is meant: the z variance
 # (cell 14 of the row-major 6x6 covariance) above zero. RViz's 2D Pose Estimate
 # and every sender from before leave it 0, and the localizer then keeps the
@@ -127,6 +141,22 @@ INITIAL_POSE_Z_VARIANCE = 0.01
 
 def _goal_id_str(goal_handle: ClientGoalHandle) -> str:
     return str(uuid.UUID(bytes=bytes(goal_handle.goal_id.uuid)))
+
+
+def _patrol_message(feedback, total: int) -> str:
+    """A running PATROL's line, from NavigateThroughPoses feedback.
+
+    ``number_of_poses_remaining`` counts the poses of this goal still ahead,
+    the last included, so it is also how many of the step's ``total`` are
+    left: a resumed patrol's goal holds exactly the ones not yet passed.
+    ``distance_remaining`` is the route's length still to drive.
+    """
+    left = int(feedback.number_of_poses_remaining)
+    distance = float(feedback.distance_remaining)
+    line = f"Patrolling: {left} of {total} waypoints left"
+    if math.isfinite(distance) and distance > 0.0:
+        line += f", {distance:.1f} m to go"
+    return line
 
 
 def _clamp_normalized(value: float) -> float:
@@ -166,7 +196,17 @@ class RobotGateway:
             action_name="navigate_to_goal",
         )
 
-        self._action_clients.update({"move": move_client})
+        # PATROL. nav2's own action, because syncai_common has no
+        # NavigateThroughGoals yet: its Result is Empty (std_msgs/Empty), so an
+        # aborted patrol carries no reason (see get_move_status). One navigation
+        # at a time across both actions; the task runner rejects the second.
+        patrol_client = ActionClient(
+            node=self._node,
+            action_type=NavigateThroughPoses,
+            action_name="navigate_through_poses",
+        )
+
+        self._action_clients.update({"move": move_client, "patrol": patrol_client})
 
     def register_service_clients(self):
 
@@ -581,8 +621,8 @@ class RobotGateway:
             )
 
     def navigation_active(self) -> bool:
-        """Whether a navigation this process sent (a MOVE, DOCK or UNDOCK goal)
-        is still executing.
+        """Whether a navigation this process sent (a MOVE, DOCK, UNDOCK or
+        PATROL goal) is still executing.
 
         The telemetry stream's gate for the local costmap and the controller's
         local plan, which mean something only while the robot drives. Asked of
@@ -594,7 +634,7 @@ class RobotGateway:
         return self._autonomous_move_active()
 
     def _send_nav_goal(
-        self, client_name: str, goal_msg
+        self, client_name: str, goal_msg, patrol_total: Optional[int] = None
     ) -> Tuple[bool, str, Optional[str]]:
         client = self._action_clients.get(client_name)
         if not client.wait_for_server(timeout_sec=NAV_SERVER_WAIT_S):
@@ -607,7 +647,11 @@ class RobotGateway:
         # nav2 accepts after this thread stopped waiting (timeout, or a Temporal
         # cancel) is still known and can be cancelled. `pending` is the
         # handshake: whichever side is second learns what the first did.
-        pending: dict = {"abandoned": False, "goal_id": None}
+        pending: dict = {
+            "abandoned": False,
+            "goal_id": None,
+            "patrol_total": patrol_total,
+        }
         future = client.send_goal_async(
             goal=goal_msg, feedback_callback=self._move_feedback_cb
         )
@@ -641,7 +685,11 @@ class RobotGateway:
 
         goal_id = _goal_id_str(goal_handle)
         with self._lock:
-            self._goals[goal_id] = MoveGoal(goal_id=goal_id, goal_handle=goal_handle)
+            self._goals[goal_id] = MoveGoal(
+                goal_id=goal_id,
+                goal_handle=goal_handle,
+                patrol_total=pending.get("patrol_total"),
+            )
             self._evict_finished_goals()
             pending["goal_id"] = goal_id
             abandoned = pending["abandoned"]
@@ -756,6 +804,39 @@ class RobotGateway:
 
         return self._send_nav_goal("move", goal_msg)
 
+    def patrol(
+        self, waypoints: Sequence[dict], total: Optional[int] = None
+    ) -> Tuple[bool, str, Optional[str]]:
+        """Send a NavigateThroughPoses goal through ``waypoints`` in order.
+
+        Each waypoint is ``move()``'s pose keywords (``x`` / ``y`` / ``yaw`` /
+        ``z``), ``z`` the ground height of that waypoint's storey. Only the last
+        yaw is turned to; the rest go out and patrol.xml ignores them. ``total``
+        is the step's waypoint count, for the progress sentence, when this goal
+        carries only the rest of it (a resumed or retried patrol); omitted, it
+        is ``len(waypoints)``.
+
+        Tracked in the same book as move()'s goals: get_move_status,
+        cancel_move and cancel_active_moves work on the id this returns.
+        """
+        self._logger.info(
+            "[RobotGateway] Sending patrol goal",
+            waypoints=len(waypoints),
+            total=total,
+            last=waypoints[-1] if waypoints else None,
+        )
+
+        goal_msg = NavigateThroughPoses.Goal(
+            poses=[self._make_pose_stamped(**waypoint) for waypoint in waypoints],
+            behavior_tree=PATROL_BEHAVIOR_TREE,
+        )
+
+        return self._send_nav_goal(
+            "patrol",
+            goal_msg,
+            patrol_total=total if total is not None else len(waypoints),
+        )
+
     def _move_feedback_cb(self, feedback_msg):
         # rclpy passes the FeedbackMessage wrapper ({goal_id, feedback}).
         goal_id = _goal_id_str(feedback_msg)
@@ -815,6 +896,18 @@ class RobotGateway:
                 "goal_id": goal.goal_id,
                 "state": goal.state.value,
             }
+            if goal.patrol_total is not None:
+                # NavigateThroughPoses: no reason on an abort (its Result is
+                # Empty), so only this side's own, for a lost goal. What it does
+                # carry is progress, which a retried or resumed PATROL starts
+                # from (execute_patrol).
+                if goal.feedback is not None:
+                    status["poses_remaining"] = int(
+                        goal.feedback.number_of_poses_remaining
+                    )
+                if goal.state is MoveState.ABORTED and goal.lost:
+                    status["error_msg"] = goal.lost
+                return status
             # The reason, on an abort only. NONE on an abort ("superseded or
             # never started") is meaningful, so it is passed on.
             if goal.state is MoveState.ABORTED and goal.result is not None:
@@ -826,15 +919,18 @@ class RobotGateway:
             return status
 
     def get_move_message(self) -> str:
-        """What the robot's navigator says it is doing, for a running MOVE.
+        """What the robot's navigator says it is doing, for a running nav step.
 
-        The executing goal's latest feedback status_msg, or "". Not keyed by
-        goal id: the task-state read does not know it, and only one navigation
-        runs at a time.
+        The executing goal's latest feedback status_msg, or "". A patrol's
+        feedback has no sentence, so one is built from its numbers
+        (_patrol_message). Not keyed by goal id: the task-state read does not
+        know it, and only one navigation runs at a time.
         """
         with self._lock:
             for goal in self._goals.values():
                 if goal.state is MoveState.EXECUTING and goal.feedback is not None:
+                    if goal.patrol_total is not None:
+                        return _patrol_message(goal.feedback, goal.patrol_total)
                     return goal.feedback.status_msg
             return ""
 
