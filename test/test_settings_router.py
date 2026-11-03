@@ -1,7 +1,7 @@
 """Tests for /api/v1/settings/controller -- the projection and the status codes.
 
-The saga is ControllerSettingsService's and is tested in
-test_controller_settings.py; here the service runs on the same stub controller
+The saga is NodeSettingsService's and is tested in
+test_node_settings.py; here the service runs on the same stub controller
 so the codes come from the real refusals, not from a second stub's guesses.
 """
 
@@ -18,13 +18,12 @@ from syncai_backend.interfaces.rest.routers.settings import (  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
-from syncai_backend.services.controller_settings import (  # noqa: E402
-    ControllerSettingsService,
-)
+from syncai_backend.services.controller_schema import CONTROLLER  # noqa: E402
+from syncai_backend.services.node_settings import NodeSettingsService  # noqa: E402
 
 # The stub controller and its fixtures, shared with the service's tests;
 # pytest finds a fixture by the name it is imported under.
-from test_controller_settings import (  # noqa: E402, F401
+from test_node_settings import (  # noqa: E402, F401
     _StubController,
     controller,
     factory_file,
@@ -39,7 +38,7 @@ URL = "/api/v1/settings/controller"
 def client(logger, svc):  # noqa: F811
     app = FastAPI()
     register_exception_handlers(app)
-    app.include_router(init_settings_router(logger=logger, controller_settings_svc=svc))
+    app.include_router(init_settings_router(logger=logger, settings_svcs={"controller": svc}))
     return TestClient(app)
 
 
@@ -122,9 +121,15 @@ def test_with_the_controller_down_the_page_still_answers(logger, repo):  # noqa:
     app.include_router(
         init_settings_router(
             logger=logger,
-            controller_settings_svc=ControllerSettingsService(
-                logger=logger, gateway=down, overlay_repo=repo
-            ),
+            settings_svcs={
+                "controller": NodeSettingsService(
+                    logger=logger,
+                    schema=CONTROLLER,
+                    gateway=down,
+                    overlay_repo=repo,
+                    subject="controller",
+                )
+            },
         )
     )
     body = TestClient(app).get(URL).json()
@@ -132,3 +137,9 @@ def test_with_the_controller_down_the_page_still_answers(logger, repo):  # noqa:
     assert body["live_available"] is False
     speed = _field(body, "max_speed")
     assert (speed["value"], speed["current"], speed["default"]) == (0.8, None, 0.8)
+
+
+def test_each_page_has_its_own_path_and_an_unknown_one_is_a_404(client):
+    """Only the pages registered exist: /planner here is not one."""
+    assert client.get("/api/v1/settings/planner").status_code == 404
+    assert client.get(URL).status_code == 200

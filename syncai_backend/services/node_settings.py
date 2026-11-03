@@ -1,13 +1,14 @@
-"""The controller settings page: read, change and reset what ``controller_schema`` lists.
+"""A settings page for one node: read, change and reset what its schema lists.
 
-A change is a small saga over two places that must agree, the running
-controller and the overlay file it boots from:
+One service per node (``controller_server`` with ``controller_schema``,
+``planner_server`` with ``planner_schema``). A change is a small saga over two
+places that must agree, the running node and the overlay file it boots from:
 
 1. Validate: each value against its field (type, range), then the rules that
    tie it to other parameters, judged on the values as they will be.
-2. Set the live and idle fields on the running controller -- undotted
-   (controller_server's own) first, in a set of their own, because that is the
-   set refused mid-goal (see ``gateways/parameters``).
+2. Set the live and idle fields on the running node -- undotted (the
+   server's own) first, in a set of their own, because controller_server
+   refuses those mid-goal (see ``gateways/parameters``).
 3. Read them back. A set the node reports as successful can still leave
    another value in force (a callback that "rejects" by skipping), so the
    read, not the report, is what gets persisted.
@@ -15,7 +16,7 @@ controller and the overlay file it boots from:
 
 A failure after step 2 restores the values read before it, best effort, so a
 change is not live without being persisted -- or persisted half live. With the
-nav session down (MANUAL mode, or the controller restarting) there is nothing
+nav session down (MANUAL mode, or the node restarting) there is nothing
 to set: the change is written to the overlay alone and applies at its start.
 
 One change at a time (409 ``settings_busy``): two interleaved sagas would each
@@ -37,14 +38,11 @@ from syncai_backend.repositories.params.overlay import ParamOverlayRepo
 if TYPE_CHECKING:
     # Type only: the gateway imports rclpy, and this saga is tested without it.
     from syncai_backend.gateways.parameters.parameters import ParameterGateway
-from syncai_backend.services.controller_schema import (
+from syncai_backend.services.settings_schema import (
     APPLY_RESTART,
-    FIELDS,
-    FIELDS_BY_ID,
-    GROUPS,
-    RULES,
     Group,
     SettingField,
+    SettingsSchema,
     Value,
     coerce,
 )
@@ -56,7 +54,7 @@ class FieldState:
     # What the form shows: the value in force, or for a restart field the
     # value the next start will load.
     value: Optional[Value]
-    # The running controller's, None with the nav session down.
+    # The running node's, None with the nav session down.
     current: Optional[Value]
     # The factory params file's, None when it is not mounted.
     default: Optional[Value]
@@ -85,16 +83,22 @@ def _undotted(name: str) -> bool:
     return "." not in name
 
 
-class ControllerSettingsService:
+class NodeSettingsService:
     def __init__(
         self,
         logger: structlog.stdlib.BoundLogger,
+        schema: SettingsSchema,
         gateway: "ParameterGateway",
         overlay_repo: ParamOverlayRepo,
+        subject: str,
     ):
-        self._logger = logger
+        """``subject`` is the node in the operator's words ("controller",
+        "planner"), for the sentences a refusal is told in."""
+        self._logger = logger.bind(settings=subject)
+        self._schema = schema
         self._gw = gateway
         self._repo = overlay_repo
+        self._subject = subject
         self._changing = threading.Lock()
 
     # --- Reading -----------------------------------------------------------
@@ -102,10 +106,10 @@ class ControllerSettingsService:
     def snapshot(self) -> SettingsSnapshot:
         factory = self._factory()
         overlay = self._overlay()
-        live = self._live([name for f in FIELDS for name in f.targets])
+        live = self._live([name for f in self._schema.fields for name in f.targets])
 
         fields = []
-        for setting in FIELDS:
+        for setting in self._schema.fields:
             name = setting.source
             current = live.get(name) if live is not None else None
             default = factory.get(name)
@@ -133,7 +137,7 @@ class ControllerSettingsService:
                 )
             )
         return SettingsSnapshot(
-            live_available=live is not None, groups=GROUPS, fields=tuple(fields)
+            live_available=live is not None, groups=self._schema.groups, fields=tuple(fields)
         )
 
     # --- Changing ----------------------------------------------------------
@@ -143,22 +147,22 @@ class ControllerSettingsService:
             raise BadRequestError("No settings to change.", code="invalid_setting")
         with self._one_change_at_a_time():
             new_values = self._validate(values)
-            settings = [FIELDS_BY_ID[field_id] for field_id in values]
+            settings = [self._schema.by_id[field_id] for field_id in values]
             self._commit(settings, new_values, drop=())
         return self.snapshot()
 
     def reset(self, field_ids: Optional[Iterable[str]] = None) -> SettingsSnapshot:
         """Back to the factory values: the keys leave the overlay, and the live
         and idle fields are set to the factory file's values."""
-        ids = list(field_ids) if field_ids is not None else [f.id for f in FIELDS]
-        unknown = [field_id for field_id in ids if field_id not in FIELDS_BY_ID]
+        ids = list(field_ids) if field_ids is not None else [f.id for f in self._schema.fields]
+        unknown = [field_id for field_id in ids if field_id not in self._schema.by_id]
         if unknown:
             raise BadRequestError(
                 f"Unknown setting: {', '.join(unknown)}", code="invalid_setting"
             )
         with self._one_change_at_a_time():
             factory = self._factory()
-            settings = [FIELDS_BY_ID[field_id] for field_id in ids]
+            settings = [self._schema.by_id[field_id] for field_id in ids]
             names = [name for s in settings for name in s.targets]
             missing = [name for name in names if name not in factory]
             if missing:
@@ -195,7 +199,7 @@ class ControllerSettingsService:
             restore = self._set_live(live_values)
         elif live_values:
             self._logger.info(
-                "[ControllerSettings] Controller not running; change written to "
+                "[NodeSettings] Node not running; change written to "
                 "the overlay only, in force from its next start",
                 names=sorted(live_values),
             )
@@ -210,7 +214,7 @@ class ControllerSettingsService:
             self._repo.write(overlay)
         except (OSError, ValueError) as exc:
             self._logger.error(
-                "[ControllerSettings] Overlay write failed; restoring the live values",
+                "[NodeSettings] Overlay write failed; restoring the live values",
                 path=self._repo.overlay_path,
                 error=str(exc),
             )
@@ -222,7 +226,7 @@ class ControllerSettingsService:
             ) from exc
 
     def _set_live(self, values: dict[str, Value]) -> dict[str, Value]:
-        """Set ``values`` on the controller and confirm them; the values they
+        """Set ``values`` on the node and confirm them; the values they
         replaced are returned for a later undo. Raises on any failure, after
         undoing whatever it had set."""
         names = list(values)
@@ -231,14 +235,14 @@ class ControllerSettingsService:
             raise UpstreamError(message)
         unknown = [name for name in names if before.get(name) is None]
         if unknown:
-            # The schema names a parameter this controller does not declare: a
+            # The schema names a parameter this node does not declare: a
             # renamed parameter in the workspace, i.e. a schema out of date.
             self._logger.error(
-                "[ControllerSettings] Controller lacks parameters the schema names",
+                "[NodeSettings] Node lacks parameters the schema names",
                 names=unknown,
             )
             raise UpstreamError(
-                f"The robot's controller has no parameter {', '.join(unknown)}; "
+                f"The robot's {self._subject} has no parameter {', '.join(unknown)}; "
                 "this backend does not match the robot's software."
             )
         restore = {name: before[name] for name in names}
@@ -265,7 +269,7 @@ class ControllerSettingsService:
         )
         if wrong:
             self._logger.error(
-                "[ControllerSettings] Controller reports values other than those set",
+                "[NodeSettings] Node reports values other than those set",
                 read_ok=ok,
                 message=message,
                 names=wrong,
@@ -290,7 +294,7 @@ class ControllerSettingsService:
             ok, message = self._gw.set_atomically(batch)
             if not ok:
                 self._logger.error(
-                    "[ControllerSettings] Could not restore the controller's "
+                    "[NodeSettings] Could not restore the node's "
                     "previous values; it runs on the new ones until restarted",
                     values=batch,
                     message=message,
@@ -310,7 +314,7 @@ class ControllerSettingsService:
     def _validate(self, values: dict[str, object]) -> dict[str, Value]:
         new_values: dict[str, Value] = {}
         for field_id, raw in values.items():
-            setting = FIELDS_BY_ID.get(field_id)
+            setting = self._schema.by_id.get(field_id)
             if setting is None:
                 raise BadRequestError(f"Unknown setting: {field_id}", code="invalid_setting")
             try:
@@ -326,7 +330,7 @@ class ControllerSettingsService:
         live_up = self._gw.available()
 
         # New value, then the overlay (what the next start loads, and for a
-        # live field what is in force), then the running controller, then the
+        # live field what is in force), then the running node, then the
         # factory file.
         def value_of(name: str) -> Optional[Value]:
             for source in (new_values, overlay):
@@ -340,7 +344,7 @@ class ControllerSettingsService:
                     return live_cache[name]
             return factory.get(name)
 
-        for rule in RULES:
+        for rule in self._schema.rules:
             if not set(rule.fields) & set(values):
                 continue
             sentence = rule.check(value_of)
@@ -354,7 +358,7 @@ class ControllerSettingsService:
     def _one_change_at_a_time(self) -> Iterator[None]:
         if not self._changing.acquire(blocking=False):
             raise ConflictError(
-                "The controller settings are already being changed; wait for "
+                f"The {self._subject} settings are already being changed; wait for "
                 "that to finish.",
                 code="settings_busy",
             )
@@ -369,7 +373,7 @@ class ControllerSettingsService:
         ok, message, values = self._gw.get(names)
         if not ok:
             self._logger.warning(
-                "[ControllerSettings] Could not read the controller's parameters",
+                "[NodeSettings] Could not read the node's parameters",
                 message=message,
             )
             return None
@@ -380,7 +384,7 @@ class ControllerSettingsService:
             return self._repo.factory()
         except (OSError, ValueError) as exc:
             self._logger.error(
-                "[ControllerSettings] Factory params file unreadable",
+                "[NodeSettings] Factory params file unreadable",
                 path=self._repo.factory_path,
                 error=str(exc),
             )
@@ -399,11 +403,17 @@ class ControllerSettingsService:
             ) from exc
 
 
-def init_controller_settings_service(
+def init_node_settings_service(
     logger: structlog.stdlib.BoundLogger,
+    schema: SettingsSchema,
     gateway: "ParameterGateway",
     overlay_repo: ParamOverlayRepo,
-) -> ControllerSettingsService:
-    return ControllerSettingsService(
-        logger=logger, gateway=gateway, overlay_repo=overlay_repo
+    subject: str,
+) -> NodeSettingsService:
+    return NodeSettingsService(
+        logger=logger,
+        schema=schema,
+        gateway=gateway,
+        overlay_repo=overlay_repo,
+        subject=subject,
     )

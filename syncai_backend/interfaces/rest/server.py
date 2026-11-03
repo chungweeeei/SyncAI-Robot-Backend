@@ -53,7 +53,7 @@ from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 from syncai_backend.services.mode_restart import ModeRestartService
 from syncai_backend.services.safety_lock import SafetyLockService
-from syncai_backend.services.controller_settings import ControllerSettingsService
+from syncai_backend.services.node_settings import NodeSettingsService
 
 from syncai_backend.temporal.worker import TemporalWorkerHandle
 
@@ -126,7 +126,8 @@ class RestDeps:
     map_usage: MapUsagePolicy
     job_gate: JobGate
     map_import_svc: MapImportService
-    controller_settings_svc: ControllerSettingsService
+    # One per settings page, by its path segment (controller, planner).
+    settings_svcs: dict[str, NodeSettingsService]
 
 
 def init_rest_server(
@@ -278,14 +279,11 @@ def init_rest_server(
         )
     )
 
-    # /api/v1/settings/controller: the controller's tunable parameters, set
-    # live over its parameter services and kept in the robot's runtime
-    # overlay (config/params/<robot_id>/controller_server.yaml).
+    # /api/v1/settings/<page>: a node's tunable parameters, set live over its
+    # parameter services and kept in the robot's runtime overlay
+    # (config/params/<robot_id>/<node>.yaml).
     app.include_router(
-        init_settings_router(
-            logger=logger,
-            controller_settings_svc=deps.controller_settings_svc,
-        )
+        init_settings_router(logger=logger, settings_svcs=deps.settings_svcs)
     )
 
     return app

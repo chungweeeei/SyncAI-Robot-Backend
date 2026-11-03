@@ -218,6 +218,8 @@ services:
       # mount, so a `git pull` replacing the file is seen. Without it the page
       # still sets and saves, but shows no defaults and refuses a reset.
       - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/src/syncai_controller/params:/home/syncrobotic/robot_ws/src/syncai_controller/params:ro
+      # The planner's, for the planner settings page; same reasons.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/src/syncai_global_planner/params:/home/syncrobotic/robot_ws/src/syncai_global_planner/params:ro
       # The per-robot identity file, mounted OVER config/system.ini as a single
       # file — the same thing the workspace's compose does, and the reason
       # `config/system.ini` is an empty placeholder in the checkout. Without

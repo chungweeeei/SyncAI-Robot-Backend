@@ -190,8 +190,9 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  map_import (the archive import's publish + vertex transaction + undo),
         │                  task_record_retention (a daemon thread: task_record's day
         │                  partitions made ahead, DETACH + DROP past 30 days, every 30 min),
-        │                  controller_settings (the settings page's saga: validate against
-        │                  controller_schema, set live, read back, write the runtime overlay)
+        │                  node_settings (a settings page's saga, one per node: validate
+        │                  against its schema -- controller_schema / planner_schema --, set
+        │                  live, read back, write the runtime overlay)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), parameters (one
         │                  node's get/set_parameters; controller_server today), workflow (Temporal),

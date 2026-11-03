@@ -16,7 +16,7 @@ from syncai_backend.repositories.params.overlay import (
     CONTROLLER_NODE_KEY,
     ParamOverlayRepo,
     flatten,
-    init_controller_overlay_repo,
+    init_overlay_repo,
     nest,
 )
 
@@ -148,10 +148,11 @@ def test_a_malformed_overlay_is_an_error_not_empty(logger, tmp_path):
         raise AssertionError("a malformed overlay must raise")
 
 
-def test_the_overlay_path_is_the_one_the_controller_launch_loads(logger, tmp_path):
-    repo = init_controller_overlay_repo(
+def test_the_overlay_path_is_the_one_the_node_launch_loads(logger, tmp_path):
+    repo = init_overlay_repo(
         logger=logger,
         robot_id="robot01",
+        node="controller_server",
         params_dir=str(tmp_path),
         factory_path=str(tmp_path / "f.yaml"),
     )
