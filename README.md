@@ -539,6 +539,9 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/robot/set_policy_mode` | Gait-controller policy index; only `0` (PPO) and `1` (HIMLOCO) |
 | GET | `/api/v1/network/wifi/scan` | Scan networks (blocks up to 45 s). A scan requested while one runs joins it and gets its answer, instead of holding a second thread and queueing a second scan in driver_manager |
 | POST | `/api/v1/network/wifi/connect` | Connect via `nmcli` (blocks up to 70 s). Connect, activate and delete of a saved network change NetworkManager's state, so one runs at a time: the others are 409 `wifi_busy` |
+| GET | `/api/v1/settings/controller` | The controller settings page: `groups` and `fields`, each field with its operator `label` / `description`, `kind`, `unit`, `min` / `max` / `step`, `apply` (`live` / `idle` / `restart`), and its `value` (the one in force; a `restart` field's the next start's), `current` (the running controller's, `null` while the nav session is down), `default` (the factory params file's), `modified` and `pending_restart`. `live_available: false` outside AUTO — values are then the saved ones. See *Controller settings* |
+| PUT | `/api/v1/settings/controller` | Body `{values: {<field id>: value}}`, only the fields being changed. Set live, read back, then saved to the robot's runtime overlay; answers the new state. 400 `invalid_setting` (range, type, or a rule tying it to another parameter — one sentence), 400 `parameter_refused` (the controller's own refusal), 409 `controller_busy` (an `idle` field while the robot navigates — nothing changed), 409 `settings_busy`, `params_not_writable`, `params_unreadable`; 502 when the controller does not take the value. With the nav session down a change is only saved |
+| DELETE | `/api/v1/settings/controller` | Back to the factory values: `?id=<field>` (repeatable) or every field. The keys leave the overlay and the live fields are set to the factory file's values. 409 `defaults_unavailable` without the factory file mounted |
 | GET | `/api/v1/maps` | Map directories on disk with vertex counts and the 3D map's state — **the build-status surface**; there is no job resource. `octomap_status` `none` / `converting` (the robot's map cleaning is building it) / `ok` / `failed` (reason in `octomap_error`) / `interrupted` (the cleaning never finished), read off `octomap.bt` and the cleaning sidecar; `octomap_version` (changes when the file does) and `octomap_resolution`. No `grid` / `thumbnail` / `grid_status` since the 2D removal (2026-10-28) |
 | GET | `/api/v1/maps/{name}` | One map's summary |
 | POST | `/api/v1/maps` | Save the current mapping run **and end it**: `pgo/save_maps` into a new map dir, always with `octomap: OCTOMAP_ON` (a map is navigable only with its `octomap.bt`); the tree lands minutes later, after the robot's map cleaning — watch `octomap_status`. Body `{name}`; the 2D-era `grid` / `octomap` keys are ignored. On success pgo goes idle and clears the "map so far" layer and `/dev/shm` itself, so the next run waits for `POST /api/v1/mapping/start`. 409 `mapping_idle` when nothing was started (before any directory is created), 409 `mapping_busy` mid start/reset. Mapping mode only in practice |
@@ -645,6 +648,44 @@ A browser reads it straight into a typed array. Both streams share one `_pump`,
 polling (polling cost ~50 ms latency and ~5 % dropped frames from two
 unsynchronised 10 Hz clocks), and the single slot still drops, so a slow client
 gets the newest frame, not a backlog.
+
+### Controller settings
+
+`/api/v1/settings/controller` lets the console tune `controller_server`
+(the walking speed, arrival tolerances, stuck detection, path following,
+stairs; docking is deliberately not on it yet)
+without a shell. Three layers, and the backend writes only the middle one:
+
+| Layer | Where | Written by |
+|---|---|---|
+| Factory | `~/robot_ws/src/syncai_controller/params/controller_server_params.yaml` (the workspace's, tracked; mounted read-only) | git, by hand |
+| Runtime overlay | `~/robot_ws/config/params/<robot_id>/controller_server.yaml` (gitignored there) | this backend |
+| Live | the running node | this backend, over `controller_server/get_parameters` / `set_parameters_atomically` |
+
+The workspace's controller launch loads the overlay after the factory file, so
+the overlay holds **only the changed keys** and a key nobody touched follows the
+factory file through a `git pull`. Deleting the overlay (and restarting the nav
+session) is the fall back to the factory values; so is launching the controller
+with `use_runtime_params:=false`.
+
+**Which parameters, and their limits, are this repo's schema**
+(`services/controller_schema.py`): the controller declares no descriptors, so
+`DescribeParameters` has nothing to offer. One field can write several
+parameters that are one calibration (the walking speed is MPPI's `vx_max` and
+RPP 3D's `desired_linear_vel`). `apply` is read off the controller's callbacks:
+`live` plugin parameters apply mid-goal, `idle` ones (controller_server's own,
+undotted) are refused while a goal runs, `restart` ones are read once at startup
+and are only saved. `wz_max` is deliberately absent: it is one calibration with
+driver_manager's velocity scales, which this page does not reach.
+
+A change (`services/controller_settings.py`) validates, sets the undotted
+parameters in a set of their own and then the plugin ones, **reads them back**
+and saves what it read — a controller callback that "rejected" a value used to
+report success — then writes the overlay (tmp + rename, previous kept as
+`.bak`). A failure after the live set restores the values read before it.
+`test_controller_schema.py` checks every parameter the schema names against the
+workspace's factory file when `SYNCAI_CONTROLLER_PARAMS` points at it; run it
+after a controller parameter is renamed.
 
 ### Recordings
 

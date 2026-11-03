@@ -29,6 +29,7 @@ from syncai_backend.interfaces.rest.routers.teleop import init_teleop_router
 from syncai_backend.interfaces.rest.routers.tts import init_tts_router
 from syncai_backend.interfaces.rest.routers.webrtc import init_webrtc_router
 from syncai_backend.interfaces.rest.routers.recording import init_recording_router
+from syncai_backend.interfaces.rest.routers.settings import init_settings_router
 
 from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.map.map import MapRepo
@@ -52,6 +53,7 @@ from syncai_backend.services.map_switch import MapSwitchService
 from syncai_backend.services.map_usage import JobGate, MapUsagePolicy
 from syncai_backend.services.mode_restart import ModeRestartService
 from syncai_backend.services.safety_lock import SafetyLockService
+from syncai_backend.services.controller_settings import ControllerSettingsService
 
 from syncai_backend.temporal.worker import TemporalWorkerHandle
 
@@ -124,6 +126,7 @@ class RestDeps:
     map_usage: MapUsagePolicy
     job_gate: JobGate
     map_import_svc: MapImportService
+    controller_settings_svc: ControllerSettingsService
 
 
 def init_rest_server(
@@ -272,6 +275,16 @@ def init_rest_server(
             logger=logger,
             recording_gw=deps.recording_gw,
             recording_catalog_repo=deps.recording_catalog_repo,
+        )
+    )
+
+    # /api/v1/settings/controller: the controller's tunable parameters, set
+    # live over its parameter services and kept in the robot's runtime
+    # overlay (config/params/<robot_id>/controller_server.yaml).
+    app.include_router(
+        init_settings_router(
+            logger=logger,
+            controller_settings_svc=deps.controller_settings_svc,
         )
     )
 

@@ -47,6 +47,16 @@ class Failure(str, Enum):
     # cannot be preempted. The caller retries; everything else is a 502.
     WHEP_SESSION_PENDING = "whep_session_pending"
 
+    # ParameterGateway: controller_server refuses its own (undotted) parameters
+    # while a goal runs. A 409 -- set it again once the robot has stopped.
+    CONTROLLER_BUSY = "controller_busy"
+
+    # ParameterGateway: a parameter callback refused the value with a reason
+    # (DockingController's v_linear_min above v_linear_max, say). A 400: the
+    # combination is the caller's to change; the schema's rules should have
+    # said so first, so one of these is also a missing rule.
+    PARAMETER_REFUSED = "parameter_refused"
+
 
 class FailureMessage(str):
     """Operator-facing prose carrying an optional machine-readable ``code``.
