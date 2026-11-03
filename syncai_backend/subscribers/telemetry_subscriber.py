@@ -65,7 +65,7 @@ class TelemetrySubscriber:
        chain's z 0 on every storey, so in AUTO the height is the LIO chain's
        (``LIO_HEIGHT_HOLD_S``), the same number MANUAL reports.
 
-    2. Joints: ``motor_states`` reduced to {URDF joint name: position}, the
+    2. Joints: ``motor_states_low_rate`` reduced to {URDF joint name: position}, the
        names the frontend looks GLB nodes up by.
     """
 
@@ -110,9 +110,13 @@ class TelemetrySubscriber:
             callback=self._lio_odom_cb,
             qos_profile=profile,
         )
+        # driver_manager's 20 Hz copy of motor_states (~200 Hz), since 2026-11:
+        # the telemetry WS sends only the newest joint pose, so the full rate
+        # was ~200 rclpy callbacks a second for nothing. Against a
+        # driver_manager that predates it the 3D model's joints stay put.
         node.create_subscription(
             msg_type=MotorStates,
-            topic="motor_states",
+            topic="motor_states_low_rate",
             callback=self._motor_states_cb,
             qos_profile=profile,
         )

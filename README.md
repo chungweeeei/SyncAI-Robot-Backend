@@ -246,7 +246,7 @@ frame from the message header and only pins the target frame (`map`).
 | `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state`; `low_level_mode.safety_state` → `SafetyLockService` (rising edge cancels every task) |
 | `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS (x, y, yaw; z from `pointlio/lio_odom`, see *Telemetry*) |
 | `pointlio/lio_odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed through `map→pointlio_odom` and the lidar mount → telemetry WS: the whole pose while mapping, base_link's height in AUTO |
-| `motor_states` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS |
+| `motor_states_low_rate` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS. driver_manager's 20 Hz copy of `motor_states` (~200 Hz) |
 | `plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | thinned to ≤512 xy pairs → telemetry WS |
 | `local_costmap/costmap/raw` | `nav2_msgs/Costmap` | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | the controller's rolling costmap, origin into `map` by TF → telemetry WS `local_costmap`, while a navigation runs |
 | `local_plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | MPPI's optimal trajectory, into `map` by TF, kept at 5 Hz → telemetry WS `local_plan`, while a navigation runs |
