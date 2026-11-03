@@ -211,6 +211,13 @@ services:
       # [initial_pose] in system.ini, in place. Mounting it :ro turns that route
       # into a 409 `ini_not_writable`.
       - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/config:/home/syncrobotic/robot_ws/config
+      # The controller's factory params, read-only: the defaults the settings
+      # page shows and resets to. What it writes goes to config/params/
+      # <robot_id>/ (the runtime overlay, under the config/ mount above), never
+      # here -- this file is the workspace's tracked fall-back. A directory
+      # mount, so a `git pull` replacing the file is seen. Without it the page
+      # still sets and saves, but shows no defaults and refuses a reset.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/src/syncai_controller/params:/home/syncrobotic/robot_ws/src/syncai_controller/params:ro
       # The per-robot identity file, mounted OVER config/system.ini as a single
       # file — the same thing the workspace's compose does, and the reason
       # `config/system.ini` is an empty placeholder in the checkout. Without

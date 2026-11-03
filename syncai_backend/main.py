@@ -29,6 +29,7 @@ from syncai_backend.repositories.pointcloud.pointcloud import init_pointcloud_re
 from syncai_backend.repositories.mapping.mapping import init_mapping_status_repo
 from syncai_backend.repositories.telemetry.telemetry import init_telemetry_repo
 from syncai_backend.repositories.recording.catalog import init_recording_catalog_repo
+from syncai_backend.repositories.params.overlay import init_controller_overlay_repo
 
 from syncai_backend.gateways.robot.robot import init_robot_gateway
 from syncai_backend.gateways.map.map import init_map_gateway
@@ -36,6 +37,7 @@ from syncai_backend.gateways.workflow.workflow import init_workflow_gateway
 from syncai_backend.gateways.tts.tts import init_tts_gateway
 from syncai_backend.gateways.webrtc.webrtc import init_webrtc_gateway
 from syncai_backend.gateways.recording.recording import init_recording_gateway
+from syncai_backend.gateways.parameters.parameters import init_parameter_gateway
 
 from syncai_backend.services.dock_state import init_dock_state_service
 from syncai_backend.services.map_import import init_map_import_service
@@ -44,6 +46,9 @@ from syncai_backend.services.map_usage import init_job_gate, init_map_usage_poli
 from syncai_backend.services.mode_restart import init_mode_restart_service
 from syncai_backend.services.safety_lock import init_safety_lock_service
 from syncai_backend.services.task_record_retention import init_task_record_retention
+from syncai_backend.services.controller_settings import (
+    init_controller_settings_service,
+)
 
 from syncai_backend.subscribers.robot_state_subscriber import (
     init_robot_state_subscriber,
@@ -146,6 +151,18 @@ class SyncAIBackend(Node):
         )
         job_gate = init_job_gate(
             logger=logger, map_catalog_repo=map_catalog_repo, workflow_gw=workflow_gw
+        )
+
+        # The controller settings page: controller_server's parameters set live
+        # over its parameter services, and the changed ones kept in the robot's
+        # runtime overlay, which the controller launch loads after its factory
+        # params. Its own gateway: it holds no handle that can move the robot.
+        controller_settings_svc = init_controller_settings_service(
+            logger=logger,
+            gateway=init_parameter_gateway(
+                logger=logger, node=self, target="controller_server"
+            ),
+            overlay_repo=init_controller_overlay_repo(logger=logger, robot_id=robot_id),
         )
 
         # The live map switch: localizer, Octo3D and the INI moved together,
@@ -262,6 +279,7 @@ class SyncAIBackend(Node):
                 map_usage=map_usage,
                 job_gate=job_gate,
                 map_import_svc=map_import_svc,
+                controller_settings_svc=controller_settings_svc,
             ),
         )
 

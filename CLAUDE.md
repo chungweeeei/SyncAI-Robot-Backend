@@ -189,14 +189,19 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  from disk, safe in the worker; JobGate asks Temporal, loop only),
         │                  map_import (the archive import's publish + vertex transaction + undo),
         │                  task_record_retention (a daemon thread: task_record's day
-        │                  partitions made ahead, DETACH + DROP past 30 days, every 30 min)
+        │                  partitions made ahead, DETACH + DROP past 30 days, every 30 min),
+        │                  controller_settings (the settings page's saga: validate against
+        │                  controller_schema, set live, read back, write the runtime overlay)
         │
-gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), workflow (Temporal),
+gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), parameters (one
+        │                  node's get/set_parameters; controller_server today), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
         │                  mapping — pgo's latched run state, aged out after 5 s),
-        │                  PostgreSQL CRUD (map vertices, task_templates, task_record), on-disk catalogues (map/, record/)
+        │                  PostgreSQL CRUD (map vertices, task_templates, task_record), on-disk catalogues (map/, record/),
+        │                  params (config/params/<robot_id>/ runtime overlays, over the workspace's
+        │                  factory params file, read-only)
 database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTemplate, TaskRecordRow); session.py
                            is the one session factory + log-and-reraise every repo uses
 
@@ -264,6 +269,7 @@ Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
 `STUN_SERVERS` / `TURN_*` are only `setdefault`ed before `InitWorker`), loaded from the cwd `.env` via python-dotenv at import time — see
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
 Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
+`~/robot_ws/config/params`, `~/robot_ws/src/syncai_controller/params` (read-only),
 `~/robot_ws/record`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
 reliably run from the workspace root. `/dev/shm` is absolute for a different reason: it is
 the tmpfs `ipc: host` makes common to this container and the robot's, and pgo and this

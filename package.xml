@@ -17,6 +17,8 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <!-- GetParameters / SetParametersAtomically: the controller settings page. -->
+  <exec_depend>rcl_interfaces</exec_depend>
   <!--
     Generated interfaces this package imports at runtime (syncai_common.msg /
     .srv), including the map gateway's SaveMaps / ResetMapping / Relocalize /
