@@ -182,16 +182,16 @@ def subs(logger, node, repo, tf_buffer):
 
 def test_subscribes_to_the_relative_pose_and_motor_states_topics(subs):
     # Relative names, so all three inherit the robot_id namespace (CLAUDE.md).
-    assert set(subs) == {"odom", "pointlio/lio_odom", "motor_states"}
+    assert set(subs) == {"odom", "pointlio/lio_odom", "motor_states_low_rate"}
     assert subs["odom"].msg_type is Odometry
     # The mapping-mode pose feed: same type, different frames and different
     # arithmetic (see the composition tests below).
     assert subs["pointlio/lio_odom"].msg_type is Odometry
-    assert subs["motor_states"].msg_type is MotorStates
+    assert subs["motor_states_low_rate"].msg_type is MotorStates
 
 
 def test_qos_is_best_effort_keep_last_on_every_feed(subs):
-    for topic in ("odom", "pointlio/lio_odom", "motor_states"):
+    for topic in ("odom", "pointlio/lio_odom", "motor_states_low_rate"):
         qos = subs[topic].qos_profile
         # motor_states' publisher is SensorDataQoS: a reliable subscriber here
         # would not be QoS-compatible and would simply never receive a sample.
@@ -493,7 +493,7 @@ def _motor_states(joints, timestamp_ns):
 
 
 def test_motor_states_reduce_to_joint_name_to_position(subs, repo):
-    subs["motor_states"].callback(
+    subs["motor_states_low_rate"].callback(
         _motor_states(
             joints=(("FL_HipX_joint", 0.5), ("FR_Knee_joint", -0.25)),
             timestamp_ns=1_754_000_000_000_000_000,
