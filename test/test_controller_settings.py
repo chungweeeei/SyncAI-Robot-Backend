@@ -40,9 +40,6 @@ FACTORY = {
         "FollowPathRPP3D.stair_linear_vel": 0.5,
         "FollowPath.stair_standoff": 1.0,
         "FollowPathRPP3D.stair_standoff": 1.0,
-        "Docking.v_linear_max": 0.4,
-        "Undocking.v_linear_max": 0.3,
-        "dock_goal_checker.xy_goal_tolerance": 0.05,
         # Read by the rules only.
         "FollowPath.walk_vx_min": 0.3,
         "FollowPath.approach_decel": 0.4,
@@ -52,8 +49,6 @@ FACTORY = {
         "FollowPath.stair_exit_ahead_dist": 3.5,
         "FollowPathRPP3D.stair_enter_dist": 1.0,
         "FollowPathRPP3D.stair_exit_ahead_dist": 3.5,
-        "Docking.v_linear_min": 0.05,
-        "Undocking.v_linear_min": 0.05,
     }.items()
 }
 

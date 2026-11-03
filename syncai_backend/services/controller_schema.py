@@ -117,7 +117,6 @@ GROUPS: tuple[Group, ...] = (
         "How the robot trades staying on its route against keeping clear of obstacles.",
     ),
     Group("stairs", "Stairs", "Walking up and down stairs."),
-    Group("docking", "Docking", "The last metre onto and off the dock."),
 )
 
 
@@ -338,43 +337,10 @@ FIELDS: tuple[SettingField, ...] = (
         max=2.0,
         step=0.1,
     ),
-    # --- Docking -----------------------------------------------------------
-    SettingField(
-        id="dock_speed",
-        group="docking",
-        label="Docking speed",
-        description="The fastest the robot walks onto the dock.",
-        targets=("Docking.v_linear_max",),
-        apply=APPLY_LIVE,
-        unit="m/s",
-        min=0.05,
-        max=0.6,
-        step=0.05,
-    ),
-    SettingField(
-        id="undock_speed",
-        group="docking",
-        label="Undocking speed",
-        description="The fastest the robot backs off the dock.",
-        targets=("Undocking.v_linear_max",),
-        apply=APPLY_LIVE,
-        unit="m/s",
-        min=0.05,
-        max=0.6,
-        step=0.05,
-    ),
-    SettingField(
-        id="dock_xy_tolerance",
-        group="docking",
-        label="Docking position tolerance",
-        description="How close to the dock pose the robot must stop.",
-        targets=("dock_goal_checker.xy_goal_tolerance",),
-        apply=APPLY_LIVE,
-        unit="m",
-        min=0.01,
-        max=0.2,
-        step=0.01,
-    ),
+    # Docking (Docking / Undocking, dock_goal_checker) is left off the page
+    # for now, by request (2026-11-03). DockingController's callback refuses a
+    # bad batch properly, so adding its fields back needs only rows here and
+    # the v_linear_min / v_linear_max rule.
 )
 
 FIELDS_BY_ID: dict[str, SettingField] = {f.id: f for f in FIELDS}
@@ -457,20 +423,6 @@ RULES: tuple[Rule, ...] = (
             ),
         )
         for plugin in ("FollowPath", "FollowPathRPP3D")
-    ),
-    # DockingController refuses v_linear_max under v_linear_min (now with a
-    # real refusal); said here first, in the operator's words.
-    *(
-        Rule(
-            fields=(field_id,),
-            check=_below(
-                f"{plugin}.v_linear_max",
-                f"{plugin}.v_linear_min",
-                "The speed ({hi} m/s) must stay above the slowest speed used on "
-                "the dock ({lo} m/s).",
-            ),
-        )
-        for plugin, field_id in (("Docking", "dock_speed"), ("Undocking", "undock_speed"))
     ),
 )
 

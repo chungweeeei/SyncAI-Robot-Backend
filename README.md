@@ -652,7 +652,8 @@ gets the newest frame, not a backlog.
 ### Controller settings
 
 `/api/v1/settings/controller` lets the console tune `controller_server`
-(the walking speed, arrival tolerances, stuck detection, stairs, docking)
+(the walking speed, arrival tolerances, stuck detection, path following,
+stairs; docking is deliberately not on it yet)
 without a shell. Three layers, and the backend writes only the middle one:
 
 | Layer | Where | Written by |
