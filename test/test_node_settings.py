@@ -1,4 +1,4 @@
-"""Tests for ControllerSettingsService: the change saga over the live controller
+"""Tests for NodeSettingsService: the change saga over the live node
 and the overlay file.
 
 A stub stands in for controller_server's parameter services, with the
@@ -15,8 +15,8 @@ from syncai_backend.repositories.params.overlay import (
     CONTROLLER_NODE_KEY,
     ParamOverlayRepo,
 )
-from syncai_backend.services.controller_schema import FIELDS
-from syncai_backend.services.controller_settings import ControllerSettingsService
+from syncai_backend.services.controller_schema import CONTROLLER
+from syncai_backend.services.node_settings import NodeSettingsService
 
 FACTORY = {
     name: value
@@ -54,7 +54,7 @@ FACTORY = {
 
 
 def test_the_fixture_covers_every_target():
-    assert all(name in FACTORY for f in FIELDS for name in f.targets)
+    assert all(name in FACTORY for f in CONTROLLER.fields for name in f.targets)
 
 
 class _StubController:
@@ -123,7 +123,13 @@ def controller():
 
 @pytest.fixture
 def svc(logger, controller, repo):
-    return ControllerSettingsService(logger=logger, gateway=controller, overlay_repo=repo)
+    return NodeSettingsService(
+        logger=logger,
+        schema=CONTROLLER,
+        gateway=controller,
+        overlay_repo=repo,
+        subject="controller",
+    )
 
 
 def _field(snapshot, field_id):
@@ -310,7 +316,13 @@ def test_reset_without_defaults_is_refused(logger, controller, tmp_path):
         factory_path=str(tmp_path / "missing.yaml"),
         node_key=CONTROLLER_NODE_KEY,
     )
-    svc = ControllerSettingsService(logger=logger, gateway=controller, overlay_repo=repo)
+    svc = NodeSettingsService(
+        logger=logger,
+        schema=CONTROLLER,
+        gateway=controller,
+        overlay_repo=repo,
+        subject="controller",
+    )
 
     with pytest.raises(ConflictError) as exc:
         svc.reset()
@@ -335,5 +347,72 @@ def test_one_change_at_a_time(svc):
         with pytest.raises(ConflictError) as exc:
             svc.apply({"max_speed": 0.6})
         assert exc.value.code == "settings_busy"
+    finally:
+        svc._changing.release()
+
+
+# --- The planner page: the same saga on another node's schema ---------------
+
+PLANNER_FACTORY = {
+    "Octo3D.clearance_cost_weight": 1.0,
+    "Octo3D.stair_cost_multiplier": 2.0,
+    "Octo3D.kerb_cost_multiplier": 1.5,
+    "Octo3D.shortcut": True,
+    "Octo3D.dynamic.block_radius": 0.35,
+    "Octo3D.dynamic.obstacle_memory": 30.0,
+    "Octo3D.snap_xy_radius": 0.5,
+    "Octo3D.max_planning_time": 2.0,
+}
+
+
+@pytest.fixture
+def planner(logger, tmp_path):
+    import yaml
+
+    from syncai_backend.repositories.params.overlay import PLANNER_NODE_KEY, nest
+    from syncai_backend.services.planner_schema import PLANNER
+
+    factory = tmp_path / "planner_factory.yaml"
+    factory.write_text(
+        yaml.safe_dump({PLANNER_NODE_KEY: {"ros__parameters": nest(PLANNER_FACTORY)}})
+    )
+    node = _StubController()
+    node.params = dict(PLANNER_FACTORY)
+    repo = ParamOverlayRepo(
+        logger=logger,
+        overlay_path=str(tmp_path / "params" / "robot" / "planner_server.yaml"),
+        factory_path=str(factory),
+        node_key=PLANNER_NODE_KEY,
+    )
+    svc = NodeSettingsService(
+        logger=logger, schema=PLANNER, gateway=node, overlay_repo=repo, subject="planner"
+    )
+    return svc, node, repo
+
+
+def test_planner_fixture_covers_every_target():
+    from syncai_backend.services.planner_schema import PLANNER
+
+    assert all(name in PLANNER_FACTORY for f in PLANNER.fields for name in f.targets)
+
+
+def test_a_planner_switch_is_set_and_saved_as_a_boolean(planner):
+    svc, node, repo = planner
+    snap = svc.apply({"shortcut": False, "stair_cost": 4})
+
+    assert node.params["Octo3D.shortcut"] is False
+    assert node.params["Octo3D.stair_cost_multiplier"] == 4.0
+    assert repo.read() == {"Octo3D.shortcut": False, "Octo3D.stair_cost_multiplier": 4.0}
+    assert _field(snap, "shortcut").value is False
+    # Every planner field is a plugin (dotted) one: one set, no server batch.
+    assert len(node.sets) == 1
+
+
+def test_a_planner_refusal_names_the_planner(planner):
+    svc, _, _ = planner
+    svc._changing.acquire()
+    try:
+        with pytest.raises(ConflictError, match="planner settings"):
+            svc.apply({"shortcut": False})
     finally:
         svc._changing.release()

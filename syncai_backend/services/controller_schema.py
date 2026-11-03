@@ -33,67 +33,20 @@ controller range-checks almost nothing, and a value it accepts can still leave
 the robot unable to walk (below the gait's walking floor) or overrun it.
 """
 
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Union
 
-Value = Union[float, int, bool]
+from typing import Optional
 
-APPLY_LIVE = "live"
-APPLY_IDLE = "idle"
-APPLY_RESTART = "restart"
-
-KIND_NUMBER = "number"
-KIND_INTEGER = "integer"
-KIND_BOOLEAN = "boolean"
-
-
-@dataclass(frozen=True)
-class Group:
-    id: str
-    label: str
-    description: str
-
-
-@dataclass(frozen=True)
-class SettingField:
-    id: str
-    group: str
-    label: str
-    description: str
-    targets: tuple[str, ...]
-    apply: str
-    kind: str = KIND_NUMBER
-    unit: Optional[str] = None
-    min: Optional[float] = None
-    max: Optional[float] = None
-    step: Optional[float] = None
-
-    @property
-    def source(self) -> str:
-        """The parameter the field's value is read from."""
-        return self.targets[0]
-
-
-# ValueOf answers a ROS parameter's value as it will be after the change being
-# checked: the new value for a target in the request, else the live one, else
-# the overlay's, else the factory file's. None when nothing knows it.
-ValueOf = Callable[[str], Optional[Value]]
-
-
-@dataclass(frozen=True)
-class Rule:
-    """A cross-parameter constraint, checked on every change.
-
-    ``check`` returns the operator's sentence when the combination is refused,
-    None when it is fine (or when a value it needs is unknown -- refusing a
-    change for want of a number nobody can supply would lock the page).
-    ``fields`` are the settings the sentence is about, for the console to
-    mark.
-    """
-
-    fields: tuple[str, ...]
-    check: Callable[[ValueOf], Optional[str]] = field(compare=False)
-
+from syncai_backend.services.settings_schema import (
+    APPLY_IDLE,
+    APPLY_LIVE,
+    APPLY_RESTART,
+    Group,
+    Rule,
+    SettingField,
+    SettingsSchema,
+    ValueOf,
+    below,
+)
 
 GROUPS: tuple[Group, ...] = (
     Group(
@@ -343,29 +296,12 @@ FIELDS: tuple[SettingField, ...] = (
     # the v_linear_min / v_linear_max rule.
 )
 
-FIELDS_BY_ID: dict[str, SettingField] = {f.id: f for f in FIELDS}
-
-
-def _below(
-    upper: str, lower: str, sentence: str
-) -> Callable[[ValueOf], Optional[str]]:
-    """A rule that ``lower`` stays strictly under ``upper`` (ROS names)."""
-
-    def check(value_of: ValueOf) -> Optional[str]:
-        hi, lo = value_of(upper), value_of(lower)
-        if hi is None or lo is None or lo < hi:
-            return None
-        return sentence.format(hi=hi, lo=lo)
-
-    return check
-
-
 RULES: tuple[Rule, ...] = (
     # MPPI raises any walking command to walk_vx_min (the gait stands still
     # under it); a cap at or under the floor leaves nothing to regulate.
     Rule(
         fields=("max_speed",),
-        check=_below(
+        check=below(
             "FollowPath.vx_max",
             "FollowPath.walk_vx_min",
             "The maximum walking speed ({hi} m/s) must stay above the slowest "
@@ -376,7 +312,7 @@ RULES: tuple[Rule, ...] = (
     # max_linear_accel, or the slowdown is clipped by the accel clamp.
     Rule(
         fields=("max_linear_accel",),
-        check=_below(
+        check=below(
             "FollowPath.max_linear_accel",
             "FollowPath.approach_decel",
             "Acceleration ({hi} m/s²) must stay above the slowdown used on the "
@@ -385,7 +321,7 @@ RULES: tuple[Rule, ...] = (
     ),
     Rule(
         fields=("max_linear_accel",),
-        check=_below(
+        check=below(
             "FollowPath.max_linear_accel",
             "FollowPath.goal_stop_decel",
             "Acceleration ({hi} m/s²) must stay above the slowdown used to stop "
@@ -396,7 +332,7 @@ RULES: tuple[Rule, ...] = (
     # approach's speed floor ends outside the tolerance and the robot creeps.
     Rule(
         fields=("xy_goal_tolerance",),
-        check=_below(
+        check=below(
             "FollowPath.approach_floor_dist",
             "goal_checker.xy_goal_tolerance",
             "The position tolerance ({lo} m) must stay under the distance at "
@@ -405,7 +341,7 @@ RULES: tuple[Rule, ...] = (
     ),
     Rule(
         fields=("xy_goal_tolerance", "approach_dist"),
-        check=_below(
+        check=below(
             "FollowPath.approach_dist",
             "goal_checker.xy_goal_tolerance",
             "The position tolerance ({lo} m) must stay under the final approach "
@@ -442,33 +378,4 @@ def _standoff_sentence(value_of: ValueOf, plugin: str) -> Optional[str]:
     )
 
 
-def coerce(setting: SettingField, value: object) -> Value:
-    """``value`` as the field's type, within its limits; ValueError otherwise.
-
-    The type matters past validation: controller_server declares its
-    parameters without dynamic typing, so a double parameter set with an int
-    (JSON's ``1`` for ``1.0``) is refused by rclcpp itself.
-    """
-    if setting.kind == KIND_BOOLEAN:
-        if not isinstance(value, bool):
-            raise ValueError(f"{setting.label} must be true or false")
-        return value
-
-    # bool is an int subclass; true for a number is a client bug, not 1.
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{setting.label} must be a number")
-    if setting.kind == KIND_INTEGER:
-        if float(value) != int(value):
-            raise ValueError(f"{setting.label} must be a whole number")
-        number: Value = int(value)
-    else:
-        number = float(value)
-        if number != number or number in (float("inf"), float("-inf")):
-            raise ValueError(f"{setting.label} must be a finite number")
-
-    unit = f" {setting.unit}" if setting.unit else ""
-    if setting.min is not None and number < setting.min:
-        raise ValueError(f"{setting.label} must be at least {setting.min}{unit}")
-    if setting.max is not None and number > setting.max:
-        raise ValueError(f"{setting.label} must be at most {setting.max}{unit}")
-    return number
+CONTROLLER = SettingsSchema(groups=GROUPS, fields=FIELDS, rules=RULES)

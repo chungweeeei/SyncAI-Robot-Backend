@@ -1,41 +1,52 @@
-"""Tests for the controller settings schema: its fields, coercion and rules.
+"""Tests for the settings schemas (controller, planner): fields, coercion, rules.
 
-The last test checks the schema against the workspace's factory params file,
-the one place a renamed controller parameter shows up before a robot answers
-"no parameter" -- set ``SYNCAI_CONTROLLER_PARAMS`` to the file to run it.
+The last test checks each schema against the workspace's factory params file,
+the one place a renamed parameter shows up before a robot answers "no
+parameter" -- set ``SYNCAI_CONTROLLER_PARAMS`` / ``SYNCAI_PLANNER_PARAMS`` to
+the files to run it.
 """
 
 import os
 
 import pytest
 
-from syncai_backend.repositories.params.overlay import CONTROLLER_NODE_KEY, _node_params
-from syncai_backend.services.controller_schema import (
+from syncai_backend.repositories.params.overlay import (
+    CONTROLLER_NODE_KEY,
+    PLANNER_NODE_KEY,
+    _node_params,
+)
+from syncai_backend.services.controller_schema import CONTROLLER
+from syncai_backend.services.planner_schema import PLANNER
+from syncai_backend.services.settings_schema import (
     APPLY_IDLE,
     APPLY_LIVE,
     APPLY_RESTART,
-    FIELDS,
-    FIELDS_BY_ID,
-    GROUPS,
-    RULES,
+    KIND_BOOLEAN,
     coerce,
 )
 
-
-def test_field_ids_are_unique_and_groups_exist():
-    assert len(FIELDS_BY_ID) == len(FIELDS)
-    group_ids = {g.id for g in GROUPS}
-    assert all(f.group in group_ids for f in FIELDS)
-    assert all(any(f.group == g.id for f in FIELDS) for g in GROUPS)
+SCHEMAS = pytest.mark.parametrize("schema", [CONTROLLER, PLANNER], ids=["controller", "planner"])
+FIELDS_BY_ID = CONTROLLER.by_id
+RULES = CONTROLLER.rules
 
 
-def test_no_parameter_is_written_by_two_fields():
-    targets = [name for f in FIELDS for name in f.targets]
+@SCHEMAS
+def test_field_ids_are_unique_and_groups_exist(schema):
+    assert len(schema.by_id) == len(schema.fields)
+    group_ids = {g.id for g in schema.groups}
+    assert all(f.group in group_ids for f in schema.fields)
+    assert all(any(f.group == g.id for f in schema.fields) for g in schema.groups)
+
+
+@SCHEMAS
+def test_no_parameter_is_written_by_two_fields(schema):
+    targets = [name for f in schema.fields for name in f.targets]
     assert len(targets) == len(set(targets))
 
 
-def test_apply_matches_where_the_controller_takes_the_parameter():
-    for f in FIELDS:
+@SCHEMAS
+def test_apply_matches_where_the_node_takes_the_parameter(schema):
+    for f in schema.fields:
         assert f.apply in (APPLY_LIVE, APPLY_IDLE, APPLY_RESTART)
         undotted = ["." not in name for name in f.targets]
         # controller_server's own parameters are the ones refused mid-goal,
@@ -45,10 +56,24 @@ def test_apply_matches_where_the_controller_takes_the_parameter():
             assert f.apply == APPLY_IDLE, f.id
 
 
-def test_every_rule_names_existing_fields():
-    for rule in RULES:
+@SCHEMAS
+def test_every_rule_names_existing_fields(schema):
+    for rule in schema.rules:
         assert rule.fields
-        assert all(field_id in FIELDS_BY_ID for field_id in rule.fields)
+        assert all(field_id in schema.by_id for field_id in rule.fields)
+
+
+def test_every_planner_field_applies_live():
+    """Octo3D refuses a build-time key, so the page offers only live ones."""
+    assert all(f.apply == APPLY_LIVE for f in PLANNER.fields)
+
+
+def test_coerce_takes_a_boolean_only_as_a_boolean():
+    shortcut = PLANNER.by_id["shortcut"]
+    assert shortcut.kind == KIND_BOOLEAN
+    assert coerce(shortcut, False) is False
+    with pytest.raises(ValueError, match="true or false"):
+        coerce(shortcut, 1)
 
 
 def test_coerce_makes_an_int_a_float():
@@ -118,16 +143,25 @@ def test_the_stair_standoff_rule_checks_both_controllers():
     assert len(_check("stair_standoff", values)) == 1
 
 
-@pytest.mark.skipif(
-    not os.environ.get("SYNCAI_CONTROLLER_PARAMS"),
-    reason="SYNCAI_CONTROLLER_PARAMS names no factory params file",
+@pytest.mark.parametrize(
+    "schema, env, key",
+    [
+        (CONTROLLER, "SYNCAI_CONTROLLER_PARAMS", CONTROLLER_NODE_KEY),
+        (PLANNER, "SYNCAI_PLANNER_PARAMS", PLANNER_NODE_KEY),
+    ],
+    ids=["controller", "planner"],
 )
-def test_every_target_is_in_the_factory_params_file():
-    factory = _node_params(os.environ["SYNCAI_CONTROLLER_PARAMS"], CONTROLLER_NODE_KEY)
-    missing = [name for f in FIELDS for name in f.targets if name not in factory]
+def test_every_target_is_in_the_factory_params_file(schema, env, key):
+    if not os.environ.get(env):
+        pytest.skip(f"{env} names no factory params file")
+    factory = _node_params(os.environ[env], key)
+    missing = [name for f in schema.fields for name in f.targets if name not in factory]
     assert not missing
-    for f in FIELDS:
+    for f in schema.fields:
         for name in f.targets:
             # A field writes one type to every target; the file must agree.
+            if f.kind == KIND_BOOLEAN:
+                assert isinstance(factory[name], bool), (f.id, name)
+                continue
             assert isinstance(factory[name], float), (f.id, name)
             assert f.min <= factory[name] <= f.max, (f.id, name, factory[name])

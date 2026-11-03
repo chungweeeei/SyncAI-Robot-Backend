@@ -1,10 +1,11 @@
 """A node's runtime parameter overlay on disk, beside its factory params file.
 
-The workspace launches controller_server on two files, in order: the factory
-params (``src/syncai_controller/params/controller_server_params.yaml``,
-tracked, ~900 lines of comments on why each value is what it is, never written
-here) and the robot's overlay, ``config/params/<robot_id>/controller_server.yaml``
--- this process's to write, gitignored there. A later file wins key by key, so
+The workspace launches controller_server and planner_server each on two
+files, in order: the package's factory params (e.g.
+``src/syncai_controller/params/controller_server_params.yaml``, tracked, mostly
+comments on why each value is what it is, never written here) and the robot's
+overlay, ``config/params/<robot_id>/<node>.yaml`` -- this process's to write,
+gitignored there. A later file wins key by key, so
 the overlay holds **only the keys the operator changed**: a key nobody touched
 keeps following the factory file through a ``git pull``, resetting one setting
 is deleting its key, and deleting the file is the fall back to the factory
@@ -14,9 +15,9 @@ The file is rewritten whole, from what this process holds, so it carries no
 hand-written comments worth keeping; it is a ROS 2 params file
 (``/**/<node>: ros__parameters:``) because rcl reads it, not this process.
 Written tmp + fsync + rename: ``config/`` is a directory bind mount, so the
-rename lands on the host, and a reader -- the controller launch at the next
-boot -- sees the old file or the new one, never half of one. A file rcl cannot
-parse would take controller_server down on every boot (the launch skips one
+rename lands on the host, and a reader -- the node's launch at the next boot
+-- sees the old file or the new one, never half of one. A file rcl cannot
+parse would take the node down on every boot (the launch skips one
 it cannot parse, but a parsable file with a wrong type in it it cannot catch).
 
 ``.bak`` is the previous overlay, kept for the operator, never read here.
@@ -35,23 +36,32 @@ Value = Union[float, int, bool, str, list]
 
 # Absolute, like every ~/robot_ws path here: entrypoints do not reliably run
 # from the workspace root. config/ is mounted read-write into the backend's
-# container; the factory file needs src/syncai_controller/params mounted
-# (read-only) beside it -- without it the page has no defaults to show.
+# container; each factory file needs its package's params/ mounted
+# (read-only) beside it -- without it that page has no defaults to show.
 DEFAULT_PARAMS_DIR = os.path.expanduser("~/robot_ws/config/params")
 DEFAULT_CONTROLLER_FACTORY = os.path.expanduser(
     "~/robot_ws/src/syncai_controller/params/controller_server_params.yaml"
 )
+DEFAULT_PLANNER_FACTORY = os.path.expanduser(
+    "~/robot_ws/src/syncai_global_planner/params/planner_server_params.yaml"
+)
 
-# The key the workspace's params files use: wildcard namespace, so one file
-# serves any robot_id.
-CONTROLLER_NODE_KEY = "/**/controller_server"
+
+def node_key(node: str) -> str:
+    """The key the workspace's params files use for ``node``: wildcard
+    namespace, so one file serves any robot_id."""
+    return f"/**/{node}"
+
+
+CONTROLLER_NODE_KEY = node_key("controller_server")
+PLANNER_NODE_KEY = node_key("planner_server")
 
 PARAMS_KEY = "ros__parameters"
 BACKUP_SUFFIX = ".bak"
 
 _HEADER = (
     "# Runtime parameter overlay, written by syncai_backend's settings page.\n"
-    "# Loaded by the controller launch after the factory params file; only the\n"
+    "# Loaded by the node's launch after its factory params file; only the\n"
     "# keys changed on the page are here. Delete this file (and restart the nav\n"
     "# session) to fall back to the factory params. Do not hand-edit while the\n"
     "# backend runs: it rewrites the whole file from what it holds.\n"
@@ -150,7 +160,7 @@ class ParamOverlayRepo:
         """Replace the overlay with exactly ``values`` (flattened names).
 
         An empty ``values`` deletes the file: no overlay is the factory state,
-        and the controller's log then says "factory params only" rather than
+        and the node's log then says "factory params only" rather than
         "0 key(s)". The previous file is kept as ``.bak`` either way.
         """
         directory = os.path.dirname(self.overlay_path)
@@ -182,7 +192,7 @@ class ParamOverlayRepo:
 
         # Read back what rcl will read: a value that does not survive the
         # round trip (an int where a double was meant) would be refused by
-        # the controller at its next start, not here.
+        # the node at its next start, not here.
         written = self.read()
         if written != values:
             raise ValueError(
@@ -218,16 +228,17 @@ class ParamOverlayRepo:
             raise
 
 
-def init_controller_overlay_repo(
+def init_overlay_repo(
     logger: structlog.stdlib.BoundLogger,
     robot_id: str,
+    node: str,
+    factory_path: str,
     params_dir: str = DEFAULT_PARAMS_DIR,
-    factory_path: str = DEFAULT_CONTROLLER_FACTORY,
 ) -> ParamOverlayRepo:
-    # The same path the controller launch derives: <config>/params/<robot_id>/.
+    # The same path the node's launch derives: <config>/params/<robot_id>/<node>.yaml.
     return ParamOverlayRepo(
         logger=logger,
-        overlay_path=os.path.join(params_dir, robot_id, "controller_server.yaml"),
+        overlay_path=os.path.join(params_dir, robot_id, f"{node}.yaml"),
         factory_path=factory_path,
-        node_key=CONTROLLER_NODE_KEY,
+        node_key=node_key(node),
     )

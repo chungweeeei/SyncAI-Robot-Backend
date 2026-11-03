@@ -3,8 +3,8 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
-from syncai_backend.services.controller_settings import (
-    ControllerSettingsService,
+from syncai_backend.services.node_settings import (
+    NodeSettingsService,
     SettingsSnapshot,
 )
 
@@ -43,7 +43,7 @@ class SettingField(BaseModel):
         ),
     )
     current: Optional[SettingValue] = Field(
-        None, description="The running controller's value; null while it is not running."
+        None, description="The running node's value; null while it is not running."
     )
     default: Optional[SettingValue] = Field(
         None, description="The robot's default (factory) value."
@@ -57,7 +57,7 @@ class SettingField(BaseModel):
     )
 
 
-class ControllerSettingsResponse(BaseModel):
+class NodeSettingsResponse(BaseModel):
     live_available: bool = Field(
         ...,
         description=(
@@ -69,7 +69,7 @@ class ControllerSettingsResponse(BaseModel):
     fields: List[SettingField]
 
 
-class UpdateControllerSettingsRequest(BaseModel):
+class UpdateNodeSettingsRequest(BaseModel):
     # Any here, typed by the schema: a 400 sentence about the one value beats
     # a 422 listing the union's every branch.
     values: Dict[str, Any] = Field(
@@ -78,8 +78,8 @@ class UpdateControllerSettingsRequest(BaseModel):
     )
 
 
-def _response(snapshot: SettingsSnapshot) -> ControllerSettingsResponse:
-    return ControllerSettingsResponse(
+def _response(snapshot: SettingsSnapshot) -> NodeSettingsResponse:
+    return NodeSettingsResponse(
         live_available=snapshot.live_available,
         groups=[
             SettingGroup(id=g.id, label=g.label, description=g.description)
@@ -110,35 +110,43 @@ def _response(snapshot: SettingsSnapshot) -> ControllerSettingsResponse:
 
 def init_settings_router(
     logger: structlog.stdlib.BoundLogger,
-    controller_settings_svc: ControllerSettingsService,
+    settings_svcs: Dict[str, NodeSettingsService],
 ) -> APIRouter:
+    """``/api/v1/settings/<page>`` for each page in ``settings_svcs``
+    (``controller``, ``planner``): one fixed path each rather than a path
+    parameter, so an unknown page is FastAPI's own 404 and /docs lists them."""
     settings_router = APIRouter(prefix="", tags=["Settings"])
 
-    # Plain `def`: each call waits on controller_server's parameter services
-    # (seconds when the nav session is down) and reads files.
+    # Plain `def`: each call waits on a node's parameter services (seconds
+    # when the nav session is down) and reads files.
+    for page, svc in settings_svcs.items():
+        _register(settings_router, logger, page, svc)
 
-    @settings_router.get(
-        "/api/v1/settings/controller", response_model=ControllerSettingsResponse
-    )
-    def get_controller_settings():
-        return _response(controller_settings_svc.snapshot())
+    return settings_router
 
-    @settings_router.put(
-        "/api/v1/settings/controller", response_model=ControllerSettingsResponse
-    )
-    def update_controller_settings(request: UpdateControllerSettingsRequest):
-        logger.info("Changing controller settings", values=request.values)
-        return _response(controller_settings_svc.apply(request.values))
 
-    @settings_router.delete(
-        "/api/v1/settings/controller", response_model=ControllerSettingsResponse
-    )
-    def reset_controller_settings(
+def _register(
+    router: APIRouter,
+    logger: structlog.stdlib.BoundLogger,
+    page: str,
+    svc: NodeSettingsService,
+) -> None:
+    path = f"/api/v1/settings/{page}"
+
+    @router.get(path, response_model=NodeSettingsResponse, name=f"get_{page}_settings")
+    def get_settings():
+        return _response(svc.snapshot())
+
+    @router.put(path, response_model=NodeSettingsResponse, name=f"update_{page}_settings")
+    def update_settings(request: UpdateNodeSettingsRequest):
+        logger.info("Changing settings", page=page, values=request.values)
+        return _response(svc.apply(request.values))
+
+    @router.delete(path, response_model=NodeSettingsResponse, name=f"reset_{page}_settings")
+    def reset_settings(
         id: Optional[List[str]] = Query(
             None, description="The fields to reset; every field when absent."
         ),
     ):
-        logger.info("Resetting controller settings", ids=id or "all")
-        return _response(controller_settings_svc.reset(id))
-
-    return settings_router
+        logger.info("Resetting settings", page=page, ids=id or "all")
+        return _response(svc.reset(id))
