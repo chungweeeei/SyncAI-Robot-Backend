@@ -56,7 +56,8 @@ STAND_UP_TIMEOUT_S = 15.0
 
 
 def _move_failure(status: dict, label: str = "move") -> str:
-    """The step's error_msg for a MOVE / DOCK / UNDOCK that did not succeed.
+    """The step's error_msg for a MOVE / DOCK / UNDOCK / PATROL that did not
+    succeed (NavigateThroughGoals carries NavigateToGoal's error fields).
 
     The robot's own sentence when it gave one (why the backend uses NavigateToGoal,
     not NavigateToPose; a dock tree's DOCK_FAILED names the node that failed). An
@@ -91,12 +92,27 @@ def _move_failure(status: dict, label: str = "move") -> str:
 NON_RETRYABLE_NAV_CODES = frozenset({201, 203, 204, 209, 220, 222, 223, 224})
 
 
-def _nav_failure_retryable(status: dict) -> bool:
-    """Whether a MOVE / DOCK / UNDOCK / PATROL that did not succeed is worth
-    another attempt: not when the robot's error_code says the same goal cannot
-    succeed (NON_RETRYABLE_NAV_CODES). Before 2026-11 every abort was retried,
-    and a goal inside a keepout zone failed three times, 10 s apart in all."""
-    return status.get("error_code") not in NON_RETRYABLE_NAV_CODES
+def _nav_failure(status: dict, label: str) -> ApplicationError:
+    """The error a MOVE / DOCK / UNDOCK / PATROL that did not succeed raises.
+
+    Non-retryable when the robot's error_code says the same goal cannot succeed
+    (NON_RETRYABLE_NAV_CODES). Before 2026-11 every abort was retried, and a
+    goal inside a keepout zone failed three times, 10 s apart in all."""
+    return ApplicationError(
+        _move_failure(status, label),
+        non_retryable=status.get("error_code") in NON_RETRYABLE_NAV_CODES,
+    )
+
+
+def _pose_kwargs(params: MoveParams) -> dict:
+    """RobotGateway.move() / patrol()'s pose keywords for one pose step's
+    params: theta (degrees) as yaw (radians)."""
+    return {
+        "x": params.x,
+        "y": params.y,
+        "z": params.z,
+        "yaw": math.radians(params.theta),
+    }
 
 
 def _patrol_passed(details) -> int:
@@ -350,16 +366,7 @@ class RobotActivities:
 
         try:
             accepted, msg, goal_id = self._robot_gw.patrol(
-                [
-                    {
-                        "x": waypoint.x,
-                        "y": waypoint.y,
-                        "z": waypoint.z,
-                        "yaw": math.radians(waypoint.theta),
-                    }
-                    for waypoint in rest
-                ],
-                total=total,
+                [_pose_kwargs(waypoint) for waypoint in rest], total=total
             )
             if not accepted:
                 raise ApplicationError(f"Patrol rejected: {msg}", non_retryable=False)
@@ -387,10 +394,7 @@ class RobotActivities:
             # NavigateThroughGoals (2026-11) carries NavigateToGoal's error_code /
             # error_msg, so a patrol's failure reads as a MOVE's, "did not start"
             # for code 0 included.
-            raise ApplicationError(
-                _move_failure(status, "patrol"),
-                non_retryable=not _nav_failure_retryable(status),
-            )
+            raise _nav_failure(status, "patrol")
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 
@@ -473,12 +477,7 @@ class RobotActivities:
         """
         if params is not None:
             self._refuse_wrong_map(expected_map)
-            move_kwargs = {
-                "x": params.x,
-                "y": params.y,
-                "z": params.z,
-                "yaw": math.radians(params.theta),
-            }
+            move_kwargs = _pose_kwargs(params)
         else:
             move_kwargs = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         if behavior_tree:
@@ -518,10 +517,7 @@ class RobotActivities:
             raise
 
         if state != "succeeded":
-            raise ApplicationError(
-                _move_failure(status, label),
-                non_retryable=not _nav_failure_retryable(status),
-            )
+            raise _nav_failure(status, label)
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 
