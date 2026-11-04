@@ -65,8 +65,9 @@ class SettingField:
 
 
 # ValueOf answers a ROS parameter's value as it will be after the change being
-# checked: the new value for a target in the request, else the live one, else
-# the overlay's, else the factory file's. None when nothing knows it.
+# checked: the new value for a target in the request, else the overlay's (what
+# the next start loads), else the running node's, else the factory file's. None
+# when nothing knows it.
 ValueOf = Callable[[str], Optional[Value]]
 
 
