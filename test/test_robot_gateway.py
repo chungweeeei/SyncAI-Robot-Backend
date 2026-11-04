@@ -26,8 +26,7 @@ from action_msgs.msg import GoalStatus  # noqa: E402
 from builtin_interfaces.msg import Time  # noqa: E402
 
 from geometry_msgs.msg import Twist  # noqa: E402
-from nav2_msgs.action import NavigateThroughPoses  # noqa: E402
-from syncai_common.action import NavigateToGoal  # noqa: E402
+from syncai_common.action import NavigateThroughGoals, NavigateToGoal  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways import ros as ros_module  # noqa: E402
@@ -97,7 +96,7 @@ def robot_gw(logger, move_client, patrol_client) -> RobotGateway:
     # Header message asserts its stamp is a builtin_interfaces/Time — a bare
     # MagicMock does not pass, so the mocked clock must answer a real one.
     node.get_clock.return_value.now.return_value.to_msg.return_value = Time()
-    clients = {"navigate_to_goal": move_client, "navigate_through_poses": patrol_client}
+    clients = {"navigate_to_goal": move_client, "navigate_through_goals": patrol_client}
     with patch(
         "syncai_backend.gateways.robot.robot.ActionClient",
         side_effect=lambda **kwargs: clients[kwargs["action_name"]],
@@ -950,7 +949,7 @@ class TestLostGoals:
         assert "error_msg" not in status
 
 
-# --- PATROL: NavigateThroughPoses on the same goal book ----------------------------
+# --- PATROL: NavigateThroughGoals on the same goal book ----------------------------
 
 WAYPOINTS = [
     {"x": 1.0, "y": 2.0, "yaw": 0.0, "z": 0.0},
@@ -975,7 +974,7 @@ def _feed_patrol(patrol_client, remaining: int, distance: float):
     callback(
         SimpleNamespace(
             goal_id=SimpleNamespace(uuid=GOAL_UUID.bytes),
-            feedback=NavigateThroughPoses.Feedback(
+            feedback=NavigateThroughGoals.Feedback(
                 number_of_poses_remaining=remaining, distance_remaining=distance
             ),
         )
@@ -989,7 +988,7 @@ class TestPatrol:
         _send_patrol(robot_gw, patrol_client)
 
         goal = patrol_client.send_goal_async.call_args.kwargs["goal"]
-        assert isinstance(goal, NavigateThroughPoses.Goal)
+        assert isinstance(goal, NavigateThroughGoals.Goal)
         # patrol.xml, the task runner's default for this action.
         assert goal.behavior_tree == ""
         assert [p.header.frame_id for p in goal.poses] == ["map"] * 3
@@ -1016,7 +1015,7 @@ class TestPatrol:
         }
 
         result_future.complete(SimpleNamespace(
-            status=GoalStatus.STATUS_SUCCEEDED, result=NavigateThroughPoses.Result()
+            status=GoalStatus.STATUS_SUCCEEDED, result=NavigateThroughGoals.Result()
         ))
         assert robot_gw.navigation_active() is False
 
@@ -1055,18 +1054,25 @@ class TestPatrol:
 
         assert robot_gw.get_move_status(goal_id)["poses_remaining"] == 1
 
-    def test_an_abort_carries_no_reason(self, robot_gw, patrol_client):
-        # NavigateThroughPoses' result is Empty: nothing to read a code from,
-        # and NavigateToGoal's "error_code 0 = never started" must not apply.
+    def test_an_abort_carries_the_robots_reason(self, robot_gw, patrol_client):
+        # NavigateThroughGoals (2026-11) has NavigateToGoal's result: the code
+        # and sentence come through as a MOVE's do, progress beside them.
         goal_id, result_future = _send_patrol(robot_gw, patrol_client)
+        _feed_patrol(patrol_client, remaining=2, distance=5.0)
 
         result_future.complete(SimpleNamespace(
-            status=GoalStatus.STATUS_ABORTED, result=NavigateThroughPoses.Result()
+            status=GoalStatus.STATUS_ABORTED,
+            result=NavigateThroughGoals.Result(
+                error_code=NavigateThroughGoals.Result.GOAL_IN_KEEPOUT,
+                error_msg="Planning failed: the goal is inside a keepout zone (...)",
+            ),
         ))
 
         status = robot_gw.get_move_status(goal_id)
         assert status["state"] == MoveState.ABORTED.value
-        assert "error_code" not in status and "error_msg" not in status
+        assert status["error_code"] == NavigateThroughGoals.Result.GOAL_IN_KEEPOUT == 223
+        assert status["error_msg"].startswith("Planning failed")
+        assert status["poses_remaining"] == 2
 
     def test_a_lost_patrol_carries_this_sides_reason(self, robot_gw, patrol_client):
         goal_id, result_future = _send_patrol(robot_gw, patrol_client)

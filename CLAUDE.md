@@ -19,13 +19,17 @@ map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `R
 2026-10-15 a MOVE runs undock.xml itself first when the robot is still on the last DOCK's
 pose (`services/dock_state.py`, in memory; README *Auto-undock*); this package never
 calls `DockToPose`) — plus `rclpy`,
-`nav2_msgs` (`LoadMap`, and since 2026-11 the PATROL step's `NavigateThroughPoses` on
-`navigate_through_poses`), `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
-those imports as they are. **A PATROL failure has no reason code** until
-SyncAI-Robot-Interface grows a `NavigateThroughGoals` (NavigateToGoal's error fields on a
-list of poses): NavigateThroughPoses' result is Empty, so an aborted patrol fails its step
-with the fixed `PATROL_ABORTED_MSG` (activities.py) — never route it through `_move_failure`,
-whose "navigation did not start" is NavigateToGoal's `error_code` 0. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
+`nav2_msgs` (`LoadMap`), `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
+those imports as they are. **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
+`navigate_through_goals`** (2026-11; nav2's `NavigateThroughPoses` until then, whose Empty result
+carried no reason), so a patrol's failure goes through `_move_failure` like a MOVE's. **Whether a
+failed MOVE / DOCK / UNDOCK / PATROL is retried is decided by its `error_code`**
+(`NON_RETRYABLE_NAV_CODES`, activities.py): the planning codes for which the same goal cannot
+succeed later — a goal inside a keepout zone (223), outside the map, no map, the robot inside
+a zone, disconnected ground — fail the step at once; everything else keeps the workflow's
+three attempts, 5 s apart. The numbers are SyncAI-Robot-Interface's (`ComputePathToPose.action`
+documents each and whether a retry helps), written as literals because they are a contract
+that is never renumbered. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `ResetOdometry` with `skip_seed` (behind `POST /api/v1/localization/auto`,
 2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; the dock trees and `DOCK_FAILED` at or after `bbcc958`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any

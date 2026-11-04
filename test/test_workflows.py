@@ -1770,7 +1770,7 @@ def test_a_retried_patrol_reads_its_count_from_the_heartbeat():
             if activity.info().attempt == 1:
                 activity.heartbeat("executing", 2)
                 raise ApplicationError(
-                    "patrol aborted (the robot reports no reason for a patrol yet)"
+                    "patrol ended in aborted: Planning failed: the way to the goal is closed"
                 )
             return ActivityResult(success=True, state="succeeded")
 
@@ -1782,14 +1782,14 @@ def test_a_retried_patrol_reads_its_count_from_the_heartbeat():
     assert asyncio.run(scenario()) == [(1, []), (2, ["executing", 2])]
 
 
-def test_a_patrol_that_aborts_three_times_fails_with_the_robots_silence():
+def test_a_patrol_that_aborts_three_times_fails_with_the_robots_reason():
     async def scenario():
         @activity.defn(name="execute_patrol")
         async def execute_patrol(
             params: PatrolParams, expected_map=None, step_id: str = "", start: int = 0
         ) -> ActivityResult:
             raise ApplicationError(
-                "patrol aborted (the robot reports no reason for a patrol yet)"
+                "patrol ended in aborted: Planning failed: the way to the goal is closed"
             )
 
         async with _worker([execute_patrol]) as client:
@@ -1802,7 +1802,7 @@ def test_a_patrol_that_aborts_three_times_fails_with_the_robots_silence():
 
     assert steps[0].status is StepStatus.FAILED
     assert steps[0].error_msg == (
-        "patrol aborted (the robot reports no reason for a patrol yet)"
+        "patrol ended in aborted: Planning failed: the way to the goal is closed"
     )
 
 
