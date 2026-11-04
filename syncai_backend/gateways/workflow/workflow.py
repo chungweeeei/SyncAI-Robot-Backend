@@ -64,6 +64,7 @@ from syncai_backend.tasks.config import (
     ACTIVE_TASK_LIST_LIMIT,
     ACTIVE_TASK_RPC_TIMEOUT_S,
     PAUSE_SIGNAL,
+    RECENTLY_ENDED_WINDOW_S,
     RESUME_SIGNAL,
     TASK_HISTORY_RPC_TIMEOUT_S,
     TASK_STATE_RPC_TIMEOUT_S,
@@ -91,17 +92,23 @@ _WORKFLOW_STATUS_MAP = {
 _TASK_STATE_RPC = timedelta(seconds=TASK_STATE_RPC_TIMEOUT_S)
 
 
-def _active_query(task_queue: str) -> str:
+def _active_query(task_queue: str, ended_since: datetime) -> str:
     """The visibility List Filter behind GET /api/v1/active_tasks.
 
     `TaskQueue` is the per-robot scope; `WorkflowType` keeps a future second
     workflow type out. Needs SQL advanced visibility (server >= 1.20 on Postgres,
     as compose pins); see _fetch_active_tasks for the INVALID_ARGUMENT otherwise.
+
+    The runs closed since ``ended_since`` come in the same query, not a second
+    one, so `recently_ended` costs no RPC. SQL visibility lists open runs first,
+    so a burst of closed ones cannot crowd a running one out of the limit.
     """
     return (
         f"WorkflowType = '{WORKFLOW_TYPE_NAME}' "
         f"AND TaskQueue = '{task_queue}' "
-        "AND ExecutionStatus = 'Running'"
+        "AND (ExecutionStatus = 'Running' OR CloseTime >= '{}')".format(
+            ended_since.astimezone(timezone.utc).isoformat()
+        )
     )
 
 
@@ -273,6 +280,8 @@ class _ActiveSnapshot:
     fetched_at: float
     as_of: datetime
     tasks: Optional[List[ActiveTask]] = None
+    # Closed within RECENTLY_ENDED_WINDOW_S of as_of; never read by the busy checks.
+    ended: Optional[List[ActiveTask]] = None
     error: Optional[Exception] = None
 
 
@@ -674,8 +683,11 @@ class WorkflowGateway:
 
         return TaskState(id=task_id, status=status, steps=steps)
 
-    async def list_active_tasks(self) -> Tuple[List[ActiveTask], datetime]:
-        """What is running on this robot right now, and when that was read.
+    async def list_active_tasks(
+        self,
+    ) -> Tuple[List[ActiveTask], List[ActiveTask], datetime]:
+        """What is running on this robot right now, what closed within
+        RECENTLY_ENDED_WINDOW_S, and when that was read.
 
         The only source for it: Temporal visibility sees every execution on this
         robot's queue, whoever started it (console, MCP, a schedule).
@@ -702,9 +714,11 @@ class WorkflowGateway:
 
         if snapshot.error is not None:
             raise snapshot.error
-        return snapshot.tasks or [], snapshot.as_of
+        return snapshot.tasks or [], snapshot.ended or [], snapshot.as_of
 
-    def _read_active_cache(self) -> Optional[Tuple[List[ActiveTask], datetime]]:
+    def _read_active_cache(
+        self,
+    ) -> Optional[Tuple[List[ActiveTask], List[ActiveTask], datetime]]:
         """Replay the snapshot while it is fresh, re-raising a cached failure.
 
         Failures are cached too: a connect to a dead Temporal can block for
@@ -718,7 +732,7 @@ class WorkflowGateway:
             return None
         if snapshot.error is not None:
             raise snapshot.error
-        return snapshot.tasks or [], snapshot.as_of
+        return snapshot.tasks or [], snapshot.ended or [], snapshot.as_of
 
     async def _fetch_active_tasks(self) -> _ActiveSnapshot:
         """One visibility query, packaged as a snapshot. Never raises."""
@@ -733,12 +747,16 @@ class WorkflowGateway:
         except UpstreamError as err:
             return failed(err)
 
+        query = _active_query(
+            self._task_queue, as_of - timedelta(seconds=RECENTLY_ENDED_WINDOW_S)
+        )
         tasks: List[ActiveTask] = []
+        ended: List[ActiveTask] = []
         try:
             # No `await` on list_workflows: it returns the iterator (unlike
             # list_schedules); awaiting it is a TypeError.
             async for execution in client.list_workflows(
-                _active_query(self._task_queue),
+                query,
                 limit=ACTIVE_TASK_LIST_LIMIT,
                 page_size=ACTIVE_TASK_LIST_LIMIT,
                 rpc_timeout=timedelta(seconds=ACTIVE_TASK_RPC_TIMEOUT_S),
@@ -753,14 +771,27 @@ class WorkflowGateway:
                     )
                     continue
 
+                # By Temporal's status, not the mapped one: ContinuedAsNew maps to
+                # IN_PROGRESS but is closed, and is neither running nor an outcome.
+                running = execution.status == WorkflowExecutionStatus.RUNNING
+                if not running and (
+                    status == "IN_PROGRESS" or execution.close_time is None
+                ):
+                    continue
+
                 schedule_id = _schedule_id_of(execution)
                 kind, name = _provenance_of(execution, schedule_id)
-                tasks.append(
+                (tasks if running else ended).append(
                     ActiveTask(
                         id=execution.id,
                         run_id=execution.run_id,
                         status=status,
                         started_at=execution.start_time.astimezone(timezone.utc),
+                        ended_at=(
+                            None
+                            if running
+                            else execution.close_time.astimezone(timezone.utc)
+                        ),
                         source=(
                             TaskSource.SCHEDULE if schedule_id else TaskSource.DIRECT
                         ),
@@ -778,7 +809,7 @@ class WorkflowGateway:
                 self._logger.error(
                     "[WorkflowGateway] Visibility rejected the active-task query; "
                     "is this server on standard visibility?",
-                    query=_active_query(self._task_queue),
+                    query=query,
                     error=str(err),
                 )
             else:
@@ -794,9 +825,13 @@ class WorkflowGateway:
 
         # Debug: the cache-miss line, the only way to see how often Temporal is asked.
         self._logger.debug(
-            "[WorkflowGateway] Active task snapshot refreshed", count=len(tasks)
+            "[WorkflowGateway] Active task snapshot refreshed",
+            count=len(tasks),
+            ended=len(ended),
         )
-        return _ActiveSnapshot(fetched_at=fetched_at, as_of=as_of, tasks=tasks)
+        return _ActiveSnapshot(
+            fetched_at=fetched_at, as_of=as_of, tasks=tasks, ended=ended
+        )
 
     def _history_filter(
         self,

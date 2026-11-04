@@ -126,7 +126,7 @@ class JobGate:
         error here is a real outage. ``change`` names what was refused.
         """
         try:
-            tasks, _ = await self._workflow_gw.list_active_tasks()
+            tasks, _, _ = await self._workflow_gw.list_active_tasks()
         except Exception as exc:
             self._logger.warning(
                 "Could not confirm the robot is idle before changing a map",

@@ -168,7 +168,7 @@ class _StubWorkflowGateway:
     async def list_active_tasks(self):
         if self.error is not None:
             raise self.error
-        return self.tasks, "2026-09-16T00:00:00Z"
+        return self.tasks, [], "2026-09-16T00:00:00Z"
 
 
 @pytest.fixture
