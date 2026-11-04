@@ -40,7 +40,7 @@ class StepType(str, Enum):
     # takes none, since undock.xml backs out 1 m from wherever the robot stands.
     DOCK = "DOCK"
     UNDOCK = "UNDOCK"
-    # A NavigateThroughPoses on the task runner's patrol.xml: through every waypoint in
+    # A NavigateThroughGoals on the task runner's patrol.xml: through every waypoint in
     # order without stopping, the last one reached with its heading as a MOVE's is.
     PATROL = "PATROL"
 
@@ -161,7 +161,7 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
 POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK, StepType.PATROL})
 
 # Steps that send a navigation goal (NavigateToGoal, or a PATROL's
-# NavigateThroughPoses): they share MOVE's pause interrupt and its live status
+# NavigateThroughGoals): they share MOVE's pause interrupt and its live status
 # sentence, pose or not.
 NAV_STEP_TYPES = POSE_STEP_TYPES | {StepType.UNDOCK}
 

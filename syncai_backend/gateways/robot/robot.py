@@ -13,9 +13,8 @@ from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
-from nav2_msgs.action import NavigateThroughPoses
 
-from syncai_common.action import NavigateToGoal
+from syncai_common.action import NavigateThroughGoals, NavigateToGoal
 from syncai_common.msg import WifiConnection, WifiNetwork
 from syncai_common.srv import (
     ActivateWifiConnection,
@@ -69,13 +68,13 @@ class MoveState(str, Enum):
 
 
 # One navigation goal: a NavigateToGoal (MOVE / DOCK / UNDOCK) or a PATROL's
-# NavigateThroughPoses, told apart by `patrol_total`. `feedback` is the latest
+# NavigateThroughGoals, told apart by `patrol_total`. `feedback` is the latest
 # Feedback (what get_move_message reads beside a running step); `result` the
-# Result (NavigateToGoal's error_code / error_msg; NavigateThroughPoses' is
-# empty). `lost` is set when this gateway gave up on the goal with no result
-# from the server (see _lose_goal): the goal reads ABORTED with `lost` as its
-# reason. One book for both actions, so the teleop gate, navigation_active and
-# cancel_active_moves cover a patrol without knowing about it.
+# Result (error_code / error_msg, the same table on both actions). `lost` is
+# set when this gateway gave up on the goal with no result from the server (see
+# _lose_goal): the goal reads ABORTED with `lost` as its reason. One book for
+# both actions, so the teleop gate, navigation_active and cancel_active_moves
+# cover a patrol without knowing about it.
 @dataclass
 class MoveGoal:
     goal_id: str
@@ -125,7 +124,7 @@ NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 DOCK_BEHAVIOR_TREE = "dock.xml"
 UNDOCK_BEHAVIOR_TREE = "undock.xml"
 
-# NavigateThroughPoses.behavior_tree for a PATROL: "" is the task runner's
+# NavigateThroughGoals.behavior_tree for a PATROL: "" is the task runner's
 # default for that action, patrol.xml (through every pose without stopping, the
 # last one reached with its heading).
 PATROL_BEHAVIOR_TREE = ""
@@ -144,7 +143,7 @@ def _goal_id_str(goal_handle: ClientGoalHandle) -> str:
 
 
 def _patrol_message(feedback, total: int) -> str:
-    """A running PATROL's line, from NavigateThroughPoses feedback.
+    """A running PATROL's line, from NavigateThroughGoals feedback.
 
     ``number_of_poses_remaining`` counts the poses of this goal still ahead,
     the last included, so it is also how many of the step's ``total`` are
@@ -196,14 +195,14 @@ class RobotGateway:
             action_name="navigate_to_goal",
         )
 
-        # PATROL. nav2's own action, because syncai_common has no
-        # NavigateThroughGoals yet: its Result is Empty (std_msgs/Empty), so an
-        # aborted patrol carries no reason (see get_move_status). One navigation
-        # at a time across both actions; the task runner rejects the second.
+        # PATROL. NavigateThroughGoals (2026-11), not nav2's NavigateThroughPoses
+        # (served beside it, unchanged): the same goal, and a result that says
+        # why a patrol failed -- nav2's is std_msgs/Empty. One navigation at a
+        # time across both actions; the task runner rejects the second.
         patrol_client = ActionClient(
             node=self._node,
-            action_type=NavigateThroughPoses,
-            action_name="navigate_through_poses",
+            action_type=NavigateThroughGoals,
+            action_name="navigate_through_goals",
         )
 
         self._action_clients.update({"move": move_client, "patrol": patrol_client})
@@ -807,7 +806,7 @@ class RobotGateway:
     def patrol(
         self, waypoints: Sequence[dict], total: Optional[int] = None
     ) -> Tuple[bool, str, Optional[str]]:
-        """Send a NavigateThroughPoses goal through ``waypoints`` in order.
+        """Send a NavigateThroughGoals goal through ``waypoints`` in order.
 
         Each waypoint is ``move()``'s pose keywords (``x`` / ``y`` / ``yaw`` /
         ``z``), ``z`` the ground height of that waypoint's storey. Only the last
@@ -826,7 +825,7 @@ class RobotGateway:
             last=waypoints[-1] if waypoints else None,
         )
 
-        goal_msg = NavigateThroughPoses.Goal(
+        goal_msg = NavigateThroughGoals.Goal(
             poses=[self._make_pose_stamped(**waypoint) for waypoint in waypoints],
             behavior_tree=PATROL_BEHAVIOR_TREE,
         )
@@ -896,18 +895,11 @@ class RobotGateway:
                 "goal_id": goal.goal_id,
                 "state": goal.state.value,
             }
-            if goal.patrol_total is not None:
-                # NavigateThroughPoses: no reason on an abort (its Result is
-                # Empty), so only this side's own, for a lost goal. What it does
-                # carry is progress, which a retried or resumed PATROL starts
-                # from (execute_patrol).
-                if goal.feedback is not None:
-                    status["poses_remaining"] = int(
-                        goal.feedback.number_of_poses_remaining
-                    )
-                if goal.state is MoveState.ABORTED and goal.lost:
-                    status["error_msg"] = goal.lost
-                return status
+            if goal.patrol_total is not None and goal.feedback is not None:
+                # A patrol's progress, which a retried or resumed PATROL starts
+                # from (execute_patrol). Its reason on an abort is read below,
+                # as a MOVE's: NavigateThroughGoals has the same result.
+                status["poses_remaining"] = int(goal.feedback.number_of_poses_remaining)
             # The reason, on an abort only. NONE on an abort ("superseded or
             # never started") is meaningful, so it is passed on.
             if goal.state is MoveState.ABORTED and goal.result is not None:

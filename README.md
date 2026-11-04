@@ -400,21 +400,20 @@ goal `DOCK_FAILED` (300) with the failing node's reason in `error_msg`; an
 unreachable staging pose is `PLAN_FAILED` / `FOLLOW_PATH_FAILED` as for a MOVE.
 Needs `syncai_common` at or after SyncAI-Robot-Interface `bbcc958`.
 
-**PATROL: `navigate_through_poses` (`nav2_msgs/NavigateThroughPoses`), 2026-11.**
+**PATROL: `navigate_through_goals` (`syncai_common/NavigateThroughGoals`), 2026-11.**
 A second action client on the same server (`syncai_task_runner`), for the PATROL
 step: `RobotGateway.patrol()` sends every waypoint as a `PoseStamped` (frame `map`,
 `z` = that waypoint's storey, yaw-only quaternion) with `behavior_tree: ""`, the
 task runner's `patrol.xml` — through every pose in order without stopping, only
-the last reached with its heading (xy 0.10 m, 0.2 rad, as a MOVE). It is nav2's
-action, not a `syncai_common` one, because **there is no `NavigateThroughGoals`
-yet**: the result is `std_msgs/Empty`, so **a PATROL failure has no reason code**
-— an ABORTED patrol fails its step with the fixed `patrol aborted (the robot
-reports no reason for a patrol yet)`, never MOVE's "navigation did not start"
-reading of `error_code` 0, which this action does not have. (A goal this side
-*lost* keeps its own reason.) Once SyncAI-Robot-Interface has a
-`NavigateThroughGoals` with NavigateToGoal's `error_code` / `error_msg` /
-`status_msg`, switch the client and route its failures through `_move_failure`.
-The goal lands in the same `MoveGoal` table (`patrol_total` marks it), so the
+the last reached with its heading (xy 0.10 m, 0.2 rad, as a MOVE). It was nav2's
+`NavigateThroughPoses` on `navigate_through_poses` until SyncAI-Robot-Interface
+grew `NavigateThroughGoals` (2026-11): the same goal with NavigateToGoal's
+`error_code` / `error_msg` result, so **a PATROL failure reads as a MOVE's** —
+`_move_failure`, "navigation did not start" for code 0 included, and the same
+retry decision (*Task orchestration*, "Which failures are retried"). The task
+runner still serves the nav2 action beside it. Needs `syncai_common` with
+`NavigateThroughGoals` and a task runner that serves it (SyncAI-Robot-Workspace
+`feature/plan-error-codes`). The goal lands in the same `MoveGoal` table (`patrol_total` marks it), so the
 status poll, `cancel_active_moves`, the teleop refusal and `navigation_active`
 cover it unchanged. Its feedback has no sentence, so `get_move_message` builds
 the step's `message` from it — `Patrolling: 3 of 5 waypoints left, 12.4 m to go`
@@ -422,7 +421,7 @@ the step's `message` from it — `Patrolling: 3 of 5 waypoints left, 12.4 m to g
 omitted until a route is planned) — and `get_move_status` adds
 `poses_remaining`, which the activity turns into the waypoints already passed
 (*Task orchestration*). One navigation at a time across `navigate_to_pose` /
-`navigate_to_goal` / `navigate_through_poses`: the task runner rejects a goal
+`navigate_to_goal` / `navigate_through_poses` / `navigate_through_goals`: the task runner rejects a goal
 sent while another navigator runs, which the step reads as a retryable
 `Patrol rejected`.
 
@@ -850,7 +849,7 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 | StepType | Activity | What it does |
 |---|---|---|
 | `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg`. A robot still on the dock the last DOCK ended on is stood up (if lying) and undocked first — *Auto-undock* under *Action client* |
-| `PATROL` | `execute_patrol` | One `NavigateThroughPoses` through `PatrolParams.waypoints` (at least two `MoveParams`; only the last `theta` is turned to) — *PATROL* under *Action client*. MOVE's map check and auto-undock, poll, heartbeat and pause interrupt. Never starts the round over: the heartbeat details carry how many waypoints are behind the robot (from `number_of_poses_remaining`), so a retry sends only the rest, and the activity signals the count to the run (`patrol_progress`, forward only), which re-dispatches a resumed patrol with it as the activity's `start`. The step's own `params` keep every waypoint; the last one is always sent. An abort fails it with the fixed `patrol aborted (the robot reports no reason for a patrol yet)` |
+| `PATROL` | `execute_patrol` | One `NavigateThroughGoals` through `PatrolParams.waypoints` (at least two `MoveParams`; only the last `theta` is turned to) — *PATROL* under *Action client*. MOVE's map check and auto-undock, poll, heartbeat and pause interrupt. Never starts the round over: the heartbeat details carry how many waypoints are behind the robot (from `number_of_poses_remaining`), so a retry sends only the rest, and the activity signals the count to the run (`patrol_progress`, forward only), which re-dispatches a resumed patrol with it as the activity's `start`. The step's own `params` keep every waypoint; the last one is always sent. An abort fails it with the robot's reason, as a MOVE's (`patrol ended in aborted: …`), retried or not by its `error_code` |
 | `DOCK` / `UNDOCK` | `execute_dock` / `execute_undock` | `execute_move` on the dock trees (`behavior_tree` `dock.xml` / `undock.xml`, see *Action client*). DOCK's `MoveParams` is the dock pose and gets MOVE's map check; UNDOCK takes no params, sends an empty pose and is checked against no map, since it backs out 1 m from wherever the robot stands. DOCK's success records the dock for the next MOVE's auto-undock, UNDOCK's forgets it; the console no longer offers UNDOCK, since a MOVE undocks by itself. Same poll, heartbeat and pause interrupt as MOVE; a cancel (or pause) also sends `MotionKey.LOCOMOTION`, best effort, because a halted dock tree stays in MPC |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.start_speak()` then `await_speak()` — queue the utterance on the speech service, then poll its job and heartbeat until it has played; a cancel `DELETE`s the job mid-sentence. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
@@ -859,6 +858,33 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 (`ARTIFACT` — conveyor pickup/drop via the artifact backend's REST API — was
 removed 2026-08 with `gateways/artifact/`; templates or schedules still carrying
 one must be purged before deploying.)
+
+**Which failures are retried (2026-11).** Every step activity runs under the
+workflow's `RetryPolicy` — three attempts, 5 s apart — and a failure raised
+`non_retryable` skips the rest. For a MOVE / DOCK / UNDOCK / PATROL that the
+robot aborted, the robot's `error_code` decides: `NON_RETRYABLE_NAV_CODES`
+(activities.py) are the planning reasons for which the same goal cannot succeed
+5 s later, and fail the step on the first attempt:
+
+| `error_code` | Reason |
+|---|---|
+| 201 `INVALID_PLANNER` | the planner id names no loaded planner |
+| 203 / 204 `START_` / `GOAL_OUTSIDE_MAP` | outside the map's grid |
+| 209 `NO_VIAPOINTS_GIVEN` | a route with no waypoints |
+| 220 `MAP_NOT_LOADED` | no 3D map loaded (until a map switch) |
+| 222 `START_IN_KEEPOUT` | the robot stands inside a keepout zone (until it is moved) |
+| 223 `GOAL_IN_KEEPOUT` | the goal, or a PATROL waypoint, is inside a keepout zone (until the zone is edited) |
+| 224 `DISCONNECTED` | start and goal on ground no stair joins |
+
+Everything else is retried: 200 (no finer reason), 202 TF, 205 / 206 nothing to
+stand on at the start / goal — which includes a person on it — 207 search
+timeout, 208 the way closed (a person across it, or a zone), 221 the map still
+loading, 1xx path following, 3xx docking, and an abort with no code (superseded
+or never started). Before this a goal inside a keepout zone was sent three
+times and failed after ~10 s, for a reason the robot knew at once. The numbers
+are SyncAI-Robot-Interface's planning table (`ComputePathToPose.action`), the
+same on `NavigateToGoal` and `NavigateThroughGoals`; they are never renumbered,
+so they are written here as literals.
 
 **Groups — steps side by side.** A step may carry an optional `group` (any
 string). Adjacent steps with the same `group` run side by side, and the next step

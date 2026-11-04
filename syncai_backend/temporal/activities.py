@@ -76,26 +76,27 @@ def _move_failure(status: dict, label: str = "move") -> str:
     return f"{label} ended in aborted"
 
 
-# A PATROL's error_msg on an abort the robot reported. Fixed, because
-# NavigateThroughPoses' result is Empty: no code, no sentence. Not _move_failure's
-# "navigation did not start" either -- that reading is NavigateToGoal's error_code 0,
-# and a patrol abort has no code to read it from. Until syncai_common has a
-# NavigateThroughGoals with NavigateToGoal's error fields, this is all there is.
-PATROL_ABORTED_MSG = "patrol aborted (the robot reports no reason for a patrol yet)"
+# NavigateToGoal / NavigateThroughGoals error_codes for which the same goal sent
+# again cannot succeed, so the step fails at once instead of spending the retry
+# policy's two retries, 5 s apart, on it. SyncAI-Robot-Interface's planning table
+# (ComputePathToPose.action documents each code and whether a retry helps):
+# INVALID_PLANNER 201, START_OUTSIDE_MAP 203, GOAL_OUTSIDE_MAP 204,
+# NO_VIAPOINTS_GIVEN 209, MAP_NOT_LOADED 220 (until a map switch),
+# START_IN_KEEPOUT 222 (until the robot is moved), GOAL_IN_KEEPOUT 223 (until the
+# zone is edited), DISCONNECTED 224. Literal numbers, not the generated constants:
+# the codes are the interface's contract and never renumbered, and this module
+# imports without syncai_common under test. Everything else stays retryable: 200
+# (no finer reason), a person on the goal (206) or across the way (208), a map
+# still loading (221), a controller or dock failure, an abort with no code.
+NON_RETRYABLE_NAV_CODES = frozenset({201, 203, 204, 209, 220, 222, 223, 224})
 
 
-def _patrol_failure(status: dict) -> str:
-    """The step's error_msg for a PATROL that did not succeed.
-
-    A goal this side lost (server gone, cancel unanswered) keeps its own reason;
-    an abort from the robot says it gave none.
-    """
-    state = status["state"]
-    if state != "aborted":
-        return f"patrol ended in {state}"
-    if status.get("error_msg"):
-        return f"patrol ended in aborted: {status['error_msg']}"
-    return PATROL_ABORTED_MSG
+def _nav_failure_retryable(status: dict) -> bool:
+    """Whether a MOVE / DOCK / UNDOCK / PATROL that did not succeed is worth
+    another attempt: not when the robot's error_code says the same goal cannot
+    succeed (NON_RETRYABLE_NAV_CODES). Before 2026-11 every abort was retried,
+    and a goal inside a keepout zone failed three times, 10 s apart in all."""
+    return status.get("error_code") not in NON_RETRYABLE_NAV_CODES
 
 
 def _patrol_passed(details) -> int:
@@ -324,7 +325,7 @@ class RobotActivities:
         step_id: str = "",
         start: int = 0,
     ) -> ActivityResult:
-        """Drive through ``params.waypoints`` in order: one NavigateThroughPoses.
+        """Drive through ``params.waypoints`` in order: one NavigateThroughGoals.
 
         ``start`` is how many waypoints a dispatch before this one had passed
         (RobotWorkflow keeps the count from PATROL_PROGRESS_SIGNAL), and a retry
@@ -383,7 +384,13 @@ class RobotActivities:
             raise
 
         if state != "succeeded":
-            raise ApplicationError(_patrol_failure(status), non_retryable=False)
+            # NavigateThroughGoals (2026-11) carries NavigateToGoal's error_code /
+            # error_msg, so a patrol's failure reads as a MOVE's, "did not start"
+            # for code 0 included.
+            raise ApplicationError(
+                _move_failure(status, "patrol"),
+                non_retryable=not _nav_failure_retryable(status),
+            )
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 
@@ -511,7 +518,10 @@ class RobotActivities:
             raise
 
         if state != "succeeded":
-            raise ApplicationError(_move_failure(status, label), non_retryable=False)
+            raise ApplicationError(
+                _move_failure(status, label),
+                non_retryable=not _nav_failure_retryable(status),
+            )
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 

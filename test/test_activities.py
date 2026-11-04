@@ -169,6 +169,45 @@ class TestExecuteMove:
             "Path following failed: the robot could not reach the goal"
         )
 
+    @pytest.mark.parametrize(
+        "code", [201, 203, 204, 209, 220, 222, 223, 224], ids=lambda c: f"code_{c}"
+    )
+    def test_a_permanent_planning_failure_is_not_retried(
+        self, env, activities, robot_gw, code
+    ):
+        # The same goal cannot succeed 5 s later (a goal inside a keepout zone,
+        # 223, was the case: three tries, 10 s, for a failure known at once).
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {
+            "goal_id": "goal-1",
+            "state": "aborted",
+            "error_code": code,
+            "error_msg": "Planning failed: the goal is inside a keepout zone (...)",
+        }
+
+        with pytest.raises(ApplicationError, match="Planning failed") as exc_info:
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert exc_info.value.non_retryable is True
+
+    @pytest.mark.parametrize(
+        "code", [0, 1, 100, 200, 202, 205, 206, 207, 208, 221, 300],
+        ids=lambda c: f"code_{c}",
+    )
+    def test_a_failure_that_may_clear_is_retried(self, env, activities, robot_gw, code):
+        # A person on the goal (206) or across the way (208), a map still
+        # loading (221), no finer reason (200), a controller or dock failure,
+        # an abort before the tree ran (0).
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {
+            "goal_id": "goal-1", "state": "aborted", "error_code": code, "error_msg": "x",
+        }
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert exc_info.value.non_retryable is False
+
     def test_an_abort_with_no_reason_says_navigation_did_not_start(
         self, env, activities, robot_gw
     ):
@@ -896,18 +935,50 @@ class TestExecutePatrol:
         assert robot_gw.patrol.call_args.kwargs["total"] == 4
         robot_gw.move.assert_not_called()
 
-    def test_an_abort_says_the_robot_gave_no_reason(self, env, activities, robot_gw):
-        # Not MOVE's "navigation did not start": that is NavigateToGoal's code 0,
-        # and NavigateThroughPoses has no code.
+    def test_an_abort_carries_the_robots_reason(self, env, activities, robot_gw):
+        # NavigateThroughGoals (2026-11): a patrol's failure reads as a MOVE's.
         robot_gw.patrol.return_value = (True, "", "p")
-        robot_gw.get_move_status.return_value = _patrol_status("aborted")
+        robot_gw.get_move_status.return_value = {
+            **_patrol_status("aborted"),
+            "error_code": 208,
+            "error_msg": "Planning failed: the way to the goal is closed (...)",
+        }
 
         with pytest.raises(ApplicationError) as raised:
             env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
 
         assert str(raised.value) == (
-            "patrol aborted (the robot reports no reason for a patrol yet)"
+            "patrol ended in aborted: Planning failed: the way to the goal is closed (...)"
         )
+        # A person across the way may leave.
+        assert raised.value.non_retryable is False
+
+    def test_a_waypoint_in_a_keepout_zone_is_not_retried(self, env, activities, robot_gw):
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = {
+            **_patrol_status("aborted"),
+            "error_code": 223,
+            "error_msg": "Planning failed: the goal is inside a keepout zone (...)",
+        }
+
+        with pytest.raises(ApplicationError, match="keepout zone") as raised:
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
+        assert raised.value.non_retryable is True
+
+    def test_an_abort_with_no_code_says_navigation_did_not_start(
+        self, env, activities, robot_gw
+    ):
+        # NavigateToGoal's contract, now a patrol's too: ABORTED + NONE is
+        # superseded or never started.
+        robot_gw.patrol.return_value = (True, "", "p")
+        robot_gw.get_move_status.return_value = {
+            **_patrol_status("aborted"), "error_code": 0, "error_msg": ""
+        }
+
+        with pytest.raises(ApplicationError, match="navigation did not start") as raised:
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
+
         assert raised.value.non_retryable is False
 
     def test_a_lost_patrol_keeps_this_sides_reason(self, env, activities, robot_gw):
