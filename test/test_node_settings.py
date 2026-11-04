@@ -68,8 +68,11 @@ class _StubController:
         self.ignores = set()
         self.refuse = None
         self.sets = []
+        self.probes = 0
 
     def available(self, timeout_sec=2.0):
+        # Counted: each probe of a node that is down costs SERVICE_WAIT_S.
+        self.probes += 1
         return self.up
 
     def get(self, names):
@@ -252,6 +255,23 @@ def test_with_the_controller_down_a_change_is_saved_for_its_start(svc, controlle
     assert _field(snap, "max_speed").value == 0.6
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda svc: svc.apply({"max_speed": 0.6}),  # a rule reads the node
+        lambda svc: svc.reset(),
+    ],
+    ids=["apply", "reset"],
+)
+def test_with_the_controller_down_a_request_waits_for_it_once(svc, controller, change):
+    # Validation, the live set and the closing read each used to probe: three
+    # waits of SERVICE_WAIT_S for one PUT.
+    controller.up = False
+    change(svc)
+
+    assert controller.probes == 1
+
+
 def test_a_failed_overlay_write_undoes_the_live_set(svc, controller, repo):
     def broken_write(values):
         raise OSError("read-only file system")
@@ -339,6 +359,26 @@ def test_an_unreadable_overlay_refuses_a_change(svc, repo):
     with pytest.raises(ConflictError) as exc:
         svc.apply({"max_speed": 0.6})
     assert exc.value.code == "params_unreadable"
+
+
+def test_an_unreadable_overlay_refuses_a_reset_before_anything_is_set(
+    svc, controller, repo
+):
+    # A reset reads the overlay only in the saga: it must be read before the
+    # live set, or the node keeps the factory values with the overlay unwritten.
+    import os
+
+    controller.params["FollowPath.vx_max"] = 0.6
+    os.makedirs(os.path.dirname(repo.overlay_path))
+    with open(repo.overlay_path, "w") as handle:
+        handle.write("a: [\n")
+
+    with pytest.raises(ConflictError) as exc:
+        svc.reset(["max_speed"])
+
+    assert exc.value.code == "params_unreadable"
+    assert controller.sets == []
+    assert controller.params["FollowPath.vx_max"] == 0.6
 
 
 def test_one_change_at_a_time(svc):

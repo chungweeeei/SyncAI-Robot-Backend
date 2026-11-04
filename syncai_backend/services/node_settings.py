@@ -23,11 +23,12 @@ One change at a time (409 ``settings_busy``): two interleaved sagas would each
 restore the other's values on a failure.
 """
 
+import functools
 import math
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional
 
 import structlog
 
@@ -79,8 +80,19 @@ def _same(a: Optional[Value], b: Optional[Value]) -> bool:
     return a == b
 
 
-def _undotted(name: str) -> bool:
-    return "." not in name
+def _batches(values: dict[str, Value]) -> tuple[dict[str, Value], dict[str, Value]]:
+    """``values`` split for set_atomically: the undotted (the server's own,
+    refused mid-goal) first, alone, so a refusal there leaves the plugins
+    untouched; then the dotted."""
+    return (
+        {n: v for n, v in values.items() if "." not in n},
+        {n: v for n, v in values.items() if "." in n},
+    )
+
+
+# Whether the node is up, asked at most once per request: every probe of a
+# node that is down waits out ParameterGateway's SERVICE_WAIT_S.
+LiveProbe = Callable[[], bool]
 
 
 class NodeSettingsService:
@@ -103,10 +115,14 @@ class NodeSettingsService:
 
     # --- Reading -----------------------------------------------------------
 
-    def snapshot(self) -> SettingsSnapshot:
+    def snapshot(self, live_up: Optional[LiveProbe] = None) -> SettingsSnapshot:
+        """``live_up`` is the probe of the request this read ends, if any."""
         factory = self._factory()
         overlay = self._overlay()
-        live = self._live([name for f in self._schema.fields for name in f.targets])
+        live = self._live(
+            [name for f in self._schema.fields for name in f.targets],
+            live_up or self._probe(),
+        )
 
         fields = []
         for setting in self._schema.fields:
@@ -145,11 +161,12 @@ class NodeSettingsService:
     def apply(self, values: dict[str, object]) -> SettingsSnapshot:
         if not values:
             raise BadRequestError("No settings to change.", code="invalid_setting")
+        live_up = self._probe()
         with self._one_change_at_a_time():
-            new_values = self._validate(values)
+            new_values = self._validate(values, live_up)
             settings = [self._schema.by_id[field_id] for field_id in values]
-            self._commit(settings, new_values, drop=())
-        return self.snapshot()
+            self._commit(settings, new_values, drop=(), live_up=live_up)
+        return self.snapshot(live_up)
 
     def reset(self, field_ids: Optional[Iterable[str]] = None) -> SettingsSnapshot:
         """Back to the factory values: the keys leave the overlay, and the live
@@ -160,6 +177,7 @@ class NodeSettingsService:
             raise BadRequestError(
                 f"Unknown setting: {', '.join(unknown)}", code="invalid_setting"
             )
+        live_up = self._probe()
         with self._one_change_at_a_time():
             factory = self._factory()
             settings = [self._schema.by_id[field_id] for field_id in ids]
@@ -172,9 +190,12 @@ class NodeSettingsService:
                     code="defaults_unavailable",
                 )
             self._commit(
-                settings, {name: factory[name] for name in names}, drop=tuple(names)
+                settings,
+                {name: factory[name] for name in names},
+                drop=tuple(names),
+                live_up=live_up,
             )
-        return self.snapshot()
+        return self.snapshot(live_up)
 
     # --- The saga ----------------------------------------------------------
 
@@ -183,6 +204,7 @@ class NodeSettingsService:
         settings: list[SettingField],
         new_values: dict[str, Value],
         drop: tuple[str, ...],
+        live_up: LiveProbe,
     ) -> None:
         """Set ``new_values`` live where that applies, then write the overlay:
         ``new_values`` merged in, or for a reset the ``drop`` keys removed."""
@@ -194,8 +216,17 @@ class NodeSettingsService:
         ]
         live_values = {name: new_values[name] for name in live_names}
 
+        # Read before anything is set live: an unreadable overlay refuses
+        # (params_unreadable), and must do so while there is nothing to undo.
+        overlay = self._overlay()
+        if drop:
+            for name in drop:
+                overlay.pop(name, None)
+        else:
+            overlay.update(new_values)
+
         restore: dict[str, Value] = {}
-        if live_values and self._gw.available():
+        if live_values and live_up():
             restore = self._set_live(live_values)
         elif live_values:
             self._logger.info(
@@ -205,12 +236,6 @@ class NodeSettingsService:
             )
 
         try:
-            overlay = self._overlay()
-            if drop:
-                for name in drop:
-                    overlay.pop(name, None)
-            else:
-                overlay.update(new_values)
             self._repo.write(overlay)
         except (OSError, ValueError) as exc:
             self._logger.error(
@@ -247,14 +272,8 @@ class NodeSettingsService:
             )
         restore = {name: before[name] for name in names}
 
-        # Undotted first, alone: the set refused mid-goal, so a refusal there
-        # leaves the plugins untouched.
-        batches = [
-            {n: v for n, v in values.items() if _undotted(n)},
-            {n: v for n, v in values.items() if not _undotted(n)},
-        ]
         done: dict[str, Value] = {}
-        for batch in batches:
+        for batch in _batches(values):
             ok, message = self._gw.set_atomically(batch)
             if not ok:
                 self._restore({n: restore[n] for n in done})
@@ -287,10 +306,7 @@ class NodeSettingsService:
         """Best-effort undo of a live set; logged, never raised."""
         if not values:
             return
-        for batch in (
-            {n: v for n, v in values.items() if _undotted(n)},
-            {n: v for n, v in values.items() if not _undotted(n)},
-        ):
+        for batch in _batches(values):
             ok, message = self._gw.set_atomically(batch)
             if not ok:
                 self._logger.error(
@@ -311,7 +327,9 @@ class NodeSettingsService:
 
     # --- Validation --------------------------------------------------------
 
-    def _validate(self, values: dict[str, object]) -> dict[str, Value]:
+    def _validate(
+        self, values: dict[str, object], live_up: LiveProbe
+    ) -> dict[str, Value]:
         new_values: dict[str, Value] = {}
         for field_id, raw in values.items():
             setting = self._schema.by_id.get(field_id)
@@ -327,16 +345,15 @@ class NodeSettingsService:
         overlay = self._overlay()
         factory = self._factory()
         live_cache: dict[str, Optional[Value]] = {}
-        live_up = self._gw.available()
 
         # New value, then the overlay (what the next start loads, and for a
         # live field what is in force), then the running node, then the
-        # factory file.
+        # factory file. The node is only asked when a rule gets this far.
         def value_of(name: str) -> Optional[Value]:
             for source in (new_values, overlay):
                 if name in source:
                     return source[name]
-            if live_up:
+            if live_up():
                 if name not in live_cache:
                     ok, _, read = self._gw.get([name])
                     live_cache[name] = read.get(name) if ok else None
@@ -367,8 +384,15 @@ class NodeSettingsService:
         finally:
             self._changing.release()
 
-    def _live(self, names: list[str]) -> Optional[dict[str, Optional[Value]]]:
-        if not self._gw.available():
+    def _probe(self) -> LiveProbe:
+        """A fresh probe for one request: the first call asks the node, the
+        rest replay that answer."""
+        return functools.cache(self._gw.available)
+
+    def _live(
+        self, names: list[str], live_up: LiveProbe
+    ) -> Optional[dict[str, Optional[Value]]]:
+        if not live_up():
             return None
         ok, message, values = self._gw.get(names)
         if not ok:

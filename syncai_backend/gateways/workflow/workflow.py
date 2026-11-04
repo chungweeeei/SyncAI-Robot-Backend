@@ -103,12 +103,11 @@ def _active_query(task_queue: str, ended_since: datetime) -> str:
     one, so `recently_ended` costs no RPC. SQL visibility lists open runs first,
     so a burst of closed ones cannot crowd a running one out of the limit.
     """
+    since = ended_since.astimezone(timezone.utc).isoformat()
     return (
         f"WorkflowType = '{WORKFLOW_TYPE_NAME}' "
         f"AND TaskQueue = '{task_queue}' "
-        "AND (ExecutionStatus = 'Running' OR CloseTime >= '{}')".format(
-            ended_since.astimezone(timezone.utc).isoformat()
-        )
+        f"AND (ExecutionStatus = 'Running' OR CloseTime >= '{since}')"
     )
 
 
@@ -283,6 +282,13 @@ class _ActiveSnapshot:
     # Closed within RECENTLY_ENDED_WINDOW_S of as_of; never read by the busy checks.
     ended: Optional[List[ActiveTask]] = None
     error: Optional[Exception] = None
+
+    def result(self) -> Tuple[List[ActiveTask], List[ActiveTask], datetime]:
+        """What list_active_tasks answers from this snapshot; a cached
+        failure is raised again."""
+        if self.error is not None:
+            raise self.error
+        return self.tasks or [], self.ended or [], self.as_of
 
 
 def _build_schedule_spec(trigger: ScheduleTrigger) -> ScheduleSpec:
@@ -712,9 +718,7 @@ class WorkflowGateway:
             snapshot = await self._fetch_active_tasks()
             self._active_snapshot = snapshot
 
-        if snapshot.error is not None:
-            raise snapshot.error
-        return snapshot.tasks or [], snapshot.ended or [], snapshot.as_of
+        return snapshot.result()
 
     def _read_active_cache(
         self,
@@ -730,9 +734,7 @@ class WorkflowGateway:
             return None
         if time.monotonic() - snapshot.fetched_at >= ACTIVE_TASK_CACHE_TTL_S:
             return None
-        if snapshot.error is not None:
-            raise snapshot.error
-        return snapshot.tasks or [], snapshot.ended or [], snapshot.as_of
+        return snapshot.result()
 
     async def _fetch_active_tasks(self) -> _ActiveSnapshot:
         """One visibility query, packaged as a snapshot. Never raises."""

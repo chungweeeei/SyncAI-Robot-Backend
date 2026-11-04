@@ -230,7 +230,7 @@ robot_id = self.get_namespace().strip("/") or "default_robot"
 | PostgreSQL database | `<robot_id>_db` (auto-created on first connect) |
 | Temporal task queues | `<robot_id>.ROBOT_TASK_QUEUE` (workflow, body activities), `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`) |
 
-**All ROS names here are relative** (`map`, `robot_state`, `navigate_to_pose`,
+**All ROS names here are relative** (`map`, `robot_state`, `navigate_to_goal`,
 `pointlio/body_cloud`). Never hardcode `/<robot_id>/…` — that bug has been fixed
 here once already.
 
@@ -632,7 +632,7 @@ maps them:
 |---|---|
 | `NotFoundError` | 404 |
 | `BadRequestError` | 400, with an optional `code` and `step_id` beside `detail` when the refusal is about one step of a task body (`invalid_step_group`; see Groups) |
-| `ConflictError` | **409**, with an optional machine-readable `code` beside `detail` (e.g. `octomap_missing`, `map_active`, `restart_refused` / `restart_running`, `recording_running`, `tts_queue_full`, `whep_session_pending`; each route's row lists its own). Clients branch on the code — e.g. re-convert's confirm-and-retry is only for `gridmap_hand_edited` — never on prose, which exists to be reworded |
+| `ConflictError` | **409**, with an optional machine-readable `code` beside `detail` (e.g. `octomap_missing`, `map_active`, `restart_refused` / `restart_running`, `recording_running`, `tts_queue_full`, `whep_session_pending`; each route's row lists its own). Clients branch on the code, never on prose, which exists to be reworded |
 | `UnauthorizedError` | 401 |
 | `UpstreamError` | **502** — a downstream (Temporal or a ROS service) failed |
 
@@ -688,7 +688,10 @@ validates, sets the undotted parameters in a set of their own and then the
 plugin ones, **reads them back** and saves what it read — a controller callback
 that "rejected" a value used to report success — then writes the overlay
 (tmp + rename, previous kept as `.bak`). A failure after the live set restores
-the values read before it. `test_settings_schema.py` checks every parameter a
+the values read before it. The overlay is read before anything is set live, so
+an unreadable one (409 `params_unreadable`) refuses with nothing to undo. Whether
+the node is up is asked once per request: with the nav session down each ask
+waits out the service timeout. `test_settings_schema.py` checks every parameter a
 schema names against the workspace's factory file when
 `SYNCAI_CONTROLLER_PARAMS` / `SYNCAI_PLANNER_PARAMS` point at them; run it after
 a parameter is renamed.
@@ -1442,17 +1445,11 @@ commands. Before reading a result from it:
 
 - **Get the interface package in, or a third of the suite does not run.**
   `vcs import < interface.repos` materialises `syncai_common`; build it with
-  `--packages-select syncai_common`. Measured 2026-09-23 (when the map srvs still
-  came from FAST-LIO2's `interface`, now folded into `syncai_common`):
-
-  | in the image | result |
-  |---|---|
-  | present | 704 passed, 1 skipped (`test_copyright`, skipped on purpose) |
-  | absent | 315 passed, 6 skipped, **11 collection errors** — those files import `syncai_common` plainly rather than via `importorskip` |
-
-  Anything touching a router or gateway needs it. (The `_INTERFACE_SRVS` guard
-  and `test_map_gateway_no_interface.py` are gone: the map srvs are a hard
-  import, and an image without them fails in the builder.)
+  `--packages-select syncai_common`. Without it, or with one older than this
+  branch needs (e.g. no `NavigateThroughGoals`), every router and gateway test
+  file is a **collection error**: they import `syncai_common` plainly rather
+  than via `importorskip`. A workspace kept between runs goes stale this way;
+  delete it and import again.
 - **The image runs as non-root on purpose.** Root bypasses permission checks, so
   `os.access(W_OK)` is `True` on a read-only file and the map router's
   `ini_not_writable` test fails against working code.

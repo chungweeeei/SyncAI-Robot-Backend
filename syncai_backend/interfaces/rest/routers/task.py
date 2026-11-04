@@ -20,6 +20,7 @@ from syncai_backend.tasks.config import (
     TASK_HISTORY_PAGE_SIZE_MAX,
 )
 from syncai_backend.tasks.schema import (
+    ActiveTask,
     MoveParams,
     NAV_STEP_TYPES,
     POSE_STEP_TYPES,
@@ -258,6 +259,25 @@ class ActiveTasksResponse(BaseModel):
             "against this, not against the client's clock — they are two "
             "different clocks and the answer is served from a short cache."
         ),
+    )
+
+
+def _active_task_response(
+    task: ActiveTask, map_name: Optional[str]
+) -> ActiveTaskResponse:
+    """One row of either list; ``map_name`` is the caller's, since a running
+    run and a closed one read it differently (see list_active_tasks)."""
+    return ActiveTaskResponse(
+        id=task.id,
+        run_id=task.run_id,
+        status=TaskStatus(task.status),
+        started_at=task.started_at,
+        ended_at=task.ended_at,
+        source=task.source,
+        schedule_id=task.schedule_id,
+        kind=task.kind,
+        name=task.name,
+        map_name=map_name,
     )
 
 
@@ -627,34 +647,13 @@ def init_task_router(
 
         return ActiveTasksResponse(
             tasks=[
-                ActiveTaskResponse(
-                    id=task.id,
-                    run_id=task.run_id,
-                    status=TaskStatus(task.status),
-                    started_at=task.started_at,
-                    source=task.source,
-                    schedule_id=task.schedule_id,
-                    kind=task.kind,
-                    name=task.name,
-                    map_name=task.map_in_use(active),
-                )
+                _active_task_response(task, map_name=task.map_in_use(active))
                 for task in tasks
             ],
             # The map as stamped: a closed run holds none, so map_in_use's
             # fallback to the loaded map would over-claim.
             recently_ended=[
-                ActiveTaskResponse(
-                    id=task.id,
-                    run_id=task.run_id,
-                    status=TaskStatus(task.status),
-                    started_at=task.started_at,
-                    ended_at=task.ended_at,
-                    source=task.source,
-                    schedule_id=task.schedule_id,
-                    kind=task.kind,
-                    name=task.name,
-                    map_name=task.map_name,
-                )
+                _active_task_response(task, map_name=task.map_name)
                 for task in sorted(ended, key=lambda t: t.ended_at, reverse=True)
             ],
             as_of=as_of,
