@@ -210,6 +210,10 @@ class ActiveTaskResponse(BaseModel):
     run_id: str = Field(..., description="Temporal run id")
     status: TaskStatus = Field(..., examples=["IN_PROGRESS"])
     started_at: datetime = Field(..., description="Execution start time (UTC)")
+    ended_at: Optional[datetime] = Field(
+        default=None,
+        description="Execution close time (UTC); null in `tasks`, set in `recently_ended`",
+    )
     source: TaskSource = Field(
         ..., description="DIRECT (someone called POST /api/v1/tasks) or SCHEDULE"
     )
@@ -236,6 +240,16 @@ class ActiveTaskResponse(BaseModel):
 class ActiveTasksResponse(BaseModel):
     tasks: List[ActiveTaskResponse] = Field(
         ..., description="Executions running on this robot's task queue"
+    )
+    recently_ended: List[ActiveTaskResponse] = Field(
+        default_factory=list,
+        description=(
+            "Executions on this queue that closed within the last few seconds "
+            "(RECENTLY_ENDED_WINDOW_S), newest close first. A run that starts and "
+            "fails between two polls is never in `tasks`; this is how a console "
+            "that did not start it can still say how it ended. Not running: "
+            "nothing here holds a map or makes the robot busy."
+        ),
     )
     as_of: datetime = Field(
         ...,
@@ -602,7 +616,7 @@ def init_task_router(
     # during a scheduled run leaves two executions running. Never 404s.
     @task_router.get("/api/v1/active_tasks", response_model=ActiveTasksResponse)
     async def list_active_tasks():
-        tasks, as_of = await workflow_gw.list_active_tasks()
+        tasks, ended, as_of = await workflow_gw.list_active_tasks()
         # Only read when some run lacks the attribute (see map_in_use), so the
         # console's 2 s poll usually costs no INI read.
         active = (
@@ -625,6 +639,23 @@ def init_task_router(
                     map_name=task.map_in_use(active),
                 )
                 for task in tasks
+            ],
+            # The map as stamped: a closed run holds none, so map_in_use's
+            # fallback to the loaded map would over-claim.
+            recently_ended=[
+                ActiveTaskResponse(
+                    id=task.id,
+                    run_id=task.run_id,
+                    status=TaskStatus(task.status),
+                    started_at=task.started_at,
+                    ended_at=task.ended_at,
+                    source=task.source,
+                    schedule_id=task.schedule_id,
+                    kind=task.kind,
+                    name=task.name,
+                    map_name=task.map_name,
+                )
+                for task in sorted(ended, key=lambda t: t.ended_at, reverse=True)
             ],
             as_of=as_of,
         )

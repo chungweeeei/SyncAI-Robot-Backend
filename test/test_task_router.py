@@ -96,6 +96,7 @@ class _StubWorkflowGateway:
                     schedule_id="robot01-sched-001",
                 )
             ],
+            [],
             datetime(2026, 8, 10, 9, 0, 30, tzinfo=timezone.utc),
         )
 
@@ -759,12 +760,47 @@ class TestActiveTasks:
         assert task["map_name"] is None
 
     def test_nothing_running_is_an_empty_list_not_a_404(self, client, workflow_gw):
-        workflow_gw.active = ([], datetime(2026, 8, 10, tzinfo=timezone.utc))
+        workflow_gw.active = ([], [], datetime(2026, 8, 10, tzinfo=timezone.utc))
 
         response = client.get("/api/v1/active_tasks")
 
         assert response.status_code == 200
         assert response.json()["tasks"] == []
+        assert response.json()["recently_ended"] == []
+
+    def test_a_run_that_just_closed_is_listed_apart_newest_first(
+        self, client, workflow_gw, catalog
+    ):
+        def closed(task_id, status, second):
+            return ActiveTask(
+                id=task_id,
+                run_id="run-1",
+                status=status,
+                started_at=datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc),
+                ended_at=datetime(2026, 8, 10, 9, 0, second, tzinfo=timezone.utc),
+                source=TaskSource.DIRECT,
+                kind=TaskKind.GOAL,
+            )
+
+        workflow_gw.active = (
+            [],
+            [closed("older", "COMPLETED", 1), closed("refused", "FAILED", 5)],
+            datetime(2026, 8, 10, 9, 0, 6, tzinfo=timezone.utc),
+        )
+
+        body = client.get("/api/v1/active_tasks").json()
+
+        # Nothing running: a run that just closed holds no map and keeps no
+        # one from dispatching, so it never reaches `tasks`.
+        assert body["tasks"] == []
+        assert [(t["id"], t["status"]) for t in body["recently_ended"]] == [
+            ("refused", "FAILED"),
+            ("older", "COMPLETED"),
+        ]
+        assert body["recently_ended"][0]["ended_at"] == "2026-08-10T09:00:05Z"
+        # As stamped (none here): the loaded map is not claimed for it.
+        assert body["recently_ended"][0]["map_name"] is None
+        assert catalog.reads == 0
 
 
 class TestTaskHistory:

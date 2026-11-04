@@ -399,7 +399,8 @@ POSTURE_KINDS = frozenset({TaskKind.STANDUP, TaskKind.LIEDOWN})
 
 
 class ActiveTask(BaseSchema):
-    """One execution running on this robot's task queue right now.
+    """One execution running on this robot's task queue right now, or one that
+    closed within RECENTLY_ENDED_WINDOW_S (then ``ended_at`` is set).
 
     Identity and provenance only, no steps: it comes from one visibility query, cheap
     enough for the console to poll (ACTIVE_TASK_CACHE_TTL_S). Steps are at
@@ -416,6 +417,9 @@ class ActiveTask(BaseSchema):
     )
     status: str = Field(..., description="Mapped through _WORKFLOW_STATUS_MAP")
     started_at: datetime = Field(..., description="Execution start time (UTC)")
+    ended_at: Optional[datetime] = Field(
+        default=None, description="Execution close time (UTC); None while running"
+    )
     source: TaskSource = Field(..., description="Who started it")
     schedule_id: Optional[str] = Field(
         default=None,

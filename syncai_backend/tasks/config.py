@@ -91,6 +91,14 @@ ACTIVE_TASK_LIST_LIMIT = 10
 # hold it for the gRPC default timeout.
 ACTIVE_TASK_RPC_TIMEOUT_S = 3.0
 
+# How long a closed run stays in the same answer's `recently_ended`. A run that starts
+# and fails inside one poll (a goal in a forbidden zone is refused in well under 2 s)
+# is never Running at a read, so without this a console that did not start it --
+# a schedule, another tab -- never learns it happened. Covers the worst-case
+# staleness above (~3.5 s) with room for a missed poll; the console takes each run
+# once, so a longer window costs a few rows, not a repeated notice.
+RECENTLY_ENDED_WINDOW_S = 10.0
+
 
 # --- One task (GET /api/v1/tasks/{id}, and cancel / pause / resume) ---------
 #

@@ -45,6 +45,7 @@ from syncai_backend.exceptions import (  # noqa: E402
     NotFoundError,
 )
 from syncai_backend.tasks.config import (  # noqa: E402
+    RECENTLY_ENDED_WINDOW_S,
     TASK_STATE_RPC_TIMEOUT_S,
     WORKFLOW_TYPE_NAME,
 )
@@ -717,7 +718,7 @@ class TestWorkflowGateway:
             ],
         )
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
-            tasks, as_of = asyncio.run(workflow_gw.list_active_tasks())
+            tasks, _, as_of = asyncio.run(workflow_gw.list_active_tasks())
 
         assert as_of.tzinfo is not None
         direct, scheduled = tasks
@@ -736,10 +737,76 @@ class TestWorkflowGateway:
             [_execution("odd", status=None), _execution("robot01-task-001")],
         )
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
-            tasks, _ = asyncio.run(workflow_gw.list_active_tasks())
+            tasks, _, _ = asyncio.run(workflow_gw.list_active_tasks())
 
         # One Temporal-side surprise must not cost the operator the whole answer.
         assert [t.id for t in tasks] == ["robot01-task-001"]
+
+    def test_active_tasks_asks_for_the_recently_closed_in_the_same_query(
+        self, workflow_gw, mock_client
+    ):
+        self._listing(mock_client, [])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            _, _, as_of = asyncio.run(workflow_gw.list_active_tasks())
+
+        # One RPC: the closed runs ride the running query, so the console's
+        # 2 s poll costs Temporal no more than it did.
+        mock_client.list_workflows.assert_called_once()
+        query = mock_client.list_workflows.call_args.args[0]
+        since = (as_of - timedelta(seconds=RECENTLY_ENDED_WINDOW_S)).isoformat()
+        assert f"AND (ExecutionStatus = 'Running' OR CloseTime >= '{since}')" in query
+        assert f"TaskQueue = '{OWN_QUEUE}'" in query
+
+    def test_active_tasks_keeps_a_closed_run_out_of_the_running_list(
+        self, workflow_gw, mock_client
+    ):
+        closed = datetime(2026, 8, 10, 8, 0, 1, tzinfo=timezone.utc)
+        self._listing(
+            mock_client,
+            [
+                _execution("running"),
+                _execution(
+                    "refused",
+                    status=WorkflowExecutionStatus.FAILED,
+                    close_time=closed,
+                    kind=TaskKind.GOAL.value,
+                ),
+                # Closed, but neither running nor an outcome.
+                _execution(
+                    "continued",
+                    status=WorkflowExecutionStatus.CONTINUED_AS_NEW,
+                    close_time=closed,
+                ),
+            ],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            tasks, ended, _ = asyncio.run(workflow_gw.list_active_tasks())
+
+        assert [(t.id, t.ended_at) for t in tasks] == [("running", None)]
+        assert [(t.id, t.status, t.ended_at) for t in ended] == [
+            ("refused", "FAILED", closed)
+        ]
+        assert ended[0].kind is TaskKind.GOAL
+
+    def test_a_recently_closed_run_does_not_make_the_robot_busy(
+        self, workflow_gw, mock_client
+    ):
+        # The run that just failed is in the answer, but it is not running: the
+        # operator's next dispatch, sent to retry it, must not be refused.
+        self._listing(
+            mock_client,
+            [
+                _execution(
+                    "robot01-task-001",
+                    status=WorkflowExecutionStatus.FAILED,
+                    close_time=datetime(2026, 8, 10, 8, 0, 1, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            asyncio.run(workflow_gw.start_task(_task()))
+
+        mock_client.start_workflow.assert_awaited_once()
 
     def test_active_tasks_replays_the_snapshot_within_ttl(self, workflow_gw, mock_client):
         self._listing(mock_client, [_execution()])

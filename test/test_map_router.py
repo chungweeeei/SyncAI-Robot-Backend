@@ -88,7 +88,7 @@ class _StubWorkflowGateway:
         self.asked += 1
         if self.error is not None:
             raise self.error
-        return self.tasks, None
+        return self.tasks, [], None
 
 
 @pytest.fixture
