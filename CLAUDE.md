@@ -199,7 +199,7 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  live, read back, write the runtime overlay)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), parameters (one
-        │                  node's get/set_parameters; controller_server today), workflow (Temporal),
+        │                  node's get/set_parameters; controller_server, planner_server), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
