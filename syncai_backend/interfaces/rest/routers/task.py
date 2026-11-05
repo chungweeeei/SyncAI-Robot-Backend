@@ -33,6 +33,7 @@ from syncai_backend.tasks.schema import (
     TaskSource,
     WorkflowTask,
     WorkflowTaskDefinition,
+    continuation_steps,
     step_group_problem,
 )
 from syncai_backend.gateways.failure import Failure, failure_code
@@ -70,8 +71,22 @@ class TaskRequest(BaseModel):
     id: str = Field(
         ..., description="Unique identifier of the task", examples=["robot01-task-001"]
     )
-    steps: List[StepRequest] = Field(
-        ..., description="List of steps to be executed", examples=[]
+    # Exactly one of steps / continue_from: checked in trigger_task, as a 400.
+    steps: Optional[List[StepRequest]] = Field(
+        default=None,
+        description="List of steps to be executed. Omitted with continue_from",
+        examples=[],
+    )
+    continue_from: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "A FAILED task to continue: this task runs its steps again from the "
+            "failed one (all of its group, a PATROL past the waypoints it had "
+            "passed); the ones before it read SKIPPED. Instead of steps and "
+            "map_name; kind and name default to that task's"
+        ),
+        examples=["robot01-task-001"],
     )
     # Optional, so the MCP server and curl dispatch unchanged (unlabelled).
     kind: Optional[TaskKind] = Field(
@@ -121,6 +136,17 @@ class TaskResponse(BaseModel):
         ...,
         description="Additional information about the task",
         examples=["Task is pending execution."],
+    )
+    continued_from: Optional[str] = Field(
+        default=None,
+        description="The failed task this one continues; null unless continue_from was sent",
+    )
+    from_step_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "The step a continuing task starts at (the failed step, or the first "
+            "of its group); null unless continue_from was sent"
+        ),
     )
 
 
@@ -182,6 +208,13 @@ class StepState(BaseModel):
         description=(
             "How long the run was held while this step was under way. The time "
             "the step itself took is ended_at - started_at - paused_seconds"
+        ),
+    )
+    waypoints_passed: int = Field(
+        default=0,
+        description=(
+            "How many of a PATROL's waypoints the robot has passed; 0 for every "
+            "other step"
         ),
     )
 
@@ -639,24 +672,34 @@ def init_task_router(
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
 
+    def stamp_map(steps, expected_map: Optional[str]) -> Optional[str]:
+        """The map a job is stamped with: the loaded one, if it drives to a pose.
+
+        Refused (409, move_refusal's code) when that is not ``expected_map``. A
+        job that does not -- an UNDOCK backs off blind, from wherever the robot
+        stands -- holds no map and is neither stamped nor refused.
+        """
+        if not any(step.type in POSE_STEP_TYPES for step in steps):
+            return None
+        active = map_catalog_repo.active_name()
+        refusal = map_usage.move_refusal(expected_map, active)
+        if refusal is not None:
+            raise ConflictError(refusal.message, code=refusal.code)
+        return active
+
     @task_router.post("/api/v1/tasks", response_model=TaskResponse)
     async def trigger_task(req: TaskRequest):
+        if (req.steps is None) == (req.continue_from is None):
+            raise BadRequestError("Provide exactly one of steps or continue_from.")
+        if req.continue_from is not None:
+            return await continue_task(req)
+
         # A sentence, not a 422: see step_group_problem.
         problem = step_group_problem(req.steps)
         if problem is not None:
             raise problem.refusal()
 
-        # A job that drives to a pose is stamped with the loaded map (what the
-        # map routes lock on and the history shows). One that does not -- an
-        # UNDOCK backs off blind, from wherever the robot stands -- holds no map
-        # and is neither stamped nor refused.
-        map_name: Optional[str] = None
-        if any(step.type in POSE_STEP_TYPES for step in req.steps):
-            active = map_catalog_repo.active_name()
-            refusal = map_usage.move_refusal(req.map_name, active)
-            if refusal is not None:
-                raise ConflictError(refusal.message, code=refusal.code)
-            map_name = active
+        map_name = stamp_map(req.steps, req.map_name)
 
         workflow_task = WorkflowTask(
             id=req.id,
@@ -674,6 +717,57 @@ def init_task_router(
             id=req.id,
             status=TaskStatus.PENDING,
             message=f"Task {req.id} accepted and queued for execution.",
+        )
+
+    async def continue_task(req: TaskRequest) -> TaskResponse:
+        """A new run of a FAILED task's steps from the failed one on (continuation_steps).
+
+        The positions are the failed run's, so its map is the expectation; the
+        caller sends none. A scheduled run's continuation is the operator's
+        dispatch, so it is a TASK, not a SCHEDULE.
+        """
+        if req.map_name is not None:
+            raise BadRequestError(
+                "map_name is not taken with continue_from: the task continued "
+                "carries its own."
+            )
+
+        failed = await workflow_gw.get_failed_run(req.continue_from)
+        continued = continuation_steps(failed.steps)
+        if continued is None:
+            raise ConflictError(
+                f"Task {req.continue_from} has no failed step to continue from",
+                code="no_failed_step",
+            )
+        steps, from_step_id = continued
+
+        map_name = stamp_map(
+            [step for step in steps if step.status is StepStatus.PENDING],
+            failed.map_name,
+        )
+
+        kind = req.kind or failed.kind
+        if kind is TaskKind.SCHEDULE:
+            kind = TaskKind.TASK
+
+        await workflow_gw.start_task(
+            request=WorkflowTask(
+                id=req.id, definition=WorkflowTaskDefinition(steps=steps)
+            ),
+            provenance=TaskProvenance(
+                kind=kind, name=req.name or failed.name, map_name=map_name
+            ),
+        )
+
+        return TaskResponse(
+            id=req.id,
+            status=TaskStatus.PENDING,
+            message=(
+                f"Task {req.id} accepted: continues task {req.continue_from} "
+                f"from step {from_step_id}."
+            ),
+            continued_from=req.continue_from,
+            from_step_id=from_step_id,
         )
 
     # Not /api/v1/tasks/preview, for the reason active_tasks gives below. Plain
@@ -875,6 +969,7 @@ def init_task_router(
                     started_at=step.started_at,
                     ended_at=step.ended_at,
                     paused_seconds=step.paused_seconds,
+                    waypoints_passed=step.waypoints_passed,
                 )
                 for step in state.steps
             ],

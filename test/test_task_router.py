@@ -26,6 +26,7 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     ActiveTask,
     MoveParams,
     PatrolParams,
+    SpeakParams,
     Step,
     StepStatus,
     StepType,
@@ -35,14 +36,35 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     TaskSource,
     TaskState,
     WaitParams,
+    continuation_steps,
 )
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
+from syncai_backend.gateways.workflow.workflow import FailedRun  # noqa: E402
 from syncai_backend.helpers.route_preview import planned, refused  # noqa: E402
 from syncai_backend.interfaces.rest.routers.task import init_task_router  # noqa: E402
 from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
+
+
+def _failed_run(**overrides):
+    """A failed run of four steps: s1 done, s2 + s3 a group whose MOVE failed
+    (the SPEAK beside it canceled), s4 never started."""
+    move = MoveParams(x=1.0, y=2.0, theta=90.0)
+    steps = [
+        Step(id="s1", type=StepType.STANDUP, status=StepStatus.COMPLETED),
+        Step(id="s2", type=StepType.SPEAK, group="g",
+             params=SpeakParams(text="Moving"), status=StepStatus.CANCELED,
+             error_msg="Canceled: step s3 failed"),
+        Step(id="s3", type=StepType.MOVE, group="g", params=move,
+             status=StepStatus.FAILED, error_msg="Move ended in aborted",
+             started_at=datetime(2026, 11, 5, 8, 0, tzinfo=timezone.utc)),
+        Step(id="s4", type=StepType.WAIT, params=WaitParams(seconds=5)),
+    ]
+    fields = dict(steps=steps, kind=TaskKind.TASK, name="Morning patrol", map_name="lab")
+    fields.update(overrides)
+    return FailedRun(**fields)
 
 
 class _StubWorkflowGateway:
@@ -53,6 +75,8 @@ class _StubWorkflowGateway:
         self.resumed = []
         self.history_calls = []
         self.stats_calls = []
+        self.failed_reads = []
+        self.failed = _failed_run()
         self.history = (
             [
                 TaskHistoryEntry(
@@ -108,6 +132,10 @@ class _StubWorkflowGateway:
 
     async def get_task_state(self, task_id):
         return self.state
+
+    async def get_failed_run(self, task_id):
+        self.failed_reads.append(task_id)
+        return self.failed
 
     async def cancel_task(self, task_id):
         self.cancelled.append(task_id)
@@ -541,6 +569,7 @@ class TestTaskState:
                 "started_at": None,
                 "ended_at": None,
                 "paused_seconds": 0.0,
+                "waypoints_passed": 0,
             }
         ]
 
@@ -1013,6 +1042,184 @@ class TestHoldTask:
 
         assert response.status_code == 409
         assert response.json()["code"] == "task_not_running"
+
+
+class TestContinuationSteps:
+    def test_starts_at_the_failed_steps_group_and_keeps_every_step(self):
+        steps, from_step_id = continuation_steps(_failed_run().steps)
+
+        assert from_step_id == "s2"
+        assert [(s.id, s.status) for s in steps] == [
+            ("s1", StepStatus.SKIPPED),
+            ("s2", StepStatus.PENDING),
+            ("s3", StepStatus.PENDING),
+            ("s4", StepStatus.PENDING),
+        ]
+
+    def test_every_step_is_fresh(self):
+        steps, _ = continuation_steps(_failed_run().steps)
+
+        s3 = steps[2]
+        assert (s3.error_msg, s3.started_at, s3.ended_at) == ("", None, None)
+        assert s3.params == MoveParams(x=1.0, y=2.0, theta=90.0)
+        assert [s.group for s in steps] == [None, "g", "g", None]
+
+    def test_a_lone_failed_step_is_its_own_start(self):
+        steps = [
+            Step(id="a", type=StepType.STANDUP, status=StepStatus.COMPLETED),
+            Step(id="b", type=StepType.STANDUP, status=StepStatus.FAILED),
+        ]
+
+        continued, from_step_id = continuation_steps(steps)
+
+        assert from_step_id == "b"
+        assert [s.status for s in continued] == [StepStatus.SKIPPED, StepStatus.PENDING]
+
+    def test_a_failed_first_step_skips_nothing(self):
+        steps = [
+            Step(id="a", type=StepType.STANDUP, status=StepStatus.FAILED),
+            Step(id="b", type=StepType.LIEDOWN),
+        ]
+
+        continued, from_step_id = continuation_steps(steps)
+
+        assert from_step_id == "a"
+        assert all(s.status is StepStatus.PENDING for s in continued)
+
+    def test_a_patrol_keeps_the_waypoints_it_had_passed(self):
+        patrol = PatrolParams(waypoints=[
+            MoveParams(x=0.0, y=0.0, theta=0.0),
+            MoveParams(x=1.0, y=0.0, theta=0.0),
+            MoveParams(x=2.0, y=0.0, theta=0.0),
+        ])
+        steps = [Step(id="p", type=StepType.PATROL, params=patrol,
+                      status=StepStatus.FAILED, waypoints_passed=2)]
+
+        continued, _ = continuation_steps(steps)
+
+        assert continued[0].waypoints_passed == 2
+        assert len(continued[0].params.waypoints) == 3
+
+    def test_nothing_failed_is_none(self):
+        steps = [Step(id="a", type=StepType.STANDUP, status=StepStatus.CANCELED)]
+
+        assert continuation_steps(steps) is None
+
+
+class TestContinueTask:
+    def _continue(self, client, **extra):
+        body = {"id": "robot01-task-002", "continue_from": "robot01-task-001", **extra}
+        return client.post("/api/v1/tasks", json=body)
+
+    def test_dispatches_the_failed_runs_steps_from_the_failed_group(
+        self, client, workflow_gw
+    ):
+        response = self._continue(client)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == "PENDING"
+        assert (body["id"], body["continued_from"], body["from_step_id"]) == (
+            "robot01-task-002", "robot01-task-001", "s2",
+        )
+        assert workflow_gw.failed_reads == ["robot01-task-001"]
+        task, provenance = workflow_gw.started[0]
+        assert task.id == "robot01-task-002"
+        assert [(s.id, s.status) for s in task.definition.steps] == [
+            ("s1", StepStatus.SKIPPED),
+            ("s2", StepStatus.PENDING),
+            ("s3", StepStatus.PENDING),
+            ("s4", StepStatus.PENDING),
+        ]
+        assert (provenance.kind, provenance.name, provenance.map_name) == (
+            TaskKind.TASK, "Morning patrol", "lab",
+        )
+
+    def test_a_plain_dispatch_answers_no_continuation(self, client):
+        body = client.post("/api/v1/tasks", json=_move_task()).json()
+
+        assert (body["continued_from"], body["from_step_id"]) == (None, None)
+
+    def test_kind_and_name_from_the_request_win(self, client, workflow_gw):
+        assert self._continue(client, kind="goal", name="Other").status_code == 200
+
+        _, provenance = workflow_gw.started[0]
+        assert (provenance.kind, provenance.name) == (TaskKind.GOAL, "Other")
+
+    def test_a_scheduled_runs_continuation_is_a_task(self, client, workflow_gw):
+        workflow_gw.failed = _failed_run(kind=TaskKind.SCHEDULE)
+
+        assert self._continue(client).status_code == 200
+
+        assert workflow_gw.started[0][1].kind is TaskKind.TASK
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"id": "t"},
+            {"id": "t", "continue_from": "robot01-task-001",
+             "steps": [{"id": "s1", "type": "STANDUP"}]},
+            {"id": "t", "continue_from": "robot01-task-001", "map_name": "lab"},
+        ],
+    )
+    def test_a_malformed_request_is_a_400_sentence(self, client, workflow_gw, body):
+        response = client.post("/api/v1/tasks", json=body)
+
+        assert response.status_code == 400
+        assert workflow_gw.started == []
+
+    def test_a_run_that_has_not_failed_is_409(self, client, workflow_gw):
+        async def _raise(task_id):
+            raise ConflictError(f"Task {task_id} has not failed", code="task_not_failed")
+
+        workflow_gw.get_failed_run = _raise
+
+        response = self._continue(client)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "task_not_failed"
+        assert workflow_gw.started == []
+
+    def test_a_run_with_no_failed_step_is_409(self, client, workflow_gw):
+        workflow_gw.failed = _failed_run(
+            steps=[Step(id="s1", type=StepType.STANDUP, status=StepStatus.PENDING)]
+        )
+
+        response = self._continue(client)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "no_failed_step"
+        assert workflow_gw.started == []
+
+    def test_an_unknown_task_is_404(self, client, workflow_gw):
+        async def _raise(task_id):
+            raise NotFoundError(f"Task {task_id} not found")
+
+        workflow_gw.get_failed_run = _raise
+
+        assert self._continue(client).status_code == 404
+
+    def test_a_run_on_another_map_is_refused(self, client, workflow_gw, catalog):
+        catalog.active = "warehouse"
+
+        response = self._continue(client)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "map_mismatch"
+        assert workflow_gw.started == []
+
+    def test_only_the_steps_still_to_run_hold_a_map(self, client, workflow_gw, catalog):
+        # The MOVE was before the failure: what is left drives nowhere, so the
+        # map switched since is no reason to refuse.
+        move = MoveParams(x=1.0, y=2.0, theta=90.0)
+        workflow_gw.failed = _failed_run(steps=[
+            Step(id="s1", type=StepType.MOVE, params=move, status=StepStatus.COMPLETED),
+            Step(id="s2", type=StepType.STANDUP, status=StepStatus.FAILED),
+        ])
+        catalog.active = "warehouse"
+
+        assert self._continue(client).status_code == 200
+        assert workflow_gw.started[0][1].map_name is None
 
 
 class TestTaskHistoryExport:
