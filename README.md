@@ -522,8 +522,8 @@ Interactive docs: `http://<robot>:3000/docs`.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
-| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL / DOCK is checked against the loaded map — 409 `map_mismatch`, see *A job's map is checked twice*; stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time |
-| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), for a running `PATROL` one built from its feedback (`Patrolling: 3 of 5 waypoints left, 12.4 m to go`), empty otherwise — plus `started_at` / `ended_at` (UTC, `null` until then and for runs older than the fields) and `paused_seconds` (a hold while the step was under way; the step's own time is `ended_at − started_at − paused_seconds`). A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
+| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL / DOCK is checked against the loaded map — 409 `map_mismatch`, see *A job's map is checked twice*; stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time. **Or** `{id, continue_from, kind?, name?}` instead of `steps` (exactly one; 400 otherwise, and with `map_name`): a new run of a FAILED task from the failed step on — see *Continuing a failed task*. The answer then carries `continued_from` and `from_step_id` (both `null` otherwise) |
+| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), for a running `PATROL` one built from its feedback (`Patrolling: 3 of 5 waypoints left, 12.4 m to go`), empty otherwise — plus `started_at` / `ended_at` (UTC, `null` until then and for runs older than the fields), `paused_seconds` (a hold while the step was under way; the step's own time is `ended_at − started_at − paused_seconds`) and `waypoints_passed` (a PATROL's progress, 0 for every other step). A step `SKIPPED` was got past by the failed run this one continues. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
 | DELETE | `/api/v1/tasks/{id}` | Request cancellation; answers `CANCELING` — the final state (possibly still `COMPLETED`) comes from GET |
 | POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` / `DOCK` / `UNDOCK` / `PATROL` is interrupted at once and re-sent on resume (a PATROL past the waypoints it had passed), a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see *Task orchestration*. 409 `task_not_running` once closed; 404 for another robot's id |
 | GET | `/api/v1/active_tasks` | What runs on this robot's queue now, *whoever* started it, with `source` / `schedule_id` / `kind` / `name` / `map_name` (the run's `TaskMap`; for a run older than the attribute, the loaded map unless it is a stand / lie down; `null` for a run that drives nowhere). A held run is still listed as `IN_PROGRESS`. Beside `tasks`, `recently_ended`: the runs that closed in the last `RECENTLY_ENDED_WINDOW_S` (10 s), newest first, with `ended_at` and the map as stamped, from the same visibility query (an `OR CloseTime >=` in the filter, no second RPC). A run that starts and fails between two polls is never in `tasks`, so this is how a console that did not start it learns how it ended; nothing in it is running, holds a map or makes `_require_idle` refuse. Not `/tasks/active`, which would shadow `/tasks/{id}` |
@@ -1023,6 +1023,22 @@ Details that matter when editing this path:
   polling, the pinned server held the query ~30 s before failing it (measured
   2026-10-25), so every poll of the detail page hung that long; bounded, it
   degrades in 2-3 s. A describe that times out is a 502.
+- **Continuing a failed task** (`POST /api/v1/tasks` with `continue_from`) is a
+  new run, under the caller's new id; the failed run stays FAILED. The backend
+  reads the failed run's steps off its query (`WorkflowGateway.get_failed_run`:
+  409 `task_not_failed` unless it failed; a failed query is a 502, never "no
+  steps") and `continuation_steps` (schema.py) dispatches **every** step, so the
+  list matches the failed run's: the block of the first FAILED step and all after
+  it fresh and `PENDING` (a group again as a whole), those before it `SKIPPED`,
+  which `RobotWorkflow.run` passes over without dispatching or timing. Not a copy
+  of their `COMPLETED`: they did not run in this run, and the report would count
+  them twice. 409 `no_failed_step` when none failed. A PATROL keeps its
+  `waypoints_passed` and the run seeds its dispatch count from it, so it goes on
+  past them. The positions are the failed run's, so its `TaskMap` is the
+  expectation (409 `map_mismatch` when the loaded map changed), checked only
+  against the steps still to run; `kind` / `name` default to the failed run's, a
+  schedule's becoming `task`. Replay-safe without a patch: no run before it has a
+  `SKIPPED` step or a nonzero `waypoints_passed` in its input.
 - **The hold is two workflow signals** (`pause` / `resume`, via
   `POST /api/v1/tasks/{id}/pause` · `/resume`) plus a flag; both idempotent, so a
   second pause or stray resume changes nothing. The run checks the flag before
@@ -1043,7 +1059,9 @@ Details that matter when editing this path:
   2 m off the dock, not at a fixed staging pose. A `PATROL` is interrupted the
   same way, but resumes **past the waypoints it had passed**: its activity reports
   each one on the `patrol_progress` signal, and `_run_move` hands the count to
-  the next dispatch as its `start` (the last waypoint is always kept).
+  the next dispatch as its `start` (the last waypoint is always kept). The count
+  is also kept on the step (`waypoints_passed`), for the query and for a run
+  continuing this one.
   Consequences:
   - **Temporal has no paused status.** A held run is `RUNNING` to the server;
     the gateway derives task-level `PAUSED` from the step list the existing
