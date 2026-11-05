@@ -25,6 +25,9 @@ class StepStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
+    # Only in a run continuing a failed one (POST /api/v1/tasks continue_from): a
+    # step the failed run got past, kept so the step list matches it, never run.
+    SKIPPED = "SKIPPED"
 
 
 # ARTIFACT was removed 2026-08; stored tasks / frozen schedules still carrying one
@@ -301,11 +304,68 @@ class Step(BaseSchema):
             "a hold before the step started is not counted"
         ),
     )
+    # Set by RobotWorkflow off PATROL_PROGRESS_SIGNAL, never by a caller. A run
+    # continuing a failed one starts the PATROL past them.
+    waypoints_passed: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "How many of a PATROL's waypoints the robot has passed; 0 for every "
+            "other step"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_params(self) -> "Step":
         validate_step_params(self.type, self.params)
         return self
+
+
+def step_blocks(steps: List[Step]) -> List[List[Step]]:
+    """``steps`` cut into blocks: a group's adjacent members, or one lone step."""
+    blocks: List[List[Step]] = []
+    for step in steps:
+        if blocks and step.group is not None and blocks[-1][-1].group == step.group:
+            blocks[-1].append(step)
+        else:
+            blocks.append([step])
+    return blocks
+
+
+def continuation_steps(steps: List[Step]) -> Optional[tuple[List[Step], str]]:
+    """A failed run's steps as a run continuing it dispatches them, and the id of
+    the step it starts at; None when no step failed.
+
+    It starts at the block of the first FAILED step (a group runs together, so all
+    of it again). Every step is kept, so the list matches the failed run's: those
+    before the start read SKIPPED, the rest PENDING, all of them fresh. A PATROL
+    keeps the waypoints it had passed.
+    """
+    blocks = step_blocks(steps)
+    start = next(
+        (i for i, block in enumerate(blocks)
+         if any(step.status is StepStatus.FAILED for step in block)),
+        None,
+    )
+    if start is None:
+        return None
+
+    continued: List[Step] = []
+    for i, block in enumerate(blocks):
+        for step in block:
+            continued.append(
+                Step(
+                    id=step.id,
+                    type=step.type,
+                    params=step.params,
+                    group=step.group,
+                    status=StepStatus.SKIPPED if i < start else StepStatus.PENDING,
+                    waypoints_passed=(
+                        step.waypoints_passed if step.type is StepType.PATROL else 0
+                    ),
+                )
+            )
+    return continued, blocks[start][0].id
 
 
 class WorkflowTaskDefinition(BaseSchema):
