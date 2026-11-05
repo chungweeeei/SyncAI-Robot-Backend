@@ -51,6 +51,11 @@ class Failure(str, Enum):
     # while a goal runs. A 409 -- set it again once the robot has stopped.
     CONTROLLER_BUSY = "controller_busy"
 
+    # RobotGateway.preview_route: a newer preview (this console's or another's)
+    # preempted this one on the planner, which takes one at a time. A 409: the
+    # newer one is the answer, and nothing is broken.
+    PREVIEW_SUPERSEDED = "preview_superseded"
+
     # ParameterGateway: a parameter callback refused the value with a reason
     # (DockingController's v_linear_min above v_linear_max, say). A 400: the
     # combination is the caller's to change; the schema's rules should have

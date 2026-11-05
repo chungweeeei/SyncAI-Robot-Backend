@@ -6,6 +6,7 @@ router hands it and answers canned views, so these tests pin the boundary
 The gateway's own behaviour lives in ``test_workflow_gateway.py``.
 """
 
+import math
 from datetime import datetime, timezone
 
 import pytest
@@ -35,6 +36,8 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     TaskState,
     WaitParams,
 )
+from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
+from syncai_backend.helpers.route_preview import planned, refused  # noqa: E402
 from syncai_backend.interfaces.rest.routers.task import init_task_router  # noqa: E402
 from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
@@ -143,15 +146,22 @@ def workflow_gw():
 
 
 class _StubRobotGateway:
-    """The router's one robot read: the running MOVE's status sentence."""
+    """The router's robot reads: the running MOVE's status sentence, and the
+    route preview, answered with whatever the test sets in ``preview``."""
 
     def __init__(self):
         self.message = ""
         self.calls = 0
+        self.preview = (True, "", planned([(0.0, 0.0, 0.0), (3.0, 4.0, 0.0)]))
+        self.previews = []
 
     def get_move_message(self):
         self.calls += 1
         return self.message
+
+    def preview_route(self, x, y, yaw, z=0.0):
+        self.previews.append({"x": x, "y": y, "yaw": yaw, "z": z})
+        return self.preview
 
 
 @pytest.fixture
@@ -1129,3 +1139,78 @@ class TestTaskHistoryExport:
         rows = self._rows(client.get("/api/v1/task_history/export"))
 
         assert rows == []
+
+
+class TestRoutePreview:
+    def _goal(self, **overrides):
+        return {"x": 3.0, "y": 4.0, "theta": 90.0, "z": 2.8, "map_name": "lab", **overrides}
+
+    def test_a_reachable_goal_answers_the_route_and_its_length(self, client, robot_gw):
+        response = client.post("/api/v1/route_preview", json=self._goal())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "reachable": True,
+            "points": [[0.0, 0.0, 0.0], [3.0, 4.0, 0.0]],
+            "length_m": 5.0,
+            "code": None,
+            "message": "",
+        }
+
+    def test_the_goal_reaches_the_planner_as_a_move_would(self, client, robot_gw):
+        client.post("/api/v1/route_preview", json=self._goal())
+
+        # theta in degrees on the wire, yaw in radians to the robot, and the
+        # z that picks the floor passed through.
+        assert robot_gw.previews == [
+            {"x": 3.0, "y": 4.0, "yaw": pytest.approx(math.pi / 2), "z": 2.8}
+        ]
+
+    def test_no_route_is_an_answer_not_an_error(self, client, robot_gw):
+        robot_gw.preview = (True, "", refused(223, "goal_in_keepout: zone 'z1'"))
+
+        response = client.post("/api/v1/route_preview", json=self._goal())
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["reachable"] is False
+        assert body["points"] == []
+        assert body["code"] == "goal_in_keepout"
+        assert body["message"].startswith("Planning failed: the goal is inside a keepout zone")
+
+    def test_a_goal_aimed_on_another_map_is_refused_before_the_planner(
+        self, client, catalog, robot_gw
+    ):
+        catalog.active = "warehouse"
+
+        response = client.post("/api/v1/route_preview", json=self._goal())
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "map_mismatch"
+        assert robot_gw.previews == []
+
+    def test_a_preview_a_newer_one_replaced_is_a_409(self, client, robot_gw):
+        robot_gw.preview = (
+            False,
+            fail(Failure.PREVIEW_SUPERSEDED, "A newer route preview replaced this one."),
+            None,
+        )
+
+        response = client.post("/api/v1/route_preview", json=self._goal())
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "preview_superseded"
+
+    def test_no_planner_to_ask_is_a_502_with_the_gateways_sentence(self, client, robot_gw):
+        robot_gw.preview = (False, "Route preview is not available.", None)
+
+        response = client.post("/api/v1/route_preview", json=self._goal())
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Route preview is not available."
+
+    def test_a_heading_outside_a_moves_range_is_refused(self, client, robot_gw):
+        response = client.post("/api/v1/route_preview", json=self._goal(theta=-180.0))
+
+        assert response.status_code == 422
+        assert robot_gw.previews == []

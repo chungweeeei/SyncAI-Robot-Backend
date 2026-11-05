@@ -45,8 +45,10 @@ from nav_msgs.msg import Path  # noqa: E402
 from syncai_backend.repositories.telemetry.telemetry import (  # noqa: E402
     init_telemetry_repo,
 )
+from syncai_backend.helpers.route_preview import (  # noqa: E402
+    MAX_PATH_POINTS as _MAX_PATH_POINTS,
+)
 from syncai_backend.subscribers.path_subscriber import (  # noqa: E402
-    _MAX_PATH_POINTS,
     init_docking_plan_subscriber,
     init_path_subscriber,
 )
