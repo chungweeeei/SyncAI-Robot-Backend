@@ -425,6 +425,23 @@ omitted until a route is planned) — and `get_move_status` adds
 sent while another navigator runs, which the step reads as a retryable
 `Patrol rejected`.
 
+**Route preview: `preview_path_to_pose` (`syncai_common/ComputePathToPose`), 2026-11.**
+The planner's own action, on the server `planner_server` added for the console's
+preview (SyncAI-Robot-Workspace `feature/preview-path-to-pose`): the same plan a
+MOVE's would get, answered to the caller and **never published on `plan` or
+kept as the last plan**, so a preview is not drawn as the route being driven
+and does not disturb a running navigation's `is_path_valid`. Not
+`compute_path_to_pose`, which is the task runner's and takes one goal at a time.
+`RobotGateway.preview_route()` sends the goal like a MOVE's (frame `map`, `z` the
+floor, `use_start: false`, `planner_id: ""`), waits `NAV_ACCEPT_WAIT_S` for
+acceptance and `PREVIEW_RESULT_WAIT_S` (6 s: Octo3D's 2 s search, behind a
+navigation's plan in flight) for the answer, and cancels a goal it gave up on.
+Nothing is tracked: a preview moves nothing. A failure keeps the planner's code
+and is worded by `helpers/route_preview.py` in the task runner's sentences, so a
+preview that fails reads as the MOVE would have. ABORTED with code `NONE` is a
+preview a newer one preempted (the planner takes one at a time),
+`preview_superseded`.
+
 **Auto-undock (2026-10-15).** A MOVE after a DOCK gets the robot off the dock
 by itself: a MOVE straight off one starts with the footprint on the dock's
 lethal cells and fails. `execute_dock`'s success records the dock's target pose
@@ -513,6 +530,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/task_history` | **Finished** runs, newest close first, one visibility page per call. Query: `page_size` (1–100, default 20), `page_token` (previous `next_page_token`), `status` (`COMPLETED` / `FAILED` / `CANCELED`), `since` / `until` (close time; naive is UTC; `until` before `since` is 400), `kind` (`goal` / `standup` / `liedown` / `task` / `schedule`), `name` (exact template name). `kind` / `name` / `map_name` are `null` for runs dispatched without them or predating the attribute — no fallback. Bounded by namespace retention |
 | GET | `/api/v1/task_history/stats` | The same runs counted: `total`, `by_status`, `success_rate` (`COMPLETED` / `total`, `null` when nothing finished). Same filters as `task_history`; one count RPC |
 | GET | `/api/v1/task_history/export` | The report: every finished run in the filter as CSV (UTF-8 with BOM, for Excel), **one row per step**, oldest close first. Same filters as `task_history` (no paging) plus `tz` (IANA, e.g. `Asia/Taipei`; times are written in it, UTC when omitted; 400 for an unknown one). Read from PostgreSQL's `task_record`, not Temporal, so it reaches back 30 days — see *The run record* |
+| POST | `/api/v1/route_preview` | The route the robot would drive from where it stands to a goal, planned as a MOVE's would be but never sent (*Route preview* above). Body: a MOVE's params (`x`, `y`, `theta` in degrees, `z` the floor's ground) plus `map_name?`. 200 `{reachable, points, length_m, code, message}` — `points` the route's `[x, y, z]` (thinned like the live route), `length_m` along it in 3D; with `reachable: false` when there is no route, `code` (`goal_in_keepout`, `no_valid_path`, `map_not_loaded`, …) and `message` the sentence the job would have failed with. 409 `map_mismatch` (as `POST /api/v1/tasks`), 409 `preview_superseded` when a newer preview replaced it, 502 when there is no planner to ask (not in Navigation). Not refused while a job runs: it moves nothing. Not `/tasks/preview`, for the reason `active_tasks` gives |
 | GET | `/api/v1/task_steps` | The steps an operator builds a job from, for a client to draw its editor with: each step's `type`, operator `label` and `hint`, `occupies_body` (`BODY_STEP_TYPES`: a group takes at most one), `while_walking` (offered on the walk to a stop: SPEAK alone — a WAIT in a MOVE's group only stretches the walk) and `params`, a list of fields of five kinds — `waypoint` (a pose on the job's map, spread into `x` / `y` / `theta` / `z` and the template's `vertex_id` on the wire; `filter: "charger"` on a DOCK), `waypoints` (PATROL's ordered list of such poses, `min_items: 2`, sent as `params.waypoints` and the template's index-aligned `vertex_ids`), `text`, `integer`, `number` — whose limits are read off `SpeakParams` / `WaitParams` / `PatrolParams`, so they cannot drift from the validators. UNDOCK is not listed: a MOVE backs off the dock by itself. No gateway behind it (`tasks/catalogue.py`). Not `/tasks/steps`, for the reason `active_tasks` gives |
 | POST | `/api/v1/schedules` | Create a schedule (cron **or** interval). A cron with its own `#`, a `CRON_TZ=`/`TZ=` prefix (use `timezone`) or `@every` (use `interval_seconds`) is 400 — see *Task orchestration* |
 | GET | `/api/v1/schedules` | List with next run times. This robot's only, filtered by the server on the schedule's `RobotId` (see *Provenance* under task history) |

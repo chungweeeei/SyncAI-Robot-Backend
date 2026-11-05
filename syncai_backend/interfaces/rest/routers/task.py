@@ -2,17 +2,18 @@ import base64
 import binascii
 import csv
 import io
+import math
 import structlog
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone, tzinfo
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 
-from syncai_backend.exceptions import BadRequestError, ConflictError
+from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
 
 from syncai_backend.tasks.catalogue import StepCatalogue, step_catalogue
 from syncai_backend.tasks.config import (
@@ -34,7 +35,9 @@ from syncai_backend.tasks.schema import (
     WorkflowTaskDefinition,
     step_group_problem,
 )
+from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
+from syncai_backend.helpers.route_preview import RoutePreview
 from syncai_backend.interfaces.rest.schemas import StepRequest
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
@@ -184,12 +187,67 @@ class StepState(BaseModel):
 
 
 class MoveMessageSource(Protocol):
-    """The one thing the task-state read needs from the robot gateway.
+    """What this router needs from the robot gateway: the running MOVE's
+    status sentence for the task-state read, and the route preview.
 
     A Protocol so this router stays free of rclpy and testable without ROS.
     """
 
     def get_move_message(self) -> str: ...
+
+    def preview_route(
+        self, x: float, y: float, yaw: float, z: float = 0.0
+    ) -> Tuple[bool, str, Optional[RoutePreview]]: ...
+
+
+class RoutePreviewRequest(MoveParams):
+    """A MOVE's goal (x, y, theta in degrees, z the ground of its floor), and
+    the map it was aimed on."""
+
+    map_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "The map the goal was aimed on. Refused with 409 map_mismatch when "
+            "it is not the map the robot is using, as POST /api/v1/tasks is."
+        ),
+        examples=["lab"],
+    )
+
+
+class RoutePreviewResponse(BaseModel):
+    reachable: bool = Field(
+        ...,
+        description=(
+            "Whether the planner found a route. False is an answer, not an "
+            "error: code and message say why"
+        ),
+    )
+    points: List[Tuple[float, float, float]] = Field(
+        ...,
+        description=(
+            "The route from the robot to the goal, (x, y, z) in the map frame, "
+            "z the ground it stands on; at most ~512 points. Empty when not reachable"
+        ),
+    )
+    length_m: float = Field(
+        ..., description="The route's length in metres, a stair's rise included"
+    )
+    code: Optional[str] = Field(
+        default=None,
+        description=(
+            "Why there is no route, machine-readable (goal_in_keepout, "
+            "no_valid_path, map_not_loaded, ...); null when reachable"
+        ),
+        examples=["goal_in_keepout"],
+    )
+    message: str = Field(
+        default="",
+        description=(
+            "Why there is no route, as the job that drove there would have "
+            "failed with it; empty when reachable"
+        ),
+    )
 
 
 class TaskStateResponse(BaseModel):
@@ -616,6 +674,41 @@ def init_task_router(
             id=req.id,
             status=TaskStatus.PENDING,
             message=f"Task {req.id} accepted and queued for execution.",
+        )
+
+    # Not /api/v1/tasks/preview, for the reason active_tasks gives below. Plain
+    # def: it waits on the planner (seconds), so FastAPI runs it off the loop.
+    # Nothing is dispatched, recorded or locked: a preview moves nothing, which
+    # is also why it is not refused while a job runs.
+    @task_router.post("/api/v1/route_preview", response_model=RoutePreviewResponse)
+    def preview_route(req: RoutePreviewRequest):
+        """The route the robot would drive from where it stands to this goal,
+        planned exactly as a MOVE's would be but never sent to the robot.
+
+        200 with ``reachable: false`` when there is no route (the planner's
+        reason in ``code`` / ``message``); 409 ``map_mismatch`` when the goal
+        was aimed on another map; 409 ``preview_superseded`` when a newer
+        preview replaced this one; 502 when there was no planner to ask.
+        """
+        refusal = map_usage.move_refusal(req.map_name, map_catalog_repo.active_name())
+        if refusal is not None:
+            raise ConflictError(refusal.message, code=refusal.code)
+
+        success, message, preview = robot_gw.preview_route(
+            x=req.x, y=req.y, yaw=math.radians(req.theta), z=req.z
+        )
+        if not success or preview is None:
+            if failure_code(message) is Failure.PREVIEW_SUPERSEDED:
+                raise ConflictError(message, code=Failure.PREVIEW_SUPERSEDED.value)
+            logger.warning("Route preview failed", message=message)
+            raise UpstreamError(message)
+
+        return RoutePreviewResponse(
+            reachable=preview.reachable,
+            points=list(preview.points),
+            length_m=preview.length_m,
+            code=preview.code,
+            message=preview.message,
         )
 
     # Built once: it is read off the params models, which do not change while

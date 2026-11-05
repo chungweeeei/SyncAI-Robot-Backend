@@ -221,6 +221,8 @@ subscribers/               ROS topics → repositories (ingest side; the map clo
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   pointcloud, system_config, map_archive (checksummed zip /
                            tar.gz of a map dir), move_guard (a run's TaskMap against the loaded map),
+                           route_preview (a planner preview's answer: the route thinned as the
+                           live one is, or the failure in the task runner's sentence),
                            disk (a tree's bytes + newest mtime, for both catalogues and the
                            recording gateway), single_flight (join a slow read in progress);
                            kept, called by nothing: occupancy_grid, pgm (write_text_atomic is

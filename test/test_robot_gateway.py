@@ -26,7 +26,13 @@ from action_msgs.msg import GoalStatus  # noqa: E402
 from builtin_interfaces.msg import Time  # noqa: E402
 
 from geometry_msgs.msg import Twist  # noqa: E402
-from syncai_common.action import NavigateThroughGoals, NavigateToGoal  # noqa: E402
+from geometry_msgs.msg import PoseStamped  # noqa: E402
+from nav_msgs.msg import Path  # noqa: E402
+from syncai_common.action import (  # noqa: E402
+    ComputePathToPose,
+    NavigateThroughGoals,
+    NavigateToGoal,
+)
 
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways import ros as ros_module  # noqa: E402
@@ -90,13 +96,24 @@ def patrol_client():
 
 
 @pytest.fixture
-def robot_gw(logger, move_client, patrol_client) -> RobotGateway:
+def preview_client():
+    client = MagicMock()
+    client.wait_for_server.return_value = True
+    return client
+
+
+@pytest.fixture
+def robot_gw(logger, move_client, patrol_client, preview_client) -> RobotGateway:
     node = MagicMock()
     # _make_pose_stamped stamps headers from the node's clock, and the real
     # Header message asserts its stamp is a builtin_interfaces/Time — a bare
     # MagicMock does not pass, so the mocked clock must answer a real one.
     node.get_clock.return_value.now.return_value.to_msg.return_value = Time()
-    clients = {"navigate_to_goal": move_client, "navigate_through_goals": patrol_client}
+    clients = {
+        "navigate_to_goal": move_client,
+        "navigate_through_goals": patrol_client,
+        "preview_path_to_pose": preview_client,
+    }
     with patch(
         "syncai_backend.gateways.robot.robot.ActionClient",
         side_effect=lambda **kwargs: clients[kwargs["action_name"]],
@@ -1091,3 +1108,111 @@ class TestPatrol:
         assert (accepted, goal_id) == (False, None)
         assert message == "Action server is not available"
         patrol_client.send_goal_async.assert_not_called()
+
+
+def _path(*points):
+    path = Path()
+    for x, y, z in points:
+        pose = PoseStamped()
+        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = x, y, z
+        path.poses.append(pose)
+    return path
+
+
+def _preview(robot_gw, preview_client, status, result, z=0.0):
+    """Drive preview_route() through acceptance to the planner's answer."""
+    handle = _goal_handle()
+    handle.get_result_async.return_value = _Future(
+        result=SimpleNamespace(status=status, result=result)
+    )
+    preview_client.send_goal_async.return_value = _Future(result=handle)
+    return robot_gw.preview_route(x=1.0, y=2.0, yaw=0.0, z=z), handle
+
+
+class TestRoutePreview:
+    def test_a_planned_route_is_answered_with_its_points(self, robot_gw, preview_client):
+        result = ComputePathToPose.Result(path=_path((0.0, 0.0, 0.0), (3.0, 4.0, 0.0)))
+
+        (ok, message, preview), _ = _preview(
+            robot_gw, preview_client, GoalStatus.STATUS_SUCCEEDED, result
+        )
+
+        assert (ok, message) == (True, "")
+        assert preview.reachable
+        assert preview.points == ((0.0, 0.0, 0.0), (3.0, 4.0, 0.0))
+        assert preview.length_m == 5.0
+
+    def test_the_goal_is_planned_from_the_robot_on_its_floor(self, robot_gw, preview_client):
+        result = ComputePathToPose.Result(path=_path((0.0, 0.0, 0.0)))
+
+        _preview(robot_gw, preview_client, GoalStatus.STATUS_SUCCEEDED, result, z=2.8)
+
+        goal = preview_client.send_goal_async.call_args.kwargs["goal"]
+        assert goal.goal.pose.position.z == 2.8
+        assert goal.goal.header.frame_id == "map"
+        # From where the robot stands, by the only planner loaded.
+        assert goal.use_start is False
+        assert goal.planner_id == ""
+
+    def test_a_goal_the_planner_cannot_reach_is_an_answer(self, robot_gw, preview_client):
+        result = ComputePathToPose.Result(
+            error_code=ComputePathToPose.Result.GOAL_IN_KEEPOUT,
+            error_msg="goal_in_keepout: zone 'z1'",
+        )
+
+        (ok, _, preview), _ = _preview(
+            robot_gw, preview_client, GoalStatus.STATUS_ABORTED, result
+        )
+
+        assert ok
+        assert not preview.reachable
+        assert preview.code == "goal_in_keepout"
+
+    def test_a_preempted_preview_says_a_newer_one_replaced_it(
+        self, robot_gw, preview_client
+    ):
+        # The planner aborts a preempted goal with a default result: no code.
+        (ok, message, preview), _ = _preview(
+            robot_gw,
+            preview_client,
+            GoalStatus.STATUS_ABORTED,
+            ComputePathToPose.Result(),
+        )
+
+        assert (ok, preview) == (False, None)
+        assert failure_code(message) is Failure.PREVIEW_SUPERSEDED
+
+    def test_no_planner_is_no_answer(self, robot_gw, preview_client):
+        preview_client.wait_for_server.return_value = False
+
+        ok, message, preview = robot_gw.preview_route(x=1.0, y=2.0, yaw=0.0)
+
+        assert (ok, preview) == (False, None)
+        assert "Navigation" in message
+        preview_client.send_goal_async.assert_not_called()
+
+    def test_a_preview_past_its_wait_is_cancelled(self, robot_gw, preview_client):
+        handle = _goal_handle()
+        handle.get_result_async.return_value = _Future(completed=False)
+        preview_client.send_goal_async.return_value = _Future(result=handle)
+
+        with patch.object(robot_module, "PREVIEW_RESULT_WAIT_S", 0.01):
+            ok, _, preview = robot_gw.preview_route(x=1.0, y=2.0, yaw=0.0)
+
+        assert (ok, preview) == (False, None)
+        # Nobody reads its answer, so the planner must not keep searching.
+        handle.cancel_goal_async.assert_called_once()
+
+    def test_a_preview_accepted_after_its_sender_gave_up_is_cancelled(
+        self, robot_gw, preview_client
+    ):
+        late = _Future(completed=False)
+        preview_client.send_goal_async.return_value = late
+
+        with patch.object(robot_module, "NAV_ACCEPT_WAIT_S", 0.01):
+            ok, _, _ = robot_gw.preview_route(x=1.0, y=2.0, yaw=0.0)
+        assert ok is False
+
+        handle = _goal_handle()
+        late.complete(handle)
+        handle.cancel_goal_async.assert_called_once()

@@ -14,7 +14,7 @@ from rclpy.action.client import ClientGoalHandle
 from action_msgs.msg import GoalStatus
 from action_msgs.srv import CancelGoal
 
-from syncai_common.action import NavigateThroughGoals, NavigateToGoal
+from syncai_common.action import ComputePathToPose, NavigateThroughGoals, NavigateToGoal
 from syncai_common.msg import WifiConnection, WifiNetwork
 from syncai_common.srv import (
     ActivateWifiConnection,
@@ -41,6 +41,7 @@ from geometry_msgs.msg import (
 
 from syncai_backend.gateways import ros
 from syncai_backend.gateways.failure import Failure, fail
+from syncai_backend.helpers.route_preview import RoutePreview, planned, refused
 
 
 class MotionKey(str, Enum):
@@ -115,6 +116,13 @@ NAV_SERVER_WAIT_S = 1.0
 NAV_ACCEPT_WAIT_S = 1.5
 NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 
+# How long preview_route() waits for the planner's answer once it accepted the
+# goal. Octo3D's own search gives up at max_planning_time (2 s), but a preview
+# plans under the same lock as a navigation's plan and waits behind one in
+# flight, so twice that and some. A REST call, not an activity: no heartbeat
+# budget to fit under.
+PREVIEW_RESULT_WAIT_S = 6.0
+
 # NavigateToGoal.behavior_tree for the DOCK / UNDOCK steps: bare file names the task
 # runner resolves in its own behavior_trees/ (syncai_common >= bbcc958). dock.xml takes
 # the dock pose and works out the staging pose from it; undock.xml ignores the pose
@@ -156,6 +164,16 @@ def _patrol_message(feedback, total: int) -> str:
     if math.isfinite(distance) and distance > 0.0:
         line += f", {distance:.1f} m to go"
     return line
+
+
+def _cancel_if_accepted(future) -> None:
+    """A preview goal answered after its sender gave up: cancel it."""
+    try:
+        goal_handle = future.result()
+    except Exception:
+        return
+    if goal_handle is not None and goal_handle.accepted:
+        goal_handle.cancel_goal_async()
 
 
 def _clamp_normalized(value: float) -> float:
@@ -205,7 +223,20 @@ class RobotGateway:
             action_name="navigate_through_goals",
         )
 
-        self._action_clients.update({"move": move_client, "patrol": patrol_client})
+        # The console's route preview (2026-11): the planner's own
+        # ComputePathToPose, on the server that plans without publishing or
+        # keeping the path, so a preview is never drawn as the route being
+        # driven and never disturbs a running navigation. Not compute_path_to_pose
+        # itself: that one is the task runner's, and takes one goal at a time.
+        preview_client = ActionClient(
+            node=self._node,
+            action_type=ComputePathToPose,
+            action_name="preview_path_to_pose",
+        )
+
+        self._action_clients.update(
+            {"move": move_client, "patrol": patrol_client, "preview": preview_client}
+        )
 
     def register_service_clients(self):
 
@@ -802,6 +833,74 @@ class RobotGateway:
         )
 
         return self._send_nav_goal("move", goal_msg)
+
+    def preview_route(
+        self, x: float, y: float, yaw: float, z: float = 0.0
+    ) -> Tuple[bool, str, Optional[RoutePreview]]:
+        """The route the planner would take from the robot to this goal.
+
+        ``(True, "", preview)`` whenever the planner answered, including a
+        goal it cannot reach (``preview.reachable`` False, with why): that is
+        the answer, not a failure. ``(False, message, None)`` when there was
+        no answer to give -- no planner (the robot is not in Navigation), a
+        timeout, or a newer preview that replaced this one.
+
+        Nothing is tracked: a preview moves nothing, so a goal abandoned on a
+        timeout is cancelled and forgotten, unlike a MOVE's.
+        """
+        client = self._action_clients["preview"]
+        if not client.wait_for_server(timeout_sec=NAV_SERVER_WAIT_S):
+            return (
+                False,
+                "Route preview is not available: the robot plans routes only in Navigation mode.",
+                None,
+            )
+
+        goal_msg = ComputePathToPose.Goal(
+            goal=self._make_pose_stamped(x=x, y=y, yaw=yaw, z=z),
+            # Empty: the only planner loaded (Octo3D), as move.xml names it.
+            planner_id="",
+            use_start=False,
+        )
+        future = client.send_goal_async(goal=goal_msg)
+        if not ros.wait_for_future(future, timeout=NAV_ACCEPT_WAIT_S):
+            # Accepted after we stopped waiting: cancel it then, so the planner
+            # does not search for an answer nobody reads.
+            future.add_done_callback(_cancel_if_accepted)
+            return False, "Timeout waiting for the route preview to start", None
+
+        goal_handle: ClientGoalHandle = future.result()
+        if not goal_handle.accepted:
+            return False, "The route preview was refused", None
+
+        result_future = goal_handle.get_result_async()
+        if not ros.wait_for_future(result_future, timeout=PREVIEW_RESULT_WAIT_S):
+            goal_handle.cancel_goal_async()
+            return False, "Timeout waiting for the route preview", None
+
+        answer = result_future.result()
+        result = answer.result
+        if answer.status == GoalStatus.STATUS_SUCCEEDED:
+            points = [
+                (p.pose.position.x, p.pose.position.y, p.pose.position.z)
+                for p in result.path.poses
+            ]
+            return True, "", planned(points)
+        if (
+            answer.status == GoalStatus.STATUS_ABORTED
+            and result.error_code != ComputePathToPose.Result.NONE
+        ):
+            return True, "", refused(result.error_code, result.error_msg)
+        # ABORTED with NONE is a goal preempted by a newer one (the planner's
+        # server takes one preview at a time); CANCELED is ours or nobody's.
+        return (
+            False,
+            fail(
+                Failure.PREVIEW_SUPERSEDED,
+                "A newer route preview replaced this one.",
+            ),
+            None,
+        )
 
     def patrol(
         self, waypoints: Sequence[dict], total: Optional[int] = None
