@@ -571,6 +571,70 @@ class TestWorkflowGateway:
             with pytest.raises(NotFoundError, match="not found"):
                 asyncio.run(workflow_gw.get_task_state("missing"))
 
+    # ==================== get_failed_run ====================
+
+    def _failed_desc(self, status=WorkflowExecutionStatus.FAILED, task_queue=OWN_QUEUE):
+        execution = _execution(
+            status=status, kind=TaskKind.TASK.value, name="Morning patrol", map_name="lab"
+        )
+        execution.task_queue = task_queue
+        return execution
+
+    def test_get_failed_run_carries_steps_and_provenance(self, workflow_gw, mock_client):
+        failed = MOVE_STEP.model_copy(update={"status": StepStatus.FAILED})
+        self._workflow_handle(mock_client, describe=self._failed_desc(), steps=[failed])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            run = asyncio.run(workflow_gw.get_failed_run("robot01-task-001"))
+
+        assert [(s.id, s.status) for s in run.steps] == [("step1", StepStatus.FAILED)]
+        assert (run.kind, run.name, run.map_name) == (TaskKind.TASK, "Morning patrol", "lab")
+
+    def test_get_failed_run_reads_a_timed_out_run_as_failed(self, workflow_gw, mock_client):
+        self._workflow_handle(
+            mock_client,
+            describe=self._failed_desc(status=WorkflowExecutionStatus.TIMED_OUT),
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            run = asyncio.run(workflow_gw.get_failed_run("robot01-task-001"))
+
+        assert run.steps == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            WorkflowExecutionStatus.RUNNING,
+            WorkflowExecutionStatus.COMPLETED,
+            WorkflowExecutionStatus.CANCELED,
+            WorkflowExecutionStatus.TERMINATED,
+        ],
+    )
+    def test_get_failed_run_refuses_a_run_that_has_not_failed(
+        self, workflow_gw, mock_client, status
+    ):
+        handle = self._workflow_handle(mock_client, describe=self._failed_desc(status=status))
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(ConflictError) as raised:
+                asyncio.run(workflow_gw.get_failed_run("robot01-task-001"))
+
+        assert raised.value.code == "task_not_failed"
+        handle.query.assert_not_awaited()
+
+    def test_get_failed_run_does_not_degrade_a_failed_query(self, workflow_gw, mock_client):
+        # Unlike get_task_state: no steps would read as "nothing failed".
+        handle = self._workflow_handle(mock_client, describe=self._failed_desc())
+        handle.query.side_effect = Exception("no worker")
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError):
+                asyncio.run(workflow_gw.get_failed_run("robot01-task-001"))
+
+    def test_get_failed_run_hides_another_robots_run(self, workflow_gw, mock_client):
+        self._workflow_handle(
+            mock_client, describe=self._failed_desc(task_queue="robot02.ROBOT_TASK_QUEUE")
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(NotFoundError):
+                asyncio.run(workflow_gw.get_failed_run("robot01-task-001"))
+
     # ==================== cancel_task ====================
 
     def test_cancel_task_cancels_after_the_ownership_describe(

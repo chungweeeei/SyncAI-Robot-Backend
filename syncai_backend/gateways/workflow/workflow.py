@@ -291,6 +291,17 @@ class _ActiveSnapshot:
         return self.tasks or [], self.ended or [], self.as_of
 
 
+@dataclass(frozen=True)
+class FailedRun:
+    """A failed run as get_failed_run reads it: its steps as they ended, and the
+    provenance a run continuing it inherits."""
+
+    steps: List[Step]
+    kind: Optional[TaskKind]
+    name: Optional[str]
+    map_name: Optional[str]
+
+
 def _build_schedule_spec(trigger: ScheduleTrigger) -> ScheduleSpec:
     """Map a ScheduleTrigger (cron or interval) to a Temporal ScheduleSpec.
 
@@ -688,6 +699,39 @@ class WorkflowGateway:
             status = "PAUSED"
 
         return TaskState(id=task_id, status=status, steps=steps)
+
+    async def get_failed_run(self, task_id: str) -> FailedRun:
+        """What a run continuing ``task_id`` needs: its steps as they ended and
+        its provenance (POST /api/v1/tasks continue_from).
+
+        409 ``task_not_failed`` unless the run failed. Unlike get_task_state a
+        failed query is a 502, not no steps: no steps would read as nothing failed.
+        """
+        handle, description = await self._describe_owned_task(
+            task_id, "Describe workflow failed"
+        )
+
+        if _WORKFLOW_STATUS_MAP.get(description.status) != "FAILED":
+            raise ConflictError(f"Task {task_id} has not failed", code="task_not_failed")
+
+        # Any failure, not only an RPCError: a query the worker fails to answer
+        # raises WorkflowQueryFailedError.
+        try:
+            steps = await handle.query(
+                "get_step_states", result_type=List[Step], rpc_timeout=_TASK_STATE_RPC
+            )
+        except Exception as err:
+            self._logger.error(
+                "[WorkflowGateway] Failed to query step states",
+                task_id=task_id,
+                error=str(err),
+            )
+            raise UpstreamError("Query workflow failed")
+
+        kind, name = _provenance_of(description, _schedule_id_of(description))
+        return FailedRun(
+            steps=steps, kind=kind, name=name, map_name=_map_of(description)
+        )
 
     async def list_active_tasks(
         self,

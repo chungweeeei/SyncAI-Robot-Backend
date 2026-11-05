@@ -24,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
         TaskRecord,
         WaitParams,
         WorkflowTask,
+        step_blocks,
     )
     from syncai_backend.tasks.search_attributes import (
         SCHEDULED_BY_KEY,
@@ -67,17 +68,6 @@ ACTIVITY_MAP = {
     StepType.UNDOCK: RobotActivities.execute_undock,
     StepType.PATROL: RobotActivities.execute_patrol,
 }
-
-
-def _blocks(steps: list[Step]) -> list[list[Step]]:
-    """``steps`` cut into blocks: a group's adjacent members, or one lone step."""
-    blocks: list[list[Step]] = []
-    for step in steps:
-        if blocks and step.group is not None and blocks[-1][-1].group == step.group:
-            blocks[-1].append(step)
-        else:
-            blocks.append([step])
-    return blocks
 
 
 def _ended_badly(task: asyncio.Future) -> bool:
@@ -171,6 +161,11 @@ class RobotWorkflow:
     def patrol_progress(self, step_id: str, passed: int) -> None:
         # Only ever forward: a late report from a cancelled dispatch is no news.
         self._patrol_passed[step_id] = max(self._patrol_passed.get(step_id, 0), passed)
+        # On the step too, for the query and the record: what a run continuing
+        # this one, should it fail, starts the PATROL past.
+        for step in self._steps:
+            if step.id == step_id:
+                step.waypoints_passed = self._patrol_passed[step_id]
 
     def _new_dispatch_id(self, step: Step) -> str:
         self._dispatches += 1
@@ -213,12 +208,23 @@ class RobotWorkflow:
     async def run(self, task: WorkflowTask):
         self._steps = task.definition.steps
         own_map = _own_map()
+        # A run continuing a failed one starts each PATROL past what it had passed;
+        # every other run's steps read 0, so dispatches are unchanged.
+        self._patrol_passed = {
+            step.id: step.waypoints_passed
+            for step in self._steps
+            if step.waypoints_passed > 0
+        }
 
         # Not BaseException: the SDK evicts a cached run by raising one through it,
         # and that must not schedule anything.
         try:
             # A lone step is awaited directly, so pre-group histories replay unchanged.
-            for block in _blocks(self._steps):
+            for block in step_blocks(self._steps):
+                # What the failed run this one continues got past (continuation_steps
+                # skips whole blocks). No run before SKIPPED carries one.
+                if all(step.status is StepStatus.SKIPPED for step in block):
+                    continue
                 if len(block) == 1:
                     await self._run_step(block[0], own_map)
                 else:

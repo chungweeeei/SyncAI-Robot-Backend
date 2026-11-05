@@ -1857,3 +1857,62 @@ def test_a_runs_map_is_handed_to_a_patrol():
         return dispatches
 
     assert asyncio.run(scenario()) == [("step-0", 0, 4, "lab")]
+
+
+# --- continuing a failed run -------------------------------------------------
+
+
+def test_skipped_steps_are_never_run_and_stay_skipped():
+    async def scenario():
+        calls: list = []
+        task = _task("task-continued", StepType.STANDUP, StepType.MOVE, StepType.LIEDOWN)
+        task.definition.steps[0].status = StepStatus.SKIPPED
+
+        async with _worker(_instant_activities(calls)) as client:
+            handle = await _start(client, task)
+            await handle.result()
+            return calls, await handle.query(RobotWorkflow.get_step_states)
+
+    calls, steps = asyncio.run(scenario())
+
+    assert [name for name, _ in calls] == ["execute_move", "execute_lie_down"]
+    assert [step.status for step in steps] == [
+        StepStatus.SKIPPED, StepStatus.COMPLETED, StepStatus.COMPLETED,
+    ]
+    assert (steps[0].started_at, steps[0].ended_at) == (None, None)
+
+
+def test_a_patrols_progress_is_on_its_step():
+    async def scenario():
+        dispatches: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        release.set()
+        task = _task("task-patrol-progress", StepType.PATROL)
+
+        async with _worker([_patrol(dispatches, started, release, report=(2, 1))]) as client:
+            handle = await _start(client, task)
+            await handle.result()
+            return await handle.query(RobotWorkflow.get_step_states)
+
+    steps = asyncio.run(scenario())
+
+    # Forward only, as the dispatch count: the late lower report is no news.
+    assert steps[0].waypoints_passed == 2
+
+
+def test_a_continued_patrol_starts_past_the_waypoints_it_had_passed():
+    async def scenario():
+        dispatches: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        release.set()
+        task = _task("task-patrol-continued", StepType.PATROL)
+        task.definition.steps[0].waypoints_passed = 2
+
+        async with _worker([_patrol(dispatches, started, release)]) as client:
+            handle = await _start(client, task)
+            await handle.result()
+            return dispatches
+
+    dispatches = asyncio.run(scenario())
+
+    assert dispatches == [("step-0", 2, 4, None)]

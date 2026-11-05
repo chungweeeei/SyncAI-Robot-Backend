@@ -426,6 +426,12 @@ waypoints it had passed**: `execute_patrol` signals the count on `PATROL_PROGRES
 forward only, and `_run_move` passes it as the next dispatch's `start`. A retry of the same
 dispatch reads it from its own heartbeat details instead. The last waypoint is always sent,
 and the step's `params` keep every waypoint).
+**A FAILED task is continued as a new run** (`POST /api/v1/tasks` with `continue_from`
+instead of `steps`): every step of the failed run, those before the failed step's
+block `SKIPPED` (the workflow passes over them; never copied as `COMPLETED`, the
+report would count them twice), the rest fresh, a PATROL past its `waypoints_passed`
+(the `patrol_progress` count, kept on the step). `continuation_steps` (schema.py)
+is the one rule.
 The MOVE wait is `workflow.wait_condition` on `handle.done() or paused`, **never a direct
 `await handle`**: that is what keeps a task cancel arriving as `asyncio.CancelledError`
 instead of being swallowed into the activity's `ActivityError`, so a cancel is never
