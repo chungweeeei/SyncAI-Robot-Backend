@@ -181,7 +181,7 @@ def test_active_name_is_read_when_the_repo_is_built(logger, tmp_path, monkeypatc
 
 
 def test_active_name_does_not_read_the_ini_again(catalog_repo, tmp_path, monkeypatch):
-    """A hand edit is seen at the next restart, as README *Gotchas* says."""
+    """A hand edit is seen at the next restart, as docs/gotchas.md says."""
     ini = _ini_naming(tmp_path, monkeypatch, "full")
     catalog_repo.load_active()
     ini.write_text("[system]\nrobot_id: robot01\n\n[map]\nname: rawonly\n")

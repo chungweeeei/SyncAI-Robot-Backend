@@ -19,7 +19,7 @@ Keyword. On the pinned server (auto-setup 1.29.7, Postgres) these take four of t
 ``Keyword01..10`` columns.
 
 auto-setup registers custom attributes only on a fresh install, with no knob for
-extra names, so the worker registers them at connect, idempotently; the README gives
+extra names, so the worker registers them at connect, idempotently; docs/tasks.md gives
 the CLI equivalent.
 """
 

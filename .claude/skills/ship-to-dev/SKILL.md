@@ -102,8 +102,9 @@ Subjects are imperative with the scope in parens
 body says *why*. End every message with the attribution line the session
 gives.
 
-`README.md` is the long-form reference and records *why* things are the
-way they are: a change in behaviour updates its section and, when it
+`docs/` is the long-form reference (`README.md` is the short overview) and
+records *why* things are the way they are: a change in behaviour updates
+its page and, when it
 alters what CLAUDE.md describes, CLAUDE.md too — in a `docs:` commit of
 their own, or folded into the change with the body saying so.
 

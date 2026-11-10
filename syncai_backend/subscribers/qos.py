@@ -1,6 +1,6 @@
 """The two subscription QoS shapes this process uses, named.
 
-Each must still match its publisher (the README's ROS interfaces table gives
+Each must still match its publisher (the table in docs/ros-interfaces.md gives
 the pairing): a durability or reliability mismatch is a silent "no messages",
 not an error. A fresh profile per call, since ``QoSProfile`` is mutable.
 """

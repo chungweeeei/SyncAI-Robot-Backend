@@ -627,7 +627,7 @@ class MapCatalogRepo:
         Every dispatch, every map-lock check and every MOVE goal asks, several
         of them on the event loop; the INI has one writer and it is
         ``set_active``, in this process. An INI edited by hand is seen at the
-        next restart (README *Gotchas*: configuration is read once).
+        next restart (docs/gotchas.md: configuration is read once).
         """
         return self._active
 

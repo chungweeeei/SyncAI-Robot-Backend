@@ -17,7 +17,7 @@ map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `R
 `NavigateToGoal` action the MOVE step sends — and the DOCK / UNDOCK steps, on its
 `behavior_tree` `dock.xml` / `undock.xml`, the UNDOCK with an empty pose — and since
 2026-10-15 a MOVE runs undock.xml itself first when the robot is still on the last DOCK's
-pose (`services/dock_state.py`, in memory; README *Auto-undock*); this package never
+pose (`services/dock_state.py`, in memory; docs/ros-interfaces.md *Auto-undock*); this package never
 calls `DockToPose`) — plus `rclpy`,
 `nav2_msgs` (`LoadMap`), `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
 those imports as they are. **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
@@ -58,9 +58,12 @@ in a workspace that also carries the nav stack, with this repo vcs-imported to
 `<workspace>/src/syncai_backend` — the rest of the stack's topics, services and
 the `~/robot_ws` layout are all runtime requirements.
 
-`README.md` is the long-form reference (every REST route, ROS interface + QoS, Temporal
-semantics, gotchas). Read the relevant section before changing a route or a subscriber;
-it records *why* things are the way they are. Keep it in sync when you change behavior.
+`README.md` is the short overview (what it is, quick start, the route areas, an index).
+**`docs/` is the long-form reference** — `architecture.md`, `ros-interfaces.md` (+ QoS),
+`rest-api.md` (every route), `tasks.md` (Temporal semantics), `configuration.md`,
+`deployment.md`, `testing.md`, `gotchas.md`. Read the relevant page before changing a
+route or a subscriber; it records *why* things are the way they are. Keep it in sync when
+you change behavior, and keep the README short: detail goes in `docs/`.
 
 ## Commands
 
@@ -112,7 +115,7 @@ this container shares the host's `/dev/shm` with the robot container (see
 itself; nothing needs copying in. It also builds `docker/livox_ros_driver2`, a
 messages-only stand-in for the Livox driver that exists solely so `ros2 bag
 record` can subscribe to `livox/lidar` (CustomMsg); keep its name and `.msg`
-files identical to upstream. The README's *As its own container*
+files identical to upstream. docs/deployment.md's *As its own container*
 and the Dockerfile header carry the rest, including why only one backend may run at a time.
 
 Test notes: tests `importorskip` `rclpy` / `syncai_common` / `httpx` etc., so on a
@@ -160,7 +163,7 @@ Consequences:
   executor spinning until `TemporalWorkerHandle.request_shutdown` returns, because the
   cancelled MOVE's cleanup (cancel the nav2 goal, restore locomotion) is ROS traffic. Do
   not reintroduce `executor.spin()` with rclpy's handlers: that is what left goals driving
-  unsupervised. README *Process model* has the sequence and the budget.
+  unsupervised. docs/architecture.md *Process model* has the sequence and the budget.
 - A nav goal always reaches a terminal state: `RobotGateway` marks a goal **lost**
   (ABORTED, `error_msg` the reason) when it learns no result is coming — the result
   future failing, a cancel unanswered within `CANCEL_RESPONSE_WAIT_S`, `UNKNOWN_GOAL_ID`
