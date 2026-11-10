@@ -93,7 +93,7 @@ def test_the_wait_bridge_times_out_false():
 _GATEWAYS = pathlib.Path(__file__).resolve().parent.parent / "syncai_backend" / "gateways"
 
 
-@pytest.mark.parametrize("relative", ["robot/robot.py", "map/map.py"])
+@pytest.mark.parametrize("relative", ["robot/robot.py", "map/map.py", "landmark/landmark.py"])
 def test_service_calls_go_through_call_service(relative):
     """A raw call_async is how the leak comes back. The one allowed exception
     is restart_mode, which keeps its request pending on purpose so a late

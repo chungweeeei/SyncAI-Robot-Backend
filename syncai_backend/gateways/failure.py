@@ -62,6 +62,13 @@ class Failure(str, Enum):
     # said so first, so one of these is also a missing rule.
     PARAMETER_REFUSED = "parameter_refused"
 
+    # LandmarkGateway: the landmark was not (steadily) in view within the
+    # detect's budget. A 409: face the robot at it and ask again; a detector
+    # that is down or cannot transform stays 502.
+    LANDMARK_NOT_DETECTED = "landmark_not_detected"
+    # LandmarkGateway: the id is not in the detector's registry. A 400.
+    LANDMARK_UNKNOWN = "unknown_landmark"
+
 
 class FailureMessage(str):
     """Operator-facing prose carrying an optional machine-readable ``code``.

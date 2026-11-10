@@ -13,7 +13,7 @@ It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
-map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, and the
+map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
 `NavigateToGoal` action the MOVE step sends — and the DOCK / UNDOCK steps, on its
 `behavior_tree` `dock.xml` / `undock.xml`, the UNDOCK with an empty pose — and since
 2026-10-15 a MOVE runs undock.xml itself first when the robot is still on the last DOCK's
@@ -31,7 +31,7 @@ three attempts, 5 s apart. The numbers are SyncAI-Robot-Interface's (`ComputePat
 documents each and whether a retry helps), written as literals because they are a contract
 that is never renumbered. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `ResetOdometry` with `skip_seed` (behind `POST /api/v1/localization/auto`,
-2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; the dock trees and `DOCK_FAILED` at or after `bbcc958`. It is named in
+2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; `DetectLandmark` (behind `POST /api/v1/landmarks/detect`, 2026-11: the charger's marker in `map`, for a `CHARGE` vertex) at or after `0d4ed9a`; the dock trees and `DOCK_FAILED` at or after `bbcc958`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
 colcon workspace root materialises it into `src/` beside this package, over
 HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
@@ -201,7 +201,8 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  against its schema -- controller_schema / planner_schema --, set
         │                  live, read back, write the runtime overlay)
         │
-gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), parameters (one
+gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), landmark (ROS srv:
+        │                  detect_landmark, polled until a sighting is steady), parameters (one
         │                  node's get/set_parameters; controller_server, planner_server), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.

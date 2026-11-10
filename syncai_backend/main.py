@@ -37,6 +37,7 @@ from syncai_backend.repositories.params.overlay import (
 
 from syncai_backend.gateways.robot.robot import init_robot_gateway
 from syncai_backend.gateways.map.map import init_map_gateway
+from syncai_backend.gateways.landmark.landmark import init_landmark_gateway
 from syncai_backend.gateways.workflow.workflow import init_workflow_gateway
 from syncai_backend.gateways.tts.tts import init_tts_gateway
 from syncai_backend.gateways.webrtc.webrtc import init_webrtc_gateway
@@ -127,6 +128,9 @@ class SyncAIBackend(Node):
         # LoadMap client. Its own gateway so the map router holds no handle that
         # can command the robot to move.
         map_gw = init_map_gateway(logger=logger, node=self)
+        # detect_landmark client: the camera's sighting of the charger, for
+        # the waypoint an operator saves from it.
+        landmark_gw = init_landmark_gateway(logger=logger, node=self)
         workflow_gw = init_workflow_gateway(logger=logger, robot_id=robot_id)
         # Speech out, over HTTP to the syncai_tts container. The speaker lock
         # lives in that service now, so this is just a pooled httpx.Client.
@@ -274,6 +278,7 @@ class SyncAIBackend(Node):
                 map_repo=map_repo,
                 map_catalog_repo=map_catalog_repo,
                 map_gw=map_gw,
+                landmark_gw=landmark_gw,
                 pointcloud_repo=pointcloud_repo,
                 map_cloud_repo=map_cloud_repo,
                 telemetry_repo=telemetry_repo,

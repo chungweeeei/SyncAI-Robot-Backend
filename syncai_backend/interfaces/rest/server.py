@@ -30,6 +30,7 @@ from syncai_backend.interfaces.rest.routers.tts import init_tts_router
 from syncai_backend.interfaces.rest.routers.webrtc import init_webrtc_router
 from syncai_backend.interfaces.rest.routers.recording import init_recording_router
 from syncai_backend.interfaces.rest.routers.settings import init_settings_router
+from syncai_backend.interfaces.rest.routers.landmark import init_landmark_router
 
 from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.map.map import MapRepo
@@ -44,6 +45,7 @@ from syncai_backend.repositories.recording.catalog import RecordingCatalogRepo
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.gateways.robot.robot import RobotGateway
 from syncai_backend.gateways.map.map import MapGateway
+from syncai_backend.gateways.landmark.landmark import LandmarkGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
 from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
@@ -109,6 +111,7 @@ class RestDeps:
     map_repo: MapRepo
     map_catalog_repo: MapCatalogRepo
     map_gw: MapGateway
+    landmark_gw: LandmarkGateway
     pointcloud_repo: PointCloudRepo
     map_cloud_repo: PointCloudRepo
     telemetry_repo: TelemetryRepo
@@ -284,6 +287,17 @@ def init_rest_server(
     # (config/params/<robot_id>/<node>.yaml).
     app.include_router(
         init_settings_router(logger=logger, settings_svcs=deps.settings_svcs)
+    )
+    # /api/v1/landmarks: where the camera sees a known landmark (the charger),
+    # on the loaded map. robot_repo answers whether the robot is localized and
+    # which floor it stands on; the catalogue, which map that is.
+    app.include_router(
+        init_landmark_router(
+            logger=logger,
+            landmark_gw=deps.landmark_gw,
+            robot_repo=deps.robot_repo,
+            map_catalog_repo=deps.map_catalog_repo,
+        )
     )
 
     return app
