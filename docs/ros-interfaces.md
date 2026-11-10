@@ -267,6 +267,20 @@ the robot side keeps its trees stateless. Consequences:
     and that search cannot recover from it on its own. Needs a map saved with
     `save_patches` (`poses.txt`) and a robot standing still.
 
+- `LandmarkGateway`: `detect_landmark` (`syncai_common/srv/DetectLandmark`,
+  `landmark_detector` of the workspace's `syncai_landmark_detection`) — a bare
+  name in the robot namespace. A query, not a trigger: the first call wakes the
+  detector (`SENSOR_STARTING`), later ones return the newest single-frame
+  sighting, and 5 s without a call puts it back to sleep, so one
+  `POST /api/v1/landmarks/detect` is a poll (0.2 s apart, 6 s budget, each call
+  waited 1 s) until `consecutive >= 3` and not `ambiguous` — thresholds the srv
+  leaves to its caller. Asked with `target_frame: "map"`, so the detector does
+  the camera → map transform at the image stamp and this process looks up no
+  TF for it. `UNKNOWN_LANDMARK` ends the poll at once; a budget that runs out
+  on `NOT_DETECTED` / `SENSOR_STARTING` / an unsteady sighting is the
+  operator's to fix (409), on `SENSOR_UNAVAILABLE` / `TRANSFORM_FAILED` the
+  robot's (502).
+
   The map gateway is separate on purpose: the map router has no business holding
   a handle that can make the robot move.
 

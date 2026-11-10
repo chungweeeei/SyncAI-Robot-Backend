@@ -56,7 +56,7 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  task_record_retention (task_record's daily partitions: made
         │                  ahead, dropped after 30 days)
         │
-gateways/                  outbound: ROS (robot, map), Temporal (workflow), speech (tts: HTTP
+gateways/                  outbound: ROS (robot, map, landmark), Temporal (workflow), speech (tts: HTTP
         │                  to the syncai_tts container), camera/speaker (webrtc: a dlopen'd Go
         │                  worker), bags (recording: a supervised `ros2 bag record` child) —
         │                  the last three hold no ROS handle

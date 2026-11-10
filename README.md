@@ -117,7 +117,7 @@ refusal codes and the reasons behind them: [docs/rest-api.md](docs/rest-api.md).
 | Health | `GET /health` |
 | Tasks, history, route preview | `/api/v1/tasks`, `/active_tasks`, `/task_history`, `/task_steps`, `/route_preview` |
 | Schedules, templates | `/api/v1/schedules`, `/task_templates` |
-| Robot, teleop, localization | `/api/v1/robot/*`, `/localization/auto` |
+| Robot, teleop, localization | `/api/v1/robot/*`, `/localization/auto`, `/landmarks/detect` |
 | Maps, vertices, keepout, floors | `/api/v1/maps`, `/maps/{name}/…` |
 | Mapping run | `/api/v1/mapping` |
 | Settings pages | `/api/v1/settings/controller`, `/planner` |
