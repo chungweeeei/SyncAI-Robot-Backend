@@ -451,8 +451,9 @@ waiting when one may go out. `test_activities.py` pins both relations; the heart
 `RobotWorkflow._run_wait` (`wait_condition` with a timeout, remainder measured on
 `workflow.now()` so replay sees the same numbers), so it takes no slot of the one-thread
 activity executor, needs no heartbeat, and survives a worker restart with the time
-already served. Schedules use `SKIP` overlap; their steps are frozen
-at registration; only the trigger is editable (`PATCH /api/v1/schedules/{id}`, an in-place
+already served. Schedules use `SKIP` overlap; one registered from a template
+runs it as it is when it fires (`resolve_template`, IO queue, then `TaskName` / `TaskMap`
+upserted; docs/tasks.md), a template's delete takes its schedules, and only the trigger is editable (`PATCH /api/v1/schedules/{id}`, an in-place
 `ScheduleHandle.update` that swaps the spec). `map_name`/template ids ride in the schedule
 **memo**; the cron string does **not** — a schedule memo cannot be rewritten by an update
 (server 1.29.7 ignores `UpdateScheduleRequest.memo`), so the cron is registered as
