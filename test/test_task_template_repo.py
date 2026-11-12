@@ -206,3 +206,141 @@ def test_rebind_map_of_an_unknown_map_moves_nothing(task_template_repo):
     )
 
     assert task_template_repo.rebind_map("ghost", "new") == 0
+
+
+# --- the 2026-11-12 purge of DOCK / UNDOCK steps ------------------------------
+#
+# Rows are written straight through the repo, as an older backend left them:
+# the router can no longer accept these step types, which is the point.
+
+_DOCK = {"id": "2-dock", "type": "DOCK", "params": {"x": 3.0, "y": 1.0, "theta": 180.0},
+         "vertex_id": None, "vertex_name": None}
+_UNDOCK = {"id": "3-undock", "type": "UNDOCK", "params": None}
+_STANDUP = {"id": "4-standup", "type": "STANDUP", "params": None}
+
+
+def _purge(logger, engine):
+    from syncai_backend.repositories.task.task_template import purge_retired_steps
+
+    return purge_retired_steps(logger, engine)
+
+
+def test_purge_strips_dock_steps_and_keeps_the_rest_in_order(
+    task_template_repo, logger, engine
+):
+    row = task_template_repo.create_task_template(
+        name="mixed", description="", map_name="lab",
+        steps=_steps("1-move") + [_DOCK, _UNDOCK, _STANDUP],
+    )
+
+    summary = _purge(logger, engine)
+
+    assert summary["stripped"] == [str(row.id)] and summary["deleted"] == []
+    kept = task_template_repo.get_task_template(row.id)
+    assert [step["id"] for step in kept.steps] == ["1-move", "4-standup"]
+    # Every key of a kept step survives, explicit nulls included.
+    assert kept.steps[0] == _steps("1-move")[0]
+    # A MOVE is left, so the map stays.
+    assert kept.map_name == "lab"
+
+
+def test_purge_deletes_a_template_that_only_docked(task_template_repo, logger, engine):
+    row = task_template_repo.create_task_template(
+        name="charge", description="", map_name="lab", steps=[_DOCK, _UNDOCK]
+    )
+
+    summary = _purge(logger, engine)
+
+    assert summary["deleted"] == [str(row.id)]
+    assert task_template_repo.get_task_template(row.id) is None
+
+
+def test_purge_clears_the_map_of_a_template_left_without_a_pose(
+    task_template_repo, logger, engine
+):
+    # The router refuses a map on a template with no MOVE / PATROL, so the next
+    # PUT would 400 on a rule the operator never broke.
+    row = task_template_repo.create_task_template(
+        name="dock-then-stand", description="", map_name="lab", steps=[_DOCK, _STANDUP]
+    )
+
+    summary = _purge(logger, engine)
+
+    assert summary["unmapped"] == [str(row.id)]
+    kept = task_template_repo.get_task_template(row.id)
+    assert ([step["id"] for step in kept.steps], kept.map_name) == (["4-standup"], None)
+
+
+def test_purge_leaves_a_template_without_dock_steps_untouched(
+    task_template_repo, logger, engine
+):
+    row = task_template_repo.create_task_template(
+        name="plain", description="", map_name="lab", steps=_steps("1-move")
+    )
+
+    assert _purge(logger, engine) == {"stripped": [], "deleted": [], "unmapped": []}
+    assert task_template_repo.get_task_template(row.id).updated_at == row.updated_at
+
+
+def test_purge_a_second_time_finds_nothing(task_template_repo, logger, engine):
+    task_template_repo.create_task_template(
+        name="mixed", description="", map_name="lab", steps=_steps("1-move") + [_DOCK]
+    )
+    task_template_repo.create_task_template(
+        name="charge", description="", map_name="lab", steps=[_DOCK]
+    )
+
+    first = _purge(logger, engine)
+    second = _purge(logger, engine)
+
+    assert (len(first["stripped"]), len(first["deleted"])) == (1, 1)
+    assert second == {"stripped": [], "deleted": [], "unmapped": []}
+    assert len(task_template_repo.list_task_templates()) == 1
+
+
+def test_purge_runs_when_the_repo_is_built(logger, engine, task_template_repo):
+    # What a deployed backend does at startup: init_task_template_repo purges.
+    from syncai_backend.repositories.task.task_template import init_task_template_repo
+
+    row = task_template_repo.create_task_template(
+        name="mixed", description="", map_name="lab", steps=_steps("1-move") + [_DOCK]
+    )
+
+    repo = init_task_template_repo(logger=logger, engine=engine)
+
+    assert [step["id"] for step in repo.get_task_template(row.id).steps] == ["1-move"]
+
+
+def test_a_purged_template_reads_back_through_the_router(
+    task_template_repo, map_repo, logger, engine
+):
+    # The point of the purge: the list that a DOCK step used to 500 now reads.
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from unittest.mock import MagicMock
+
+    from syncai_backend.interfaces.rest.routers.task_template import (
+        init_task_template_router,
+    )
+
+    task_template_repo.create_task_template(
+        name="mixed", description="", map_name="lab",
+        steps=_steps("1-move") + [dict(_DOCK, group="g"), dict(_STANDUP, group="g")],
+    )
+    _purge(logger, engine)
+
+    catalog = MagicMock()
+    catalog.active_name.return_value = "lab"
+    app = FastAPI()
+    app.include_router(
+        init_task_template_router(
+            logger=logger,
+            task_template_repo=task_template_repo,
+            map_repo=map_repo,
+            map_catalog_repo=catalog,
+            workflow_gw=MagicMock(),
+        )
+    )
+    body = TestClient(app).get("/api/v1/task_templates").json()
+
+    assert [step["id"] for step in body[0]["steps"]] == ["1-move", "4-standup"]

@@ -7,16 +7,16 @@ Interactive docs: `http://<robot>:3000/docs`.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
-| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL / DOCK is checked against the loaded map — 409 `map_mismatch`, see [*A job's map is checked twice*](tasks.md); stand / lie down / UNDOCK never are. 409 `task_running` while any task runs — one task at a time. **Or** `{id, continue_from, kind?, name?}` instead of `steps` (exactly one; 400 otherwise, and with `map_name`): a new run of a FAILED task from the failed step on — see [*Continuing a failed task*](tasks.md). The answer then carries `continued_from` and `from_step_id` (both `null` otherwise) |
-| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE` / `DOCK` / `UNDOCK`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), for a running `PATROL` one built from its feedback (`Patrolling: 3 of 5 waypoints left, 12.4 m to go`), empty otherwise — plus `started_at` / `ended_at` (UTC, `null` until then and for runs older than the fields), `paused_seconds` (a hold while the step was under way; the step's own time is `ended_at − started_at − paused_seconds`) and `waypoints_passed` (a PATROL's progress, 0 for every other step). A step `SKIPPED` was got past by the failed run this one continues. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
+| POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL is checked against the loaded map — 409 `map_mismatch`, see [*A job's map is checked twice*](tasks.md); stand / lie down / SPEAK / WAIT never are. 409 `task_running` while any task runs — one task at a time. **Or** `{id, continue_from, kind?, name?}` instead of `steps` (exactly one; 400 otherwise, and with `map_name`): a new run of a FAILED task from the failed step on — see [*Continuing a failed task*](tasks.md). The answer then carries `continued_from` and `from_step_id` (both `null` otherwise) |
+| GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), for a running `PATROL` one built from its feedback (`Patrolling: 3 of 5 waypoints left, 12.4 m to go`), empty otherwise — plus `started_at` / `ended_at` (UTC, `null` until then and for runs older than the fields), `paused_seconds` (a hold while the step was under way; the step's own time is `ended_at − started_at − paused_seconds`) and `waypoints_passed` (a PATROL's progress, 0 for every other step). A step `SKIPPED` was got past by the failed run this one continues. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |
 | DELETE | `/api/v1/tasks/{id}` | Request cancellation; answers `CANCELING` — the final state (possibly still `COMPLETED`) comes from GET |
-| POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` / `DOCK` / `UNDOCK` / `PATROL` is interrupted at once and re-sent on resume (a PATROL past the waypoints it had passed), a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see [*Task orchestration*](tasks.md). 409 `task_not_running` once closed; 404 for another robot's id |
+| POST | `/api/v1/tasks/{id}/pause` · `/resume` | Hold / release the running task — *requests* (workflow signals): pause answers `PAUSING`, resume `IN_PROGRESS`; the hold is read back from GET. A `MOVE` / `PATROL` is interrupted at once and re-sent on resume (a PATROL past the waypoints it had passed), a `WAIT` freezes its countdown, a `SPEAK` or posture step finishes first — see [*Task orchestration*](tasks.md). 409 `task_not_running` once closed; 404 for another robot's id |
 | GET | `/api/v1/active_tasks` | What runs on this robot's queue now, *whoever* started it, with `source` / `schedule_id` / `kind` / `name` / `map_name` (the run's `TaskMap`; for a run older than the attribute, the loaded map unless it is a stand / lie down; `null` for a run that drives nowhere). A held run is still listed as `IN_PROGRESS`. Beside `tasks`, `recently_ended`: the runs that closed in the last `RECENTLY_ENDED_WINDOW_S` (10 s), newest first, with `ended_at` and the map as stamped, from the same visibility query (an `OR CloseTime >=` in the filter, no second RPC). A run that starts and fails between two polls is never in `tasks`, so this is how a console that did not start it learns how it ended; nothing in it is running, holds a map or makes `_require_idle` refuse. Not `/tasks/active`, which would shadow `/tasks/{id}` |
 | GET | `/api/v1/task_history` | **Finished** runs, newest close first, one visibility page per call. Query: `page_size` (1–100, default 20), `page_token` (previous `next_page_token`), `status` (`COMPLETED` / `FAILED` / `CANCELED`), `since` / `until` (close time; naive is UTC; `until` before `since` is 400), `kind` (`goal` / `standup` / `liedown` / `task` / `schedule`), `name` (exact template name). `kind` / `name` / `map_name` are `null` for runs dispatched without them or predating the attribute — no fallback. Bounded by namespace retention |
 | GET | `/api/v1/task_history/stats` | The same runs counted: `total`, `by_status`, `success_rate` (`COMPLETED` / `total`, `null` when nothing finished). Same filters as `task_history`; one count RPC |
 | GET | `/api/v1/task_history/export` | The report: every finished run in the filter as CSV (UTF-8 with BOM, for Excel), **one row per step**, oldest close first. Same filters as `task_history` (no paging) plus `tz` (IANA, e.g. `Asia/Taipei`; times are written in it, UTC when omitted; 400 for an unknown one). Read from PostgreSQL's `task_record`, not Temporal, so it reaches back 30 days — see *The run record* |
 | POST | `/api/v1/route_preview` | The route the robot would drive from where it stands to a goal, planned as a MOVE's would be but never sent ([*Route preview*](ros-interfaces.md)). Body: a MOVE's params (`x`, `y`, `theta` in degrees, `z` the floor's ground) plus `map_name?`. 200 `{reachable, points, length_m, code, message}` — `points` the route's `[x, y, z]` (thinned like the live route), `length_m` along it in 3D; with `reachable: false` when there is no route, `code` (`goal_in_keepout`, `no_valid_path`, `map_not_loaded`, …) and `message` the sentence the job would have failed with. 409 `map_mismatch` (as `POST /api/v1/tasks`), 409 `preview_superseded` when a newer preview replaced it, 502 when there is no planner to ask (not in Navigation). Not refused while a job runs: it moves nothing. Not `/tasks/preview`, for the reason `active_tasks` gives |
-| GET | `/api/v1/task_steps` | The steps an operator builds a job from, for a client to draw its editor with: each step's `type`, operator `label` and `hint`, `occupies_body` (`BODY_STEP_TYPES`: a group takes at most one), `while_walking` (offered on the walk to a stop: SPEAK alone — a WAIT in a MOVE's group only stretches the walk) and `params`, a list of fields of five kinds — `waypoint` (a pose on the job's map, spread into `x` / `y` / `theta` / `z` and the template's `vertex_id` on the wire; `filter: "charger"` on a DOCK), `waypoints` (PATROL's ordered list of such poses, `min_items: 2`, sent as `params.waypoints` and the template's index-aligned `vertex_ids`), `text`, `integer`, `number` — whose limits are read off `SpeakParams` / `WaitParams` / `PatrolParams`, so they cannot drift from the validators. UNDOCK is not listed: a MOVE backs off the dock by itself. No gateway behind it (`tasks/catalogue.py`). Not `/tasks/steps`, for the reason `active_tasks` gives |
+| GET | `/api/v1/task_steps` | The steps an operator builds a job from, for a client to draw its editor with: each step's `type`, operator `label` and `hint`, `occupies_body` (`BODY_STEP_TYPES`: a group takes at most one), `while_walking` (offered on the walk to a stop: SPEAK alone — a WAIT in a MOVE's group only stretches the walk) and `params`, a list of fields of five kinds — `waypoint` (a pose on the job's map, spread into `x` / `y` / `theta` / `z` and the template's `vertex_id` on the wire; an optional `filter: "charger"` offers only charging waypoints — no listed step sets it since DOCK was removed), `waypoints` (PATROL's ordered list of such poses, `min_items: 2`, sent as `params.waypoints` and the template's index-aligned `vertex_ids`), `text`, `integer`, `number` — whose limits are read off `SpeakParams` / `WaitParams` / `PatrolParams`, so they cannot drift from the validators. Every `StepType` is listed (DOCK / UNDOCK were removed on 2026-11-12). No gateway behind it (`tasks/catalogue.py`). Not `/tasks/steps`, for the reason `active_tasks` gives |
 | POST | `/api/v1/schedules` | Create a schedule (cron **or** interval). A cron with its own `#`, a `CRON_TZ=`/`TZ=` prefix (use `timezone`) or `@every` (use `interval_seconds`) is 400 — see [*Task orchestration*](tasks.md) |
 | GET | `/api/v1/schedules` | List with next run times. This robot's only, filtered by the server on the schedule's `RobotId` (see [*Provenance*](tasks.md) under task history) |
 | GET | `/api/v1/schedules/{id}` | Describe one. `steps` are those it was registered with: with a `task_template_id` only the fallback, since each run reads the template as it fires. `task_template_name` is the template's name now (the memo's once it is gone), here and in the list |
@@ -81,7 +81,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | GET | `/api/v1/webrtc/status` | `library_loaded` plus the `video` / `audio` / `duplex` slots (`session_id`, `age_seconds`) as this backend believes them. No callback from the worker, so an abandoned session reads live until the next create preempts it. Deliberately not in `/health` |
 | WS | `/api/v1/robot/pointcloud/stream` | Live `body_cloud`, ~10 Hz |
 | WS | `/api/v1/robot/pointcloud/map/stream` | pgo's merged "map so far", every few seconds at most, mapping mode only; each frame replaces the whole layer |
-| WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (1 Hz), `dock_path` (2 Hz), and while a navigation runs `local_costmap` (2 Hz) and `local_plan` (5 Hz) |
+| WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (1 Hz), and while a navigation runs `local_costmap` (2 Hz) and `local_plan` (5 Hz) |
 
 **A job's map is read-only while it runs.** Vertex create / update / delete,
 `PUT …/keepout` and `PUT …/octomap/edits` answer 409 `task_running`
@@ -115,8 +115,8 @@ silence from here).
 **The local picture rides the same socket, only while a navigation runs**
 (2026-10-20): `local_costmap`, the controller's 4 × 4 m rolling costmap (the
 terrain layer's, inflated), and
-`local_plan`, the 2 s trajectory MPPI is following. "Runs" is a MOVE, DOCK or
-UNDOCK goal this process sent that has not ended (`RobotGateway.navigation_active`)
+`local_plan`, the 2 s trajectory MPPI is following. "Runs" is a MOVE or PATROL
+goal this process sent that has not ended (`RobotGateway.navigation_active`)
 — not a route on `plan`, which the planner keeps re-sending after a success and
 a failure. When the goal ends, however it ends, each client gets one empty
 frame of each (`width` 0, `points` []), the clear; a goal sent from rviz or the
@@ -272,9 +272,7 @@ A `CHARGE` vertex's `theta` is **the charger's own heading, out of its face** �
 towards a robot in front of it — however it was placed. One placed with the
 console's *Detect* (`POST /api/v1/landmarks/detect`) carries the charger's marker
 as measured: its centre, `theta` out of its face, `z` the floor under the robot
-that saw it. A DOCK step turns that `theta` round before dock.xml has it
-(`_facing_params` in `temporal/activities.py`), since DockToPose drives onto a
-pose the robot faces the charger on and the staging pose is backed off along it.
+that saw it.
 
 ## Task templates
 
@@ -291,11 +289,9 @@ the include-order note in `server.py`).
   step *order*, and a child table would be rewritten whole on every edit anyway.
   **Forward-compat rule: only add optional keys to a stored step; never rename,
   retype or repurpose one.**
-- **A MOVE / DOCK step keeps both a `vertex_id` and a `params` snapshot**
-  (a DOCK typically references a `CHARGE` vertex; an UNDOCK has no params and
-  cannot reference one); every read
+- **A MOVE step keeps both a `vertex_id` and a `params` snapshot**; every read
   reports `resolved_params` — the vertex's *current* pose if it exists
-  (`vertex_status: CURRENT`), else the snapshot (`MISSING`). Moving a dock
+  (`vertex_status: CURRENT`), else the snapshot (`MISSING`). Moving a vertex
   updates every template using it. Resolution is server-side (one
   implementation); the client dispatches by sending `resolved_params` through
   `POST /api/v1/tasks`.
@@ -310,7 +306,7 @@ the include-order note in `server.py`).
   counts the step once). An unknown or other-map vertex is 400 naming the
   waypoint (1-based, `Step 'p' waypoint 3 …`), and so is a MISSING one when the
   template is scheduled.
-- **Map scoping keys off "contains a MOVE / PATROL / DOCK", not "references a
+- **Map scoping keys off "contains a MOVE / PATROL", not "references a
   vertex"** — a hand-typed `(x, y, theta)` is in a map's frame too. Any such step ⇒
   `map_name`
   required; none ⇒ `map_name` absent, runs anywhere. A template for a map that is

@@ -19,7 +19,6 @@ import asyncio
 import dataclasses
 import math
 import threading
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -36,7 +35,6 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     PatrolParams,
     SpeakParams,
 )
-from syncai_backend.services.dock_state import DockStateService  # noqa: E402
 from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.temporal.activities import RobotActivities  # noqa: E402
 
@@ -62,22 +60,7 @@ def map_catalog_repo():
 
 
 @pytest.fixture
-def robot_repo():
-    repo = MagicMock()
-    # No robot_state yet: the auto-undock never fires unless a test sets one.
-    repo.get_robot_state.return_value = None
-    return repo
-
-
-@pytest.fixture
-def dock_state():
-    return DockStateService()
-
-
-@pytest.fixture
-def activities(
-    logger, robot_gw, tts_gw, map_catalog_repo, robot_repo, dock_state
-) -> RobotActivities:
+def activities(logger, robot_gw, tts_gw, map_catalog_repo) -> RobotActivities:
     return RobotActivities(
         logger=logger,
         robot_gw=robot_gw,
@@ -88,22 +71,9 @@ def activities(
             map_catalog_repo=map_catalog_repo,
             task_template_repo=None,
         ),
-        robot_repo=robot_repo,
-        dock_state=dock_state,
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
-    )
-
-
-def _robot_state(x=0.0, y=0.0, theta_deg=0.0, motion_state=5, localized=True):
-    """The fields of syncai_common's RobotState the auto-undock reads."""
-    return SimpleNamespace(
-        localization_valid=localized,
-        localization_status=SimpleNamespace(
-            position=SimpleNamespace(x=x, y=y, yaw=math.radians(theta_deg))
-        ),
-        low_level_mode=SimpleNamespace(motion_state=motion_state),
     )
 
 
@@ -198,7 +168,7 @@ class TestExecuteMove:
     )
     def test_a_failure_that_may_clear_is_retried(self, env, activities, robot_gw, code):
         # A person on the goal (206) or across the way (208), a map still
-        # loading (221), no finer reason (200), a controller or dock failure,
+        # loading (221), no finer reason (200), a controller failure,
         # an abort before the tree ran (0).
         robot_gw.move.return_value = (True, "", "goal-1")
         robot_gw.get_move_status.return_value = {
@@ -305,7 +275,7 @@ class TestExecuteMove:
         robot_gw.cancel_active_moves.assert_called_once()
 
     def test_a_cancelled_move_leaves_the_gait_alone(self, env, activities, robot_gw):
-        # move.xml never leaves RL; only the dock trees need it put back.
+        # move.xml never leaves RL, so a cancel puts no gait back.
         robot_gw.move.return_value = (True, "", "goal-1")
         robot_gw.get_move_status.side_effect = CancelledError()
 
@@ -314,137 +284,6 @@ class TestExecuteMove:
 
         robot_gw.set_motion_key.assert_not_called()
         assert "behavior_tree" not in robot_gw.move.call_args[1]
-
-
-class TestExecuteDock:
-    """DOCK / UNDOCK are execute_move on the dock trees: same send, poll and
-    cancel, plus putting RL back when a tree is cut short. Only DOCK has a pose,
-    so only DOCK meets the map check."""
-
-    def test_sends_the_dock_pose_on_its_tree_facing_the_charger(
-        self, env, activities, robot_gw
-    ):
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
-
-        result = env.run(
-            activities.execute_dock, MoveParams(x=1.0, y=2.0, theta=90.0), "lab"
-        )
-
-        assert result.success is True
-        kwargs = robot_gw.move.call_args[1]
-        assert kwargs["behavior_tree"] == "dock.xml"
-        assert (kwargs["x"], kwargs["y"]) == (1.0, 2.0)
-        # The charger faces +y; the robot docks facing it, -y. Turned the
-        # other way, dock.xml's staging pose lands inside the charger's wall.
-        assert kwargs["yaw"] == pytest.approx(-1.5707963)
-
-    @pytest.mark.parametrize(
-        "charger, docked", [(0.0, 180.0), (180.0, 0.0), (-45.0, 135.0), (135.0, -45.0)]
-    )
-    def test_the_turned_heading_stays_in_moveparams_bounds(
-        self, env, activities, robot_gw, charger, docked
-    ):
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
-
-        env.run(activities.execute_dock, MoveParams(x=0.0, y=0.0, theta=charger), "lab")
-
-        assert robot_gw.move.call_args[1]["yaw"] == pytest.approx(math.radians(docked))
-
-    def test_an_undock_sends_an_empty_pose_on_its_tree(
-        self, env, activities, robot_gw
-    ):
-        # undock.xml backs out 1 m from where the robot stands and reads no pose.
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
-
-        result = env.run(activities.execute_undock)
-
-        assert result.success is True
-        kwargs = robot_gw.move.call_args[1]
-        assert kwargs == {"x": 0.0, "y": 0.0, "yaw": 0.0, "behavior_tree": "undock.xml"}
-
-    def test_an_undock_drives_whatever_map_is_loaded(
-        self, env, activities, robot_gw, map_catalog_repo
-    ):
-        # No coordinates, so a map switch cannot make them wrong.
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
-
-        result = env.run(activities.execute_undock)
-
-        assert result.success is True
-        map_catalog_repo.active_name.assert_not_called()
-
-    def test_a_failed_dock_carries_the_robots_reason(self, env, activities, robot_gw):
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.return_value = {
-            "goal_id": "goal-1",
-            "state": "aborted",
-            "error_code": 300,
-            "error_msg": "controller dock_to_pose aborted the goal (error_code 304)",
-        }
-
-        with pytest.raises(ApplicationError) as exc_info:
-            env.run(activities.execute_dock, MoveParams(x=0.0, y=0.0, theta=0.0))
-
-        assert str(exc_info.value) == (
-            "dock ended in aborted: "
-            "controller dock_to_pose aborted the goal (error_code 304)"
-        )
-        assert exc_info.value.non_retryable is False
-
-    def test_a_rejected_undock_is_retryable(self, env, activities, robot_gw):
-        robot_gw.move.return_value = (False, "server not available", None)
-
-        with pytest.raises(ApplicationError, match="Undock rejected") as exc_info:
-            env.run(activities.execute_undock)
-
-        assert exc_info.value.non_retryable is False
-
-    def test_a_dock_from_another_map_never_sends_a_goal(
-        self, env, activities, robot_gw
-    ):
-        with pytest.raises(ApplicationError) as exc_info:
-            env.run(
-                activities.execute_dock,
-                MoveParams(x=0.0, y=0.0, theta=0.0),
-                "warehouse",
-            )
-
-        assert exc_info.value.non_retryable is True
-        assert exc_info.value.type == "map_mismatch"
-        robot_gw.move.assert_not_called()
-
-    def test_a_cancel_cancels_the_goal_then_restores_locomotion(
-        self, env, activities, robot_gw
-    ):
-        # A halted dock tree stays in MPC; the next MOVE needs RL.
-        order = []
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.side_effect = CancelledError()
-        robot_gw.cancel_active_moves.side_effect = lambda: order.append("cancel")
-        robot_gw.set_motion_key.side_effect = lambda key: (
-            order.append(key) or (True, "")
-        )
-
-        with pytest.raises(CancelledError):
-            env.run(activities.execute_dock, MoveParams(x=0.0, y=0.0, theta=0.0))
-
-        assert order == ["cancel", MotionKey.LOCOMOTION]
-
-    def test_a_refused_restore_does_not_mask_the_cancel(
-        self, env, activities, robot_gw
-    ):
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.side_effect = CancelledError()
-        robot_gw.set_motion_key.side_effect = RuntimeError("safety lock")
-
-        with pytest.raises(CancelledError):
-            env.run(activities.execute_undock)
-
-        robot_gw.cancel_active_moves.assert_called_once()
 
 
 class TestMoveMapCheck:
@@ -772,152 +611,6 @@ class TestReportStarted:
         )
 
 
-class TestAutoUndock:
-    """A MOVE after a DOCK backs the robot off the dock first (undock.xml),
-    standing it up before that when it lies there; services/dock_state.py has
-    why the backend, not the task runner, keeps the dock."""
-
-    DOCK = MoveParams(x=3.0, y=-1.5, theta=90.0)
-
-    @pytest.fixture(autouse=True)
-    def _goals_succeed(self, robot_gw):
-        robot_gw.move.return_value = (True, "", "goal-1")
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
-        robot_gw.set_motion_key.return_value = (True, "")
-
-    @staticmethod
-    def _trees(robot_gw):
-        return [c.kwargs.get("behavior_tree", "") for c in robot_gw.move.call_args_list]
-
-    def test_a_successful_dock_records_its_pose_and_map(
-        self, env, activities, dock_state
-    ):
-        env.run(activities.execute_dock, self.DOCK, "lab")
-
-        # As the robot stands on it: turned round from the charger's 90 deg.
-        record = dock_state.current()
-        assert (record.map, record.x, record.y, record.theta_deg) == ("lab", 3.0, -1.5, -90.0)
-
-    def test_a_dock_without_a_run_map_records_the_loaded_one(
-        self, env, activities, dock_state
-    ):
-        env.run(activities.execute_dock, self.DOCK)
-
-        assert dock_state.current().map == "lab"
-
-    def test_a_failed_dock_records_nothing(self, env, activities, robot_gw, dock_state):
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "aborted"}
-
-        with pytest.raises(ApplicationError):
-            env.run(activities.execute_dock, self.DOCK, "lab")
-
-        assert dock_state.current() is None
-
-    def test_an_undock_forgets_the_dock(self, env, activities, dock_state):
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-
-        env.run(activities.execute_undock)
-
-        assert dock_state.current() is None
-
-    def test_a_move_with_no_dock_just_moves(self, env, activities, robot_gw, robot_repo):
-        robot_repo.get_robot_state.return_value = _robot_state(3.0, -1.5, 90.0)
-
-        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
-
-        assert self._trees(robot_gw) == [""]
-
-    def test_a_move_on_the_dock_undocks_first(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-        # Within the tolerances, standing in MPC as dock.xml leaves it.
-        robot_repo.get_robot_state.return_value = _robot_state(3.05, -1.45, 95.0)
-
-        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
-
-        assert self._trees(robot_gw) == ["undock.xml", ""]
-        robot_gw.set_motion_key.assert_not_called()
-        assert dock_state.current() is None
-
-    def test_a_move_from_lying_on_the_dock_stands_up_first(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-        order = []
-        robot_repo.get_robot_state.side_effect = [
-            _robot_state(3.0, -1.5, 90.0, motion_state=2),  # the on-dock check
-            _robot_state(3.0, -1.5, 90.0, motion_state=2),  # still getting up
-            _robot_state(3.0, -1.5, 90.0, motion_state=0),  # standing
-        ]
-        robot_gw.set_motion_key.side_effect = lambda key: order.append(key) or (True, "")
-        robot_gw.move.side_effect = lambda **kw: (
-            order.append(kw.get("behavior_tree", "")) or (True, "", "goal-1")
-        )
-
-        with patch(SLEEP):
-            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
-
-        assert order == [MotionKey.STAND, "undock.xml", ""]
-
-    def test_a_robot_that_never_stands_fails_the_attempt_retryably(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-        robot_repo.get_robot_state.return_value = _robot_state(
-            3.0, -1.5, 90.0, motion_state=2
-        )
-
-        with patch("syncai_backend.temporal.activities.STAND_UP_TIMEOUT_S", 0.0):
-            with pytest.raises(ApplicationError, match="did not report standing") as exc:
-                env.run(
-                    activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab"
-                )
-
-        assert exc.value.non_retryable is False
-        robot_gw.move.assert_not_called()
-        # Still on the dock: the next attempt tries again.
-        assert dock_state.current() is not None
-
-    def test_a_robot_moved_off_the_dock_forgets_it_and_just_moves(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        # Teleop drove it away: a blind back-out from here is what must not happen.
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-        robot_repo.get_robot_state.return_value = _robot_state(5.0, -1.5, 90.0)
-
-        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
-
-        assert self._trees(robot_gw) == [""]
-        assert dock_state.current() is None
-
-    def test_a_move_refused_for_its_map_never_backs_out(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-        robot_repo.get_robot_state.return_value = _robot_state(3.0, -1.5, 90.0)
-
-        with pytest.raises(ApplicationError):
-            env.run(
-                activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "warehouse"
-            )
-
-        robot_gw.move.assert_not_called()
-
-    def test_a_failed_undock_fails_the_move_and_keeps_the_dock(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        dock_state.record("lab", 3.0, -1.5, 90.0)
-        robot_repo.get_robot_state.return_value = _robot_state(3.0, -1.5, 90.0)
-        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "aborted"}
-
-        with pytest.raises(ApplicationError, match="undock ended in aborted"):
-            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
-
-        assert self._trees(robot_gw) == ["undock.xml"]
-        assert dock_state.current() is not None
-
-
 def _patrol_params(count=4):
     # Waypoint i at x = i, on alternate storeys, the last facing -90 deg.
     return PatrolParams(
@@ -1144,7 +837,7 @@ class TestExecutePatrol:
             env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
 
         robot_gw.cancel_active_moves.assert_called_once()
-        # No dock tree ran, so no gait to put back.
+        # patrol.xml never leaves RL, so no gait to put back.
         robot_gw.set_motion_key.assert_not_called()
 
     def test_a_patrol_planned_on_another_map_is_refused(self, env, activities, robot_gw):
@@ -1153,20 +846,6 @@ class TestExecutePatrol:
 
         assert raised.value.non_retryable is True
         robot_gw.patrol.assert_not_called()
-
-    def test_a_patrol_takes_the_robot_off_the_dock_first(
-        self, env, activities, robot_gw, robot_repo, dock_state
-    ):
-        dock_state.record("lab", 0.0, 0.0, 0.0)
-        robot_repo.get_robot_state.return_value = _robot_state()
-        robot_gw.move.return_value = (True, "", "undock")
-        robot_gw.patrol.return_value = (True, "", "p")
-        robot_gw.get_move_status.return_value = _patrol_status("succeeded")
-
-        env.run(activities.execute_patrol, _patrol_params(), "lab", "s1", 0)
-
-        assert robot_gw.move.call_args.kwargs["behavior_tree"] == "undock.xml"
-        robot_gw.patrol.assert_called_once()
 
 
 class TestResolveTemplate:
@@ -1184,8 +863,6 @@ class TestResolveTemplate:
                 map_catalog_repo=map_catalog_repo,
                 task_template_repo=None,
             ),
-            robot_repo=MagicMock(),
-            dock_state=DockStateService(),
             task_record_repo=MagicMock(),
             task_template_repo=task_template_repo,
             map_repo=map_repo,

@@ -73,8 +73,6 @@ ACTIVITY_MAP = {
     StepType.STANDUP: RobotActivities.execute_stand,
     StepType.LIEDOWN: RobotActivities.execute_lie_down,
     StepType.SPEAK: RobotActivities.execute_speak,
-    StepType.DOCK: RobotActivities.execute_dock,
-    StepType.UNDOCK: RobotActivities.execute_undock,
     StepType.PATROL: RobotActivities.execute_patrol,
 }
 
@@ -409,9 +407,8 @@ class RobotWorkflow:
 
         # Postures take no argument; passing None would fail the arg-count check.
         args = [] if step.params is None else [step.params]
-        # MOVE / DOCK get the map as a second argument only when there is one, so old
-        # one-argument histories and runs without the attribute look the same. UNDOCK
-        # has no pose to check against it and takes no argument at all.
+        # MOVE gets the map as a second argument only when there is one, so old
+        # one-argument histories and runs without the attribute look the same.
         if step.type in POSE_STEP_TYPES and own_map is not None:
             args.append(own_map)
         # PATROL is new, so no old history constrains it: always the map (None
@@ -459,7 +456,7 @@ class RobotWorkflow:
         new_activity_id = (lambda: self._new_dispatch_id(step)) if report_start else None
 
         # A pause that landed before this step holds here, before dispatch. That is
-        # the whole hold for SPEAK and postures; MOVE / DOCK / UNDOCK and WAIT are
+        # the whole hold for SPEAK and postures; MOVE / PATROL and WAIT are
         # interrupted below.
         try:
             await self._hold(step)
@@ -503,9 +500,7 @@ class RobotWorkflow:
     async def _run_move(
         self, step: Step, activity_fn, activity_options: dict, new_activity_id=None
     ) -> ActivityResult:
-        """Run a MOVE / DOCK / UNDOCK, letting a pause interrupt it and a resume
-        re-send it (a dock from its staging leg; an undock backs out a further
-        metre from wherever the pause stopped it, since its goal has no pose).
+        """Run a MOVE / PATROL, letting a pause interrupt it and a resume re-send it.
 
         Never ``await handle`` directly: that lets a run cancel be swallowed into
         ActivityError(cause=CancelledError), indistinguishable from the pause's own.

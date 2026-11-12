@@ -20,12 +20,13 @@ PathSink = Callable[[Tuple[Tuple[float, float, float], ...], float], None]
 
 
 class PathSubscriber:
-    """Feeds one of TelemetryRepo's path slots, and therefore the telemetry
+    """Feeds TelemetryRepo's route slot, and therefore the telemetry
     WebSocket, from a map-frame ``nav_msgs/Path`` topic: the planner's
-    ``plan`` (``init_path_subscriber``) or the docking controller's
-    ``docking_plan`` (``init_docking_plan_subscriber``). The two share the
-    frame gate, the thinning and the empty-means-clear rule, which is why
-    they are one class with the topic and the slot as arguments.
+    ``plan`` (``init_path_subscriber``). The topic and the slot are arguments
+    because a second map-frame path, the docking controller's
+    ``docking_plan``, shared the frame gate, the thinning and the
+    empty-means-clear rule until it went with the robot stack's dock trees
+    (2026-11).
 
     Apart from TelemetrySubscriber: a route arrives once a second in the map
     frame (no TF) and wants different QoS. Not the controller's
@@ -73,8 +74,8 @@ class PathSubscriber:
     def _plan_cb(self, msg: Path):
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        # An empty path is a clear (the planner's clear_plan, controller_server
-        # at the end of every dock goal), and it is honoured in any frame: it
+        # An empty path is a clear (the planner's clear_plan), and it is
+        # honoured in any frame: it
         # carries no coordinates to misplace, and dropping one would leave the
         # old route up until the TTL.
         if not msg.poses:
@@ -116,30 +117,6 @@ def init_path_subscriber(
         logger=logger,
         topic="plan",
         sink=lambda points, stamp: telemetry_repo.update_path(points=points, stamp=stamp),
-    )
-    subscriber.register(node=node)
-    return subscriber
-
-
-def init_docking_plan_subscriber(
-    logger: structlog.stdlib.BoundLogger, node: Node, telemetry_repo: TelemetryRepo
-) -> PathSubscriber:
-    """The DockingController's predicted approach onto the dock (2 Hz, map
-    frame), which the planner's ``plan`` does not cover: the final metre is
-    driven by a control law with no planner involved. The staging leg before
-    it is an ordinary plan and arrives on ``plan``.
-
-    Its own slot rather than the route's, so the console can draw the two
-    differently and a dock's clear never erases a route (or the reverse).
-    controller_server publishes the empty Path when the dock goal ends,
-    however it ends; the repo's TTL covers a controller that died mid-dock.
-    """
-    subscriber = PathSubscriber(
-        logger=logger,
-        topic="docking_plan",
-        sink=lambda points, stamp: telemetry_repo.update_docking_plan(
-            points=points, stamp=stamp
-        ),
     )
     subscriber.register(node=node)
     return subscriber

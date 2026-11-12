@@ -57,7 +57,7 @@ class Failure(str, Enum):
     PREVIEW_SUPERSEDED = "preview_superseded"
 
     # ParameterGateway: a parameter callback refused the value with a reason
-    # (DockingController's v_linear_min above v_linear_max, say). A 400: the
+    # (a v_linear_min above its v_linear_max, say). A 400: the
     # combination is the caller's to change; the schema's rules should have
     # said so first, so one of these is also a missing rule.
     PARAMETER_REFUSED = "parameter_refused"

@@ -290,10 +290,9 @@ FIELDS: tuple[SettingField, ...] = (
         max=2.0,
         step=0.1,
     ),
-    # Docking (Docking / Undocking, dock_goal_checker) is left off the page
-    # for now, by request (2026-11-03). DockingController's callback refuses a
-    # bad batch properly, so adding its fields back needs only rows here and
-    # the v_linear_min / v_linear_max rule.
+    # Docking (Docking / Undocking, dock_goal_checker) was left off the page by
+    # request (2026-11-03), and the robot stack has since removed the
+    # DockingController with its dock trees (2026-11): nothing to add back.
 )
 
 RULES: tuple[Rule, ...] = (

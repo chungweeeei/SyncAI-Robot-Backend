@@ -8,14 +8,15 @@ handle that can move the robot.
 
 Atomically, not ``set_parameters``: rclcpp hands the atomic call's whole list
 to each on-set callback at once, so a callback that judges a pair
-(DockingController's ``v_linear_min`` against ``v_linear_max``) sees both new
+(a ``v_linear_min`` against its ``v_linear_max``, as the since-removed
+DockingController's did) sees both new
 values, where ``set_parameters`` would try them one at a time and refuse the
 first of a pair that is only valid together.
 
 A refusal is not always a clean one. The callbacks of a node run in turn and
 rclcpp stops at the first that refuses -- after the ones before it already
 applied their share to their plugin. The controller's validating callbacks
-(RPP 3D, Docking) refuse before touching anything; controller_server's own,
+(RPP 3D) refuse before touching anything; controller_server's own,
 which refuses every undotted parameter while a goal runs, is registered first
 and so runs last. The caller therefore sends undotted parameters in a set of
 their own, and reads back after any refusal rather than assuming nothing moved.

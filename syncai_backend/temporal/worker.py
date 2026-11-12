@@ -13,6 +13,7 @@ from temporalio.worker import Worker
 
 from syncai_backend.temporal.workflows import RobotWorkflow
 from syncai_backend.temporal.activities import RobotActivities
+from syncai_backend.temporal.retired_schedules import purge_retired_schedule_steps
 from syncai_backend.tasks.config import io_task_queue, task_queue, temporal_server_url
 from syncai_backend.tasks.search_attributes import (
     ensure_search_attributes,
@@ -22,11 +23,9 @@ from syncai_backend.gateways.robot.robot import RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
-from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.map.map import MapRepo
 from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
-from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.map_usage import MapUsagePolicy
 
 # Same bounded retry as database/postgres.py (compose services may come up after the
@@ -183,6 +182,11 @@ async def run_worker(
     # must exist before the first run is stamped. Non-fatal.
     await ensure_search_attributes(client, logger)
 
+    # Before either worker polls: a schedule still holding a DOCK / UNDOCK step
+    # starts runs that cannot decode their input (temporal/retired_schedules.py).
+    # Here for the same reason as the line above. Non-fatal.
+    await purge_retired_schedule_steps(client, logger, task_queue(robot_id))
+
     # For STEP_STARTED_SIGNAL: activities run in executor threads, the client on this loop.
     activities.bind_client(client, asyncio.get_running_loop())
 
@@ -192,8 +196,6 @@ async def run_worker(
         workflows=[RobotWorkflow],
         activities=[
             activities.execute_move,
-            activities.execute_dock,
-            activities.execute_undock,
             activities.execute_patrol,
             activities.execute_stand,
             activities.execute_lie_down,
@@ -251,8 +253,6 @@ def start_temporal_worker(
     tts_gw: TtsGateway,
     map_catalog_repo: MapCatalogRepo,
     map_usage: MapUsagePolicy,
-    robot_repo: RobotRepo,
-    dock_state: DockStateService,
     task_record_repo: TaskRecordRepo,
     task_template_repo: TaskTemplateRepo,
     map_repo: MapRepo,
@@ -271,8 +271,6 @@ def start_temporal_worker(
                 tts_gw=tts_gw,
                 map_catalog_repo=map_catalog_repo,
                 map_usage=map_usage,
-                robot_repo=robot_repo,
-                dock_state=dock_state,
                 task_record_repo=task_record_repo,
                 task_template_repo=task_template_repo,
                 map_repo=map_repo,

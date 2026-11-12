@@ -68,7 +68,7 @@ class MoveState(str, Enum):
     REJECTED = "rejected"
 
 
-# One navigation goal: a NavigateToGoal (MOVE / DOCK / UNDOCK) or a PATROL's
+# One navigation goal: a NavigateToGoal (MOVE) or a PATROL's
 # NavigateThroughGoals, told apart by `patrol_total`. `feedback` is the latest
 # Feedback (what get_move_message reads beside a running step); `result` the
 # Result (error_code / error_msg, the same table on both actions). `lost` is
@@ -123,14 +123,6 @@ NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 # budget to fit under.
 PREVIEW_RESULT_WAIT_S = 6.0
 
-# NavigateToGoal.behavior_tree for the DOCK / UNDOCK steps: bare file names the task
-# runner resolves in its own behavior_trees/ (syncai_common >= bbcc958). dock.xml takes
-# the dock pose and works out the staging pose from it; undock.xml ignores the pose
-# (task runner e027dbe) and backs out 1 m from where the robot stands. Both drive
-# DockToPose themselves, so this process never calls that action. "" is the task
-# runner's default, move.xml.
-DOCK_BEHAVIOR_TREE = "dock.xml"
-UNDOCK_BEHAVIOR_TREE = "undock.xml"
 
 # NavigateThroughGoals.behavior_tree for a PATROL: "" is the task runner's
 # default for that action, patrol.xml (through every pose without stopping, the
@@ -651,8 +643,8 @@ class RobotGateway:
             )
 
     def navigation_active(self) -> bool:
-        """Whether a navigation this process sent (a MOVE, DOCK, UNDOCK or
-        PATROL goal) is still executing.
+        """Whether a navigation this process sent (a MOVE or PATROL goal) is
+        still executing.
 
         The telemetry stream's gate for the local costmap and the controller's
         local plan, which mean something only while the robot drives. Asked of

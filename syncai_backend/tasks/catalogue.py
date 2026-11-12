@@ -150,9 +150,8 @@ def _spec(step_type: StepType, label: str, hint: str, params: list) -> StepSpec:
 def step_catalogue() -> StepCatalogue:
     """Every step an operator authors, in the order the console offers them.
 
-    UNDOCK is left out: a MOVE backs the robot off the dock it last docked on
-    by itself (services/dock_state.py), so an operator never writes one, and
-    the console no longer loads a template that has one.
+    Every StepType is listed. (DOCK and UNDOCK were removed on 2026-11-12;
+    tasks/retired_steps.py purges the stored ones.)
     """
     text = _bounds(SpeakParams, "text")
     repeat = _bounds(SpeakParams, "repeat")
@@ -178,13 +177,6 @@ def step_catalogue() -> StepCatalogue:
                         min_items=waypoints["min_length"],
                     )
                 ],
-            ),
-            _spec(
-                StepType.DOCK,
-                "Dock",
-                "Go to a waypoint, then walk straight onto the charger there and "
-                "stay standing on it.",
-                [WaypointField(key="target", label="Charger", filter="charger")],
             ),
             _spec(
                 StepType.SPEAK,

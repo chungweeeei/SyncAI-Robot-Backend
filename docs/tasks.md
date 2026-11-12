@@ -7,20 +7,19 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 
 | StepType | Activity | What it does |
 |---|---|---|
-| `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg`. A robot still on the dock the last DOCK ended on is stood up (if lying) and undocked first — [*Auto-undock*](ros-interfaces.md) under [*Action client*](ros-interfaces.md) |
-| `PATROL` | `execute_patrol` | One `NavigateThroughGoals` through `PatrolParams.waypoints` (at least two `MoveParams`; only the last `theta` is turned to) — *PATROL* under [*Action client*](ros-interfaces.md). MOVE's map check and auto-undock, poll, heartbeat and pause interrupt. Never starts the round over: the heartbeat details carry how many waypoints are behind the robot (from `number_of_poses_remaining`), so a retry sends only the rest, and the activity signals the count to the run (`patrol_progress`, forward only), which re-dispatches a resumed patrol with it as the activity's `start`. The step's own `params` keep every waypoint; the last one is always sent. An abort fails it with the robot's reason, as a MOVE's (`patrol ended in aborted: …`), retried or not by its `error_code` |
-| `DOCK` / `UNDOCK` | `execute_dock` / `execute_undock` | `execute_move` on the dock trees (`behavior_tree` `dock.xml` / `undock.xml`, see [*Action client*](ros-interfaces.md)). DOCK's `MoveParams` is the charger's pose, `theta` out of its face, sent and recorded turned round (the heading the robot docks on), and gets MOVE's map check; UNDOCK takes no params, sends an empty pose and is checked against no map, since it backs out 1 m from wherever the robot stands. DOCK's success records the dock for the next MOVE's auto-undock, UNDOCK's forgets it; the console no longer offers UNDOCK, since a MOVE undocks by itself. Same poll, heartbeat and pause interrupt as MOVE; a cancel (or pause) also sends `MotionKey.LOCOMOTION`, best effort, because a halted dock tree stays in MPC |
+| `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg`. |
+| `PATROL` | `execute_patrol` | One `NavigateThroughGoals` through `PatrolParams.waypoints` (at least two `MoveParams`; only the last `theta` is turned to) — *PATROL* under [*Action client*](ros-interfaces.md). MOVE's map check, poll, heartbeat and pause interrupt. Never starts the round over: the heartbeat details carry how many waypoints are behind the robot (from `number_of_poses_remaining`), so a retry sends only the rest, and the activity signals the count to the run (`patrol_progress`, forward only), which re-dispatches a resumed patrol with it as the activity's `start`. The step's own `params` keep every waypoint; the last one is always sent. An abort fails it with the robot's reason, as a MOVE's (`patrol ended in aborted: …`), retried or not by its `error_code` |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.start_speak()` then `await_speak()` — queue the utterance on the speech service, then poll its job and heartbeat until it has played; a cancel `DELETE`s the job mid-sentence. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
 | `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the body queue's one-thread executor, no heartbeat, and it survives a backend restart with the time already served |
 
 (`ARTIFACT` — conveyor pickup/drop via the artifact backend's REST API — was
 removed 2026-08 with `gateways/artifact/`; templates or schedules still carrying
-one must be purged before deploying.)
+one must be purged before deploying. DOCK / UNDOCK steps (on `dock.xml` / `undock.xml`), the MOVE's auto-undock and the `dock_path` telemetry frame were removed on 2026-11-12, with the robot stack's dock trees, and the stored data cleaned the same day: the backend strips those steps from templates and schedules at startup (`tasks/retired_steps.py`).)
 
 **Which failures are retried (2026-11).** Every step activity runs under the
 workflow's `RetryPolicy` — three attempts, 5 s apart — and a failure raised
-`non_retryable` skips the rest. For a MOVE / DOCK / UNDOCK / PATROL that the
+`non_retryable` skips the rest. For a MOVE / PATROL that the
 robot aborted, the robot's `error_code` decides: `NON_RETRYABLE_NAV_CODES`
 (activities.py) are the planning reasons for which the same goal cannot succeed
 5 s later, and fail the step on the first attempt:
@@ -38,7 +37,7 @@ robot aborted, the robot's `error_code` decides: `NON_RETRYABLE_NAV_CODES`
 Everything else is retried: 200 (no finer reason), 202 TF, 205 / 206 nothing to
 stand on at the start / goal — which includes a person on it — 207 search
 timeout, 208 the way closed (a person across it, or a zone), 221 the map still
-loading, 1xx path following, 3xx docking, and an abort with no code (superseded
+loading, 1xx path following, and an abort with no code (superseded
 or never started). Before this a goal inside a keepout zone was sent three
 times and failed after ~10 s, for a reason the robot knew at once. The numbers
 are SyncAI-Robot-Interface's planning table (`ComputePathToPose.action`), the
@@ -55,7 +54,7 @@ rejoining a closed group, or a group's second body step):
 
 - a group's members must be **adjacent** — the same name again after another
   step is refused, not read as a second group;
-- **at most one `MOVE` / `PATROL` / `DOCK` / `UNDOCK` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
+- **at most one `MOVE` / `PATROL` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
   slot, so two would only run one after the other.
 
 **Start order**: a group's members start **in list order**, each once the one
@@ -63,7 +62,7 @@ before it has *started* — not finished — and from then on they overlap:
 
 | Member | Started when |
 |---|---|
-| `MOVE` / `PATROL` / `DOCK` / `UNDOCK` | nav2 accepted the goal |
+| `MOVE` / `PATROL` | nav2 accepted the goal |
 | `SPEAK` | its first utterance is queued (the speech service plays in accepted order) |
 | `STANDUP` / `LIEDOWN` | the motion key is sent (the activity ends right there) |
 | `WAIT` | its timer runs |
@@ -97,7 +96,7 @@ Details that matter when editing this path:
 
 - **Two queues, split by what an activity occupies.** The body queue
   (`<robot_id>.ROBOT_TASK_QUEUE`, which also carries the workflow) runs `MOVE`,
-  `DOCK` / `UNDOCK` and the posture steps in a single-worker `ThreadPoolExecutor` with
+  `PATROL` and the posture steps in a single-worker `ThreadPoolExecutor` with
   `max_concurrent_activities=1` — one thing at a time, like the robot — so
   Temporal holds a second body activity server-side instead of handing it over
   to queue with its timeouts ticking, and two runs can never drive at once. The
@@ -188,13 +187,7 @@ Details that matter when editing this path:
   canceled". Only a `MOVE` is cut short: `pause` cancels the in-flight activity
   handle, landing in `execute_move`'s `except CancelledError` and cancelling the
   nav2 goal exactly as a task cancel would; resume re-dispatches the step from
-  scratch (same target, fresh attempts, from wherever the robot is). `DOCK` /
-  `UNDOCK` are interrupted the same way (`_run_move` serves all three): the dock
-  tree is halted mid-approach, `execute_dock` puts the walking gait back
-  (`MotionKey.LOCOMOTION` — the halted tree leaves the robot in MPC), and resume
-  starts the tree over: a DOCK from its staging leg, an UNDOCK with a fresh 1 m
-  back-out from wherever the pause stopped it — so a paused undock ends up to
-  2 m off the dock, not at a fixed staging pose. A `PATROL` is interrupted the
+  scratch (same target, fresh attempts, from wherever the robot is). A `PATROL` is interrupted the
   same way, but resumes **past the waypoints it had passed**: its activity reports
   each one on the `patrol_progress` signal, and `_run_move` hands the count to
   the next dispatch as its `start` (the last waypoint is always kept). The count
@@ -271,14 +264,13 @@ Details that matter when editing this path:
     would be one count per value.
   - The page token is Temporal's, base64url'd, valid only for the same `status` /
     `since` / `until` / `kind` / `name`. A rejected or malformed token is 400.
-- **A job's map is checked twice.** MOVE / PATROL / DOCK coordinates are a place in one map's
+- **A job's map is checked twice.** MOVE / PATROL coordinates are a place in one map's
   frame; on another map they are a real place, just the wrong one. The rule is
   `helpers/move_guard.py`: refuse positions planned on another map
   (`map_mismatch`); an unknown map is never refused. `POST /api/v1/tasks`
-  asks before starting a run, and `execute_move` (and `execute_dock`, `execute_patrol`) asks
+  asks before starting a run, and `execute_move` (and `execute_patrol`) asks
   again before every goal with the run's own `TaskMap` (read off
-  `workflow.info()`, passed as their optional second argument). An UNDOCK has
-  no coordinates and is checked by neither. The second check is the one a schedule meets — it
+  `workflow.info()`, passed as their optional second argument). The second check is the one a schedule meets — it
   never passes the first — and its refusal is a non-retryable step failure, so
   the history row says why. A schedule registered before `TaskMap` drives as it
   always did.
