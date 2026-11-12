@@ -268,11 +268,13 @@ REST says **"vertex"** with a `VertexType` enum (`MOVE` /
 `map_vertices`). Intentional — no migration was done. `type` is validated at the
 REST boundary and stored as a plain string.
 
-A `CHARGE` vertex placed with the console's *Detect* (`POST /api/v1/landmarks/detect`)
-carries **the charger's marker**: its centre, `theta` out of its face, `z` the floor
-under the robot that saw it. That is not where the robot stands when docked, which a
-DOCK step takes its vertex's pose to be — the charge behaviour that approaches a
-marker pose is the robot side's (a BT action of its own), and DOCK is unchanged.
+A `CHARGE` vertex's `theta` is **the charger's own heading, out of its face** —
+towards a robot in front of it — however it was placed. One placed with the
+console's *Detect* (`POST /api/v1/landmarks/detect`) carries the charger's marker
+as measured: its centre, `theta` out of its face, `z` the floor under the robot
+that saw it. A DOCK step turns that `theta` round before dock.xml has it
+(`_facing_params` in `temporal/activities.py`), since DockToPose drives onto a
+pose the robot faces the charger on and the staging pose is backed off along it.
 
 ## Task templates
 

@@ -321,7 +321,9 @@ class TestExecuteDock:
     cancel, plus putting RL back when a tree is cut short. Only DOCK has a pose,
     so only DOCK meets the map check."""
 
-    def test_sends_the_dock_pose_on_its_tree(self, env, activities, robot_gw):
+    def test_sends_the_dock_pose_on_its_tree_facing_the_charger(
+        self, env, activities, robot_gw
+    ):
         robot_gw.move.return_value = (True, "", "goal-1")
         robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
 
@@ -333,7 +335,22 @@ class TestExecuteDock:
         kwargs = robot_gw.move.call_args[1]
         assert kwargs["behavior_tree"] == "dock.xml"
         assert (kwargs["x"], kwargs["y"]) == (1.0, 2.0)
-        assert kwargs["yaw"] == pytest.approx(1.5707963)
+        # The charger faces +y; the robot docks facing it, -y. Turned the
+        # other way, dock.xml's staging pose lands inside the charger's wall.
+        assert kwargs["yaw"] == pytest.approx(-1.5707963)
+
+    @pytest.mark.parametrize(
+        "charger, docked", [(0.0, 180.0), (180.0, 0.0), (-45.0, 135.0), (135.0, -45.0)]
+    )
+    def test_the_turned_heading_stays_in_moveparams_bounds(
+        self, env, activities, robot_gw, charger, docked
+    ):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        env.run(activities.execute_dock, MoveParams(x=0.0, y=0.0, theta=charger), "lab")
+
+        assert robot_gw.move.call_args[1]["yaw"] == pytest.approx(math.radians(docked))
 
     def test_an_undock_sends_an_empty_pose_on_its_tree(
         self, env, activities, robot_gw
@@ -777,8 +794,9 @@ class TestAutoUndock:
     ):
         env.run(activities.execute_dock, self.DOCK, "lab")
 
+        # As the robot stands on it: turned round from the charger's 90 deg.
         record = dock_state.current()
-        assert (record.map, record.x, record.y, record.theta_deg) == ("lab", 3.0, -1.5, 90.0)
+        assert (record.map, record.x, record.y, record.theta_deg) == ("lab", 3.0, -1.5, -90.0)
 
     def test_a_dock_without_a_run_map_records_the_loaded_one(
         self, env, activities, dock_state
