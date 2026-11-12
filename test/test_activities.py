@@ -325,6 +325,54 @@ class TestMoveMapCheck:
         assert result.success is True
 
 
+class TestExecuteCharge:
+    """A NavigateToGoal on charge.xml, sent the charger waypoint as stored:
+    the marker's centre, the heading out of its face, which is the yaw the
+    tree takes."""
+
+    @pytest.fixture(autouse=True)
+    def _goals_succeed(self, robot_gw):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+    def test_sends_the_marker_on_its_tree(self, env, activities, robot_gw):
+        result = env.run(
+            activities.execute_charge, MoveParams(x=1.0, y=2.0, theta=90.0, z=2.5), "lab"
+        )
+
+        assert result.success is True
+        kwargs = robot_gw.move.call_args[1]
+        assert kwargs["behavior_tree"] == "charge.xml"
+        assert (kwargs["x"], kwargs["y"], kwargs["z"]) == (1.0, 2.0, 2.5)
+        # The marker's own heading, out of its face: not turned round, since
+        # charge.xml stages out along it.
+        assert kwargs["yaw"] == pytest.approx(math.radians(90.0))
+
+    def test_a_failed_charge_is_retryable(self, env, activities, robot_gw):
+        robot_gw.get_move_status.return_value = {
+            "goal_id": "goal-1",
+            "state": "aborted",
+            "error_code": 300,
+            "error_msg": "track_pose aborted the goal (error_code 333)",
+        }
+
+        with pytest.raises(ApplicationError, match="charge ended in aborted") as exc_info:
+            env.run(activities.execute_charge, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
+
+        assert exc_info.value.non_retryable is False
+
+    def test_a_charge_from_another_map_never_sends_a_goal(
+        self, env, activities, robot_gw
+    ):
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(
+                activities.execute_charge, MoveParams(x=0.0, y=0.0, theta=0.0), "warehouse"
+            )
+
+        assert exc_info.value.type == "map_mismatch"
+        robot_gw.move.assert_not_called()
+
+
 class TestPostureActivities:
     def test_stand_sends_its_motion_key(self, env, activities, robot_gw):
         robot_gw.set_motion_key.return_value = (True, "")

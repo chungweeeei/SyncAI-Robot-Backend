@@ -38,6 +38,7 @@ from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways import ros as ros_module  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
 from syncai_backend.gateways.robot.robot import (  # noqa: E402
+    CHARGE_BEHAVIOR_TREE,
     INITIAL_POSE_Z_VARIANCE_INDEX,
     MAX_TRACKED_GOALS,
     MotionKey,
@@ -160,21 +161,20 @@ class TestMoveGoalStateMachine:
         # move.xml: the task runner's default tree.
         assert goal_msg.behavior_tree == ""
 
-    def test_a_goal_may_name_another_tree(self, robot_gw, move_client):
-        """``behavior_tree`` goes out on the same client, so the goal book, cancel
-        and teleop gate cover such a goal too; only the tree differs. No step
-        sends one since DOCK / UNDOCK were removed (2026-11-12)."""
+    def test_a_charge_goal_names_its_tree(self, robot_gw, move_client):
+        """A CHARGE goes out on the same client, so the goal book, cancel and
+        teleop gate cover it too; only the tree differs."""
         handle = _goal_handle()
         handle.get_result_async.return_value = _Future(completed=False)
         move_client.send_goal_async.return_value = _Future(result=handle)
 
         accepted, _, goal_id = robot_gw.move(
-            x=1.0, y=2.0, yaw=0.0, behavior_tree="other.xml"
+            x=1.0, y=2.0, yaw=0.0, behavior_tree=CHARGE_BEHAVIOR_TREE
         )
 
         assert accepted is True
         goal_msg = move_client.send_goal_async.call_args[1]["goal"]
-        assert goal_msg.behavior_tree == "other.xml"
+        assert goal_msg.behavior_tree == "charge.xml"
         assert robot_gw.get_move_status(goal_id=goal_id)["state"] == (
             MoveState.EXECUTING.value
         )

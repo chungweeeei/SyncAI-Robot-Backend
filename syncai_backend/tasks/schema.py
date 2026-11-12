@@ -40,6 +40,11 @@ class StepType(str, Enum):
     LIEDOWN = "LIEDOWN"
     SPEAK = "SPEAK"
     WAIT = "WAIT"
+    # A NavigateToGoal on charge.xml (gateways/robot CHARGE_BEHAVIOR_TREE): the last
+    # metre walked on the charger's own marker. x/y/theta is the charger waypoint as
+    # Detect stored it -- the marker's centre, the heading out of its face -- which
+    # is what the tree takes.
+    CHARGE = "CHARGE"
     # A NavigateThroughGoals on the task runner's patrol.xml: through every waypoint in
     # order without stopping, the last one reached with its heading as a MOVE's is.
     PATROL = "PATROL"
@@ -148,13 +153,14 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.LIEDOWN: None,
     StepType.SPEAK: SpeakParams,
     StepType.WAIT: WaitParams,
+    StepType.CHARGE: MoveParams,
     StepType.PATROL: PatrolParams,
 }
 
 
 # Steps whose params are poses on the loaded map: they share MOVE's map stamping /
 # check and its template vertex refs (a PATROL's one per waypoint, ``vertex_ids``).
-POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.PATROL})
+POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.CHARGE, StepType.PATROL})
 
 # Steps that send a navigation goal (NavigateToGoal, or a PATROL's
 # NavigateThroughGoals): they share MOVE's pause interrupt and its live status
@@ -220,7 +226,7 @@ def step_group_problem(steps) -> Optional[StepGroupProblem]:
             if len(body) > 1:
                 return StepGroupProblem(
                     f"Group '{group}' has more than one "
-                    "MOVE/PATROL/STANDUP/LIEDOWN step "
+                    "MOVE/PATROL/CHARGE/STANDUP/LIEDOWN step "
                     f"({', '.join(body)}); the robot can do only one at a time",
                     step.id,
                 )
@@ -248,7 +254,7 @@ GROUP_DESCRIPTION = (
     "Adjacent steps with the same group run at the same time, started in "
     "list order (each once the one before it has started), and the next "
     "step starts once all of them have finished; if one fails the others are "
-    "canceled. At most one MOVE/PATROL/STANDUP/LIEDOWN per group. Omitted: the step "
+    "canceled. At most one MOVE/PATROL/CHARGE/STANDUP/LIEDOWN per group. Omitted: the step "
     "runs on its own, after the one before it"
 )
 

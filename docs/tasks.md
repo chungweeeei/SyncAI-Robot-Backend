@@ -9,6 +9,7 @@ A task is an ordered list of steps; `RobotWorkflow` walks them one at a time by
 |---|---|---|
 | `MOVE` | `execute_move` | Send a `NavigateToGoal` goal, poll to a terminal state, heartbeat every 0.25 s; a failure's message carries the robot's `error_msg`. |
 | `PATROL` | `execute_patrol` | One `NavigateThroughGoals` through `PatrolParams.waypoints` (at least two `MoveParams`; only the last `theta` is turned to) — *PATROL* under [*Action client*](ros-interfaces.md). MOVE's map check, poll, heartbeat and pause interrupt. Never starts the round over: the heartbeat details carry how many waypoints are behind the robot (from `number_of_poses_remaining`), so a retry sends only the rest, and the activity signals the count to the run (`patrol_progress`, forward only), which re-dispatches a resumed patrol with it as the activity's `start`. The step's own `params` keep every waypoint; the last one is always sent. An abort fails it with the robot's reason, as a MOVE's (`patrol ended in aborted: …`), retried or not by its `error_code` |
+| `CHARGE` | `execute_charge` | A MOVE on `charge.xml` (`MoveParams`: the charger waypoint — the marker's centre, `theta` out of its face — sent as stored): stages in front of the charger and walks onto it by its marker; ends standing on it. Everything else is a MOVE's: map check, poll, heartbeat, pause interrupt, retry by `error_code` — *CHARGE* under [*Action client*](ros-interfaces.md) |
 | `STANDUP` / `LIEDOWN` | `execute_stand` / `execute_lie_down` | Send the motion key; fire-and-forget (see `activities.py`) |
 | `SPEAK` | `execute_speak` | `TtsGateway.start_speak()` then `await_speak()` — queue the utterance on the speech service, then poll its job and heartbeat until it has played; a cancel `DELETE`s the job mid-sentence. `SpeakParams`: `text` (1–1000 chars, English only), `voice` (default `af_heart`; see `GET /api/v1/tts/voices`), `speed` (0.5–2.0) — the REST route's constraints, since both drive one gateway |
 | `WAIT` | — (workflow timer) | Idle for `WaitParams.seconds` (0 < s ≤ 3600). Not an activity: a durable timer in `RobotWorkflow._run_wait`, so no slot of the body queue's one-thread executor, no heartbeat, and it survives a backend restart with the time already served |
@@ -19,7 +20,7 @@ one must be purged before deploying. DOCK / UNDOCK steps (on `dock.xml` / `undoc
 
 **Which failures are retried (2026-11).** Every step activity runs under the
 workflow's `RetryPolicy` — three attempts, 5 s apart — and a failure raised
-`non_retryable` skips the rest. For a MOVE / PATROL that the
+`non_retryable` skips the rest. For a MOVE / CHARGE / PATROL that the
 robot aborted, the robot's `error_code` decides: `NON_RETRYABLE_NAV_CODES`
 (activities.py) are the planning reasons for which the same goal cannot succeed
 5 s later, and fail the step on the first attempt:
@@ -54,7 +55,7 @@ rejoining a closed group, or a group's second body step):
 
 - a group's members must be **adjacent** — the same name again after another
   step is refused, not read as a second group;
-- **at most one `MOVE` / `PATROL` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
+- **at most one `MOVE` / `PATROL` / `CHARGE` / `STANDUP` / `LIEDOWN`** per group: the body queue has one
   slot, so two would only run one after the other.
 
 **Start order**: a group's members start **in list order**, each once the one
@@ -62,7 +63,7 @@ before it has *started* — not finished — and from then on they overlap:
 
 | Member | Started when |
 |---|---|
-| `MOVE` / `PATROL` | nav2 accepted the goal |
+| `MOVE` / `PATROL` / `CHARGE` | nav2 accepted the goal |
 | `SPEAK` | its first utterance is queued (the speech service plays in accepted order) |
 | `STANDUP` / `LIEDOWN` | the motion key is sent (the activity ends right there) |
 | `WAIT` | its timer runs |
@@ -264,11 +265,11 @@ Details that matter when editing this path:
     would be one count per value.
   - The page token is Temporal's, base64url'd, valid only for the same `status` /
     `since` / `until` / `kind` / `name`. A rejected or malformed token is 400.
-- **A job's map is checked twice.** MOVE / PATROL coordinates are a place in one map's
+- **A job's map is checked twice.** MOVE / CHARGE / PATROL coordinates are a place in one map's
   frame; on another map they are a real place, just the wrong one. The rule is
   `helpers/move_guard.py`: refuse positions planned on another map
   (`map_mismatch`); an unknown map is never refused. `POST /api/v1/tasks`
-  asks before starting a run, and `execute_move` (and `execute_patrol`) asks
+  asks before starting a run, and `execute_move` (and `execute_patrol`, `execute_charge`) asks
   again before every goal with the run's own `TaskMap` (read off
   `workflow.info()`, passed as their optional second argument). The second check is the one a schedule meets — it
   never passes the first — and its refusal is a non-retryable step failure, so

@@ -148,6 +148,17 @@ resolves it.
 
 **Removed: DOCK / UNDOCK.** DOCK / UNDOCK steps (on `dock.xml` / `undock.xml`), the MOVE's auto-undock and the `dock_path` telemetry frame were removed on 2026-11-12, with the robot stack's dock trees, and the stored data cleaned the same day: the backend strips those steps from templates and schedules at startup (`tasks/retired_steps.py`).
 
+**CHARGE: `charge.xml`, 2026-11.** A `CHARGE` step is a `NavigateToGoal` on the
+MOVE's client with `behavior_tree: "charge.xml"` (`CHARGE_BEHAVIOR_TREE`), sent the
+charger waypoint as stored: the marker's centre, the heading out of its face — what
+the console's *Detect* stores on a `CHARGE` vertex. The task runner's tree stages
+1.3 m out along that heading, checks the marker is in view, switches to MPC and walks
+onto the charger on the marker's sightings (`track_pose`), so it ends on the charger
+the camera sees rather than where the map puts it. It ends standing on the charger
+in MPC; a `LIEDOWN` after it lies the robot down. Nothing here records that the robot
+is on a charger (the auto-undock went with UNDOCK), so a MOVE afterwards drives off
+as from anywhere. Same goal book, cancel, pause, map check and retry rule as a MOVE.
+
 **PATROL: `navigate_through_goals` (`syncai_common/NavigateThroughGoals`), 2026-11.**
 A second action client on the same server (`syncai_task_runner`), for the PATROL
 step: `RobotGateway.patrol()` sends every waypoint as a `PoseStamped` (frame `map`,

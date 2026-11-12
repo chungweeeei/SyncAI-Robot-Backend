@@ -14,7 +14,9 @@ standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
 map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
-`NavigateToGoal` action the MOVE step sends) — plus `rclpy`,
+`NavigateToGoal` action the MOVE step sends — and the CHARGE step on its `behavior_tree`
+`charge.xml` (2026-11), sent the charger waypoint as stored, its heading out of the marker's
+face; docs/ros-interfaces.md) — plus `rclpy`,
 `nav2_msgs` (`LoadMap`), `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
 those imports as they are. **DOCK / UNDOCK steps, the MOVE's auto-undock and the `dock_path`
 telemetry frame were removed on 2026-11-12** with the robot stack's dock trees, and the stored
@@ -23,7 +25,7 @@ data cleaned the same day: a stored DOCK / UNDOCK step no longer parses, so
 startup, idempotently (`tasks/retired_steps.py`). **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
 `navigate_through_goals`** (2026-11; nav2's `NavigateThroughPoses` until then, whose Empty result
 carried no reason), so a patrol's failure goes through `_move_failure` like a MOVE's. **Whether a
-failed MOVE / PATROL is retried is decided by its `error_code`**
+failed MOVE / CHARGE / PATROL is retried is decided by its `error_code`**
 (`NON_RETRYABLE_NAV_CODES`, activities.py): the planning codes for which the same goal cannot
 succeed later — a goal inside a keepout zone (223), outside the map, no map, the robot inside
 a zone, disconnected ground — fail the step at once; everything else keeps the workflow's
@@ -132,7 +134,7 @@ ament linters (`test_copyright`, `test_flake8`, `test_pep257`) are part of the s
 two daemon threads. Main thread: `MultiThreadedExecutor.spin()` (all ROS callbacks, TF,
 service/action clients). uvicorn thread: FastAPI on `0.0.0.0:3000`. Temporal worker
 thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotWorkflow`
-+ the body activities (MOVE, PATROL, postures) in a single-worker `ThreadPoolExecutor`,
++ the body activities (MOVE, CHARGE, PATROL, postures) in a single-worker `ThreadPoolExecutor`,
 `max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time.
 
 Consequences:
@@ -397,7 +399,7 @@ has *started* (MOVE / PATROL: goal accepted; SPEAK: utterance queued; postures: 
 timer running) — a member is scheduled under activity id `<step id>#<n>`
 (`group_activity_id`) and `MOVE`/`SPEAK` report through the `step_started` signal
 (`STEP_STARTED_SIGNAL`, sent by `RobotActivities._report_started` on the worker's
-client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/PATROL/STANDUP/LIEDOWN per group, members
+client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/PATROL/CHARGE/STANDUP/LIEDOWN per group, members
 adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
 router that also names the offending step (`code: invalid_step_group`, `step_id`: the
 step rejoining a closed group, or the second body step), so the console marks that row.

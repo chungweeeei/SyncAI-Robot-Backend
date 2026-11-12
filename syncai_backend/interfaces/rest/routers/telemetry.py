@@ -85,7 +85,7 @@ def init_telemetry_router(
         trees (2026-11). A client still handling the type simply never gets it.
 
         Two more, **only while a navigation this backend sent is running** (a
-        MOVE or PATROL goal; ``navigation_active``), because they mean
+        MOVE, CHARGE or PATROL goal; ``navigation_active``), because they mean
         something only while the robot drives:
 
             {"type": "local_costmap", "resolution": .., "width": .., "height": ..,

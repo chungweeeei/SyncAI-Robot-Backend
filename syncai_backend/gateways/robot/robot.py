@@ -124,6 +124,13 @@ NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 PREVIEW_RESULT_WAIT_S = 6.0
 
 
+# NavigateToGoal.behavior_tree for a CHARGE (task runner charge.xml, SyncAI-Robot-
+# Workspace 2026-11): its pose is the charger's MARKER with the yaw out of its face,
+# not where the robot ends. The tree stages 1.3 m out along that yaw, checks the
+# marker is in view, switches to MPC and walks onto the charger on the marker's
+# sightings (track_pose); it ends standing on the charger in MPC.
+CHARGE_BEHAVIOR_TREE = "charge.xml"
+
 # NavigateThroughGoals.behavior_tree for a PATROL: "" is the task runner's
 # default for that action, patrol.xml (through every pose without stopping, the
 # last one reached with its heading).
@@ -643,8 +650,8 @@ class RobotGateway:
             )
 
     def navigation_active(self) -> bool:
-        """Whether a navigation this process sent (a MOVE or PATROL goal) is
-        still executing.
+        """Whether a navigation this process sent (a MOVE, CHARGE or PATROL
+        goal) is still executing.
 
         The telemetry stream's gate for the local costmap and the controller's
         local plan, which mean something only while the robot drives. Asked of

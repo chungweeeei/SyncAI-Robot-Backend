@@ -73,6 +73,7 @@ ACTIVITY_MAP = {
     StepType.STANDUP: RobotActivities.execute_stand,
     StepType.LIEDOWN: RobotActivities.execute_lie_down,
     StepType.SPEAK: RobotActivities.execute_speak,
+    StepType.CHARGE: RobotActivities.execute_charge,
     StepType.PATROL: RobotActivities.execute_patrol,
 }
 
@@ -407,7 +408,7 @@ class RobotWorkflow:
 
         # Postures take no argument; passing None would fail the arg-count check.
         args = [] if step.params is None else [step.params]
-        # MOVE gets the map as a second argument only when there is one, so old
+        # MOVE / CHARGE get the map as a second argument only when there is one, so old
         # one-argument histories and runs without the attribute look the same.
         if step.type in POSE_STEP_TYPES and own_map is not None:
             args.append(own_map)
