@@ -385,6 +385,14 @@ class WorkflowTask(BaseSchema):
     definition: WorkflowTaskDefinition = Field(
         ..., description="Definition of the workflow task"
     )
+    # A schedule registered from a template: each run reads the template as it
+    # starts (RobotWorkflow._resolve_template), so an edit reaches the next run.
+    # `definition` is then the registration's snapshot, run only if the template
+    # cannot be read. Optional, so schedules and runs from before it decode.
+    task_template_id: Optional[str] = Field(
+        default=None,
+        description="The task template a scheduled run executes as it is when it fires",
+    )
 
 
 class TaskState(BaseSchema):
@@ -594,7 +602,10 @@ class ScheduleTask(BaseSchema):
     )
     task_template_id: Optional[str] = Field(
         default=None,
-        description="The task template this schedule was frozen from, if any.",
+        description=(
+            "The task template each run executes, read as it fires; `definition` "
+            "is then only its fallback."
+        ),
     )
     task_template_name: Optional[str] = Field(
         default=None, description="That template's name at registration time."
@@ -615,10 +626,10 @@ class ScheduleView(BaseSchema):
     steps: List[Step] = Field(
         default_factory=list,
         description=(
-            "The frozen step list, decoded from the schedule's start-workflow "
-            "args. Populated by describe() only -- always empty from "
+            "The step list registered with the schedule, decoded from its "
+            "start-workflow args. Populated by describe() only -- always empty from "
             "list_schedules(), whose ScheduleListActionStartWorkflow carries the "
-            "workflow type name and nothing else. Frozen at registration: later "
-            "vertex edits do not reach a scheduled run."
+            "workflow type name and nothing else. With a task_template_id these are "
+            "only the fallback: each run reads the template as it fires."
         ),
     )

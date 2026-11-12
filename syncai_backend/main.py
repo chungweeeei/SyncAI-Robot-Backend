@@ -265,6 +265,8 @@ class SyncAIBackend(Node):
             robot_repo=robot_repo,
             dock_state=dock_state_svc,
             task_record_repo=task_record_repo,
+            task_template_repo=task_template_repo,
+            map_repo=map_repo,
         )
         # Kept for main()'s shutdown: the worker is stopped before the ROS
         # context goes, so a running MOVE can still cancel its nav2 goal.

@@ -1,6 +1,7 @@
 import asyncio
 import math
 import time
+import uuid
 from typing import Optional
 
 import structlog
@@ -18,6 +19,11 @@ from syncai_backend.tasks.config import (
     reports_start,
 )
 from syncai_backend.tasks.schema import MoveParams, PatrolParams, SpeakParams, TaskRecord
+from syncai_backend.tasks.template_resolution import (
+    ResolvedTemplate,
+    resolve_stored_steps,
+    stored_vertex_ids,
+)
 from syncai_backend.gateways.robot.robot import (
     DOCK_BEHAVIOR_TREE,
     UNDOCK_BEHAVIOR_TREE,
@@ -27,8 +33,10 @@ from syncai_backend.gateways.robot.robot import (
 from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
+from syncai_backend.repositories.map.map import MapRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.task.task_record import TaskRecordRepo
+from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.map_usage import MapUsagePolicy
 
@@ -140,6 +148,8 @@ class RobotActivities:
         robot_repo: RobotRepo,
         dock_state: DockStateService,
         task_record_repo: TaskRecordRepo,
+        task_template_repo: TaskTemplateRepo,
+        map_repo: MapRepo,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
@@ -155,6 +165,9 @@ class RobotActivities:
         self._dock_state = dock_state
         # Where record_task leaves each finished run (the report export's source).
         self._task_record_repo = task_record_repo
+        # What resolve_template reads: a scheduled run's template and its vertices.
+        self._task_template_repo = task_template_repo
+        self._map_repo = map_repo
         # Bound by run_worker, for _report_started: a sync activity cannot use the
         # async-only activity.client().
         self._client: Optional[Client] = None
@@ -665,4 +678,32 @@ class RobotActivities:
             "[RobotActivity] Task recorded",
             task_id=record.task_id,
             status=record.status,
+        )
+
+    @activity.defn
+    def resolve_template(self, task_template_id: str) -> Optional[ResolvedTemplate]:
+        """A scheduled run's template as it is now (RobotWorkflow._resolve_template).
+
+        On the IO queue: database reads only. None when the template is gone,
+        which leaves the run on the snapshot it was registered with. Another map
+        loaded is not raised but answered, in move_guard's sentence, so the run
+        is still named after the template it failed to run.
+        """
+        row = self._task_template_repo.get_task_template(uuid.UUID(task_template_id))
+        if row is None:
+            return None
+        vertices = {}
+        if row.map_name is not None:
+            ids = stored_vertex_ids(row.steps)
+            vertices = {
+                v.id: v for v in self._map_repo.get_vertices(map=row.map_name, vertex_ids=ids)
+            }
+        refusal = self._map_usage.move_refusal(
+            row.map_name, self._map_catalog_repo.active_name()
+        )
+        return ResolvedTemplate(
+            name=row.name,
+            map_name=row.map_name,
+            steps=resolve_stored_steps(row.steps, vertices),
+            refusal=refusal.message if refusal is not None else None,
         )

@@ -17,6 +17,7 @@ gone, the flag still matters, so it is pinned on the body-level fields now.)
 """
 
 import asyncio
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -90,11 +91,35 @@ def workflow_gw():
     return _StubWorkflowGateway(_view())
 
 
+class _StubTemplateRepo:
+    """The template names the schedule routes read; ``fail`` makes the read raise."""
+
+    def __init__(self):
+        self.rows = []
+        self.fail = False
+
+    def list_task_templates(self):
+        if self.fail:
+            raise RuntimeError("database unreachable")
+        return self.rows
+
+
 @pytest.fixture
-def client(logger, workflow_gw):
+def task_template_repo():
+    return _StubTemplateRepo()
+
+
+@pytest.fixture
+def client(logger, workflow_gw, task_template_repo):
     app = FastAPI()
     register_exception_handlers(app)
-    app.include_router(init_schedule_router(logger=logger, workflow_gw=workflow_gw))
+    app.include_router(
+        init_schedule_router(
+            logger=logger,
+            workflow_gw=workflow_gw,
+            task_template_repo=task_template_repo,
+        )
+    )
     return TestClient(app)
 
 
@@ -276,3 +301,32 @@ def test_read_steps_swallows_a_decode_failure(logger):
 
     steps = asyncio.run(_read_steps(logger, _desc(action, _StubConverter(raises=True))))
     assert steps == []
+
+
+# --- The template's name now -------------------------------------------------
+
+
+def _row(id, name):
+    return SimpleNamespace(id=uuid.UUID(id), name=name)
+
+
+@pytest.mark.parametrize("path", ["/api/v1/schedules", "/api/v1/schedules/sched-1"])
+def test_a_renamed_template_is_named_as_it_is_now(client, task_template_repo, path):
+    """The memo keeps the registration's name and cannot be rewritten, so a
+    rename shows through only by reading the template."""
+    task_template_repo.rows = [
+        _row("0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55", "Evening patrol"),
+        _row("11111111-2222-3333-4444-555555555555", "Someone else"),
+    ]
+
+    body = client.get(path).json()
+    row = body[0] if isinstance(body, list) else body
+
+    assert row["task_template_name"] == "Evening patrol"
+
+
+def test_a_deleted_or_unreadable_template_keeps_the_memos_name(client, task_template_repo):
+    assert client.get("/api/v1/schedules").json()[0]["task_template_name"] == "Morning patrol"
+
+    task_template_repo.fail = True
+    assert client.get("/api/v1/schedules").json()[0]["task_template_name"] == "Morning patrol"

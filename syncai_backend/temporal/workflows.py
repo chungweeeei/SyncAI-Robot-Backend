@@ -32,6 +32,7 @@ with workflow.unsafe.imports_passed_through():
         TASK_MAP_KEY,
         TASK_NAME_KEY,
     )
+    from syncai_backend.tasks.template_resolution import ResolvedTemplate
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
 
 
@@ -58,6 +59,14 @@ TASK_RECORD_PATCH = "task-record"
 # record_task is one insert. Bounded from scheduling, not only from start: with no IO
 # worker polling it would otherwise hold the run open, and the report is not worth that.
 RECORD_TASK_TIMEOUT = timedelta(minutes=2)
+
+# A schedule registered from a template reads it as each run starts
+# (_resolve_template); patched so runs from before it replay on their snapshot.
+SCHEDULE_RESOLVES_TEMPLATE_PATCH = "schedule-resolves-template"
+
+# resolve_template is two reads. Bounded from scheduling like record_task: with no
+# IO worker polling, the run goes on its snapshot rather than waiting.
+RESOLVE_TEMPLATE_TIMEOUT = timedelta(seconds=30)
 
 ACTIVITY_MAP = {
     StepType.MOVE: RobotActivities.execute_move,
@@ -219,6 +228,15 @@ class RobotWorkflow:
         # Not BaseException: the SDK evicts a cached run by raising one through it,
         # and that must not schedule anything.
         try:
+            if task.task_template_id and workflow.patched(
+                SCHEDULE_RESOLVES_TEMPLATE_PATCH
+            ):
+                own_map, refusal = await self._resolve_template(
+                    task.task_template_id, own_map
+                )
+                if refusal is not None:
+                    _end(self._steps[0], StepStatus.FAILED, refusal)
+                    raise ApplicationError(refusal, non_retryable=True)
             # A lone step is awaited directly, so pre-group histories replay unchanged.
             for block in step_blocks(self._steps):
                 # What the failed run this one continues got past (continuation_steps
@@ -233,6 +251,52 @@ class RobotWorkflow:
             await self._record("CANCELED" if _is_cancel(err) else "FAILED", own_map)
             raise
         await self._record("COMPLETED", own_map)
+
+    async def _resolve_template(
+        self, task_template_id: str, own_map: str | None
+    ) -> tuple[str | None, str | None]:
+        """Run the template as it is now instead of the snapshot.
+
+        Answers the run's map and why it must not go ahead (None: it may).
+
+        The run is renamed and re-mapped after it (TaskName / TaskMap), so the
+        history names it as the operator does today and every MOVE checks the
+        map the template is on now. Another map loaded fails the run on its
+        first step, before anything moves or speaks. A template that is gone or
+        cannot be read leaves the snapshot: an unattended run keeps its last
+        known route rather than not running at all.
+        """
+        info = workflow.info()
+        try:
+            resolved: ResolvedTemplate | None = await workflow.execute_activity(
+                RobotActivities.resolve_template,
+                task_template_id,
+                task_queue=io_task_queue_for(info.task_queue),
+                schedule_to_close_timeout=RESOLVE_TEMPLATE_TIMEOUT,
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=2),
+                    maximum_attempts=3,
+                ),
+            )
+        except ActivityError as err:
+            workflow.logger.warning(
+                "Could not read the schedule's task; running its snapshot: %s",
+                err.cause or err,
+            )
+            return own_map, None
+        if resolved is None:
+            return own_map, None
+
+        workflow.upsert_search_attributes(
+            [
+                TASK_NAME_KEY.value_set(resolved.name),
+                TASK_MAP_KEY.value_set(resolved.map_name)
+                if resolved.map_name
+                else TASK_MAP_KEY.value_unset(),
+            ]
+        )
+        self._steps = resolved.steps
+        return resolved.map_name, resolved.refusal
 
     async def _record(self, status: str, own_map: str | None) -> None:
         """Leave the run's ``task_record`` row (the report export's source).

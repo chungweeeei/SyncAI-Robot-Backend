@@ -1137,7 +1137,11 @@ class WorkflowGateway:
 
         # Temporal appends the nominal trigger time to this id, so each run is a
         # distinct execution, readable via GET /api/v1/tasks/{id}.
-        workflow_task = WorkflowTask(id=schedule.id, definition=schedule.definition)
+        workflow_task = WorkflowTask(
+            id=schedule.id,
+            definition=schedule.definition,
+            task_template_id=schedule.task_template_id,
+        )
 
         # Provenance + robot_id into the memo; the trigger rides in the spec.
         memo = _schedule_to_memo(schedule, self._robot_id)
@@ -1403,6 +1407,25 @@ class WorkflowGateway:
                 "[WorkflowGateway] Failed to update schedule", error=str(err)
             )
             raise UpstreamError("Update schedule failed")
+
+    async def delete_template_schedules(self, task_template_id: str) -> List[str]:
+        """Delete this robot's schedules that run ``task_template_id``; their ids.
+
+        A template's delete takes its schedules with it: they run the template
+        as it is when they fire, so one left behind would run a task that no
+        longer exists anywhere the operator can see it. One already gone
+        between the list and the delete is not a failure.
+        """
+        deleted: List[str] = []
+        for view in await self.list_schedules():
+            if view.task_template_id != task_template_id:
+                continue
+            try:
+                await self.delete_schedule(view.id)
+            except NotFoundError:
+                continue
+            deleted.append(view.id)
+        return deleted
 
 
 def init_workflow_gateway(
