@@ -313,9 +313,22 @@ Details that matter when editing this path:
   only the workflow type name and faking it would cost a describe per row. A
   decode failure degrades to `[]` with a warning, never a 502 — like the
   per-step query.
-- **A scheduled run's steps are frozen at registration.** The action args hold a
-  concrete `WorkflowTask` that nothing re-reads, so later vertex edits reach
-  templates and immediate dispatches but *not* a registered schedule.
-  `POST /api/v1/task_templates/{id}/schedule` therefore refuses a template whose map is
-  not active, or with a `MISSING` vertex — an unattended run does not get the
-  snapshot fallback a watching operator is allowed.
+- **A schedule registered from a template runs the template as it is when it
+  fires.** The action's `WorkflowTask` carries `task_template_id` beside the steps
+  resolved at registration, and the run's first act (`RobotWorkflow._resolve_template`,
+  behind the `schedule-resolves-template` patch) is the IO-queue activity
+  `resolve_template`: the template's steps, resolved against its vertices by the
+  rule the template routes use (`tasks/template_resolution.py`), its name and
+  map. The run then upserts `TaskName` / `TaskMap` to them, so the history names
+  it as the operator does today and every MOVE checks the map the template is on
+  now; another map loaded fails the first step with `move_guard`'s sentence
+  before anything moves or speaks. A vertex deleted since resolves to its
+  snapshot, as an immediate dispatch does; a template that is gone or cannot be
+  read leaves the run on the registration's steps. Deleting a template deletes
+  its schedules first (`WorkflowGateway.delete_template_schedules`), and the
+  schedule routes answer `task_template_name` from the template, since the memo
+  cannot be rewritten. A schedule registered with its own steps
+  (`POST /api/v1/schedules`), and every one from before the patch, still runs the
+  steps it was registered with.
+  `POST /api/v1/task_templates/{id}/schedule` still refuses a template whose map is
+  not active, or with a `MISSING` vertex, at registration.

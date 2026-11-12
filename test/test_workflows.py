@@ -118,7 +118,9 @@ from syncai_backend.tasks.schema import (  # noqa: E402
 from syncai_backend.tasks.search_attributes import (  # noqa: E402
     TASK_KIND_KEY,
     TASK_MAP_KEY,
+    TASK_NAME_KEY,
 )
+from syncai_backend.tasks.template_resolution import ResolvedTemplate  # noqa: E402
 from syncai_backend.temporal.activities import ActivityResult  # noqa: E402
 from syncai_backend.temporal.worker import HEARTBEAT_THROTTLE_MAX  # noqa: E402
 from syncai_backend.temporal.workflows import RobotWorkflow  # noqa: E402
@@ -1916,3 +1918,183 @@ def test_a_continued_patrol_starts_past_the_waypoints_it_had_passed():
     dispatches = asyncio.run(scenario())
 
     assert dispatches == [("step-0", 2, 4, None)]
+
+
+# --- A schedule's run reads its template ------------------------------------
+
+
+def _resolver(answer, asked: Optional[list] = None):
+    """A ``resolve_template`` answering ``answer`` (raised, if an exception)."""
+
+    @activity.defn(name="resolve_template")
+    async def resolve_template(task_template_id: str) -> Optional[ResolvedTemplate]:
+        if asked is not None:
+            asked.append(task_template_id)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return resolve_template
+
+
+async def _register_name_and_map(client) -> None:
+    await client.operator_service.add_search_attributes(
+        AddSearchAttributesRequest(
+            namespace=client.namespace,
+            search_attributes={
+                TASK_NAME_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+                TASK_MAP_KEY.name: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+            },
+        )
+    )
+
+
+def _scheduled(task_id: str, *step_types: StepType) -> WorkflowTask:
+    """A run a template-backed schedule starts: the snapshot plus the template id."""
+    task = _task(task_id, *step_types)
+    task.task_template_id = "0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55"
+    return task
+
+
+def _run_scheduled(task, resolver):
+    """Run ``task`` stamped as a schedule stamps it (old name, old map)."""
+
+    async def scenario():
+        calls: list = []
+        records: list = []
+
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams, expected_map=None) -> ActivityResult:
+            calls.append(("execute_move", params, expected_map))
+            return ActivityResult(success=True, state="succeeded")
+
+        @activity.defn(name="execute_speak")
+        async def execute_speak(params: SpeakParams) -> ActivityResult:
+            calls.append(("execute_speak", params.text, None))
+            return ActivityResult(success=True, state="succeeded")
+
+        body = [execute_move] + _instant_activities(calls)[1:]
+        async with _worker(
+            body, io_activities=[execute_speak, resolver], record_task=_recorder(records)
+        ) as client:
+            await _register_name_and_map(client)
+            handle = await client.start_workflow(
+                RobotWorkflow.run,
+                task,
+                id=task.id,
+                task_queue=TASK_QUEUE,
+                search_attributes=TypedSearchAttributes(
+                    [
+                        SearchAttributePair(TASK_NAME_KEY, "Old name"),
+                        SearchAttributePair(TASK_MAP_KEY, "lab"),
+                    ]
+                ),
+            )
+            failure = None
+            try:
+                await handle.result()
+            except WorkflowFailureError as err:
+                failure = err
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return calls, records, steps, failure
+
+    return asyncio.run(scenario())
+
+
+def test_a_scheduled_run_executes_its_template_as_it_is_now():
+    """An edit after registration reaches the next run: the snapshot's MOVE is
+    replaced by what the template says now, and the run is named after it."""
+    asked: list = []
+    edited = ResolvedTemplate(
+        name="Morning round",
+        map_name="lab",
+        steps=[
+            Step(id="1-speak", type=StepType.SPEAK, params=SpeakParams(text="Hello")),
+            Step(id="2-move", type=StepType.MOVE, params=MoveParams(x=7.0, y=8.0, theta=0.0)),
+        ],
+    )
+
+    calls, records, steps, failure = _run_scheduled(
+        _scheduled("sched-edited", StepType.MOVE), _resolver(edited, asked)
+    )
+
+    assert failure is None
+    assert asked == ["0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55"]
+    assert [(name, arg) for name, arg, _ in calls] == [
+        ("execute_speak", "Hello"),
+        ("execute_move", MoveParams(x=7.0, y=8.0, theta=0.0)),
+    ]
+    assert [step.id for step in steps] == ["1-speak", "2-move"]
+    assert records[0].name == "Morning round"
+    assert records[0].map_name == "lab"
+
+
+def test_a_template_moved_to_another_map_is_checked_against_that_map():
+    """TaskMap follows the template, so every MOVE checks the map it is on now."""
+    moved = ResolvedTemplate(
+        name="Round",
+        map_name="warehouse",
+        steps=[Step(id="1-move", type=StepType.MOVE, params=MoveParams(x=1.0, y=1.0, theta=0.0))],
+    )
+
+    calls, records, _, _ = _run_scheduled(
+        _scheduled("sched-moved", StepType.MOVE), _resolver(moved)
+    )
+
+    assert calls[0][2] == "warehouse"
+    assert records[0].map_name == "warehouse"
+
+
+def test_a_refused_template_fails_its_first_step_before_anything_runs():
+    refused = ResolvedTemplate(
+        name="Round",
+        map_name="warehouse",
+        steps=[
+            Step(id="1-speak", type=StepType.SPEAK, params=SpeakParams(text="Hello")),
+            Step(id="2-move", type=StepType.MOVE, params=MoveParams(x=1.0, y=1.0, theta=0.0)),
+        ],
+        refusal="This job's positions are on the map 'warehouse', but the robot is using 'lab'.",
+    )
+
+    calls, records, steps, failure = _run_scheduled(
+        _scheduled("sched-refused", StepType.MOVE), _resolver(refused)
+    )
+
+    assert failure is not None
+    assert calls == []
+    assert steps[0].status is StepStatus.FAILED
+    assert steps[0].error_msg == refused.refusal
+    assert steps[1].status is StepStatus.PENDING
+    assert records[0].status == "FAILED"
+    assert records[0].name == "Round"
+    assert records[0].map_name == "warehouse"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [None, ApplicationError("database unreachable", non_retryable=True)],
+    ids=["template-gone", "unreadable"],
+)
+def test_a_template_that_cannot_be_read_leaves_the_snapshot(answer):
+    calls, records, steps, failure = _run_scheduled(
+        _scheduled("sched-snapshot", StepType.MOVE), _resolver(answer)
+    )
+
+    assert failure is None
+    assert [(name, arg) for name, arg, _ in calls] == [
+        ("execute_move", MoveParams(x=1.5, y=-2.5, theta=90.0))
+    ]
+    assert steps[0].status is StepStatus.COMPLETED
+    assert (records[0].name, records[0].map_name) == ("Old name", "lab")
+
+
+def test_a_run_without_a_template_never_asks_for_one():
+    asked: list = []
+
+    calls, _, _, failure = _run_scheduled(
+        _task("sched-composer", StepType.MOVE), _resolver(None, asked)
+    )
+
+    assert failure is None
+    assert asked == []
+    assert len(calls) == 1

@@ -23,6 +23,7 @@ pytest.importorskip("yaml")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from syncai_backend.exceptions import UpstreamError  # noqa: E402
 from syncai_backend.helpers.system_config import SYSTEM_INI_ENV  # noqa: E402
 from syncai_backend.interfaces.rest.routers.task_template import (  # noqa: E402
     init_task_template_router,
@@ -33,13 +34,21 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
 
 
 class _StubWorkflowGateway:
-    """Records create_schedule calls instead of talking to Temporal."""
+    """Records schedule calls instead of talking to Temporal."""
 
     def __init__(self):
         self.schedules = []
+        self.deleted_for = []
+        self.delete_error = None
 
     async def create_schedule(self, schedule):
         self.schedules.append(schedule)
+
+    async def delete_template_schedules(self, task_template_id):
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted_for.append(task_template_id)
+        return []
 
 
 @pytest.fixture
@@ -352,6 +361,30 @@ def test_create_list_get_delete_round_trip(client):
     assert client.get(f"/api/v1/task_templates/{task_id}").status_code == 404
 
 
+def test_a_delete_takes_the_templates_schedules_with_it(client, workflow_gw):
+    task_id = _create(client).json()["id"]
+
+    assert client.delete(f"/api/v1/task_templates/{task_id}").status_code == 200
+
+    assert workflow_gw.deleted_for == [task_id]
+
+
+def test_a_delete_that_cannot_reach_the_schedules_deletes_nothing(client, workflow_gw):
+    """The schedules go first: one left behind would fire a template that is gone."""
+    task_id = _create(client).json()["id"]
+    workflow_gw.delete_error = UpstreamError("List schedules failed")
+
+    assert client.delete(f"/api/v1/task_templates/{task_id}").status_code == 502
+    assert client.get(f"/api/v1/task_templates/{task_id}").status_code == 200
+
+
+def test_deleting_an_unknown_template_touches_no_schedule(client, workflow_gw):
+    res = client.delete("/api/v1/task_templates/0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55")
+
+    assert res.status_code == 404
+    assert workflow_gw.deleted_for == []
+
+
 def test_list_filter_returns_the_map_and_the_map_independent(client):
     _create(client, name="on-full")
     _create(client, name="on-rawonly", map_name="rawonly")
@@ -419,6 +452,8 @@ def test_schedule_freezes_the_current_resolution(client, workflow_gw, dock):
     assert registered.task_template_id == task_id
     assert registered.task_template_name == "patrol"
     assert not hasattr(move, "vertex_id")
+    # Each run reads the template by this id; the steps above are its fallback.
+    assert "as it is each time it fires" in res.json()["message"]
 
 
 def test_schedule_refuses_a_missing_vertex(client, workflow_gw, map_repo, dock):

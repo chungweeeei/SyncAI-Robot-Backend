@@ -15,6 +15,9 @@ its ``params.waypoints`` (null where a waypoint is a free point on the map), and
 each CURRENT vertex's pose is swapped into its waypoint. Temporal gets **a label, not a
 reference**: the template's name (``TaskName``) and, for a schedule, its id in
 the memo, never a ``vertex_id``, so nothing there goes stale on a vertex edit.
+A scheduled run reads the template itself as it starts (``WorkflowTask``'s
+``task_template_id``), through the same resolution
+(``tasks/template_resolution.py``).
 
 **The path is ``/api/v1/task_templates``, not ``/api/v1/tasks/templates``**:
 ``GET /api/v1/tasks/{id}`` takes any ``str``, so a static sub-path would be
@@ -25,7 +28,6 @@ import uuid
 import structlog
 
 from datetime import datetime
-from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter
@@ -45,6 +47,7 @@ from syncai_backend.tasks.schema import (
     WorkflowTaskDefinition,
     step_group_problem,
 )
+from syncai_backend.tasks.template_resolution import VertexRefStatus, resolve_pose
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.interfaces.rest.schemas import (
     ScheduleResponse,
@@ -195,17 +198,6 @@ class TaskTemplateScheduleRequest(BaseModel):
 
 
 # --- Response models --------------------------------------------------------
-
-
-class VertexRefStatus(str, Enum):
-    NONE = "NONE"
-    """The step references no vertex; its coordinates were typed by hand."""
-
-    CURRENT = "CURRENT"
-    """The vertex exists; `resolved_params` and `vertex_name` come from it."""
-
-    MISSING = "MISSING"
-    """The vertex is gone; `resolved_params` is the snapshot taken at save time."""
 
 
 class TemplateStepResponse(BaseModel):
@@ -467,21 +459,13 @@ def init_task_template_router(
         for vertex_id, snapshot_name, waypoint in zip(
             vertex_ids, snapshot_names, stored.params.waypoints
         ):
-            vertex = vertices.get(vertex_id) if vertex_id is not None else None
-            if vertex_id is None:
-                names.append(None)
-                statuses.append(VertexRefStatus.NONE)
-                waypoints.append(waypoint)
-            elif vertex is None:
-                names.append(snapshot_name)
-                statuses.append(VertexRefStatus.MISSING)
-                waypoints.append(waypoint)
+            resolved, status = resolve_pose(waypoint, vertex_id, vertices)
+            waypoints.append(resolved)
+            statuses.append(status)
+            if status is VertexRefStatus.CURRENT:
+                names.append(vertices[vertex_id].name)
             else:
-                names.append(vertex.name)
-                statuses.append(VertexRefStatus.CURRENT)
-                waypoints.append(
-                    MoveParams(x=vertex.x, y=vertex.y, theta=vertex.theta, z=vertex.z)
-                )
+                names.append(snapshot_name if status is VertexRefStatus.MISSING else None)
         if VertexRefStatus.MISSING in statuses:
             overall = VertexRefStatus.MISSING
         elif VertexRefStatus.CURRENT in statuses:
@@ -540,10 +524,7 @@ def init_task_template_router(
             # The vertex's *current* name, so a rename shows through.
             vertex_name=vertex.name,
             vertex_status=VertexRefStatus.CURRENT,
-            # Moving a vertex moves every template that references it.
-            resolved_params=MoveParams(
-                x=vertex.x, y=vertex.y, theta=vertex.theta, z=vertex.z
-            ),
+            resolved_params=resolve_pose(stored.params, stored.vertex_id, vertices)[0],
         )
 
     def _response(
@@ -679,24 +660,33 @@ def init_task_template_router(
     @task_template_router.delete(
         "/api/v1/task_templates/{id}", response_model=DeleteResponse
     )
-    def delete_task_template(id: uuid.UUID):
-        _require(id)
-        task_template_repo.delete_task_template(task_id=id)
+    async def delete_task_template(id: uuid.UUID):
+        """Delete a template and every schedule that runs it.
+
+        ``async`` for the schedule RPCs, which go first: a schedule left behind
+        would fire a template that is gone. Should Temporal refuse, nothing has
+        been deleted and the 502 says so; the template's delete is the last step.
+        """
+        await run_in_threadpool(_require, id)
+        await workflow_gw.delete_template_schedules(str(id))
+        await run_in_threadpool(task_template_repo.delete_task_template, task_id=id)
         return DeleteResponse(message=f"Task template {id} has been deleted.")
 
     @task_template_router.post(
         "/api/v1/task_templates/{id}/schedule", response_model=ScheduleResponse
     )
     async def schedule_task_template(id: uuid.UUID, req: TaskTemplateScheduleRequest):
-        """Freeze this template's current resolution into a Temporal schedule.
+        """Register a Temporal schedule that runs this template.
 
         ``async`` for the create_schedule gRPC; the psycopg2 work goes to the
         threadpool in one hop so a wedged Postgres cannot stall the event loop.
 
-        The schedule stores concrete steps, so later vertex edits do not reach
-        it. Because a scheduled run is unattended, it is refused (400) for
-        another map than the loaded one or a deleted vertex, which a hand
-        dispatch only warns about.
+        Each run reads the template as it fires (RobotWorkflow._resolve_template),
+        so later edits to it and to its vertices reach the next run. The steps
+        resolved here ride along as the fallback for a run that cannot read it.
+        Because a scheduled run is unattended, it is refused (400) for another
+        map than the loaded one or a deleted vertex, which a hand dispatch only
+        warns about.
         """
 
         def _freeze() -> Tuple[TaskTemplate, List[Step]]:
@@ -762,8 +752,7 @@ def init_task_template_router(
         return ScheduleResponse(
             id=req.id,
             message=(
-                f"Schedule {req.id} runs '{row.name}' ({len(steps)} steps), "
-                "frozen at the vertices' current positions."
+                f"Schedule {req.id} runs '{row.name}' as it is each time it fires."
             ),
         )
 

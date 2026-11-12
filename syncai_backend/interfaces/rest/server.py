@@ -203,7 +203,13 @@ def init_rest_server(
             task_record_repo=deps.task_record_repo,
         )
     )
-    app.include_router(init_schedule_router(logger=logger, workflow_gw=deps.workflow_gw))
+    app.include_router(
+        init_schedule_router(
+            logger=logger,
+            workflow_gw=deps.workflow_gw,
+            task_template_repo=deps.task_template_repo,
+        )
+    )
     app.include_router(
         init_robot_router(
             logger=logger,

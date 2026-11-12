@@ -1,7 +1,8 @@
 import structlog
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import APIRouter
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from syncai_backend.tasks.schema import (
@@ -15,6 +16,7 @@ from syncai_backend.interfaces.rest.schemas import (
     ScheduleTriggerRequest,
     StepRequest,
 )
+from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 
 
 class ScheduleRequest(BaseModel):
@@ -73,30 +75,57 @@ class ScheduleStateResponse(BaseModel):
     )
     task_template_id: Optional[str] = Field(
         default=None,
-        description="The task template this schedule was frozen from, if any.",
+        description=(
+            "The task template this schedule runs, read as each run starts, so "
+            "an edit to it reaches the next run. Null for a schedule registered "
+            "with its own steps (POST /api/v1/schedules)."
+        ),
     )
     task_template_name: Optional[str] = Field(
-        default=None, description="That template's name at registration time."
+        default=None,
+        description=(
+            "That template's name now, or its name at registration time once "
+            "the template is gone."
+        ),
     )
     # StepRequest reused as the element: a second identical model could drift.
     steps: List[StepRequest] = Field(
         default_factory=list,
         description=(
-            "The frozen step list. Populated by GET /api/v1/schedules/{id} only; "
-            "the collection endpoint always answers [], because Temporal's "
-            "schedule *list* API does not carry the start-workflow arguments. "
-            "Frozen at registration: later vertex edits do not reach a scheduled "
-            "run, so a client comparing these against their source template is "
-            "how staleness becomes visible. Only the trigger is editable "
-            "(PATCH /api/v1/schedules/{id}); it never touches these."
+            "The step list registered with the schedule. Populated by "
+            "GET /api/v1/schedules/{id} only; the collection endpoint always "
+            "answers [], because Temporal's schedule *list* API does not carry "
+            "the start-workflow arguments. With a task_template_id these are only "
+            "the fallback for a run that cannot read the template; what runs is "
+            "the template. Without one, they are what every run executes. Only "
+            "the trigger is editable (PATCH /api/v1/schedules/{id})."
         ),
     )
 
 
 def init_schedule_router(
-    logger: structlog.stdlib.BoundLogger, workflow_gw: WorkflowGateway
+    logger: structlog.stdlib.BoundLogger,
+    workflow_gw: WorkflowGateway,
+    task_template_repo: TaskTemplateRepo,
 ) -> APIRouter:
     schedule_router = APIRouter(prefix="", tags=["Schedule"])
+
+    def _template_names(views: List[ScheduleView]) -> Dict[str, str]:
+        """The current name of each template these schedules run, by id.
+
+        A schedule's memo cannot be rewritten (the server ignores it on update),
+        so a renamed template's name is read here rather than kept there. Never
+        fatal: a failed read leaves the names the memos carry.
+        """
+        ids = {view.task_template_id for view in views if view.task_template_id}
+        if not ids:
+            return {}
+        try:
+            rows = task_template_repo.list_task_templates()
+        except Exception as err:
+            logger.warn("[schedule] Could not read template names", error=str(err))
+            return {}
+        return {str(row.id): row.name for row in rows if str(row.id) in ids}
 
     @schedule_router.post("/api/v1/schedules", response_model=ScheduleResponse)
     async def create_schedule(req: ScheduleRequest):
@@ -120,7 +149,9 @@ def init_schedule_router(
         )
 
     def _state_response(
-        view: ScheduleView, steps: Optional[List[StepRequest]] = None
+        view: ScheduleView,
+        names: Dict[str, str],
+        steps: Optional[List[StepRequest]] = None,
     ) -> ScheduleStateResponse:
         # `steps` None on the list path: see the field's description.
         return ScheduleStateResponse(
@@ -134,7 +165,9 @@ def init_schedule_router(
             next_run_times=view.next_run_times,
             map_name=view.map_name,
             task_template_id=view.task_template_id,
-            task_template_name=view.task_template_name,
+            task_template_name=names.get(
+                view.task_template_id or "", view.task_template_name
+            ),
             steps=steps or [],
         )
 
@@ -142,7 +175,9 @@ def init_schedule_router(
         "/api/v1/schedules", response_model=List[ScheduleStateResponse]
     )
     async def list_schedules():
-        return [_state_response(view) for view in await workflow_gw.list_schedules()]
+        views = await workflow_gw.list_schedules()
+        names = await run_in_threadpool(_template_names, views)
+        return [_state_response(view, names) for view in views]
 
     @schedule_router.get(
         "/api/v1/schedules/{id}",
@@ -153,9 +188,11 @@ def init_schedule_router(
     )
     async def get_schedule(id: str):
         view = await workflow_gw.get_schedule(schedule_id=id)
+        names = await run_in_threadpool(_template_names, [view])
 
         return _state_response(
             view,
+            names,
             steps=[
                 StepRequest(
                     id=step.id, type=step.type, params=step.params, group=step.group

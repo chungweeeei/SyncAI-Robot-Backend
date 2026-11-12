@@ -91,6 +91,8 @@ def activities(
         robot_repo=robot_repo,
         dock_state=dock_state,
         task_record_repo=MagicMock(),
+        task_template_repo=MagicMock(),
+        map_repo=MagicMock(),
     )
 
 
@@ -1147,3 +1149,93 @@ class TestExecutePatrol:
 
         assert robot_gw.move.call_args.kwargs["behavior_tree"] == "undock.xml"
         robot_gw.patrol.assert_called_once()
+
+
+class TestResolveTemplate:
+    """A scheduled run's template, read as the run starts (the workflow's half is
+    pinned in test_workflows.py)."""
+
+    @pytest.fixture
+    def resolver(self, logger, map_catalog_repo, task_template_repo, map_repo):
+        return RobotActivities(
+            logger=logger,
+            robot_gw=MagicMock(),
+            tts_gw=MagicMock(),
+            map_catalog_repo=map_catalog_repo,
+            map_usage=MapUsagePolicy(
+                map_catalog_repo=map_catalog_repo,
+                task_template_repo=None,
+            ),
+            robot_repo=MagicMock(),
+            dock_state=DockStateService(),
+            task_record_repo=MagicMock(),
+            task_template_repo=task_template_repo,
+            map_repo=map_repo,
+        )
+
+    @staticmethod
+    def _template(task_template_repo, map_repo, map_name="lab"):
+        dock, hall = map_repo.create_vertices(
+            map="lab",
+            vertices=[
+                {"name": "dock", "type": "MOVE", "x": 3.0, "y": -1.5, "theta": 90.0},
+                {"name": "hall", "type": "MOVE", "x": 5.0, "y": 2.0, "theta": 0.0},
+            ],
+        )
+        snapshot = {"x": 0.0, "y": 0.0, "theta": 0.0, "z": 0.0}
+        row = task_template_repo.create_task_template(
+            name="Morning round",
+            description="",
+            map_name=map_name,
+            steps=[
+                {"id": "1-move", "type": "MOVE", "params": snapshot,
+                 "vertex_id": str(dock.id)},
+                {"id": "2-patrol", "type": "PATROL",
+                 "params": {"waypoints": [snapshot, snapshot]},
+                 "vertex_ids": [str(hall.id), None]},
+                {"id": "3-speak", "type": "SPEAK", "params": {"text": "Done"},
+                 "group": "g"},
+            ],
+        )
+        return row, dock, hall
+
+    def test_a_template_is_resolved_against_its_vertices_as_they_are_now(
+        self, resolver, task_template_repo, map_repo
+    ):
+        row, dock, _ = self._template(task_template_repo, map_repo)
+        map_repo.update_vertex(vertex_id=dock.id, x=9.0)
+
+        resolved = resolver.resolve_template(str(row.id))
+
+        assert resolved.name == "Morning round"
+        assert resolved.map_name == "lab"
+        assert resolved.refusal is None
+        move, patrol, speak = resolved.steps
+        assert (move.params.x, move.params.y, move.params.theta) == (9.0, -1.5, 90.0)
+        # A waypoint from a vertex goes where it is; a free point stays put.
+        assert [(w.x, w.y) for w in patrol.params.waypoints] == [(5.0, 2.0), (0.0, 0.0)]
+        assert (speak.params.text, speak.group) == ("Done", "g")
+
+    def test_a_deleted_vertex_falls_back_to_the_snapshot(
+        self, resolver, task_template_repo, map_repo
+    ):
+        row, dock, _ = self._template(task_template_repo, map_repo)
+        map_repo.delete_vertex(vertex_id=dock.id)
+
+        move = resolver.resolve_template(str(row.id)).steps[0]
+
+        assert (move.params.x, move.params.y) == (0.0, 0.0)
+
+    def test_another_map_loaded_is_answered_not_raised(
+        self, resolver, task_template_repo, map_repo, map_catalog_repo
+    ):
+        row, _, _ = self._template(task_template_repo, map_repo)
+        map_catalog_repo.active_name.return_value = "warehouse"
+
+        resolved = resolver.resolve_template(str(row.id))
+
+        assert resolved.name == "Morning round"
+        assert "'lab'" in resolved.refusal and "'warehouse'" in resolved.refusal
+
+    def test_a_template_that_is_gone_answers_none(self, resolver):
+        assert resolver.resolve_template("0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55") is None
