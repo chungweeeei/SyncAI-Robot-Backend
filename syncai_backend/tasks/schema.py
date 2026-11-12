@@ -39,7 +39,9 @@ class StepType(str, Enum):
     SPEAK = "SPEAK"
     WAIT = "WAIT"
     # A NavigateToGoal on the dock trees (gateways/robot DOCK_BEHAVIOR_TREE). DOCK's
-    # x/y/theta is the dock pose, which dock.xml derives the staging pose from; UNDOCK
+    # x/y/theta is the charger's pose, theta out of its face as the console stores a
+    # charger waypoint; execute_dock turns it round into the heading the robot docks
+    # on, which dock.xml derives the staging pose from; UNDOCK
     # takes none, since undock.xml backs out 1 m from wherever the robot stands.
     DOCK = "DOCK"
     UNDOCK = "UNDOCK"
@@ -269,7 +271,7 @@ class Step(BaseSchema):
         description=(
             "Parameters for the step, which vary based on the step type. "
             "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK (x/y/theta: "
-            "the dock pose), PATROL (waypoints), SPEAK and WAIT"
+            "the charger's pose, theta out of its face), PATROL (waypoints), SPEAK and WAIT"
         ),
     )
     status: StepStatus = Field(

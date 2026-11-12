@@ -123,6 +123,16 @@ def _pose_kwargs(params: MoveParams) -> dict:
     }
 
 
+def _facing_params(params: MoveParams) -> MoveParams:
+    """A DOCK's params as dock.xml takes them: the heading turned round, from
+    the charger's own, out of its face (what the console stores on a charger
+    waypoint), to the one the robot faces the charger on, which DockToPose
+    drives onto and ComputeStagingPose backs the staging pose off along. Kept
+    in (-180, 180], the bound MoveParams holds theta to."""
+    theta = params.theta - 180.0 if params.theta > 0.0 else params.theta + 180.0
+    return params.model_copy(update={"theta": theta})
+
+
 def _patrol_passed(details) -> int:
     """How many waypoints the previous attempt left behind it, off its heartbeat
     details (``(state, passed)``); 0 when it beat none or something older."""
@@ -317,16 +327,21 @@ class RobotActivities:
         lying it down on 2026-10-15 -- a LIEDOWN step after the DOCK does that).
         Success records the dock for the next MOVE's auto-undock, under the
         run's map, or the loaded one for a run that carries none.
+
+        ``params.theta`` is the charger's heading, out of its face; the goal
+        and the record carry it turned round (_facing_params), the way the
+        robot stands on the dock.
         """
+        dock = _facing_params(params)
         result = self._navigate(
-            params, expected_map, behavior_tree=DOCK_BEHAVIOR_TREE, label="dock"
+            dock, expected_map, behavior_tree=DOCK_BEHAVIOR_TREE, label="dock"
         )
         self._dock_state.record(
             expected_map if expected_map is not None
             else self._map_catalog_repo.active_name(),
-            params.x,
-            params.y,
-            params.theta,
+            dock.x,
+            dock.y,
+            dock.theta,
         )
         return result
 
