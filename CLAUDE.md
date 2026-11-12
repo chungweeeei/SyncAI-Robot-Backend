@@ -14,16 +14,16 @@ standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
 map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
-`NavigateToGoal` action the MOVE step sends — and the DOCK / UNDOCK steps, on its
-`behavior_tree` `dock.xml` / `undock.xml`, the UNDOCK with an empty pose — and since
-2026-10-15 a MOVE runs undock.xml itself first when the robot is still on the last DOCK's
-pose (`services/dock_state.py`, in memory; docs/ros-interfaces.md *Auto-undock*); this package never
-calls `DockToPose`) — plus `rclpy`,
+`NavigateToGoal` action the MOVE step sends) — plus `rclpy`,
 `nav2_msgs` (`LoadMap`), `tf2_ros`, and `std_srvs` (`SetBool`, for driver_manager's `set_safety_lock`). Keep
-those imports as they are. **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
+those imports as they are. **DOCK / UNDOCK steps, the MOVE's auto-undock and the `dock_path`
+telemetry frame were removed on 2026-11-12** with the robot stack's dock trees, and the stored
+data cleaned the same day: a stored DOCK / UNDOCK step no longer parses, so
+`init_task_template_repo` strips them from templates and `run_worker` from schedules at every
+startup, idempotently (`tasks/retired_steps.py`). **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
 `navigate_through_goals`** (2026-11; nav2's `NavigateThroughPoses` until then, whose Empty result
 carried no reason), so a patrol's failure goes through `_move_failure` like a MOVE's. **Whether a
-failed MOVE / DOCK / UNDOCK / PATROL is retried is decided by its `error_code`**
+failed MOVE / PATROL is retried is decided by its `error_code`**
 (`NON_RETRYABLE_NAV_CODES`, activities.py): the planning codes for which the same goal cannot
 succeed later — a goal inside a keepout zone (223), outside the map, no map, the robot inside
 a zone, disconnected ground — fail the step at once; everything else keeps the workflow's
@@ -31,7 +31,7 @@ three attempts, 5 s apart. The numbers are SyncAI-Robot-Interface's (`ComputePat
 documents each and whether a retry helps), written as literals because they are a contract
 that is never renumbered. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `ResetOdometry` with `skip_seed` (behind `POST /api/v1/localization/auto`,
-2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; `DetectLandmark` (behind `POST /api/v1/landmarks/detect`, 2026-11: the charger's marker in `map`, for a `CHARGE` vertex) at or after `0d4ed9a`; the dock trees and `DOCK_FAILED` at or after `bbcc958`. It is named in
+2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; `DetectLandmark` (behind `POST /api/v1/landmarks/detect`, 2026-11: the charger's marker in `map`, for a `CHARGE` vertex) at or after `0d4ed9a`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
 colcon workspace root materialises it into `src/` beside this package, over
 HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
@@ -132,7 +132,7 @@ ament linters (`test_copyright`, `test_flake8`, `test_pep257`) are part of the s
 two daemon threads. Main thread: `MultiThreadedExecutor.spin()` (all ROS callbacks, TF,
 service/action clients). uvicorn thread: FastAPI on `0.0.0.0:3000`. Temporal worker
 thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotWorkflow`
-+ the body activities (MOVE, PATROL, DOCK / UNDOCK, postures) in a single-worker `ThreadPoolExecutor`,
++ the body activities (MOVE, PATROL, postures) in a single-worker `ThreadPoolExecutor`,
 `max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time.
 
 Consequences:
@@ -191,7 +191,7 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  restart_mode dispatch and its outcome),
         │                  safety_lock (the driver lock's rising edge -> cancel every task),
         │                  map_switch (activate's saga: localizer, Octo3D, INI and
-        │                  the undo for each), dock_state (the last DOCK's pose), map_usage
+        │                  the undo for each), map_usage
         │                  (every "may this map change / be driven on" refusal: MapUsagePolicy
         │                  from disk, safe in the worker; JobGate asks Temporal, loop only),
         │                  map_import (the archive import's publish + vertex transaction + undo),
@@ -397,7 +397,7 @@ has *started* (MOVE / PATROL: goal accepted; SPEAK: utterance queued; postures: 
 timer running) — a member is scheduled under activity id `<step id>#<n>`
 (`group_activity_id`) and `MOVE`/`SPEAK` report through the `step_started` signal
 (`STEP_STARTED_SIGNAL`, sent by `RobotActivities._report_started` on the worker's
-client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/PATROL/DOCK/UNDOCK/STANDUP/LIEDOWN per group, members
+client, never fatal), behind the `group-start-in-order` patch. At most one MOVE/PATROL/STANDUP/LIEDOWN per group, members
 adjacent — `step_group_problem` (schema.py) is the one check, a 400 sentence in every
 router that also names the offending step (`code: invalid_step_group`, `step_id`: the
 step rejoining a closed group, or the second body step), so the console marks that row.
@@ -425,7 +425,7 @@ step rather than asking a second time. A held run stays *running* to everything 
 (`active_tasks`, `_require_idle`, the map activation gate). Only a `MOVE` is cut short —
 `_run_move` cancels the in-flight activity handle, which lands in `execute_move`'s
 `except CancelledError` and cancels the nav2 goal — and is re-sent from scratch on resume
-(DOCK / UNDOCK / PATROL alike, through the same `_run_move`; a PATROL is re-sent **past the
+(a PATROL alike, through the same `_run_move`, but re-sent **past the
 waypoints it had passed**: `execute_patrol` signals the count on `PATROL_PROGRESS_SIGNAL`,
 forward only, and `_run_move` passes it as the next dispatch's `start`. A retry of the same
 dispatch reads it from its own heartbeat details instead. The last waypoint is always sent,
@@ -468,7 +468,7 @@ is unregistered falls back to the whole namespace). All four are registered
 idempotently by the worker at connect; the history
 list and `/stats` filter and count on the first two, and `kind=schedule` is answered from
 `TemporalScheduledById` so schedules that predate the attributes still count. `TaskMap`
-is the map a run's MOVE / PATROL / DOCK positions are in: stamped by the backend (the loaded map at
+is the map a run's MOVE / PATROL positions are in: stamped by the backend (the loaded map at
 dispatch, a schedule's `map_name`), never taken from the caller, and an attribute rather
 than memo because a scheduled run inherits only its action's attributes. Dispatch and
 `execute_move` both check it against the loaded map through `helpers/move_guard.py`.

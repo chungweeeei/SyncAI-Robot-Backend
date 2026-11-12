@@ -68,7 +68,6 @@ def init_telemetry_router(
             {"type": "joints", "joints": {"FL_HipX_joint": .., ...},
              "stamp": ..}
             {"type": "path",   "points": [[x, y, z], ...], "stamp": ..}
-            {"type": "dock_path", "points": [[x, y, z], ...], "stamp": ..}
 
         Pose is map-frame planar (yaw in degrees); joints are radians by URDF
         joint name. Each type is sent only when newer, at its own rate.
@@ -81,15 +80,12 @@ def init_telemetry_router(
         empty plan) or when the repo's TTL expires a route that stopped
         arriving.
 
-        ``dock_path`` is the last metre of a dock: the approach the docking
-        controller predicts from the robot to the dock, map-frame metres,
-        thinned like ``path`` (z included), at 2 Hz while it drives. The
-        staging leg before it is an ordinary ``path``. Empty ``points`` clears
-        it, sent when the dock goal ends however it ends, or by its own (3 s)
-        TTL.
+        There is no ``dock_path`` frame any more: it carried the docking
+        controller's ``docking_plan``, which went with the robot stack's dock
+        trees (2026-11). A client still handling the type simply never gets it.
 
         Two more, **only while a navigation this backend sent is running** (a
-        MOVE, DOCK or UNDOCK goal; ``navigation_active``), because they mean
+        MOVE or PATROL goal; ``navigation_active``), because they mean
         something only while the robot drives:
 
             {"type": "local_costmap", "resolution": .., "width": .., "height": ..,
@@ -111,7 +107,6 @@ def init_telemetry_router(
         last_pose_seq = 0
         last_joints_seq = 0
         last_path_seq = 0
-        last_dock_path_seq = 0
         last_local_costmap_seq = 0
         last_local_plan_seq = 0
         # Whether this client was last sent the local picture: the edge that
@@ -154,19 +149,6 @@ def init_telemetry_router(
                             "type": "path",
                             "points": path.points,
                             "stamp": path.stamp,
-                        }
-                    )
-
-                dock_path = telemetry_repo.get_docking_plan(
-                    after_seq=last_dock_path_seq
-                )
-                if dock_path is not None:
-                    last_dock_path_seq = dock_path.seq
-                    await ws.send_json(
-                        {
-                            "type": "dock_path",
-                            "points": dock_path.points,
-                            "stamp": dock_path.stamp,
                         }
                     )
 

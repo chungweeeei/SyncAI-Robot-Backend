@@ -8,6 +8,12 @@ from sqlalchemy.orm import Session
 
 from syncai_backend.database.models import TaskTemplate, _utcnow
 from syncai_backend.database.session import logged_session, session_factory
+from syncai_backend.tasks.retired_steps import (
+    RETIRED_REASON,
+    stored_steps_problem,
+    strip_retired_steps,
+)
+from syncai_backend.tasks.schema import POSE_STEP_TYPES
 
 
 class TaskTemplateRepo:
@@ -142,4 +148,92 @@ def init_task_template_repo(
     # Redundant with init_map_repo's (shared `Base.metadata`), but keeps each
     # factory self-sufficient and construction order irrelevant.
     TaskTemplate.metadata.create_all(engine)
+    purge_retired_steps(logger, engine)
     return TaskTemplateRepo(logger=logger, engine=engine)
+
+
+# What a stripped template's map_name is checked against: the router's rule that
+# a template with no pose step names no map (_check_map_scope).
+_POSE_TYPES = frozenset(step_type.value for step_type in POSE_STEP_TYPES)
+
+
+def purge_retired_steps(logger: structlog.stdlib.BoundLogger, engine: Engine) -> dict:
+    """Strip DOCK / UNDOCK steps from every stored template (tasks/retired_steps.py).
+
+    Per template that has one:
+
+    - **Nothing left: the template is deleted.** A template must have at least
+      one step (``TaskTemplateRequest``), and one that only docked does nothing
+      now. Its schedules go at the worker's startup (temporal/retired_schedules.py),
+      since their frozen copy is DOCK-only too.
+    - **Steps left, but no MOVE / PATROL:** ``map_name`` is cleared, because the
+      router refuses a map on a template with no pose step, and the next PUT
+      would 400 on a rule the operator never broke.
+    - **What is left does not parse or breaks the group rules:** deleted, and
+      said at ERROR. Removing steps cannot cause that, so it means the row was
+      unsound before; kept, it would still fail every template list.
+
+    One transaction, so a crash half-way leaves every row as it was. A second
+    run finds nothing (idempotent), so it costs one SELECT per startup. Returns
+    the counts it logs, for the tests.
+    """
+    summary = {"stripped": [], "deleted": [], "unmapped": []}
+    with Session(engine) as session, session.begin():
+        for row in session.scalars(select(TaskTemplate)).all():
+            kept, removed = strip_retired_steps(row.steps or [])
+            if not removed:
+                continue
+            template = str(row.id)
+            if not kept:
+                session.delete(row)
+                summary["deleted"].append(template)
+                logger.warning(
+                    "[TaskTemplateRepo] Deleted a template whose only steps were DOCK / "
+                    "UNDOCK",
+                    template_id=template,
+                    name=row.name,
+                    removed_step_ids=removed,
+                    reason=RETIRED_REASON,
+                )
+                continue
+            problem = stored_steps_problem(kept)
+            if problem is not None:
+                session.delete(row)
+                summary["deleted"].append(template)
+                logger.error(
+                    "[TaskTemplateRepo] Deleted a template whose steps left after "
+                    "removing DOCK / UNDOCK cannot run; they could not before either",
+                    template_id=template,
+                    name=row.name,
+                    removed_step_ids=removed,
+                    problem=problem,
+                    reason=RETIRED_REASON,
+                )
+                continue
+            # Assigned whole: JSON columns are not mutation-tracked.
+            row.steps = kept
+            row.updated_at = _utcnow()
+            unmapped = row.map_name is not None and not any(
+                entry.get("type") in _POSE_TYPES for entry in kept
+            )
+            if unmapped:
+                row.map_name = None
+                summary["unmapped"].append(template)
+            summary["stripped"].append(template)
+            logger.warning(
+                "[TaskTemplateRepo] Removed DOCK / UNDOCK steps from a template",
+                template_id=template,
+                name=row.name,
+                removed_step_ids=removed,
+                steps_left=len(kept),
+                map_name_cleared=unmapped,
+                reason=RETIRED_REASON,
+            )
+    if summary["stripped"] or summary["deleted"]:
+        logger.warning(
+            "[TaskTemplateRepo] Purged DOCK / UNDOCK steps from stored templates",
+            stripped=len(summary["stripped"]),
+            deleted=len(summary["deleted"]),
+            map_name_cleared=len(summary["unmapped"]),
+        )
+    return summary

@@ -35,7 +35,7 @@ switches) happens here.
 - **Maps** — 3D maps (`octomap.bt`) saved from a mapping run, switched live,
   renamed, deleted, exported / imported as archives; vertices, forbidden zones
   (`keepout.json`), floors.
-- **Tasks** — multi-step jobs (`MOVE`, `PATROL`, `DOCK`, `STANDUP`, `LIEDOWN`,
+- **Tasks** — multi-step jobs (`MOVE`, `PATROL`, `STANDUP`, `LIEDOWN`,
   `SPEAK`, `WAIT`) run as Temporal workflows: pause / resume / cancel, step
   groups, schedules, templates, history and a CSV report.
 - **Streams** — live point cloud, mapping-mode map cloud and telemetry over
@@ -176,7 +176,7 @@ subscriber, and keep it in sync when behaviour changes.
 | Page | Covers |
 |---|---|
 | [architecture.md](docs/architecture.md) | process model and threads, shutdown order, layering, map storage (octomap, keepout, floors, archives), `robot_id` scoping |
-| [ros-interfaces.md](docs/ros-interfaces.md) | subscriptions and QoS, the map cloud file, action / service clients, auto-undock, publishers, TF |
+| [ros-interfaces.md](docs/ros-interfaces.md) | subscriptions and QoS, the map cloud file, action / service clients, publishers, TF |
 | [rest-api.md](docs/rest-api.md) | every REST / WebSocket route, errors, wire formats, settings pages, recordings, WebRTC, templates, the run record |
 | [tasks.md](docs/tasks.md) | Temporal: step types, retries, groups, pause / resume, continuing a failed task, history, schedules |
 | [configuration.md](docs/configuration.md) | every environment variable, the system INI, the loaded map, Postgres |

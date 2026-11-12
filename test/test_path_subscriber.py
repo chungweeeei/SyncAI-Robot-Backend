@@ -48,10 +48,7 @@ from syncai_backend.repositories.telemetry.telemetry import (  # noqa: E402
 from syncai_backend.helpers.route_preview import (  # noqa: E402
     MAX_PATH_POINTS as _MAX_PATH_POINTS,
 )
-from syncai_backend.subscribers.path_subscriber import (  # noqa: E402
-    init_docking_plan_subscriber,
-    init_path_subscriber,
-)
+from syncai_backend.subscribers.path_subscriber import init_path_subscriber  # noqa: E402
 
 
 class _FakeNode:
@@ -174,39 +171,6 @@ def test_an_empty_plan_clears_whatever_its_frame(subscription, repo):
     subscription.callback(_path([], frame_id=""))
 
     assert repo.get_path(after_seq=seq).points == ()
-
-
-# --- the docking plan ---------------------------------------------------------
-
-
-@pytest.fixture
-def docking_subscription(logger, node, repo):
-    init_docking_plan_subscriber(logger=logger, node=node, telemetry_repo=repo)
-    (sub,) = node.subscriptions
-    return sub
-
-
-def test_the_docking_plan_is_the_relative_docking_plan_topic(docking_subscription):
-    assert docking_subscription.topic == "docking_plan"
-    assert docking_subscription.msg_type is Path
-    assert (
-        docking_subscription.qos_profile.reliability
-        == rclpy.qos.ReliabilityPolicy.BEST_EFFORT
-    )
-
-
-def test_the_docking_plan_fills_its_own_slot(docking_subscription, repo):
-    docking_subscription.callback(_path([(1.0, 1.0), (1.5, 1.2)]))
-
-    assert repo.get_docking_plan().points == ((1.0, 1.0, 0.0), (1.5, 1.2, 0.0))
-    assert repo.get_path() is None
-
-
-def test_the_docking_plan_has_the_same_frame_gate(docking_subscription, repo):
-    # The controller integrates in odom; only the map-frame copy may land.
-    docking_subscription.callback(_path([(1.0, 1.0)], frame_id="robot01/odom"))
-
-    assert repo.get_docking_plan() is None
 
 
 # --- thinning -----------------------------------------------------------------

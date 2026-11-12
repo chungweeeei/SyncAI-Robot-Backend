@@ -38,7 +38,7 @@ def test_stored_steps_resolve_into_the_steps_a_run_executes():
     steps = resolve_stored_steps(
         [
             {"id": "1-move", "type": "MOVE", "params": snapshot, "vertex_id": str(DOCK)},
-            {"id": "2-dock", "type": "DOCK", "params": snapshot, "vertex_id": str(GONE)},
+            {"id": "2-gone", "type": "MOVE", "params": snapshot, "vertex_id": str(GONE)},
             {"id": "3-patrol", "type": "PATROL",
              "params": {"waypoints": [snapshot, snapshot]},
              "vertex_ids": [None, str(DOCK)]},
@@ -53,7 +53,7 @@ def test_stored_steps_resolve_into_the_steps_a_run_executes():
     )
 
     assert [s.type for s in steps] == [
-        StepType.MOVE, StepType.DOCK, StepType.PATROL, StepType.PATROL,
+        StepType.MOVE, StepType.MOVE, StepType.PATROL, StepType.PATROL,
         StepType.SPEAK, StepType.STANDUP,
     ]
     assert steps[0].params == MoveParams(x=3.0, y=-1.5, theta=90.0, z=2.5)

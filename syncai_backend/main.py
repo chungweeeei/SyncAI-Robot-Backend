@@ -44,7 +44,6 @@ from syncai_backend.gateways.webrtc.webrtc import init_webrtc_gateway
 from syncai_backend.gateways.recording.recording import init_recording_gateway
 from syncai_backend.gateways.parameters.parameters import init_parameter_gateway
 
-from syncai_backend.services.dock_state import init_dock_state_service
 from syncai_backend.services.map_import import init_map_import_service
 from syncai_backend.services.map_switch import init_map_switch_service
 from syncai_backend.services.map_usage import init_job_gate, init_map_usage_policy
@@ -70,10 +69,7 @@ from syncai_backend.subscribers.mapping_status_subscriber import (
 from syncai_backend.subscribers.telemetry_subscriber import (
     init_telemetry_subscriber,
 )
-from syncai_backend.subscribers.path_subscriber import (
-    init_docking_plan_subscriber,
-    init_path_subscriber,
-)
+from syncai_backend.subscribers.path_subscriber import init_path_subscriber
 from syncai_backend.subscribers.local_nav_subscriber import (
     init_local_nav_subscriber,
 )
@@ -208,11 +204,6 @@ class SyncAIBackend(Node):
             logger=logger, robot_gw=robot_gw, workflow_gw=workflow_gw
         )
 
-        # Where the last DOCK ended, so a MOVE off the dock undocks first. In
-        # memory on purpose (see services/dock_state.py); only the activities
-        # use it today.
-        dock_state_svc = init_dock_state_service()
-
         # One /tf + /tf_static subscription for the whole process (see
         # subscribers/tf.py).
         self._tf_listener = init_tf_listener(logger=logger, node=self)
@@ -242,10 +233,6 @@ class SyncAIBackend(Node):
         )
         # The planner's route, onto the telemetry socket; already in the map frame.
         init_path_subscriber(logger=logger, node=self, telemetry_repo=telemetry_repo)
-        # The dock's last metre, which no planner draws; also map frame.
-        init_docking_plan_subscriber(
-            logger=logger, node=self, telemetry_repo=telemetry_repo
-        )
         # The controller's local costmap and local plan, onto the same socket
         # while a navigation runs; from odom into the map frame by TF.
         init_local_nav_subscriber(
@@ -262,8 +249,6 @@ class SyncAIBackend(Node):
             tts_gw=tts_gw,
             map_catalog_repo=map_catalog_repo,
             map_usage=map_usage,
-            robot_repo=robot_repo,
-            dock_state=dock_state_svc,
             task_record_repo=task_record_repo,
             task_template_repo=task_template_repo,
             map_repo=map_repo,

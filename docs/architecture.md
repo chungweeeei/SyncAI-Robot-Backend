@@ -49,9 +49,8 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; no business logi
 services/                  domain work that outlives a request: mode_restart (the latest
         │                  restart_mode dispatch and how it ended); safety_lock (the driver
         │                  safety lock's rising edge → cancel every task); map_switch (the
-        │                  live map switch's steps and their undos); dock_state (the last
-        │                  DOCK's pose, for the auto-undock); map_usage (whether a map may
-        │                  be edited, destroyed, switched to or driven on); map_import (an
+        │                  live map switch's steps and their undos); map_usage (whether a
+        │                  map may be edited, destroyed, switched to or driven on); map_import (an
         │                  archive's directory and vertex rows, published together);
         │                  task_record_retention (task_record's daily partitions: made
         │                  ahead, dropped after 30 days)

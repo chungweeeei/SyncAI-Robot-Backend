@@ -146,22 +146,7 @@ replaces the loss. What still needs a nudge: a server that restarted while no
 task was cancelling — the next cancel, safety-lock trip or `move()` is what
 resolves it.
 
-`DOCK` / `UNDOCK` steps are goals on the **same** client: `move(...,
-behavior_tree=...)` sets the goal's `behavior_tree` to `dock.xml` / `undock.xml`
-(`DOCK_BEHAVIOR_TREE` / `UNDOCK_BEHAVIOR_TREE`; `""` is the task runner's default
-`move.xml`). A DOCK's `pose` is the **dock pose**: dock.xml computes the staging
-pose from it, drives there, switches to MPC and calls the controller's `DockToPose`
-action; it ends **standing on the dock in MPC** (the task runner stopped lying it
-down on 2026-10-15 — a LIEDOWN step after the DOCK does that). An UNDOCK's `pose`
-is **empty** (zeros): undock.xml ignores it since task runner `e027dbe` and backs
-out 1 m from where the robot stands, switching back to RL at the end; it has no
-stand-up step, so a robot lying on the dock is stood up first (see *Auto-undock*
-below). This process never calls `DockToPose`. Sharing the client is what puts docks in the goal table, so the
-status poll, `status_msg`, `cancel_active_moves` (safety lock included) and the
-teleop refusal cover them with no extra code. A docking-branch failure ends the
-goal `DOCK_FAILED` (300) with the failing node's reason in `error_msg`; an
-unreachable staging pose is `PLAN_FAILED` / `FOLLOW_PATH_FAILED` as for a MOVE.
-Needs `syncai_common` at or after SyncAI-Robot-Interface `bbcc958`.
+**Removed: DOCK / UNDOCK.** DOCK / UNDOCK steps (on `dock.xml` / `undock.xml`), the MOVE's auto-undock and the `dock_path` telemetry frame were removed on 2026-11-12, with the robot stack's dock trees, and the stored data cleaned the same day: the backend strips those steps from templates and schedules at startup (`tasks/retired_steps.py`).
 
 **PATROL: `navigate_through_goals` (`syncai_common/NavigateThroughGoals`), 2026-11.**
 A second action client on the same server (`syncai_task_runner`), for the PATROL
@@ -204,36 +189,6 @@ and is worded by `helpers/route_preview.py` in the task runner's sentences, so a
 preview that fails reads as the MOVE would have. ABORTED with code `NONE` is a
 preview a newer one preempted (the planner takes one at a time),
 `preview_superseded`.
-
-**Auto-undock (2026-10-15).** A MOVE after a DOCK gets the robot off the dock
-by itself: a MOVE straight off one starts with the footprint on the dock's
-lethal cells and fails. `execute_dock`'s success records the dock's target pose
-and map (`services/dock_state.py`, `DockStateService`); `execute_move`, after
-its map check, asks whether the robot is still on it — same map, a localized
-pose within 0.2 m / 0.3 rad of the record (unmeasured) — and if so sends
-`MotionKey.STAND` and waits up to 15 s (unmeasured) for `motion_state` STAND
-when it lies there (a LIEDOWN after the DOCK), runs undock.xml, forgets the
-dock, and then drives. The state is here and not in the task runner on purpose
-(SyncAI-Robot-Workspace, 2026-10-15): only this process sees the LIEDOWN, and
-the robot side keeps its trees stateless. Consequences:
-
-- A record the robot is provably not at (another map loaded, or a localized
-  pose outside the window — teleop drove it away, a cancelled undock moved it)
-  is dropped, never acted on: a blind 1 m back-out from a stale record is the
-  failure this guards against. No robot_state yet or an unlocalized pose
-  proves nothing; the MOVE just drives and the record stays.
-- **It is in memory.** A backend restart forgets the dock, and the next MOVE
-  fails on the dock's lethal cells as it did before this existed; an UNDOCK
-  step through `POST /api/v1/tasks` still gets the robot off.
-- The auto-undock runs inside the MOVE's attempt, so the MOVE's retry, pause
-  and cancel cover it. A cancel or pause during the back-out cancels the goal
-  and restores RL (as for an UNDOCK); the next attempt, or the resumed step,
-  asks again, and a robot stopped within the window backs out again from
-  there. A failed back-out fails the attempt with `undock ended in …` and keeps
-  the record. In a group, the undock goal's acceptance reports the MOVE
-  started, so a grouped SPEAK starts with the back-out.
-- The UNDOCK step stays (API, stored templates and schedules), and its success
-  forgets the dock too; the console no longer offers it.
 
 **Service clients.** Every call goes through `gateways/ros.py`'s `call_service`: send, wait off the executor thread, and on timeout `remove_pending_request` the abandoned request, which otherwise sat in the client's pending table for the life of the process whenever its server was restarted under it (`switch_mode` / `restart_mode` rebuild them all). `restart_mode` alone keeps its request pending, for the late answer that reports the restart's outcome. `test_ros_call_service.py` fails on a new raw `call_async`.
 

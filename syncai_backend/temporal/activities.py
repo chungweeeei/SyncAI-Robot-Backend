@@ -24,20 +24,13 @@ from syncai_backend.tasks.template_resolution import (
     resolve_stored_steps,
     stored_vertex_ids,
 )
-from syncai_backend.gateways.robot.robot import (
-    DOCK_BEHAVIOR_TREE,
-    UNDOCK_BEHAVIOR_TREE,
-    MotionKey,
-    RobotGateway,
-)
+from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.map.map import MapRepo
-from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
-from syncai_backend.services.dock_state import DockStateService
 from syncai_backend.services.map_usage import MapUsagePolicy
 
 
@@ -51,24 +44,13 @@ NAV_POLL_INTERVAL_S = 0.25
 # MOVE_HEARTBEAT_TIMEOUT beside the heartbeat sent just before it (test_activities.py).
 STARTED_REPORT_TIMEOUT_S = 1.0
 
-# RobotState.low_level_mode.motion_state values the auto-undock reads (the
-# console's table is routers/robot.py's _MOTION_STATE_TO_STR).
-MOTION_STATE_STAND = 0
-MOTION_STATE_LIE_DOWN = 2
-
-# How long a MOVE's auto-undock waits for a robot lying on the dock to report
-# STAND after the STANDUP key, before the attempt fails (retryably). Unmeasured:
-# a stand-up has been seen to take a few seconds, and robot_state publishes at
-# 1 Hz, so this leaves room for both with margin.
-STAND_UP_TIMEOUT_S = 15.0
-
 
 def _move_failure(status: dict, label: str = "move") -> str:
-    """The step's error_msg for a MOVE / DOCK / UNDOCK / PATROL that did not
-    succeed (NavigateThroughGoals carries NavigateToGoal's error fields).
+    """The step's error_msg for a MOVE / PATROL that did not succeed
+    (NavigateThroughGoals carries NavigateToGoal's error fields).
 
     The robot's own sentence when it gave one (why the backend uses NavigateToGoal,
-    not NavigateToPose; a dock tree's DOCK_FAILED names the node that failed). An
+    not NavigateToPose). An
     abort with error_code NONE is a goal that was superseded or never started, not a
     navigation failure, and is said so.
     """
@@ -96,12 +78,12 @@ def _move_failure(status: dict, label: str = "move") -> str:
 # the codes are the interface's contract and never renumbered, and this module
 # imports without syncai_common under test. Everything else stays retryable: 200
 # (no finer reason), a person on the goal (206) or across the way (208), a map
-# still loading (221), a controller or dock failure, an abort with no code.
+# still loading (221), a controller failure, an abort with no code.
 NON_RETRYABLE_NAV_CODES = frozenset({201, 203, 204, 209, 220, 222, 223, 224})
 
 
 def _nav_failure(status: dict, label: str) -> ApplicationError:
-    """The error a MOVE / DOCK / UNDOCK / PATROL that did not succeed raises.
+    """The error a MOVE / PATROL that did not succeed raises.
 
     Non-retryable when the robot's error_code says the same goal cannot succeed
     (NON_RETRYABLE_NAV_CODES). Before 2026-11 every abort was retried, and a
@@ -121,16 +103,6 @@ def _pose_kwargs(params: MoveParams) -> dict:
         "z": params.z,
         "yaw": math.radians(params.theta),
     }
-
-
-def _facing_params(params: MoveParams) -> MoveParams:
-    """A DOCK's params as dock.xml takes them: the heading turned round, from
-    the charger's own, out of its face (what the console stores on a charger
-    waypoint), to the one the robot faces the charger on, which DockToPose
-    drives onto and ComputeStagingPose backs the staging pose off along. Kept
-    in (-180, 180], the bound MoveParams holds theta to."""
-    theta = params.theta - 180.0 if params.theta > 0.0 else params.theta + 180.0
-    return params.model_copy(update={"theta": theta})
 
 
 def _patrol_passed(details) -> int:
@@ -155,8 +127,6 @@ class RobotActivities:
         tts_gw: TtsGateway,
         map_catalog_repo: MapCatalogRepo,
         map_usage: MapUsagePolicy,
-        robot_repo: RobotRepo,
-        dock_state: DockStateService,
         task_record_repo: TaskRecordRepo,
         task_template_repo: TaskTemplateRepo,
         map_repo: MapRepo,
@@ -164,15 +134,10 @@ class RobotActivities:
         self._logger = logger
         self._robot_gw = robot_gw
         self._tts_gw = tts_gw
-        # Read-only: the loaded map, for the auto-undock.
+        # Read-only: the loaded map, for the map checks.
         self._map_catalog_repo = map_catalog_repo
         # execute_move's check, the same rule POST /api/v1/tasks applies.
         self._map_usage = map_usage
-        # The latest RobotState (pose, motion state), for the auto-undock's checks.
-        self._robot_repo = robot_repo
-        # Where the last DOCK ended; see services/dock_state.py. One per process,
-        # built in main.py like every other collaborator.
-        self._dock_state = dock_state
         # Where record_task leaves each finished run (the report export's source).
         self._task_record_repo = task_record_repo
         # What resolve_template reads: a scheduled run's template and its vertices.
@@ -307,59 +272,11 @@ class RobotActivities:
     ) -> ActivityResult:
         """Send a NavigateToGoal goal and supervise it to a terminal state.
 
-        A robot still standing (or lying) on the dock the last DOCK ended on is
-        taken off it first (_undock_if_docked): a MOVE straight off a dock starts
-        with the footprint on its lethal cells and fails. The map check runs
-        before that, so a MOVE refused for its map never backs the robot out.
+        Drives from wherever the robot stands. Until 2026-11-12 a MOVE after a
+        DOCK first backed the robot off the dock on undock.xml (the auto-undock);
+        it went with the DOCK / UNDOCK steps and the robot stack's dock trees.
         """
-        self._refuse_wrong_map(expected_map)
-        self._undock_if_docked()
-        return self._navigate(params, expected_map, behavior_tree="", label="move")
-
-    @activity.defn
-    def execute_dock(
-        self, params: MoveParams, expected_map: Optional[str] = None
-    ) -> ActivityResult:
-        """Dock at the pose in ``params``: a NavigateToGoal on dock.xml.
-
-        The tree drives to the staging pose, switches to MPC and approaches with
-        DockToPose; it ends standing on the dock in MPC (the task runner stopped
-        lying it down on 2026-10-15 -- a LIEDOWN step after the DOCK does that).
-        Success records the dock for the next MOVE's auto-undock, under the
-        run's map, or the loaded one for a run that carries none.
-
-        ``params.theta`` is the charger's heading, out of its face; the goal
-        and the record carry it turned round (_facing_params), the way the
-        robot stands on the dock.
-        """
-        dock = _facing_params(params)
-        result = self._navigate(
-            dock, expected_map, behavior_tree=DOCK_BEHAVIOR_TREE, label="dock"
-        )
-        self._dock_state.record(
-            expected_map if expected_map is not None
-            else self._map_catalog_repo.active_name(),
-            dock.x,
-            dock.y,
-            dock.theta,
-        )
-        return result
-
-    @activity.defn
-    def execute_undock(self) -> ActivityResult:
-        """Back off the dock: a NavigateToGoal on undock.xml (MPC, back out 1 m
-        from where the robot stands, RL). The tree reads no pose, so the goal's
-        is left empty and there is no map to check it against.
-
-        Kept for the API and for stored templates / schedules: a MOVE after a
-        DOCK undocks by itself now, so the console no longer offers the step.
-        Success forgets the dock, so the next MOVE does not back out again.
-        """
-        result = self._navigate(
-            None, None, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock"
-        )
-        self._dock_state.clear()
-        return result
+        return self._navigate(params, expected_map, label="move")
 
     @activity.defn
     def execute_patrol(
@@ -377,12 +294,10 @@ class RobotActivities:
         details; the goal carries only the waypoints past the larger of the two,
         the last one always. ``step_id`` names the step in those reports.
 
-        The map check and the auto-undock are a MOVE's (execute_move). The
-        cleanup on a cancel is too: whatever is executing is cancelled. A patrol
-        never runs a dock tree, so there is no gait to restore.
+        The map check is a MOVE's (_navigate's). The cleanup on a cancel is too:
+        whatever is executing is cancelled.
         """
         self._refuse_wrong_map(expected_map)
-        self._undock_if_docked()
 
         total = len(params.waypoints)
         passed = max(start, _patrol_passed(activity.info().heartbeat_details))
@@ -426,54 +341,6 @@ class RobotActivities:
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
 
-    def _undock_if_docked(self) -> None:
-        """Get the robot off the recorded dock, if it is still on it.
-
-        Lying (a LIEDOWN after the DOCK): STANDUP first, and wait until the
-        controller reports STAND, because undock.xml starts from standing and
-        what its MPC switch does from lying is unmeasured. Then undock.xml, then
-        forget the dock.
-
-        Runs inside the MOVE's attempt, so the MOVE's retry, pause and cancel
-        cover it: a cancel or pause during the back-out lands in _navigate's
-        cleanup (goal cancelled, RL restored), and the next attempt (or the
-        resumed step) asks again. A robot stopped within the on-dock tolerance
-        backs out again from there; one stopped outside it is not on the dock
-        any more and just drives. In a group, the undock goal's acceptance is
-        what reports the MOVE started, so a grouped SPEAK starts with the
-        back-out rather than after it.
-        """
-        state = self._robot_repo.get_robot_state()
-        if not self._dock_state.is_on_dock(state, self._map_catalog_repo.active_name()):
-            return
-
-        self._logger.info("[RobotActivity] Robot is on the dock; undocking before the move")
-        if state.low_level_mode.motion_state == MOTION_STATE_LIE_DOWN:
-            self._set_motion_key(key=MotionKey.STAND, label="Stand")
-            self._wait_for_motion_state(MOTION_STATE_STAND, STAND_UP_TIMEOUT_S, "standing")
-
-        self._navigate(None, None, behavior_tree=UNDOCK_BEHAVIOR_TREE, label="undock")
-        self._dock_state.clear()
-
-    def _wait_for_motion_state(self, motion_state: int, timeout_s: float, label: str) -> None:
-        """Poll RobotState until the controller reports ``motion_state``,
-        heartbeating each round. Retryable on timeout: the next attempt sends
-        the key again from whatever the robot is doing by then."""
-        deadline = time.monotonic() + timeout_s
-        while True:
-            state = self._robot_repo.get_robot_state()
-            reported = None if state is None else state.low_level_mode.motion_state
-            activity.heartbeat(label, reported)
-            if reported == motion_state:
-                return
-            if time.monotonic() >= deadline:
-                raise ApplicationError(
-                    f"Auto-undock: the robot did not report {label} within "
-                    f"{timeout_s:.0f} s (motion state {reported})",
-                    non_retryable=False,
-                )
-            time.sleep(NAV_POLL_INTERVAL_S)
-
     def _refuse_wrong_map(self, expected_map: Optional[str]) -> None:
         """Raise move_guard's refusal (non-retryable) for a goal planned on
         ``expected_map`` when another map is loaded."""
@@ -485,31 +352,24 @@ class RobotActivities:
 
     def _navigate(
         self,
-        params: Optional[MoveParams],
+        params: MoveParams,
         expected_map: Optional[str],
-        behavior_tree: str,
         label: str,
     ) -> ActivityResult:
-        """Send a NavigateToGoal goal on ``behavior_tree`` and supervise it.
+        """Send a NavigateToGoal goal on the task runner's default tree and
+        supervise it.
 
-        ``expected_map`` is the run's ``TaskMap``. A goal with a pose is first
-        checked against the loaded map (helpers/move_guard.py, as POST
-        /api/v1/tasks does): another map's coordinates are refused,
-        non-retryable; this is the check that catches a
-        schedule firing after a map switch. ``params`` None (an UNDOCK) skips it and
-        sends an empty pose: the tree works from the robot's own frame.
+        ``expected_map`` is the run's ``TaskMap``. The goal is first checked
+        against the loaded map (helpers/move_guard.py, as POST /api/v1/tasks
+        does): another map's coordinates are refused, non-retryable; this is the
+        check that catches a schedule firing after a map switch.
 
         Cancellation is *thrown* into this thread as CancelledError (in the poll
         loop or inside move()), so cleanup lives in the except clause. A blocking
         call like time.sleep is not interrupted, hence the short NAV_POLL_INTERVAL_S.
         """
-        if params is not None:
-            self._refuse_wrong_map(expected_map)
-            move_kwargs = _pose_kwargs(params)
-        else:
-            move_kwargs = {"x": 0.0, "y": 0.0, "yaw": 0.0}
-        if behavior_tree:
-            move_kwargs["behavior_tree"] = behavior_tree
+        self._refuse_wrong_map(expected_map)
+        move_kwargs = _pose_kwargs(params)
 
         # The heartbeat_timeout clock starts with the activity, and move() can block
         # up to NAV_GOAL_SEND_BUDGET_S; beat first so a slow nav2 does not fail it.
@@ -536,8 +396,6 @@ class RobotActivities:
             # move() has no id yet. Shielded so the cancel RPC finishes first.
             with activity.shield_thread_cancel_exception():
                 self._robot_gw.cancel_active_moves()
-                if behavior_tree:
-                    self._restore_locomotion(label)
 
             self._logger.warning(
                 f"[RobotActivity] {label.capitalize()} activity has been cancelled"
@@ -548,23 +406,6 @@ class RobotActivities:
             raise _nav_failure(status, label)
 
         return ActivityResult(success=True, goal_id=goal_id, state=state)
-
-    def _restore_locomotion(self, label: str) -> None:
-        """Put the walking gait back after a dock tree was cut short.
-
-        A halted dock.xml / undock.xml does not switch back from MPC itself (its
-        fallback only runs on a failure), and the next MOVE needs RL. Best effort:
-        a refusal (safety lock) is logged, never raised over the cancel.
-        """
-        try:
-            accepted, msg = self._robot_gw.set_motion_key(key=MotionKey.LOCOMOTION)
-        except Exception as err:
-            accepted, msg = False, str(err)
-        if not accepted:
-            self._logger.warning(
-                f"[RobotActivity] Could not restore locomotion after {label}",
-                error=msg,
-            )
 
     def _set_motion_key(self, key: MotionKey, label: str) -> ActivityResult:
         """Send a motion key. Fire-and-forget: this does NOT wait for the pose.

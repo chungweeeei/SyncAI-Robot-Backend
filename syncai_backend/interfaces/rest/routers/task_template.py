@@ -71,8 +71,7 @@ class TemplateStepRequest(StepRequest):
     vertex_id: Optional[uuid.UUID] = Field(
         default=None,
         description=(
-            "The map vertex this MOVE / DOCK step's coordinates were "
-            "taken from (for a dock, typically a CHARGE vertex). "
+            "The map vertex this MOVE step's coordinates were taken from. "
             "`params` is kept as a snapshot either way: a dispatch prefers the "
             "vertex's current pose and falls back to the snapshot once the "
             "vertex has been deleted."
@@ -150,7 +149,7 @@ class TaskTemplateRequest(BaseModel):
     map_name: Optional[str] = Field(
         default=None,
         description=(
-            "The map whose frame the MOVE / DOCK coordinates are in. "
+            "The map whose frame the MOVE / PATROL coordinates are in. "
             "Required when the template has any such step; must be omitted when "
             "it has none."
         ),
@@ -297,21 +296,21 @@ def _check_step_groups(steps: List[TemplateStepRequest]) -> None:
 
 
 def _check_map_scope(map_name: Optional[str], steps: List[TemplateStepRequest]) -> None:
-    """Any MOVE / PATROL / DOCK step means a map name is required; none means it is
+    """Any MOVE / PATROL step means a map name is required; none means it is
     forbidden.
 
     Any such step, not just a vertex reference: hand-typed coordinates are in a
-    map's frame too. An UNDOCK has no coordinates, so it does not count.
+    map's frame too.
     """
     has_move = any(step.type in POSE_STEP_TYPES for step in steps)
     if has_move and not map_name:
         raise ValueError(
-            "a template with MOVE/PATROL/DOCK steps must name the map its "
+            "a template with MOVE/PATROL steps must name the map its "
             "coordinates are in"
         )
     if not has_move and map_name:
         raise ValueError(
-            "a template with no MOVE/PATROL/DOCK step is map-independent; "
+            "a template with no MOVE/PATROL step is map-independent; "
             "omit map_name"
         )
 

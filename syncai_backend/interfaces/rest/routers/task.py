@@ -26,7 +26,6 @@ from syncai_backend.tasks.schema import (
     NAV_STEP_TYPES,
     POSE_STEP_TYPES,
     Step,
-    StepType,
     StepStatus,
     TaskKind,
     TaskProvenance,
@@ -150,16 +149,6 @@ class TaskResponse(BaseModel):
     )
 
 
-class DockPose(BaseModel):
-    x: float = Field(..., description="Dock x in the map frame, metres", examples=[1.0])
-    y: float = Field(..., description="Dock y in the map frame, metres", examples=[2.0])
-    theta: float = Field(
-        ...,
-        description="Dock heading in degrees, CCW from +x, the way the robot faces on it",
-        examples=[90.0],
-    )
-
-
 class StepState(BaseModel):
     id: str = Field(
         ..., description="Unique identifier of the step", examples=["step1"]
@@ -183,14 +172,6 @@ class StepState(BaseModel):
     group: Optional[str] = Field(
         default=None,
         description="The step's group, as dispatched: steps sharing one ran side by side",
-    )
-    dock: Optional[DockPose] = Field(
-        default=None,
-        description=(
-            "The dock pose a DOCK step drives onto, as dispatched (map frame); "
-            "null for every other step. A console derives the staging pose "
-            "from it to draw the approach of a running dock"
-        ),
     )
     started_at: Optional[datetime] = Field(
         default=None,
@@ -676,8 +657,8 @@ def init_task_router(
         """The map a job is stamped with: the loaded one, if it drives to a pose.
 
         Refused (409, move_refusal's code) when that is not ``expected_map``. A
-        job that does not -- an UNDOCK backs off blind, from wherever the robot
-        stands -- holds no map and is neither stamped nor refused.
+        job that does not (postures, SPEAK, WAIT only) holds no map and is
+        neither stamped nor refused.
         """
         if not any(step.type in POSE_STEP_TYPES for step in steps):
             return None
@@ -937,19 +918,11 @@ def init_task_router(
 
     def _step_message(step: Step) -> str:
         # Read live from the gateway: the workflow cannot see an activity's
-        # progress. Only a running MOVE / DOCK / UNDOCK has a goal; between retry
+        # progress. Only a running MOVE / PATROL has a goal; between retry
         # attempts the gateway answers "".
         if step.type in NAV_STEP_TYPES and step.status is StepStatus.IN_PROGRESS:
             return robot_gw.get_move_message()
         return ""
-
-    def _step_dock(step: Step) -> Optional[DockPose]:
-        # The params as dispatched, which a template already resolved from its
-        # vertex: the pose the robot is driving to, not the vertex as it may
-        # have been edited since.
-        if step.type is StepType.DOCK and isinstance(step.params, MoveParams):
-            return DockPose(x=step.params.x, y=step.params.y, theta=step.params.theta)
-        return None
 
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)
     async def get_task_state(id: str):
@@ -965,7 +938,6 @@ def init_task_router(
                     error_msg=step.error_msg or "",
                     message=_step_message(step),
                     group=step.group,
-                    dock=_step_dock(step),
                     started_at=step.started_at,
                     ended_at=step.ended_at,
                     paused_seconds=step.paused_seconds,

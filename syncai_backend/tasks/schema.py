@@ -31,20 +31,15 @@ class StepStatus(str, Enum):
 
 
 # ARTIFACT was removed 2026-08; stored tasks / frozen schedules still carrying one
-# fail validation, so purge them before deploying.
+# fail validation, so purge them before deploying. DOCK / UNDOCK were removed
+# 2026-11-12 with the robot stack's dock trees, and the stored ones are purged at
+# startup instead (tasks/retired_steps.py).
 class StepType(str, Enum):
     MOVE = "MOVE"
     STANDUP = "STANDUP"
     LIEDOWN = "LIEDOWN"
     SPEAK = "SPEAK"
     WAIT = "WAIT"
-    # A NavigateToGoal on the dock trees (gateways/robot DOCK_BEHAVIOR_TREE). DOCK's
-    # x/y/theta is the charger's pose, theta out of its face as the console stores a
-    # charger waypoint; execute_dock turns it round into the heading the robot docks
-    # on, which dock.xml derives the staging pose from; UNDOCK
-    # takes none, since undock.xml backs out 1 m from wherever the robot stands.
-    DOCK = "DOCK"
-    UNDOCK = "UNDOCK"
     # A NavigateThroughGoals on the task runner's patrol.xml: through every waypoint in
     # order without stopping, the last one reached with its heading as a MOVE's is.
     PATROL = "PATROL"
@@ -153,22 +148,19 @@ STEP_PARAMS_TYPE: dict[StepType, Optional[type[BaseModel]]] = {
     StepType.LIEDOWN: None,
     StepType.SPEAK: SpeakParams,
     StepType.WAIT: WaitParams,
-    StepType.DOCK: MoveParams,
-    StepType.UNDOCK: None,
     StepType.PATROL: PatrolParams,
 }
 
 
 # Steps whose params are poses on the loaded map: they share MOVE's map stamping /
 # check and its template vertex refs (a PATROL's one per waypoint, ``vertex_ids``).
-# UNDOCK is not one -- its goal carries no pose, so a job that only backs off the
-# dock holds no map.
-POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.DOCK, StepType.PATROL})
+POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.PATROL})
 
 # Steps that send a navigation goal (NavigateToGoal, or a PATROL's
 # NavigateThroughGoals): they share MOVE's pause interrupt and its live status
-# sentence, pose or not.
-NAV_STEP_TYPES = POSE_STEP_TYPES | {StepType.UNDOCK}
+# sentence. The same set as POSE_STEP_TYPES since UNDOCK, the one goal without a
+# pose, was removed; kept apart because the two questions differ.
+NAV_STEP_TYPES = POSE_STEP_TYPES
 
 
 # Steps on the one-slot body queue (config.TASK_QUEUE_SUFFIX). Two in one group would
@@ -228,7 +220,7 @@ def step_group_problem(steps) -> Optional[StepGroupProblem]:
             if len(body) > 1:
                 return StepGroupProblem(
                     f"Group '{group}' has more than one "
-                    "MOVE/PATROL/DOCK/UNDOCK/STANDUP/LIEDOWN step "
+                    "MOVE/PATROL/STANDUP/LIEDOWN step "
                     f"({', '.join(body)}); the robot can do only one at a time",
                     step.id,
                 )
@@ -256,7 +248,7 @@ GROUP_DESCRIPTION = (
     "Adjacent steps with the same group run at the same time, started in "
     "list order (each once the one before it has started), and the next "
     "step starts once all of them have finished; if one fails the others are "
-    "canceled. At most one MOVE/PATROL/DOCK/UNDOCK/STANDUP/LIEDOWN per group. Omitted: the step "
+    "canceled. At most one MOVE/PATROL/STANDUP/LIEDOWN per group. Omitted: the step "
     "runs on its own, after the one before it"
 )
 
@@ -270,8 +262,8 @@ class Step(BaseSchema):
         default=None,
         description=(
             "Parameters for the step, which vary based on the step type. "
-            "Omitted for STANDUP/LIEDOWN/UNDOCK, required for MOVE, DOCK (x/y/theta: "
-            "the charger's pose, theta out of its face), PATROL (waypoints), SPEAK and WAIT"
+            "Omitted for STANDUP/LIEDOWN, required for MOVE, PATROL (waypoints), "
+            "SPEAK and WAIT"
         ),
     )
     status: StepStatus = Field(

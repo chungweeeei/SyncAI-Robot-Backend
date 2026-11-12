@@ -2,8 +2,7 @@
 
 What these hold is that the catalogue cannot say something the validators
 then refuse: its body rule is BODY_STEP_TYPES, its limits are the params
-models' own, and every step a template stores is in it but UNDOCK, which a
-MOVE does by itself.
+models' own, and every step a template stores is in it.
 """
 
 import pytest
@@ -34,7 +33,7 @@ def _field(step_type, key):
 
 def test_lists_every_step_an_operator_authors():
     listed = [spec.type for spec in step_catalogue().steps]
-    assert set(listed) == set(StepType) - {StepType.UNDOCK}
+    assert set(listed) == set(StepType)
     assert len(listed) == len(set(listed))
 
 
@@ -58,7 +57,6 @@ def test_offers_a_waypoint_for_exactly_the_steps_that_drive_to_a_pose():
             field.kind in ("waypoint", "waypoints") for field in spec.params
         )
         assert has_waypoint == (spec.type in POSE_STEP_TYPES), spec.type
-    assert _field(StepType.DOCK, "target").filter == "charger"
 
 
 def test_patrol_takes_an_ordered_list_of_at_least_two_waypoints():

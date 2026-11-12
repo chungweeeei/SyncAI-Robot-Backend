@@ -73,12 +73,21 @@ async def _stub_ensure_search_attributes(client, logger) -> bool:
     return True
 
 
+_purged: list = []
+
+
+async def _stub_purge_retired_schedule_steps(client, logger, task_queue) -> dict:
+    _purged.append(task_queue)
+    return {"updated": [], "deleted": []}
+
+
 @pytest.fixture(autouse=True)
 def _stub_temporal(monkeypatch):
     _StubClient.reset(failures=0)
     _StubWorker.run_error = None
     _StubWorker.built = []
     _registered.clear()
+    _purged.clear()
     monkeypatch.setattr(worker_mod, "Client", _StubClient)
     monkeypatch.setattr(worker_mod, "Worker", _StubWorker)
     monkeypatch.setattr(worker_mod, "RETRY_INTERVAL", 0)
@@ -86,6 +95,10 @@ def _stub_temporal(monkeypatch):
     # in test_search_attributes.py. Here only *that it runs* matters.
     monkeypatch.setattr(
         worker_mod, "ensure_search_attributes", _stub_ensure_search_attributes
+    )
+    # Pinned in test_retired_schedules.py; here only that it runs, once.
+    monkeypatch.setattr(
+        worker_mod, "purge_retired_schedule_steps", _stub_purge_retired_schedule_steps
     )
 
 
@@ -112,6 +125,8 @@ def test_connect_retries_then_runs():
     # The history's search attributes are registered on the connection that
     # finally succeeded, before the worker polls -- once, not per attempt.
     assert len(_registered) == 1
+    # And DOCK / UNDOCK are purged from this robot's schedules, once, before polling.
+    assert _purged == ["robot01.ROBOT_TASK_QUEUE"]
 
 
 def test_body_and_io_activities_poll_separate_queues():
@@ -130,8 +145,6 @@ def test_body_and_io_activities_poll_separate_queues():
     assert body["workflows"]
     assert body["max_concurrent_activities"] == 1
     assert activities.execute_move in body["activities"]
-    assert activities.execute_dock in body["activities"]
-    assert activities.execute_undock in body["activities"]
     # PATROL drives: the body slot, never the IO queue.
     assert activities.execute_patrol in body["activities"]
     assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
@@ -178,8 +191,6 @@ def test_worker_run_dying_marks_dead():
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
         map_usage=MagicMock(),
-        robot_repo=MagicMock(),
-        dock_state=MagicMock(),
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
@@ -288,8 +299,6 @@ def _start(monkeypatch):
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
         map_usage=MagicMock(),
-        robot_repo=MagicMock(),
-        dock_state=MagicMock(),
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
@@ -329,8 +338,6 @@ def test_request_shutdown_after_the_worker_died_answers_at_once():
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
         map_usage=MagicMock(),
-        robot_repo=MagicMock(),
-        dock_state=MagicMock(),
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
@@ -354,8 +361,6 @@ def test_request_shutdown_reports_a_worker_that_will_not_stop(monkeypatch):
         tts_gw=MagicMock(),
         map_catalog_repo=MagicMock(),
         map_usage=MagicMock(),
-        robot_repo=MagicMock(),
-        dock_state=MagicMock(),
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),

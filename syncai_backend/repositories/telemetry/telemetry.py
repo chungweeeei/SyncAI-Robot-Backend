@@ -19,15 +19,9 @@ from typing import Dict, Optional, Tuple
 # never blinks a live route out.
 _PATH_TTL_S = 6.0
 
-# The docking plan's fallback, by the same rule at its own rate: the
-# DockingController sends it at 2 Hz and controller_server clears it when the
-# dock goal ends, so expiry only catches a controller that died mid-dock. 3 s
-# is six periods.
-_DOCKING_PLAN_TTL_S = 3.0
-
 # The local costmap's fallback: the controller's costmap publishes at 2 Hz
 # (publish_frequency) for as long as anything subscribes, so silence means the
-# controller is gone. Six periods, as the docking plan's.
+# controller is gone. Six periods.
 _LOCAL_COSTMAP_TTL_S = 3.0
 
 # The local plan's, shorter on purpose: MPPI publishes it only on the cycles
@@ -181,8 +175,8 @@ class _LocalCostmapSlot:
 class TelemetryRepo:
     """In-process single-slot caches for the internal telemetry stream.
 
-    Pose, joints, the route, the docking plan, the local costmap and the local
-    plan are sequenced independently because they arrive at very different
+    Pose, joints, the route, the local costmap and the local plan are
+    sequenced independently because they arrive at very different
     rates. Newest sample only, under a
     lock (ROS thread writes, asyncio reads), as in PointCloudRepo.
     """
@@ -196,7 +190,6 @@ class TelemetryRepo:
         self._joints_seq = 0
         self._joints: Optional[JointsSample] = None
         self._path = _PathSlot(ttl_s=_PATH_TTL_S)
-        self._docking_plan = _PathSlot(ttl_s=_DOCKING_PLAN_TTL_S)
         self._local_costmap = _LocalCostmapSlot(ttl_s=_LOCAL_COSTMAP_TTL_S)
         self._local_plan = _PathSlot(ttl_s=_LOCAL_PLAN_TTL_S)
 
@@ -217,12 +210,6 @@ class TelemetryRepo:
     def update_path(self, points: Tuple[Tuple[float, float, float], ...], stamp: float):
         with self._lock:
             self._path.update(points=points, stamp=stamp)
-
-    def update_docking_plan(
-        self, points: Tuple[Tuple[float, float, float], ...], stamp: float
-    ):
-        with self._lock:
-            self._docking_plan.update(points=points, stamp=stamp)
 
     def update_local_costmap(
         self,
@@ -275,12 +262,6 @@ class TelemetryRepo:
         """
         with self._lock:
             return self._path.get(after_seq)
-
-    def get_docking_plan(self, after_seq: int = 0) -> Optional[PathSample]:
-        """The docking controller's predicted approach, by get_path's rules
-        with _DOCKING_PLAN_TTL_S."""
-        with self._lock:
-            return self._docking_plan.get(after_seq)
 
     def get_local_costmap(self, after_seq: int = 0) -> Optional[LocalCostmapSample]:
         """The local costmap if newer than ``after_seq``, by get_path's rules
