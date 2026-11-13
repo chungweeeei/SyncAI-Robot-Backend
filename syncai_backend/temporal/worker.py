@@ -196,6 +196,7 @@ async def run_worker(
         workflows=[RobotWorkflow],
         activities=[
             activities.execute_move,
+            activities.execute_charge,
             activities.execute_patrol,
             activities.execute_stand,
             activities.execute_lie_down,

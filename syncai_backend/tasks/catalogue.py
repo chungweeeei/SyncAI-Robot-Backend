@@ -179,6 +179,13 @@ def step_catalogue() -> StepCatalogue:
                 ],
             ),
             _spec(
+                StepType.CHARGE,
+                "Charge",
+                "Go to a charger, find its marker, and walk onto the charger by "
+                "the marker; stay standing on it.",
+                [WaypointField(key="target", label="Charger", filter="charger")],
+            ),
+            _spec(
                 StepType.SPEAK,
                 "Speak",
                 "Say a line on the robot’s speaker.",

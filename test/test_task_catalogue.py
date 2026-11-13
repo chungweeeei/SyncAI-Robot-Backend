@@ -57,6 +57,7 @@ def test_offers_a_waypoint_for_exactly_the_steps_that_drive_to_a_pose():
             field.kind in ("waypoint", "waypoints") for field in spec.params
         )
         assert has_waypoint == (spec.type in POSE_STEP_TYPES), spec.type
+    assert _field(StepType.CHARGE, "target").filter == "charger"
 
 
 def test_patrol_takes_an_ordered_list_of_at_least_two_waypoints():

@@ -239,6 +239,27 @@ def test_vertex_from_another_map_names_both_maps(client, map_repo):
     assert "rawonly" in res.json()["detail"] and "full" in res.json()["detail"]
 
 
+def test_a_charge_step_resolves_its_vertex_like_a_move(client, dock):
+    step = dict(_move(dock.id, step_id="1-charge"), type="CHARGE")
+
+    created = _create(client, steps=[step])
+
+    assert created.status_code == 200
+    stored = created.json()["steps"][0]
+    assert stored["type"] == "CHARGE"
+    assert stored["vertex_status"] == "CURRENT"
+    assert stored["resolved_params"] == {"x": 3.0, "y": -1.5, "theta": 90.0, "z": 0.0}
+
+
+def test_charge_steps_require_a_map_name(client):
+    step = dict(_move(step_id="1-charge"), type="CHARGE")
+
+    res = _create(client, map_name=None, steps=[step])
+
+    assert res.status_code == 400
+    assert "must name the map" in res.json()["detail"]
+
+
 @pytest.mark.parametrize("step_type", ["DOCK", "UNDOCK"])
 def test_the_removed_dock_steps_are_refused(client, step_type):
     # Removed on 2026-11-12 with the robot stack's dock trees; what was stored

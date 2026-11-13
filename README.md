@@ -35,7 +35,7 @@ switches) happens here.
 - **Maps** — 3D maps (`octomap.bt`) saved from a mapping run, switched live,
   renamed, deleted, exported / imported as archives; vertices, forbidden zones
   (`keepout.json`), floors.
-- **Tasks** — multi-step jobs (`MOVE`, `PATROL`, `STANDUP`, `LIEDOWN`,
+- **Tasks** — multi-step jobs (`MOVE`, `PATROL`, `CHARGE`, `STANDUP`, `LIEDOWN`,
   `SPEAK`, `WAIT`) run as Temporal workflows: pause / resume / cancel, step
   groups, schedules, templates, history and a CSV report.
 - **Streams** — live point cloud, mapping-mode map cloud and telemetry over

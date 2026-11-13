@@ -27,6 +27,7 @@ from syncai_backend.tasks.schema import (
     POSE_STEP_TYPES,
     Step,
     StepStatus,
+    StepType,
     TaskKind,
     TaskProvenance,
     TaskSource,
@@ -149,6 +150,16 @@ class TaskResponse(BaseModel):
     )
 
 
+class ChargerPose(BaseModel):
+    x: float = Field(..., description="Marker x in the map frame, metres", examples=[1.0])
+    y: float = Field(..., description="Marker y in the map frame, metres", examples=[2.0])
+    theta: float = Field(
+        ...,
+        description="Marker heading in degrees, CCW from +x, out of its face",
+        examples=[90.0],
+    )
+
+
 class StepState(BaseModel):
     id: str = Field(
         ..., description="Unique identifier of the step", examples=["step1"]
@@ -172,6 +183,15 @@ class StepState(BaseModel):
     group: Optional[str] = Field(
         default=None,
         description="The step's group, as dispatched: steps sharing one ran side by side",
+    )
+    charge: Optional[ChargerPose] = Field(
+        default=None,
+        description=(
+            "The charger waypoint a CHARGE step walks onto, as dispatched (map "
+            "frame): the marker's centre, theta out of its face; null for every "
+            "other step. A console derives the staging pose from it (1.3 m out "
+            "along theta, facing back) to draw the approach of a running charge"
+        ),
     )
     started_at: Optional[datetime] = Field(
         default=None,
@@ -918,11 +938,20 @@ def init_task_router(
 
     def _step_message(step: Step) -> str:
         # Read live from the gateway: the workflow cannot see an activity's
-        # progress. Only a running MOVE / PATROL has a goal; between retry
+        # progress. Only a running MOVE / PATROL / CHARGE has a goal; between retry
         # attempts the gateway answers "".
         if step.type in NAV_STEP_TYPES and step.status is StepStatus.IN_PROGRESS:
             return robot_gw.get_move_message()
         return ""
+
+    def _step_charge(step: Step) -> Optional[ChargerPose]:
+        # The params as dispatched, which a template already resolved from its
+        # vertex: the charger the robot is walking onto, not the vertex as it
+        # may have been edited since. The waypoint as stored (the marker, the
+        # heading out of its face) is also what is sent.
+        if step.type is StepType.CHARGE and isinstance(step.params, MoveParams):
+            return ChargerPose(x=step.params.x, y=step.params.y, theta=step.params.theta)
+        return None
 
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)
     async def get_task_state(id: str):
@@ -938,6 +967,7 @@ def init_task_router(
                     error_msg=step.error_msg or "",
                     message=_step_message(step),
                     group=step.group,
+                    charge=_step_charge(step),
                     started_at=step.started_at,
                     ended_at=step.ended_at,
                     paused_seconds=step.paused_seconds,

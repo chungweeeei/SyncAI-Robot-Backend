@@ -24,7 +24,11 @@ from syncai_backend.tasks.template_resolution import (
     resolve_stored_steps,
     stored_vertex_ids,
 )
-from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
+from syncai_backend.gateways.robot.robot import (
+    CHARGE_BEHAVIOR_TREE,
+    MotionKey,
+    RobotGateway,
+)
 from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
@@ -279,6 +283,22 @@ class RobotActivities:
         return self._navigate(params, expected_map, label="move")
 
     @activity.defn
+    def execute_charge(
+        self, params: MoveParams, expected_map: Optional[str] = None
+    ) -> ActivityResult:
+        """Charge at the charger waypoint in ``params``: a NavigateToGoal on
+        charge.xml, sent as stored -- the console stores a charger's heading
+        out of the marker's face, which is what the tree takes.
+
+        The last metre follows the marker as the camera sees it, so it ends on
+        the charger and not where the map says the charger is. It ends standing
+        on the charger in MPC; a LIEDOWN step after it lies the robot down.
+        """
+        return self._navigate(
+            params, expected_map, label="charge", behavior_tree=CHARGE_BEHAVIOR_TREE
+        )
+
+    @activity.defn
     def execute_patrol(
         self,
         params: PatrolParams,
@@ -355,9 +375,10 @@ class RobotActivities:
         params: MoveParams,
         expected_map: Optional[str],
         label: str,
+        behavior_tree: str = "",
     ) -> ActivityResult:
-        """Send a NavigateToGoal goal on the task runner's default tree and
-        supervise it.
+        """Send a NavigateToGoal goal on ``behavior_tree`` ("" is the task
+        runner's default, move.xml) and supervise it.
 
         ``expected_map`` is the run's ``TaskMap``. The goal is first checked
         against the loaded map (helpers/move_guard.py, as POST /api/v1/tasks
@@ -370,6 +391,8 @@ class RobotActivities:
         """
         self._refuse_wrong_map(expected_map)
         move_kwargs = _pose_kwargs(params)
+        if behavior_tree:
+            move_kwargs["behavior_tree"] = behavior_tree
 
         # The heartbeat_timeout clock starts with the activity, and move() can block
         # up to NAV_GOAL_SEND_BUDGET_S; beat first so a slow nav2 does not fail it.

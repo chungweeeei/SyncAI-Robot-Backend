@@ -239,6 +239,15 @@ def _move_task(task_id="robot01-task-001"):
     }
 
 
+def _charge_task(task_id="robot01-charge-001"):
+    return {
+        "id": task_id,
+        "steps": [
+            {"id": "s1", "type": "CHARGE", "params": {"x": 3.0, "y": 1.0, "theta": 180.0}}
+        ],
+    }
+
+
 def _patrol_task(task_id="robot01-patrol-001"):
     return {
         "id": task_id,
@@ -437,6 +446,25 @@ class TestJobMap:
         _, provenance = workflow_gw.started[0]
         assert provenance.map_name == "lab"
 
+    def test_a_charge_job_is_stamped_like_a_move(self, client, workflow_gw):
+        assert client.post("/api/v1/tasks", json=_charge_task()).status_code == 200
+        assert workflow_gw.started[0][1].map_name == "lab"
+
+    def test_a_charge_from_another_map_is_refused(self, client, workflow_gw):
+        task = {**_charge_task(), "map_name": "warehouse"}
+
+        response = client.post("/api/v1/tasks", json=task)
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "map_mismatch"
+        assert workflow_gw.started == []
+
+    def test_a_charge_without_a_pose_is_refused(self, client, workflow_gw):
+        task = {"id": "robot01-charge-001", "steps": [{"id": "s1", "type": "CHARGE"}]}
+
+        assert client.post("/api/v1/tasks", json=task).status_code == 422
+        assert workflow_gw.started == []
+
     def test_a_patrol_job_is_stamped_like_a_move(self, client, workflow_gw):
         response = client.post("/api/v1/tasks", json=_patrol_task())
         assert response.status_code == 200, response.text
@@ -512,9 +540,10 @@ class TestTaskState:
 
         assert body["status"] == "IN_PROGRESS"
         # StepState is status/error/message (and the group it ran in, and
-        # its times) — the definition (params) stays out. No feedback from the
-        # robot yet reads as an empty message; an ungrouped step reads group
-        # null, and one without times reads them null.
+        # its times) — the definition (params) stays out, but for a CHARGE's
+        # charger. No feedback from the robot yet reads as an empty message; an
+        # ungrouped step reads group null, a step that is not a CHARGE reads
+        # charge null, and one without times reads them null.
         assert body["steps"] == [
             {
                 "id": "step1",
@@ -522,6 +551,7 @@ class TestTaskState:
                 "error_msg": "",
                 "message": "",
                 "group": None,
+                "charge": None,
                 "started_at": None,
                 "ended_at": None,
                 "paused_seconds": 0.0,
@@ -561,6 +591,60 @@ class TestTaskState:
         body = client.get("/api/v1/tasks/robot01-patrol-001").json()
 
         assert body["steps"][0]["message"] == robot_gw.message
+        # Not a charge: no charger for a patrol's waypoints.
+        assert body["steps"][0]["charge"] is None
+
+    def test_a_running_charge_carries_the_robots_status(
+        self, client, workflow_gw, robot_gw
+    ):
+        robot_gw.message = "Charging: 0.42 m from the charger"
+        workflow_gw.state = TaskState(
+            id="robot01-charge-001",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="s1",
+                    type=StepType.CHARGE,
+                    params=MoveParams(x=3.0, y=1.0, theta=180.0),
+                    status=StepStatus.IN_PROGRESS,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-charge-001").json()
+
+        assert body["steps"][0]["message"] == "Charging: 0.42 m from the charger"
+
+    def test_a_charge_step_carries_its_charger(self, client, workflow_gw):
+        # The console derives the staging pose from it (1.3 m out along the
+        # marker's face) to draw the approach, so it is there in every state,
+        # not only while running -- and only on the CHARGE: a MOVE's goal is
+        # the route's end, which `plan` draws.
+        workflow_gw.state = TaskState(
+            id="robot01-task-003",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="0-move",
+                    type=StepType.MOVE,
+                    params=MoveParams(x=1.0, y=2.0, theta=0.0),
+                    status=StepStatus.COMPLETED,
+                ),
+                Step(
+                    id="1-charge",
+                    type=StepType.CHARGE,
+                    params=MoveParams(x=3.0, y=-1.5, theta=180.0),
+                    status=StepStatus.PENDING,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-task-003").json()
+
+        assert [step["charge"] for step in body["steps"]] == [
+            None,
+            {"x": 3.0, "y": -1.5, "theta": 180.0},
+        ]
 
     def test_a_step_carries_its_times(self, client, workflow_gw):
         started = datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
@@ -655,10 +739,10 @@ class TestTaskSteps:
         assert res.status_code == 200
         steps = res.json()["steps"]
         assert [step["type"] for step in steps] == [
-            "MOVE", "PATROL", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
+            "MOVE", "PATROL", "CHARGE", "SPEAK", "WAIT", "STANDUP", "LIEDOWN",
         ]
         assert [step["while_walking"] for step in steps] == [
-            False, False, True, False, False, False,
+            False, False, False, True, False, False, False,
         ]
         assert steps[0]["params"] == [
             {"kind": "waypoint", "key": "target", "label": "Waypoint", "filter": None}

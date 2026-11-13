@@ -145,6 +145,7 @@ def test_body_and_io_activities_poll_separate_queues():
     assert body["workflows"]
     assert body["max_concurrent_activities"] == 1
     assert activities.execute_move in body["activities"]
+    assert activities.execute_charge in body["activities"]
     # PATROL drives: the body slot, never the IO queue.
     assert activities.execute_patrol in body["activities"]
     assert io["task_queue"] == "robot01.ROBOT_IO_QUEUE"
