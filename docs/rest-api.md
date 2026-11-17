@@ -4,8 +4,19 @@
 
 Interactive docs: `http://<robot>:3000/docs`.
 
+**Every route but `/health` and `POST /api/v1/auth/login` needs a token**
+(`interfaces/rest/auth.py`): `Authorization: Bearer <token>` on a request, and
+`?token=<token>` on a WebSocket, since a browser cannot set a header there. A
+missing, forged or expired token is 401 `{"detail": "Your session has ended.
+Sign in again."}`, and a WebSocket is closed with 1008 before it is accepted.
+There is one account (`AUTH_USERNAME` / `AUTH_PASSWORD`) and no route to add
+another; a token lasts `JWT_EXPIRE_SECONDS` and there is no refresh — the
+console signs in again.
+
 | Method | Path | Notes |
 |---|---|---|
+| POST | `/api/v1/auth/login` | Sign in: `{username, password}` → `{access_token, token_type: "bearer", expires_at, expires_in}` — `expires_at` in epoch seconds, `expires_in` the seconds it lasts, which is what a client should time a sign-out by, since the robot's clock and the browser's need not agree. 401 `Wrong username or password.` for either half wrong. No token needed |
+| GET | `/api/v1/auth/me` | The token's `{username, expires_at}`: how a console checks that a token it kept still works |
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
 | POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL is checked against the loaded map — 409 `map_mismatch`, see [*A job's map is checked twice*](tasks.md); stand / lie down / SPEAK / WAIT never are. 409 `task_running` while any task runs — one task at a time. **Or** `{id, continue_from, kind?, name?}` instead of `steps` (exactly one; 400 otherwise, and with `map_name`): a new run of a FAILED task from the failed step on — see [*Continuing a failed task*](tasks.md). The answer then carries `continued_from` and `from_step_id` (both `null` otherwise) |
 | GET | `/api/v1/tasks/{id}` | Overall status + per-step state (workflow query): `id`, `status`, `error_msg`, and `message` — for a running `MOVE`, the robot navigator's live status sentence (`NavigateToGoal` feedback `status_msg`, read from `RobotGateway`), for a running `PATROL` one built from its feedback (`Patrolling: 3 of 5 waypoints left, 12.4 m to go`), empty otherwise — `charge` (a `CHARGE` step's charger waypoint as dispatched, `{x, y, theta, z}`: the marker's centre, `theta` out of its face, `z` the ground of its storey (its `MoveParams.z`, 0 on the ground floor), from which a console draws the 1.3 m staging pose on that storey; `null` for every other step) — plus `started_at` / `ended_at` (UTC, `null` until then and for runs older than the fields), `paused_seconds` (a hold while the step was under way; the step's own time is `ended_at − started_at − paused_seconds`) and `waypoints_passed` (a PATROL's progress, 0 for every other step). A step `SKIPPED` was got past by the failed run this one continues. A held run answers `status: PAUSED`, its held step `PAUSED` — the only place a hold is visible |

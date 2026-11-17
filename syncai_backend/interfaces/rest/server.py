@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass
 import uvicorn
 import structlog
-from fastapi import FastAPI, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -17,6 +17,8 @@ from syncai_backend.exceptions import (
     UnauthorizedError,
 )
 
+from syncai_backend.interfaces.rest.auth import AuthConfig, init_auth_guard
+from syncai_backend.interfaces.rest.routers.auth import init_auth_router
 from syncai_backend.interfaces.rest.routers.task import init_task_router
 from syncai_backend.interfaces.rest.routers.schedule import init_schedule_router
 from syncai_backend.interfaces.rest.routers.task_template import init_task_template_router
@@ -134,6 +136,8 @@ class RestDeps:
     map_import_svc: MapImportService
     # One per settings page, by its path segment (controller, planner).
     settings_svcs: dict[str, NodeSettingsService]
+    # The sign-in account and the token key (interfaces/rest/auth.py).
+    auth: AuthConfig
 
 
 def init_rest_server(
@@ -193,10 +197,19 @@ def init_rest_server(
             "task_server_error": worker_error,
         }
 
+    # Sign-in is the one route open without a token, beside /health above,
+    # which a container healthcheck calls with none.
+    app.include_router(init_auth_router(logger=logger, auth=deps.auth))
+
+    # Everything else, the WebSocket streams included, needs a token: each
+    # router is included into this one and it into the app, so a router added
+    # below is guarded without having to remember to be.
+    protected = APIRouter(dependencies=[Depends(init_auth_guard(deps.auth))])
+
     # The catalogue answers which map a dispatched job is stamped with, and
     # map_usage whether it may drive on it at all. task_record_repo is the
     # report export's source.
-    app.include_router(
+    protected.include_router(
         init_task_router(
             logger=logger,
             workflow_gw=deps.workflow_gw,
@@ -206,14 +219,14 @@ def init_rest_server(
             task_record_repo=deps.task_record_repo,
         )
     )
-    app.include_router(
+    protected.include_router(
         init_schedule_router(
             logger=logger,
             workflow_gw=deps.workflow_gw,
             task_template_repo=deps.task_template_repo,
         )
     )
-    app.include_router(
+    protected.include_router(
         init_robot_router(
             logger=logger,
             robot_repo=deps.robot_repo,
@@ -222,13 +235,13 @@ def init_rest_server(
             safety_lock_svc=deps.safety_lock_svc,
         )
     )
-    app.include_router(init_network_router(logger=logger, robot_gw=deps.robot_gw))
+    protected.include_router(init_network_router(logger=logger, robot_gw=deps.robot_gw))
     # /api/v1/maps: catalogue on disk plus the vertex table. task_template_repo
     # is for rename (task_templates.map_name keys on the directory name);
     # map_usage / job_gate answer whether a map may be changed (job_gate is
     # the one that asks Temporal); mapping_status_repo is pgo's latched run
     # state; map_switch_svc is the live switch's saga.
-    app.include_router(
+    protected.include_router(
         init_map_router(
             logger=logger,
             map_repo=deps.map_repo,
@@ -246,7 +259,7 @@ def init_rest_server(
     # current pose; workflow_gw is for freezing a template into a schedule. The
     # prefix (not /api/v1/tasks/templates) avoids colliding with
     # /api/v1/tasks/{id}, so include order does not matter.
-    app.include_router(
+    protected.include_router(
         init_task_template_router(
             logger=logger,
             task_template_repo=deps.task_template_repo,
@@ -257,14 +270,14 @@ def init_rest_server(
     )
     # Two streams, one router: the live body_cloud and pgo's merged "map so
     # far" cloud (mapping mode only) share the wire format and the pump.
-    app.include_router(
+    protected.include_router(
         init_pointcloud_router(
             logger=logger,
             pointcloud_repo=deps.pointcloud_repo,
             map_cloud_repo=deps.map_cloud_repo,
         )
     )
-    app.include_router(
+    protected.include_router(
         init_telemetry_router(
             logger=logger,
             telemetry_repo=deps.telemetry_repo,
@@ -274,16 +287,16 @@ def init_rest_server(
         )
     )
     # Inbound WS: the console's manual-control velocity frames.
-    app.include_router(init_teleop_router(logger=logger, robot_gw=deps.robot_gw))
+    protected.include_router(init_teleop_router(logger=logger, robot_gw=deps.robot_gw))
     # Speech out, via the syncai_tts container over HTTP (it owns the speaker).
-    app.include_router(init_tts_router(logger=logger, tts_gw=deps.tts_gw))
+    protected.include_router(init_tts_router(logger=logger, tts_gw=deps.tts_gw))
     # Video out, as WHEP. The backend owns signalling only; media runs in a Go
     # c-shared library dlopened on first request. See gateways/webrtc.
-    app.include_router(init_webrtc_router(logger=logger, webrtc_gw=deps.webrtc_gw))
+    protected.include_router(init_webrtc_router(logger=logger, webrtc_gw=deps.webrtc_gw))
     # Bag recording needs both halves: the gateway owns the live `ros2 bag
     # record` child, the repo owns record/ on disk. Only holding both can say
     # "no metadata and no process behind it" means interrupted.
-    app.include_router(
+    protected.include_router(
         init_recording_router(
             logger=logger,
             recording_gw=deps.recording_gw,
@@ -291,20 +304,20 @@ def init_rest_server(
         )
     )
     # The last day of the stack's pane logs and the host journal, as a tar.
-    app.include_router(
+    protected.include_router(
         init_logs_router(logger=logger, log_bundle_gw=deps.log_bundle_gw)
     )
 
     # /api/v1/settings/<page>: a node's tunable parameters, set live over its
     # parameter services and kept in the robot's runtime overlay
     # (config/params/<robot_id>/<node>.yaml).
-    app.include_router(
+    protected.include_router(
         init_settings_router(logger=logger, settings_svcs=deps.settings_svcs)
     )
     # /api/v1/landmarks: where the camera sees a known landmark (the charger),
     # on the loaded map. robot_repo answers whether the robot is localized and
     # which floor it stands on; the catalogue, which map that is.
-    app.include_router(
+    protected.include_router(
         init_landmark_router(
             logger=logger,
             landmark_gw=deps.landmark_gw,
@@ -312,6 +325,7 @@ def init_rest_server(
             map_catalog_repo=deps.map_catalog_repo,
         )
     )
+    app.include_router(protected)
 
     return app
 
