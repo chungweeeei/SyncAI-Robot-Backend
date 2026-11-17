@@ -33,7 +33,7 @@ three attempts, 5 s apart. The numbers are SyncAI-Robot-Interface's (`ComputePat
 documents each and whether a retry helps), written as literals because they are a contract
 that is never renumbered. `RobotState.low_level_mode.safety_state` needs `syncai_common` at or
 after SyncAI-Robot-Interface `b1996dd`; `ResetOdometry` with `skip_seed` (behind `POST /api/v1/localization/auto`,
-2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; `DetectLandmark` (behind `POST /api/v1/landmarks/detect`, 2026-11: the charger's marker in `map`, for a `CHARGE` vertex) at or after `0d4ed9a`. It is named in
+2026-10-15; it called `AutoLocalize` until then) at or after `21165d1`; `DetectLandmark` (behind `POST /api/v1/landmarks/detect`, 2026-11: the charger's marker, asked in the camera's frame and carried into `map` with the process's TF buffer, for a `CHARGE` vertex; an ambiguous sighting is kept with its heading on the line of sight, 409 `landmark_off_axis` past 10°) at or after `0d4ed9a`. It is named in
 **`interface.repos`** (branch `dev`): `vcs import < interface.repos` from any
 colcon workspace root materialises it into `src/` beside this package, over
 HTTPS, with no `SyncAI-Robot-Workspace` checkout and no credentials.
@@ -204,7 +204,8 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  live, read back, write the runtime overlay)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), landmark (ROS srv:
-        │                  detect_landmark, polled until a sighting is steady), parameters (one
+        │                  detect_landmark, polled for 5 steady sightings, carried into map
+        │                  with the shared TF buffer; helpers/landmark_heading judges them), parameters (one
         │                  node's get/set_parameters; controller_server, planner_server), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
         │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
@@ -227,6 +228,8 @@ subscribers/               ROS topics → repositories (ingest side; the map clo
 temporal/                  worker, RobotWorkflow, activities
 helpers/                   pointcloud, system_config, map_archive (checksummed zip /
                            tar.gz of a map dir), move_guard (a run's TaskMap against the loaded map),
+                           landmark_heading (a detect's sightings -> the waypoint: position,
+                           heading -- the line of sight when ambiguous --, off_axis),
                            route_preview (a planner preview's answer: the route thinned as the
                            live one is, or the failure in the task runner's sentence),
                            disk (a tree's bytes + newest mtime, for both catalogues and the
