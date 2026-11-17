@@ -37,3 +37,13 @@ def test_an_axis_pointing_up_has_no_heading():
     assert planar_yaw(*_quat(0.0, -math.pi / 2, 0.7)) is None
     # 70 degrees off the floor: past the 60 the helper accepts.
     assert planar_yaw(*_quat(0.0, math.radians(70), 0.7)) is None
+
+
+@pytest.mark.parametrize("roll, pitch, yaw", [(0.0, 0.0, 0.4), (0.2, 0.3, -2.0), (0.0, 1.3, 1.0)])
+def test_the_rotation_matrix_form_agrees_with_the_quaternion_form(roll, pitch, yaw):
+    from syncai_backend.helpers.planar_pose import planar_yaw_of_rotation
+    from syncai_backend.helpers.pointcloud import quat_to_rotation_matrix
+
+    quaternion = _quat(roll, pitch, yaw)
+
+    assert planar_yaw_of_rotation(quat_to_rotation_matrix(*quaternion)) == planar_yaw(*quaternion)
