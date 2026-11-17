@@ -31,8 +31,10 @@ class LandmarkDetectResponse(BaseModel):
     z: float = Field(
         ...,
         description=(
-            "The ground height the robot stands on, metres: the floor the "
-            "landmark is on, and a waypoint's z. Not the landmark's own height."
+            "The robot's body height when it looked, metres (RobotState's: its "
+            "base, about 0.3 m over the floor standing). It names the floor the "
+            "landmark is on; it is not that floor's ground (the console puts the "
+            "waypoint there) nor the landmark's own height."
         ),
     )
     theta: float = Field(
@@ -145,7 +147,7 @@ def init_landmark_router(
 
         # Read after the detect, not before: the floor is the one the robot
         # stood on when it saw the landmark.
-        ground_z = _localized_z()
+        body_z = _localized_z()
 
         logger.info(
             "[LandmarkRouter] Landmark detected",
@@ -161,7 +163,7 @@ def init_landmark_router(
             map=active,
             x=waypoint.x,
             y=waypoint.y,
-            z=ground_z,
+            z=body_z,
             theta=math.degrees(waypoint.yaw),
             marker_z=waypoint.z,
             consecutive=waypoint.consecutive,

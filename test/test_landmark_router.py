@@ -116,7 +116,7 @@ def test_detect_answers_a_waypoint_pose_on_the_loaded_map(stubs):
     assert body["map"] == "office"
     assert (body["x"], body["y"]) == (3.0, -1.0)
     assert body["theta"] == pytest.approx(90.0)
-    # The floor the robot stands on, not the marker's height on the wall.
+    # The robot's body height, which names the floor: not the marker's height on the wall.
     assert body["z"] == 2.75
     assert body["marker_z"] == 0.4
     assert body["consecutive"] == 4
