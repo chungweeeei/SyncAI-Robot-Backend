@@ -68,6 +68,10 @@ class Failure(str, Enum):
     LANDMARK_NOT_DETECTED = "landmark_not_detected"
     # LandmarkGateway: the id is not in the detector's registry. A 400.
     LANDMARK_UNKNOWN = "unknown_landmark"
+    # The landmark router: seen, but from too far off its face's axis for the
+    # heading to be told from the image. A 409: stand the robot square in front
+    # of it and ask again (the bound is MAX_OFF_AXIS_RAD).
+    LANDMARK_OFF_AXIS = "landmark_off_axis"
 
 
 class FailureMessage(str):

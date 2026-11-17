@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from syncai_backend.exceptions import BadRequestError, ConflictError, UpstreamError
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.landmark.landmark import LandmarkGateway
-from syncai_backend.helpers.planar_pose import planar_yaw
+from syncai_backend.helpers.landmark_heading import MAX_OFF_AXIS_RAD, landmark_waypoint
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.robot.robot import RobotRepo
 
@@ -31,15 +31,18 @@ class LandmarkDetectResponse(BaseModel):
     z: float = Field(
         ...,
         description=(
-            "The ground height the robot stands on, metres: the floor the "
-            "landmark is on, and a waypoint's z. Not the landmark's own height."
+            "The robot's body height when it looked, metres (RobotState's: its "
+            "base, about 0.3 m over the floor standing). It names the floor the "
+            "landmark is on; it is not that floor's ground (the console puts the "
+            "waypoint there) nor the landmark's own height."
         ),
     )
     theta: float = Field(
         ...,
         description=(
             "Where the landmark faces, degrees: out of its face, towards a "
-            "robot in front of it."
+            "robot in front of it. With `ambiguous`, the line of sight from the "
+            "landmark to the camera, off by at most `off_axis_deg`."
         ),
     )
     marker_z: float = Field(..., description="The landmark's centre height, metres.")
@@ -47,6 +50,21 @@ class LandmarkDetectResponse(BaseModel):
     age: float = Field(..., description="Seconds from the image to the answer.")
     reprojection_error_px: float = Field(
         ..., description="The fit's residual in pixels; -1 when it has none."
+    )
+    ambiguous: bool = Field(
+        ...,
+        description=(
+            "The image could not tell which way the landmark faces (its two "
+            "mirrored solutions), so `theta` is the line of sight."
+        ),
+    )
+    off_axis_deg: float = Field(
+        ...,
+        description=(
+            "Degrees between the landmark's face and the line of sight: how far "
+            "off its axis the robot stood. With `ambiguous`, the bound on `theta`'s "
+            "error; refused past the limit."
+        ),
     )
 
 
@@ -88,7 +106,7 @@ def init_landmark_router(
         if not detecting.acquire(blocking=False):
             raise ConflictError("A detection is already running.", code="detect_running")
         try:
-            ok, message, sighting = landmark_gw.detect(landmark_id)
+            ok, message, sightings = landmark_gw.detect(landmark_id)
         finally:
             detecting.release()
 
@@ -100,38 +118,59 @@ def init_landmark_router(
                 raise BadRequestError(message, code=code.value)
             raise UpstreamError(message)
 
-        pose = sighting.pose.pose
-        yaw = planar_yaw(
-            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w
-        )
-        if yaw is None:
+        waypoint = landmark_waypoint(sightings)
+        if waypoint is None:
+            logger.warning(
+                "[LandmarkRouter] Landmark faces the floor or the ceiling",
+                landmark_id=landmark_id,
+            )
             raise ConflictError(
                 f"'{landmark_id}' was seen facing the floor or the ceiling, "
                 "so it has no heading on the map.",
                 code=Failure.LANDMARK_NOT_DETECTED.value,
             )
+        off_axis_deg = math.degrees(waypoint.off_axis)
+        if waypoint.too_far_off_axis:
+            logger.warning(
+                "[LandmarkRouter] Landmark seen too far off its axis",
+                landmark_id=landmark_id,
+                off_axis_deg=off_axis_deg,
+                limit_deg=math.degrees(MAX_OFF_AXIS_RAD),
+                reprojection_error_px=waypoint.reprojection_error_px,
+            )
+            raise ConflictError(
+                f"'{landmark_id}' was seen {off_axis_deg:.0f}° off its face's axis (at most "
+                f"{math.degrees(MAX_OFF_AXIS_RAD):.0f}°), where the camera cannot tell which "
+                "way it faces. Stand the robot square in front of it and detect again.",
+                code=Failure.LANDMARK_OFF_AXIS.value,
+            )
 
         # Read after the detect, not before: the floor is the one the robot
         # stood on when it saw the landmark.
-        ground_z = _localized_z()
+        body_z = _localized_z()
 
         logger.info(
             "[LandmarkRouter] Landmark detected",
             landmark_id=landmark_id,
             map=active,
-            x=pose.position.x,
-            y=pose.position.y,
+            x=waypoint.x,
+            y=waypoint.y,
+            theta=math.degrees(waypoint.yaw),
+            ambiguous=waypoint.ambiguous,
+            off_axis_deg=off_axis_deg,
         )
         return LandmarkDetectResponse(
             map=active,
-            x=pose.position.x,
-            y=pose.position.y,
-            z=ground_z,
-            theta=math.degrees(yaw),
-            marker_z=pose.position.z,
-            consecutive=sighting.consecutive,
-            age=sighting.age,
-            reprojection_error_px=sighting.reprojection_error_px,
+            x=waypoint.x,
+            y=waypoint.y,
+            z=body_z,
+            theta=math.degrees(waypoint.yaw),
+            marker_z=waypoint.z,
+            consecutive=waypoint.consecutive,
+            age=waypoint.age,
+            reprojection_error_px=waypoint.reprojection_error_px,
+            ambiguous=waypoint.ambiguous,
+            off_axis_deg=off_axis_deg,
         )
 
     return landmark_router

@@ -239,13 +239,21 @@ preview a newer one preempted (the planner takes one at a time),
   detector (`SENSOR_STARTING`), later ones return the newest single-frame
   sighting, and 5 s without a call puts it back to sleep, so one
   `POST /api/v1/landmarks/detect` is a poll (0.2 s apart, 6 s budget, each call
-  waited 1 s) until `consecutive >= 3` and not `ambiguous` — thresholds the srv
-  leaves to its caller. Asked with `target_frame: "map"`, so the detector does
-  the camera → map transform at the image stamp and this process looks up no
-  TF for it. `UNKNOWN_LANDMARK` ends the poll at once; a budget that runs out
-  on `NOT_DETECTED` / `SENSOR_STARTING` / an unsteady sighting is the
-  operator's to fix (409), on `SENSOR_UNAVAILABLE` / `TRANSFORM_FAILED` the
-  robot's (502).
+  waited 1 s) until 5 sightings with `consecutive >= 3` are in, **ambiguous
+  or not** — thresholds the srv leaves to its caller. An ambiguous sighting is
+  kept (2026-11-17; refused until then, and at the 1.0–1.3 m a robot stands in
+  front of the charger every one is): its two solutions share the position and
+  mirror each other about the line of sight, so `helpers/landmark_heading.py`
+  takes the line of sight (marker → camera) as the heading and refuses it past
+  10° off the marker's axis (409 `landmark_off_axis`). That needs where the
+  camera stood, so the pose is asked with an empty `target_frame` (the
+  camera's own frame) and carried into `map` here, marker and camera through
+  the one `map ← camera` transform looked up in the process's TF buffer at the
+  image stamp (0.2 s timeout; a failure is 502). Until 2026-11-17 it was asked
+  with `target_frame: "map"` and this process looked up no TF for it.
+  `UNKNOWN_LANDMARK` ends the poll at once; a budget that runs out on
+  `NOT_DETECTED` / `SENSOR_STARTING` / an unsteady sighting is the operator's
+  to fix (409), on `SENSOR_UNAVAILABLE` / `TRANSFORM_FAILED` the robot's (502).
 
   The map gateway is separate on purpose: the map router has no business holding
   a handle that can make the robot move.
@@ -255,5 +263,7 @@ localization seed) and `cmd_vel` (`geometry_msgs/Twist`, teleop output and the
 zero-velocity watchdog).
 
 **TF:** a `TransformListener` with `spin_thread=False` (it rides the node's
-executor instead of adding another GIL-contending thread), used only to bring
-`body_cloud` into `map`.
+executor instead of adding another GIL-contending thread): the process's one
+`/tf` + `/tf_static` subscription, whose buffer brings `body_cloud`, the robot's
+telemetry pose and the local costmap / plan into `map`, and `LandmarkGateway`'s
+sightings (so `main.py` builds it before the gateways).

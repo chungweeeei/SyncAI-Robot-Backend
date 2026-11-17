@@ -120,13 +120,19 @@ class SyncAIBackend(Node):
         # The bags on disk, as opposed to the one being written. Filesystem only.
         recording_catalog_repo = init_recording_catalog_repo(logger=logger)
 
+        # The process's one /tf + /tf_static subscription, shared by the landmark
+        # gateway and the subscribers below; built before either needs it.
+        self._tf_listener = init_tf_listener(logger=logger, node=self)
+
         robot_gw = init_robot_gateway(logger=logger, node=self)
         # LoadMap client. Its own gateway so the map router holds no handle that
         # can command the robot to move.
         map_gw = init_map_gateway(logger=logger, node=self)
-        # detect_landmark client: the camera's sighting of the charger, for
-        # the waypoint an operator saves from it.
-        landmark_gw = init_landmark_gateway(logger=logger, node=self)
+        # detect_landmark client: the camera's sighting of the charger, carried
+        # into the map with the shared TF buffer, for the waypoint an operator saves.
+        landmark_gw = init_landmark_gateway(
+            logger=logger, node=self, tf_buffer=self._tf_listener.buffer
+        )
         workflow_gw = init_workflow_gateway(logger=logger, robot_id=robot_id)
         # Speech out, over HTTP to the syncai_tts container. The speaker lock
         # lives in that service now, so this is just a pooled httpx.Client.
@@ -203,10 +209,6 @@ class SyncAIBackend(Node):
         safety_lock_svc = init_safety_lock_service(
             logger=logger, robot_gw=robot_gw, workflow_gw=workflow_gw
         )
-
-        # One /tf + /tf_static subscription for the whole process (see
-        # subscribers/tf.py).
-        self._tf_listener = init_tf_listener(logger=logger, node=self)
 
         init_robot_state_subscriber(
             logger=logger,

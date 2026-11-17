@@ -1,8 +1,9 @@
 """Tests for /api/v1/landmarks/detect — projection over a stubbed gateway.
 
-The gateway's poll is its own test file; what the router owns is the refusals
-before the detect, the status per failure, and the 6-DOF sighting flattened to
-a waypoint's (x, y, z, theta) with the robot's floor as z.
+The gateway's poll is its own test file and the sighting's maths is
+helpers/landmark_heading's; what the router owns is the refusals before the
+detect, the status per failure, and the sighting as a waypoint's
+(x, y, z, theta) with the robot's floor as z.
 """
 
 import math
@@ -18,6 +19,10 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
+from syncai_backend.helpers.landmark_heading import (  # noqa: E402
+    MAX_OFF_AXIS_RAD,
+    LandmarkSighting,
+)
 from syncai_backend.interfaces.rest.routers.landmark import (  # noqa: E402
     init_landmark_router,
 )
@@ -28,26 +33,26 @@ from syncai_backend.interfaces.rest.server import (  # noqa: E402
 URL = "/api/v1/landmarks/detect"
 
 
-def _sighting(x=3.0, y=-1.0, z=0.4, yaw=math.pi / 2, pitch=0.0):
-    # Yaw then pitch about the body y axis, as (x, y, z, w).
-    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
-    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
-    return SimpleNamespace(
-        pose=SimpleNamespace(
-            pose=SimpleNamespace(
-                position=SimpleNamespace(x=x, y=y, z=z),
-                orientation=SimpleNamespace(x=-sy * sp, y=cy * sp, z=sy * cp, w=cy * cp),
-            )
-        ),
+def _sighting(x=3.0, y=-1.0, z=0.4, yaw=math.pi / 2, ambiguous=False, error=0.6):
+    # The camera 1.2 m north of the landmark: the line of sight is +90 degrees.
+    return LandmarkSighting(
+        x=x,
+        y=y,
+        z=z,
+        yaw=yaw,
+        camera_x=x,
+        camera_y=y + 1.2,
+        camera_z=0.1,
+        ambiguous=ambiguous,
         consecutive=4,
         age=0.05,
-        reprojection_error_px=0.6,
+        reprojection_error_px=error,
     )
 
 
 class _StubLandmarkGateway:
     def __init__(self):
-        self.result = (True, "", _sighting())
+        self.result = (True, "", [_sighting()])
         self.calls = []
         self.gate = None
         self.entered = threading.Event()
@@ -111,28 +116,68 @@ def test_detect_answers_a_waypoint_pose_on_the_loaded_map(stubs):
     assert body["map"] == "office"
     assert (body["x"], body["y"]) == (3.0, -1.0)
     assert body["theta"] == pytest.approx(90.0)
-    # The floor the robot stands on, not the marker's height on the wall.
+    # The robot's body height, which names the floor: not the marker's height on the wall.
     assert body["z"] == 2.75
     assert body["marker_z"] == 0.4
     assert body["consecutive"] == 4
     assert body["age"] == 0.05
     assert body["reprojection_error_px"] == 0.6
+    assert body["ambiguous"] is False
+    assert body["off_axis_deg"] == pytest.approx(0.0)
     assert stubs.gateway.calls == ["charger_a"]
 
 
-def test_a_tilted_landmark_keeps_its_heading(stubs):
-    stubs.gateway.result = (True, "", _sighting(yaw=-0.5, pitch=0.3))
+def test_the_heading_is_answered_in_degrees(stubs):
+    stubs.gateway.result = (True, "", [_sighting(yaw=-0.5)])
 
     assert stubs.client.post(URL).json()["theta"] == pytest.approx(math.degrees(-0.5))
 
 
 def test_a_landmark_facing_the_ceiling_is_not_a_detection(stubs):
-    stubs.gateway.result = (True, "", _sighting(pitch=-math.pi / 2))
+    stubs.gateway.result = (True, "", [_sighting(yaw=None)])
 
     response = stubs.client.post(URL)
 
     assert response.status_code == 409
     assert response.json()["code"] == "landmark_not_detected"
+
+
+def test_an_ambiguous_landmark_takes_the_line_of_sight_and_says_how_far_off_it_was(stubs):
+    # Faces 96 degrees or its mirror 84: the image cannot tell, the line of sight is 90.
+    stubs.gateway.result = (
+        True,
+        "",
+        [
+            _sighting(yaw=math.radians(96.0), ambiguous=True, error=0.9),
+            _sighting(yaw=math.radians(84.0), ambiguous=True, error=0.2),
+        ],
+    )
+
+    response = stubs.client.post(URL)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["theta"] == pytest.approx(90.0)
+    assert body["ambiguous"] is True
+    assert body["off_axis_deg"] == pytest.approx(6.0)
+    # The best fit's numbers, the one the angle was judged on.
+    assert body["reprojection_error_px"] == 0.2
+
+
+def test_an_ambiguous_landmark_seen_too_far_off_its_axis_is_409(stubs):
+    off_axis = math.degrees(MAX_OFF_AXIS_RAD) + 5.0
+    stubs.gateway.result = (
+        True,
+        "",
+        [_sighting(yaw=math.radians(90.0 + off_axis), ambiguous=True)],
+    )
+
+    response = stubs.client.post(URL)
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["code"] == "landmark_off_axis"
+    assert f"{off_axis:.0f}°" in body["detail"]
 
 
 def test_the_landmark_can_be_named(stubs):
