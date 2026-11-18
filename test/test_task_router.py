@@ -641,10 +641,31 @@ class TestTaskState:
 
         body = client.get("/api/v1/tasks/robot01-task-003").json()
 
+        # A charger dispatched without a floor is on the ground floor's 0.
         assert [step["charge"] for step in body["steps"]] == [
             None,
-            {"x": 3.0, "y": -1.5, "theta": 180.0},
+            {"x": 3.0, "y": -1.5, "theta": 180.0, "z": 0.0},
         ]
+
+    def test_a_charge_step_carries_its_chargers_floor(self, client, workflow_gw):
+        # The ground of the charger's storey, as dispatched: without it the
+        # console draws an upstairs charge's staging point on the ground floor.
+        workflow_gw.state = TaskState(
+            id="robot01-charge-002",
+            status="IN_PROGRESS",
+            steps=[
+                Step(
+                    id="1-charge",
+                    type=StepType.CHARGE,
+                    params=MoveParams(x=3.0, y=-1.5, theta=180.0, z=5.15),
+                    status=StepStatus.IN_PROGRESS,
+                ),
+            ],
+        )
+
+        body = client.get("/api/v1/tasks/robot01-charge-002").json()
+
+        assert body["steps"][0]["charge"] == {"x": 3.0, "y": -1.5, "theta": 180.0, "z": 5.15}
 
     def test_a_step_carries_its_times(self, client, workflow_gw):
         started = datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)

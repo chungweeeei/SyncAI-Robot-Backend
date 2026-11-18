@@ -158,6 +158,13 @@ class ChargerPose(BaseModel):
         description="Marker heading in degrees, CCW from +x, out of its face",
         examples=[90.0],
     )
+    # The charge's own MoveParams.z: without it a console draws an upstairs
+    # charge's staging point on the ground floor.
+    z: float = Field(
+        0.0,
+        description="Ground height (metres, map frame) of the storey the charger is on",
+        examples=[0.0],
+    )
 
 
 class StepState(BaseModel):
@@ -188,9 +195,10 @@ class StepState(BaseModel):
         default=None,
         description=(
             "The charger waypoint a CHARGE step walks onto, as dispatched (map "
-            "frame): the marker's centre, theta out of its face; null for every "
-            "other step. A console derives the staging pose from it (1.3 m out "
-            "along theta, facing back) to draw the approach of a running charge"
+            "frame): the marker's centre, theta out of its face, z the ground of "
+            "its storey; null for every other step. A console derives the staging "
+            "pose from it (1.3 m out along theta, facing back) to draw the "
+            "approach of a running charge, on that storey"
         ),
     )
     started_at: Optional[datetime] = Field(
@@ -950,7 +958,9 @@ def init_task_router(
         # may have been edited since. The waypoint as stored (the marker, the
         # heading out of its face) is also what is sent.
         if step.type is StepType.CHARGE and isinstance(step.params, MoveParams):
-            return ChargerPose(x=step.params.x, y=step.params.y, theta=step.params.theta)
+            return ChargerPose(
+                x=step.params.x, y=step.params.y, theta=step.params.theta, z=step.params.z
+            )
         return None
 
     @task_router.get("/api/v1/tasks/{id}", response_model=TaskStateResponse)
