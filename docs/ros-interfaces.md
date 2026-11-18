@@ -78,7 +78,7 @@ exception out of a callback would end the executor and the process.
 `timestamp` are for operators only. `routers/robot.py` names its response fields
 one by one — the *only* thing keeping them out of a frozen public payload — so
 that list is a **whitelist, not a mirror**: a new message field stays out until
-somebody decides otherwise. That has been decided twice:
+somebody decides otherwise. That has been decided three times:
 
 - **`localization_valid`.** `RobotStateSubscriber` **stores every sample**,
   including those where it is false — before relocalization, and for the whole
@@ -98,6 +98,13 @@ somebody decides otherwise. That has been decided twice:
   it, and MPC's own code reads `UNKNOWN`. The raw integers stay on the topic:
   `ros2 topic echo /<robot_id>/robot_state --field low_level_mode` tells unmapped
   codes apart.
+- **`state`** (2026-11-18) — `RobotStatus` as its constant's name
+  (`UNINITIALIZED` / `IDLE` / `RUNNING` / `WARNING` / `ERROR` / `CHARGING`,
+  `UNKNOWN` for any other code), widened in when syncai_robot_state began
+  deriving `CHARGING` from the driver's `power_supply_status`. It is a rollup,
+  one value at a time, most-severe-first (`UNINITIALIZED` > `CHARGING` >
+  `WARNING` > `IDLE`): a robot on its charger before relocalization reads
+  `UNINITIALIZED`. `RUNNING` / `ERROR` are declared but never emitted.
 
 `low_level_mode.safety_locked` is **not the controller's**: it is
 `syncai_driver_manager`'s software safety lock (`RobotLowLevelMode.safety_state`,
