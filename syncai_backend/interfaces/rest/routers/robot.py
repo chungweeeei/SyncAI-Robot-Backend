@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from syncai_common.msg import RobotMode, RobotState as RobotStateMsg
+from syncai_common.msg import RobotMode, RobotState as RobotStateMsg, RobotStatus
 
 from syncai_backend.exceptions import ConflictError, UpstreamError, NotFoundError
 from syncai_backend.gateways.failure import Failure, failure_code
@@ -27,6 +27,23 @@ _ROBOT_MODE_TO_STR = {
 
 def _mode_to_str(mode: int) -> str:
     return _ROBOT_MODE_TO_STR.get(mode, "UNKNOWN")
+
+
+# Reverse lookup: RobotStatus uint8 constant -> name. All six are listed though
+# syncai_robot_state emits four (RUNNING / ERROR are never derived), so one it
+# starts emitting needs no change here; a code outside the message reads UNKNOWN.
+_ROBOT_STATUS_TO_STR = {
+    RobotStatus.UNINITIALIZED: "UNINITIALIZED",
+    RobotStatus.IDLE: "IDLE",
+    RobotStatus.RUNNING: "RUNNING",
+    RobotStatus.WARNING: "WARNING",
+    RobotStatus.ERROR: "ERROR",
+    RobotStatus.CHARGING: "CHARGING",
+}
+
+
+def _status_to_str(status: int) -> str:
+    return _ROBOT_STATUS_TO_STR.get(status, "UNKNOWN")
 
 
 # Reverse lookups for the gait controller's state (RobotState.low_level_mode).
@@ -171,6 +188,17 @@ class RobotState(BaseModel):
         description=(
             "Which byobu session is up (MAINTENANCE/MANUAL/AUTO). NOT the gait "
             "controller's state machine — that is `low_level_mode`."
+        ),
+    )
+    state: str = Field(
+        ...,
+        description=(
+            "syncai_robot_state's one-word rollup, most-severe-first: "
+            "UNINITIALIZED (not localized; see localization_valid) > CHARGING "
+            "> WARNING (battery low) > IDLE. RUNNING and ERROR are declared "
+            "but not emitted yet; UNKNOWN for a code outside RobotStatus. "
+            "One value at a time: a robot charging before it is localized "
+            "reads UNINITIALIZED."
         ),
     )
     low_level_mode: RobotLowLevelMode = Field(
@@ -433,6 +461,7 @@ def init_robot_router(
             robot_id=state.robot_id,
             map=state.map,
             mode=_mode_to_str(state.mode),
+            state=_status_to_str(state.state),
             # Through the fallback dicts, never PolicyMode (it would 500).
             low_level_mode=RobotLowLevelMode(
                 policy=_policy_state_to_str(state.low_level_mode.policy_state),

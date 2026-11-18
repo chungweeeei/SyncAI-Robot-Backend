@@ -28,7 +28,7 @@ pytest.importorskip("httpx")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from syncai_common.msg import RobotMode  # noqa: E402
+from syncai_common.msg import RobotMode, RobotStatus  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
@@ -36,6 +36,7 @@ from syncai_backend.interfaces.rest.routers.robot import (  # noqa: E402
     RobotNetworkStatus,
     init_robot_router,
     _mode_to_str,
+    _status_to_str,
     _parse_wifi_info,
 )
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
@@ -173,6 +174,22 @@ def test_mode_to_str_unknown_mode():
     assert _mode_to_str(255) == "UNKNOWN"
 
 
+@pytest.mark.parametrize(
+    "status,label",
+    [
+        (RobotStatus.UNINITIALIZED, "UNINITIALIZED"),
+        (RobotStatus.IDLE, "IDLE"),
+        (RobotStatus.RUNNING, "RUNNING"),
+        (RobotStatus.WARNING, "WARNING"),
+        (RobotStatus.ERROR, "ERROR"),
+        (RobotStatus.CHARGING, "CHARGING"),
+        (255, "UNKNOWN"),
+    ],
+)
+def test_status_to_str(status, label):
+    assert _status_to_str(status) == label
+
+
 def test_parse_wifi_info_valid_json():
     info = _parse_wifi_info('{"ssid": "net", "rssi": -40, "ip_address": "10.0.0.2"}')
 
@@ -211,6 +228,7 @@ def test_state_projects_the_message(client, robot_repo, make_robot_state):
     assert body["map"] == "dp2f"
     assert body["timestamp"] == 1754000000
     assert body["mode"] == "AUTO"
+    assert body["state"] == "IDLE"
     assert body["localization_status"]["position"]["x"] == pytest.approx(1.5)
     assert body["localization_status"]["velocity"] == pytest.approx(0.25)
     assert body["network_status"]["ssid"] == "net"
@@ -241,6 +259,22 @@ def test_state_trims_each_motor_to_health_fields(client, robot_repo, make_robot_
     assert motors[1]["temperature"] == 55
     assert motors[1]["error"] == 7
     assert set(motors[0]) == {"name", "temperature", "error"}
+
+
+def test_state_reports_charging(client, robot_repo, make_robot_state):
+    robot_repo.update_robot_state(state=make_robot_state(state=RobotStatus.CHARGING))
+
+    assert _get_state(client).json()["state"] == "CHARGING"
+
+
+def test_state_degrades_an_unknown_status_code(client, robot_repo, make_robot_state):
+    """A code outside RobotStatus is a label, not a 500."""
+    robot_repo.update_robot_state(state=make_robot_state(state=99))
+
+    response = _get_state(client)
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "UNKNOWN"
 
 
 def test_state_reports_the_low_level_mode(client, robot_repo, make_robot_state):
@@ -315,6 +349,7 @@ def test_state_payload_keys_are_exactly_the_whitelist(
         "robot_id",
         "map",
         "mode",
+        "state",
         "low_level_mode",
         "localization_valid",
         "localization_status",
@@ -322,12 +357,11 @@ def test_state_payload_keys_are_exactly_the_whitelist(
         "battery_status",
         "motor_status",
     }
-    # Named individually as well, because these are the two the message carries
-    # and the payload must keep holding back. (localization_valid used to be a
-    # third: it was widened in deliberately when the subscriber stopped dropping
-    # unlocalized samples — the consumer needs it to tell the zeroed placeholder
-    # pose from a robot at the origin.)
-    assert "state" not in body
+    # Named individually as well, because this is what the message carries and
+    # the payload must keep holding back. (localization_valid and state used to
+    # be held back too; each was widened in deliberately — localization_valid
+    # when the subscriber stopped dropping unlocalized samples, state when
+    # syncai_robot_state began deriving CHARGING.)
     assert "timestamp" not in body["motor_status"][0]
 
 
