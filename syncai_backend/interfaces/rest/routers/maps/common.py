@@ -166,6 +166,14 @@ def _summary(
 ) -> MapSummaryResponse:
     octomap_status, octomap_error = _octomap_status(stored)
     tree = stored.octomap if octomap_status is OctomapStatus.OK else None
+    # Only of a clean taken to be running: the sidecar of one killed hard
+    # keeps its last mark, and a bar over `interrupted` would read as moving.
+    record = stored.map_clean_record
+    progress = (
+        record.progress
+        if octomap_status is OctomapStatus.CONVERTING and record is not None
+        else None
+    )
 
     return MapSummaryResponse(
         name=stored.name,
@@ -176,6 +184,7 @@ def _summary(
         vertex_count=vertex_count,
         octomap_status=octomap_status,
         octomap_error=octomap_error,
+        octomap_progress=progress,
         octomap_version=tree.version if tree is not None else None,
         octomap_resolution=tree.resolution if tree is not None else None,
     )

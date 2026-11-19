@@ -529,6 +529,51 @@ def test_map_clean_record_defaults_the_tree_fields(catalog_repo, maps_dir):
     assert record.octomap_written is False
     assert record.octomap_error is None
     assert record.error == "no patches"
+    assert record.progress is None
+
+
+@pytest.mark.parametrize(
+    "progress, expected",
+    [
+        ({"stage": "misses", "fraction": 0.424}, 0.424),
+        ({"stage": "hits", "fraction": 0}, 0.0),
+        # The stage is the robot's word: one this build has never heard of
+        # must not cost the number.
+        ({"stage": "polish", "fraction": 0.9}, 0.9),
+        ({"fraction": 1.7}, 1.0),
+        ({"fraction": -0.2}, 0.0),
+        # Not a fraction: no bar, and the rest of the record still reads.
+        ({"fraction": True}, None),
+        ({"fraction": "0.5"}, None),
+        ({"fraction": None}, None),
+        ({"stage": "misses"}, None),
+        (0.5, None),
+        (None, None),
+    ],
+)
+def test_map_clean_record_reads_the_progress_fraction(catalog_repo, maps_dir, progress, expected):
+    document = {"status": "converting", "params": {"octomap": True}}
+    if progress is not None:
+        document["progress"] = progress
+    _plant_clean(maps_dir / "full", document)
+
+    record = catalog_repo.get_map("full").map_clean_record
+
+    assert record.status is MapCleanStatus.CONVERTING
+    assert record.octomap_requested is True
+    assert record.progress == (None if expected is None else pytest.approx(expected))
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_map_clean_record_drops_a_fraction_json_could_not_send_back(
+    catalog_repo, maps_dir, literal
+):
+    """Python's ``json`` reads these; a response holding one fails the whole listing."""
+    (maps_dir / "full" / "map_clean.recipe.json").write_text(
+        '{"status": "converting", "progress": {"fraction": %s}}' % literal
+    )
+
+    assert catalog_repo.get_map("full").map_clean_record.progress is None
 
 
 @pytest.mark.parametrize("text", ['{"status": "ok"', "[]", '{"status": "sideways"}', ""])

@@ -201,6 +201,12 @@ class MapCleanRecord:
     ``params.octomap`` and ``measurements.octomap_written`` /
     ``octomap_error``, which is where a tree that was asked for and not
     written is reported. ``error`` is the clean's own, on ``failed``.
+
+    ``progress`` is the sidecar's ``progress.fraction``: how much of the whole
+    clean is done, 0..1, as the clean itself reckons it (its stages and their
+    shares are the robot's to know, not this backend's). None when the
+    sidecar has none: pgo_node's own ``converting``, a clean still queued
+    behind another, or a robot from before the clean reported it.
     """
 
     status: MapCleanStatus
@@ -209,6 +215,7 @@ class MapCleanRecord:
     octomap_written: bool
     octomap_error: Optional[str]
     error: Optional[str]
+    progress: Optional[float] = None
 
     def running(self, now: Optional[datetime] = None) -> bool:
         """Is the clean still at work on the map directory?
@@ -941,6 +948,7 @@ class MapCatalogRepo:
         measurements = document.get("measurements")
         params = params if isinstance(params, dict) else {}
         measurements = measurements if isinstance(measurements, dict) else {}
+        progress = document.get("progress")
         started_at = document.get("started_at")
         error = document.get("error")
         octomap_error = measurements.get("octomap_error")
@@ -953,7 +961,25 @@ class MapCatalogRepo:
                 octomap_error if isinstance(octomap_error, str) and octomap_error else None
             ),
             error=error if isinstance(error, str) and error else None,
+            progress=_parse_fraction(
+                progress.get("fraction") if isinstance(progress, dict) else None
+            ),
         )
+
+
+def _parse_fraction(value: object) -> Optional[float]:
+    """A sidecar's ``progress.fraction`` -> 0..1, or None if it is not one.
+
+    Tolerant like the rest of the sidecar's read: a value this build cannot
+    use costs the bar, not the listing. Not ``bool`` (an ``int`` in Python:
+    ``true`` would read as a finished clean), and not NaN or an infinity,
+    which ``json`` would then fail to serialise for the whole listing.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return min(1.0, max(0.0, float(value)))
 
 
 def _parse_keepout_zone(entry: object) -> Optional[KeepoutZone]:
