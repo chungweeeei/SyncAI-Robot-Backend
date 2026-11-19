@@ -651,12 +651,15 @@ def _clean_payload(
     octomap_error=None,
     started_at=None,
     error=None,
+    progress=None,
 ):
     payload = {
         "status": status,
         "started_at": _now_iso() if started_at is None else started_at,
         "params": {"voxel_size": 0.1, "octomap": octomap},
     }
+    if progress is not None:
+        payload["progress"] = {"stage": "misses", "fraction": progress}
     if status == "ok":
         measurements = {"octomap_written": bool(written)}
         if octomap_error is not None:
@@ -708,6 +711,34 @@ def test_list_reports_converting_while_the_clean_runs(client, maps_dir):
 
     assert entry["octomap_status"] == "converting"
     assert entry["octomap_version"] is None
+    # pgo_node's own sidecar, or a clean still queued: running, nothing to say.
+    assert entry["octomap_progress"] is None
+
+
+def test_list_reports_how_far_a_running_clean_is(client, maps_dir):
+    _plant_clean(maps_dir / "rawonly", _clean_payload("converting", progress=0.424))
+
+    entry = _entry(client, "rawonly")
+
+    assert entry["octomap_status"] == "converting"
+    assert entry["octomap_progress"] == pytest.approx(0.424)
+
+
+def test_progress_is_only_of_a_clean_taken_to_be_running(client, maps_dir, make_bt):
+    """A sidecar keeps its last mark; only ``converting`` may draw a bar from it."""
+    # Killed hard at 42 %: interrupted, and a bar over that would read as moving.
+    _plant_clean(
+        maps_dir / "rawonly",
+        _clean_payload("converting", started_at=_old_iso(), progress=0.424),
+    )
+    # A re-clean under way: the old tree is still the map's, so it is `ok`.
+    make_bt(maps_dir / "full" / "octomap.bt")
+    _plant_clean(maps_dir / "full", _clean_payload("converting", progress=0.424))
+
+    assert _entry(client, "rawonly")["octomap_status"] == "interrupted"
+    assert _entry(client, "rawonly")["octomap_progress"] is None
+    assert _entry(client, "full")["octomap_status"] == "ok"
+    assert _entry(client, "full")["octomap_progress"] is None
 
 
 def test_list_reports_converting_for_a_clean_with_no_start_time(client, maps_dir):

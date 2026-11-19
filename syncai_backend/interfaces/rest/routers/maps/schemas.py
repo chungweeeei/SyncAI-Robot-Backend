@@ -126,6 +126,17 @@ class MapSummaryResponse(BaseModel):
             "status other than `failed`."
         ),
     )
+    octomap_progress: Optional[float] = Field(
+        None,
+        description=(
+            "How much of the build is done, 0 to 1, as the robot's map cleaning "
+            "reports it while it runs. Null for every status other than "
+            "`converting`, and null while `converting` until the cleaning has "
+            "reported (it is queued behind another map's, or the robot's "
+            "software is from before it reported any). Never 1: `ok` is what "
+            "says the build is done."
+        ),
+    )
     octomap_version: Optional[str] = Field(
         None,
         description=(
