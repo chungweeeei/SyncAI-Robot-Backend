@@ -4,15 +4,21 @@ What is pinned: the one account signs in and nothing else does, with one
 sentence for either half wrong; a token opens a guarded route over a header
 and a WebSocket over its query, and an expired, forged or missing one opens
 neither; sign-in itself is reachable without one, as JSON for the console and
-as the form /docs' Authorize dialog sends; the real server's OpenAPI names
-that flow on every guarded route; and /docs asks for the account alone.
+as the form /docs' Authorize dialog sends; a good token is renewed into a
+fresh one in the same chain, and a chain is not renewed past its cap; the
+real server's OpenAPI names that flow on every guarded route; and /docs asks
+for the account alone.
 """
+
+import time
 
 import pytest
 
 pytest.importorskip("httpx")
 pytest.importorskip("jwt")
 pytest.importorskip("python_multipart")
+
+import jwt  # noqa: E402
 
 from fastapi import APIRouter, Depends, FastAPI, WebSocket  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -24,6 +30,7 @@ from syncai_backend.interfaces.rest.auth import (  # noqa: E402
     AuthConfig,
     init_auth_guard,
     issue_token,
+    renew_token,
 )
 from syncai_backend.interfaces.rest.routers.auth import init_auth_router  # noqa: E402
 from syncai_backend.interfaces.rest.server import register_exception_handlers  # noqa: E402
@@ -126,6 +133,65 @@ def test_a_token_signed_with_another_key_is_refused(client):
     token, _ = issue_token(other, "admin")
     res = client.get("/api/v1/guarded", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 401
+
+
+def test_a_good_token_is_renewed_into_a_fresh_one_that_opens_routes(client):
+    first = _sign_in(client)
+    res = client.post(
+        "/api/v1/auth/refresh", headers={"Authorization": f"Bearer {first['access_token']}"}
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["token_type"] == "bearer"
+    assert 0 < body["expires_in"] <= 3600
+    res = client.get(
+        "/api/v1/guarded", headers={"Authorization": f"Bearer {body['access_token']}"}
+    )
+    assert res.status_code == 200
+
+
+def test_a_renewal_keeps_the_chain_s_start(client):
+    # Signed in two hours ago, renewed ten minutes ago: the new token still
+    # says when the password was given.
+    began = int(time.time()) - 7200
+    token, _ = issue_token(CFG, "admin", now=int(time.time()) - 600, auth_time=began)
+    res = client.post("/api/v1/auth/refresh", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 200
+    claims = jwt.decode(res.json()["access_token"], CFG.secret, algorithms=["HS256"])
+    assert claims["auth_time"] == began
+    assert claims["sub"] == "admin"
+
+
+def test_a_chain_is_not_renewed_past_its_cap():
+    began = 1_000_000
+    claims = {"sub": "admin", "iat": began, "auth_time": began}
+    renew_token(CFG, claims, now=began + CFG.max_session_s - 1)
+    with pytest.raises(Exception) as exc:
+        renew_token(CFG, claims, now=began + CFG.max_session_s)
+    assert str(exc.value) == SIGN_IN_AGAIN
+
+
+def test_no_token_outlives_its_chain_s_cap():
+    began = 1_000_000
+    near_cap = began + CFG.max_session_s - 600
+    _, expires_at = issue_token(CFG, "admin", now=near_cap, auth_time=began)
+    assert expires_at == began + CFG.max_session_s
+
+
+def test_a_token_from_before_auth_time_starts_its_chain_at_its_own_issue():
+    claims = {"sub": "admin", "iat": 1_000_000}
+    token, _ = renew_token(CFG, claims, now=1_000_100)
+    assert jwt.decode(token, CFG.secret, algorithms=["HS256"], options={"verify_exp": False})[
+        "auth_time"
+    ] == 1_000_000
+
+
+def test_renewal_needs_a_token_that_still_works(client):
+    expired, _ = issue_token(CFG, "admin", now=0)
+    for headers in ({}, {"Authorization": f"Bearer {expired}"}):
+        res = client.post("/api/v1/auth/refresh", headers=headers)
+        assert res.status_code == 401
+        assert res.json() == {"detail": SIGN_IN_AGAIN}
 
 
 def test_a_stream_opens_with_the_token_in_its_query(client):

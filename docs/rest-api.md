@@ -11,8 +11,11 @@ Interactive docs: `http://<robot>:3000/docs`.
 missing, forged or expired token is 401 `{"detail": "Your session has ended.
 Sign in again."}`, and a WebSocket is closed with 1008 before it is accepted.
 There is one account (`AUTH_USERNAME` / `AUTH_PASSWORD`) and no route to add
-another; a token lasts `JWT_EXPIRE_SECONDS` and there is no refresh — the
-console signs in again.
+another. A token lasts `JWT_EXPIRE_SECONDS`, and an open console trades it
+for a fresh one before then (`POST /api/v1/auth/refresh`), since the emergency
+stop is behind the sign-in and an operator watching a patrol presses nothing
+for an hour. One sign-in is renewed for at most `JWT_MAX_SESSION_SECONDS`
+(12 h): past it the renewal is 401 and the console asks for the password.
 
 The guard is declared to OpenAPI as an OAuth2 password flow, so `/docs` has an
 **Authorize** button: give it the account and every request tried from the
@@ -34,6 +37,7 @@ reappear and can be left empty.
 |---|---|---|
 | POST | `/api/v1/auth/login` | Sign in: `{username, password}` → `{access_token, token_type: "bearer", expires_at, expires_in}` — `expires_at` in epoch seconds, `expires_in` the seconds it lasts, which is what a client should time a sign-out by, since the robot's clock and the browser's need not agree. 401 `Wrong username or password.` for either half wrong. No token needed |
 | POST | `/api/v1/auth/token` | The same sign-in as an OAuth2 password grant: a form (`username`, `password`), the same answer and the same 401. What `/docs`' Authorize dialog calls; the console uses `login`. No token needed |
+| POST | `/api/v1/auth/refresh` | Trade a token that still works for a fresh one: no body, the same answer as `login`. The new token keeps when the password was given (`auth_time`), so a chain of renewals ends at `JWT_MAX_SESSION_SECONDS` from the sign-in — the last token is cut short at it, `expires_in` saying so — and a renewal past it is 401 `Your session has ended. Sign in again.`, as is one without a working token |
 | GET | `/api/v1/auth/me` | The token's `{username, expires_at}`: how a console checks that a token it kept still works |
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
 | POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL is checked against the loaded map — 409 `map_mismatch`, see [*A job's map is checked twice*](tasks.md); stand / lie down / SPEAK / WAIT never are. 409 `task_running` while any task runs — one task at a time. **Or** `{id, continue_from, kind?, name?}` instead of `steps` (exactly one; 400 otherwise, and with `map_name`): a new run of a FAILED task from the failed step on — see [*Continuing a failed task*](tasks.md). The answer then carries `continued_from` and `from_step_id` (both `null` otherwise) |

@@ -1,3 +1,5 @@
+import time
+
 import structlog
 from fastapi import APIRouter, Depends
 from fastapi.security import OAuth2PasswordRequestForm
@@ -10,6 +12,7 @@ from syncai_backend.interfaces.rest.auth import (
     check_credentials,
     init_auth_guard,
     issue_token,
+    renew_token,
 )
 
 
@@ -61,6 +64,20 @@ def init_auth_router(logger: structlog.stdlib.BoundLogger, auth: AuthConfig) -> 
         """The same sign-in as a form, which is how an OAuth2 password flow
         sends it: what the Authorize dialog of /docs calls."""
         return sign_in(form.username, form.password)
+
+    @auth_router.post("/api/v1/auth/refresh", response_model=LoginResponse)
+    def refresh(claims: dict = Depends(require_auth)):
+        """Trade a token that still works for a fresh one, so an open console
+        is not signed out mid-watch. Refused, 401, once its sign-in has been
+        renewed for JWT_MAX_SESSION_SECONDS: the password is asked again."""
+        token, expires_at = renew_token(auth, claims)
+        return LoginResponse(
+            access_token=token,
+            expires_at=expires_at,
+            # Measured from now rather than read off the config: the last
+            # token of a chain is cut short at its cap.
+            expires_in=max(0, expires_at - int(time.time())),
+        )
 
     @auth_router.get("/api/v1/auth/me", response_model=SessionResponse)
     def me(claims: dict = Depends(require_auth)):
