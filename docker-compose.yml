@@ -187,6 +187,12 @@ services:
       # — v4l2src fails with a permission error, not a missing-element one.
       # Overridable because the gid is per-host: `getent group video`.
       - "${VIDEO_GID:-44}"
+      # The host journal's group (systemd-journal), for GET /api/v1/logs/export:
+      # the journal files are root:systemd-journal 0640, so uid 1000 reads them
+      # only through it. Per-host like the video gid: `getent group
+      # systemd-journal`. Wrong or absent, the export answers without the journal
+      # and its manifest says permission was denied.
+      - "${JOURNAL_GID:-101}"
 
     volumes:
       # Stable device names from syncai_sys_manager's udev rules, installed on
@@ -259,6 +265,14 @@ services:
       # recording is reachable from one and invisible to the other at the moment
       # it matters.
       - ${RECORD_DIR:-./record}:/home/syncrobotic/robot_ws/record
+      # GET /api/v1/logs/export's two sources, both read-only. log/stack/ is
+      # where NodeManager's `tmux pipe-pane` taps write every byobu pane's
+      # multilog files (log/stack/<robot_id>/<pane>/); under ROBOT_WS because
+      # the robot container writes them into the workspace. /var/log/journal is
+      # the host's persistent systemd journal, kernel included, read with
+      # `journalctl -D`. Either missing, the export leaves that half out.
+      - ${ROBOT_WS:-/home/syncrobotic/SyncAI-Robot-Workspace}/log/stack:/home/syncrobotic/robot_ws/log/stack:ro
+      - /var/log/journal:/var/log/journal:ro
       # The WebRTC Go worker, dlopen'd lazily on the first /whep request. A
       # single file, read-only: nothing here writes it, and it is built
       # elsewhere (SyncAI-WebRTC-Worker, `docker compose up build-lib`) and
