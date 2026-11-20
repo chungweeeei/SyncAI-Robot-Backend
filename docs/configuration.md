@@ -7,7 +7,8 @@
 | `AUTH_USERNAME` | `admin` | `interfaces/rest/auth.py` — the one account the console signs in with |
 | `AUTH_PASSWORD` | `admin` | ditto. A warning is logged at startup while it is the default |
 | `JWT_SECRET` | random per process | ditto — the key tokens are signed with. Unset, a backend restart signs every console out; set it to keep sessions across restarts |
-| `JWT_EXPIRE_SECONDS` | `3600` | ditto — how long a sign-in lasts; there is no refresh |
+| `JWT_EXPIRE_SECONDS` | `3600` | ditto — how long one token lasts. An open console renews it before then (`POST /api/v1/auth/refresh`) |
+| `JWT_MAX_SESSION_SECONDS` | `43200` (12 h) | ditto — how long one sign-in may be renewed for; past it a renewal is 401 and the password is asked again. No token outlives it |
 | `TEMPORAL_ADDRESS` | `127.0.0.1:7233` | Temporal client + worker |
 | `POSTGRES_HOST` | `localhost` | `database/postgres.py` |
 | `POSTGRES_PORT` | `5432` | ditto |

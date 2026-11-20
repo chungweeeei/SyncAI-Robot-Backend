@@ -6,6 +6,13 @@ design for now. A sign-in answers a JWT (HS256) that the console sends on every
 request, and which expires on its own: the token is the whole session, so there
 is nothing to revoke server-side and a sign-out is the console forgetting it.
 
+An open console trades its token, still good, for a fresh one before it
+expires (POST /api/v1/auth/refresh): the emergency stop is behind the sign-in,
+and an operator watching a patrol presses nothing for an hour. Each token
+carries when its chain of renewals began (`auth_time`), and a chain is not
+renewed past JWT_MAX_SESSION_SECONDS, so a console left open is still asked
+for the password once a shift.
+
 The guard is declared to OpenAPI as an OAuth2 password flow, which is what
 gives /docs its Authorize dialog: it trades the account for a token at
 TOKEN_URL and sends it with every request tried from the page.
@@ -29,6 +36,9 @@ from syncai_backend.exceptions import UnauthorizedError
 _DEFAULT_USERNAME = "admin"
 _DEFAULT_PASSWORD = "admin"
 _DEFAULT_EXPIRE_S = 3600
+# A shift: how long one sign-in may be renewed for before the password is
+# asked again.
+_DEFAULT_MAX_SESSION_S = 12 * 3600
 _ALGORITHM = "HS256"
 
 # Said for every refusal of a request without a usable token, so the answer
@@ -46,6 +56,7 @@ class AuthConfig:
     password: str
     secret: str
     expire_s: int
+    max_session_s: int = _DEFAULT_MAX_SESSION_S
 
     @classmethod
     def from_env(cls, logger: structlog.stdlib.BoundLogger) -> "AuthConfig":
@@ -65,6 +76,9 @@ class AuthConfig:
             password=password,
             secret=secret,
             expire_s=int(os.getenv("JWT_EXPIRE_SECONDS", str(_DEFAULT_EXPIRE_S))),
+            max_session_s=int(
+                os.getenv("JWT_MAX_SESSION_SECONDS", str(_DEFAULT_MAX_SESSION_S))
+            ),
         )
 
 
@@ -77,17 +91,42 @@ def check_credentials(cfg: AuthConfig, username: str, password: str) -> bool:
 
 
 def issue_token(
-    cfg: AuthConfig, username: str, now: "float | None" = None
+    cfg: AuthConfig,
+    username: str,
+    now: "float | None" = None,
+    auth_time: "int | None" = None,
 ) -> tuple[str, int]:
-    """A signed token for ``username`` and its expiry, in epoch seconds."""
+    """A signed token for ``username`` and its expiry, in epoch seconds.
+
+    ``auth_time`` is when the password was given: now for a sign-in, the
+    renewed token's own for a renewal. A token never outlives its chain's cap.
+    """
     issued = int(time.time() if now is None else now)
-    expires_at = issued + cfg.expire_s
+    began = issued if auth_time is None else auth_time
+    expires_at = min(issued + cfg.expire_s, began + cfg.max_session_s)
     token = jwt.encode(
-        {"sub": username, "iat": issued, "exp": expires_at},
+        {"sub": username, "iat": issued, "exp": expires_at, "auth_time": began},
         cfg.secret,
         algorithm=_ALGORITHM,
     )
     return token, expires_at
+
+
+def renew_token(
+    cfg: AuthConfig, claims: dict, now: "float | None" = None
+) -> tuple[str, int]:
+    """A fresh token for a still-good one's holder, in the same chain.
+
+    UnauthorizedError once the chain has reached its cap: the same sentence
+    as any other refusal, so the console signs in again as it would for an
+    expired token. A token from before ``auth_time`` existed starts its chain
+    at its own ``iat``.
+    """
+    at = int(time.time() if now is None else now)
+    began = int(claims.get("auth_time", claims.get("iat", at)))
+    if at >= began + cfg.max_session_s:
+        raise UnauthorizedError(SIGN_IN_AGAIN)
+    return issue_token(cfg, claims["sub"], now=at, auth_time=began)
 
 
 def verify_token(cfg: AuthConfig, token: str) -> dict:
