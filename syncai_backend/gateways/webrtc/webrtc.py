@@ -45,15 +45,15 @@ class _Slot(NamedTuple):
     created_at: float
 
 
-# The three session kinds, one slot each: video is WHEP (robot sends), audio is
-# WHIP (browser sends), duplex is both. The signalling is otherwise identical.
+# The two session kinds, one slot each: video is WHEP (robot sends), audio is
+# WHIP (browser sends). The signalling is otherwise identical. The worker also
+# exports a duplex (both on one connection); nothing served it but the
+# console's developer bench, so it is not bound here.
 _VIDEO = "video"
 _AUDIO = "audio"
-_DUPLEX = "duplex"
 _EXPORTS = {
     _VIDEO: ("CreateVideoSession", "DeleteVideoSession"),
     _AUDIO: ("CreateAudioSession", "DeleteAudioSession"),
-    _DUPLEX: ("CreateDuplexSession", "DeleteDuplexSession"),
 }
 
 # The devices each kind holds; the whole arbitration rule. A create preempts
@@ -65,7 +65,6 @@ _SPEAKER = "speaker"
 _DEVICES = {
     _VIDEO: frozenset({_CAMERA}),
     _AUDIO: frozenset({_SPEAKER}),
-    _DUPLEX: frozenset({_CAMERA, _SPEAKER}),
 }
 
 
@@ -370,17 +369,6 @@ class WebRtcGateway:
         """Unlike the video export, this answers not-found for an unknown id."""
         return self._delete_session(_AUDIO, session_id)
 
-    def create_duplex_session(self, offer_sdp: str) -> Tuple[bool, str, dict]:
-        """Both directions over one peer connection.
-
-        Claims camera and speaker together, preempting any WHEP or WHIP session.
-        """
-        return self._create_session(_DUPLEX, offer_sdp)
-
-    def delete_duplex_session(self, session_id: str) -> Tuple[bool, str, None]:
-        """Idempotent, matching the worker's export."""
-        return self._delete_session(_DUPLEX, session_id)
-
     def status(self) -> Dict:
         """What this backend believes about its session slots.
 
@@ -407,7 +395,6 @@ class WebRtcGateway:
             "library_loaded": self._lib is not None,
             "video": describe(slots[_VIDEO]),
             "audio": describe(slots[_AUDIO]),
-            "duplex": describe(slots[_DUPLEX]),
         }
 
 

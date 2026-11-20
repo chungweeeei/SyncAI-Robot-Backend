@@ -35,15 +35,9 @@ class WebRtcStatusResponse(BaseModel):
         None,
         description="The single WHIP talker slot, with the same caveat as `video`.",
     )
-    duplex: Optional[SessionStatus] = Field(
-        None,
-        description="The bidirectional slot. It holds the camera and the speaker "
-        "together, so it is never populated at the same time as `video` or "
-        "`audio` — a create of either kind preempts the other.",
-    )
 
 
-# What the three create routes answer, for OpenAPI: no response_model, the
+# What the two create routes answer, for OpenAPI: no response_model, the
 # body is the answer SDP.
 _SDP_ANSWER = {
     201: {
@@ -200,55 +194,6 @@ def init_webrtc_router(
                 session_id=session_id,
                 message=message,
             )
-
-        return Response(status_code=204)
-
-    @webrtc_router.post(
-        "/api/v1/webrtc/duplex",
-        status_code=201,
-        responses=_SDP_ANSWER,
-        response_class=Response,
-    )
-    def duplex_create(offer: bytes = Body(b"", media_type="application/sdp")):
-        """Both directions over one peer connection: camera out, microphone in.
-
-        **Not** WHEP or WHIP, which each specify one direction. One handshake
-        and one port pair, and both directions live or die together. It holds
-        the camera and the speaker, so it and WHEP/WHIP preempt each other
-        (the gateway arbitrates by device).
-        """
-        offer_sdp = _decode_offer(offer)
-
-        # One video m-line, one sendrecv audio m-line; logged, as for WHEP. A
-        # second audio m-line is rejected by pion and shows up as no microphone.
-        if offer_sdp.count("m=video") != 1 or offer_sdp.count("m=audio") != 1:
-            logger.warning(
-                "Duplex offer is not the expected one-video-one-audio shape",
-                video_lines=offer_sdp.count("m=video"),
-                audio_lines=offer_sdp.count("m=audio"),
-            )
-
-        success, message, payload = webrtc_gw.create_duplex_session(offer_sdp=offer_sdp)
-        if not success:
-            logger.error("Duplex session creation failed", message=message)
-            _raise_for(message)
-
-        return _created("duplex", "Duplex", payload)
-
-    @webrtc_router.delete(
-        "/api/v1/webrtc/duplex/{session_id}", status_code=204, response_class=Response
-    )
-    def duplex_delete(session_id: str):
-        """Tear a duplex session down, releasing both devices.
-
-        Idempotent like the WHEP teardown.
-        """
-        success, message, _ = webrtc_gw.delete_duplex_session(session_id=session_id)
-        if not success:
-            logger.error(
-                "Duplex session teardown failed", session_id=session_id, message=message
-            )
-            _raise_for(message)
 
         return Response(status_code=204)
 
