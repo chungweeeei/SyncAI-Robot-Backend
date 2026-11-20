@@ -74,6 +74,7 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/recordings/stop` | SIGINT the recorder and block until it has flushed — with compression, zstd of the open split, about a minute for a full 2 GB one on the Orin. Escalates to SIGTERM/SIGKILL only after 15 s with no write under its directory (or 5 min total), so set client timeouts accordingly. `complete: false` = killed; run `ros2 bag reindex` (the messages are there). 409 `not_recording` |
 | GET | `/api/v1/recordings` | Every bag under `record/`, newest first: `status` `recording` / `ok` / `interrupted` and, once finished, `duration_seconds`, `message_count`, topics recorded. `message_count: 0` signals a topic typo — nothing refuses a topic that does not exist yet |
 | DELETE | `/api/v1/recordings/{name}` | `rmtree`, no undo. 409 `recording_active` for the live one, else 404 |
+| GET | `/api/v1/logs/export` | The last 24 h of logs as one uncompressed `.tar` (`<robot_id>-logs-<UTC stamp>.tar`): every stack pane's multilog files plus the host's systemd journal, and a `manifest.json`. Always 200 — a source that cannot be read is left out and named in the manifest. Blocks while it builds (journalctl up to 120 s); see [*Log export*](#log-export) |
 | POST | `/api/v1/webrtc/whep` | Camera to browser (WHEP): body is the SDP offer (`application/sdp`); **201** with the answer and a **relative** `Location: /api/v1/webrtc/whep/{session_id}`. Preempts a live `video` (one camera). 400 for an empty, oversized (> 64 KiB), non-UTF-8 or media-less offer; 409 `whep_session_pending` while another create is mid-handshake (retry); anything else, a missing `.so` included, 502 with the worker's sentence. Blocks for ICE gathering (0.1–5 s) |
 | POST | `/api/v1/webrtc/whip` | Browser mic to robot speaker (WHIP), same shape; `Location: /api/v1/webrtc/whip/{session_id}`. Preempts `audio` (one speaker); coexists with `video` |
 | DELETE | `/api/v1/webrtc/{whep,whip}/{session_id}` | Tear down. **204 even for an unknown id** — the worker cannot tell "already self-closed" from "never existed" |
@@ -233,6 +234,34 @@ the same treatment; a robot workspace's install space already has the real drive
 `interrupted` is derived, never stored: a directory with no `metadata.yaml` and
 no live process — a bag whose backend went away mid-recording. The same
 disk-outlives-the-process split as the map cleaning's sidecar.
+
+## Log export
+
+`GET /api/v1/logs/export` gathers two sources into one tar under
+`<robot_id>-logs-<stamp>/`:
+
+- **`stack/<pane>/`** — the stack's own logs, which are **not** in the journal:
+  `NodeManager` taps every byobu pane with `tmux pipe-pane` into multilog under
+  the workspace's `log/stack/<robot_id>/<pane>/` (this backend's own pane
+  included, as `backend/`). A pane's `current` and its gzipped `@<tai64n>.s`
+  rotations are taken **whole** when their mtime is inside the last 24 h — a
+  rotation's mtime is its last write, so these are exactly the files whose lines
+  overlap the window, the oldest reaching somewhat before it. Not filtered line
+  by line and not recompressed (the rotations are gzip already). `current` is
+  copied at the size it had when opened, so the writes that keep arriving
+  cannot corrupt the tar.
+- **`journal.log`** — the host's systemd journal since the same instant, kernel
+  included: `journalctl -D /var/log/journal --since=@<epoch> -o
+  short-iso-precise` against the read-only mount of the host's journal. Output
+  despite a non-zero exit (an unreadable file among many) is kept.
+- **`manifest.json`** — the window, each pane's files and sizes, and for either
+  source `included: false` with the reason when it could not be read (directory
+  not mounted, `journalctl` missing or past 120 s, permission denied — the
+  container needs the host's `systemd-journal` group, `JOURNAL_GID`).
+
+The tar is built into an anonymous temp file on the maps' disk and streamed
+from it, as a map export is: a day of logs is far too big to hold in the
+process that supervises the running job.
 
 ## WebRTC
 

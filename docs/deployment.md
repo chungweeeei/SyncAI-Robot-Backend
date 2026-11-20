@@ -120,6 +120,7 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | `WEBRTC_LIB` | `./lib/libsyncai_worker.so` | the WebRTC worker `.so` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `postgres` / `postgres` | the infra stack's credentials |
 | `UID` / `GID` / `VIDEO_GID` | `1000` / `1000` / `44` | container user and the host's `video` group (`getent group video`) |
+| `JOURNAL_GID` | `101` | the host's `systemd-journal` group (`getent group systemd-journal`), so `GET /api/v1/logs/export` can read the journal; wrong, the export answers without it |
 | `PIP_INDEX_URL` | `https://pypi.org/simple` | build only: the PyPI index the base stage installs from (a mirror when PyPI is slow) |
 
 ```bash
@@ -203,6 +204,12 @@ The compose file comments every piece of the service; the ones that bite:
   (`.gitkeep`; the `.so` is gitignored) so Docker never creates a bind source
   itself: one it creates is `root:root`, unwritable for the uid-1000 user, and a
   missing *single-file* source becomes a directory that dlopen then fails on.
+- **Two read-only mounts for the log export** (`GET /api/v1/logs/export`):
+  `ROBOT_WS`'s `log/stack/` (the stack's multilog pane logs, written by the
+  robot container) and the host's `/var/log/journal` (read with `journalctl -D`,
+  hence `systemd` in the image and `JOURNAL_GID` above). The backend run as a
+  byobu pane inside the robot container already sees `log/stack/`; it has the
+  journal only if that container mounts it too.
 - **`ipc: host`.** pgo hands over the map cloud as a PCD under the host's
   `/dev/shm/syncai_pgo/<robot_id>` (see [*ROS interfaces*](ros-interfaces.md)); the path only names
   the same file if both containers share the host's IPC namespace (the

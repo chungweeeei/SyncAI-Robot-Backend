@@ -120,6 +120,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #     arrive from the host through the nvidia container runtime — so the video
 #     session additionally needs `runtime: nvidia` and /dev/video* in compose,
 #     while the audio session works on what is installed here.
+#   * systemd, for `journalctl` alone: GET /api/v1/logs/export reads the host's
+#     journal off a read-only /var/log/journal mount (`journalctl -D`). Nothing
+#     runs it as init. Without it the export still answers, journal left out.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         ros-humble-nav2-msgs \
@@ -134,6 +137,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-alsa \
+        systemd \
     && rm -rf /var/lib/apt/lists/*
 
 # Copied on its own, ahead of any source, so editing the package does not
