@@ -18,6 +18,7 @@ from syncai_backend.temporal.worker import (
     start_temporal_worker,
 )
 
+from syncai_backend.interfaces.rest.auth import AuthConfig
 from syncai_backend.interfaces.rest.server import RestDeps, start_rest_server
 
 from syncai_backend.repositories.robot.robot import init_robot_repo
@@ -295,6 +296,7 @@ class SyncAIBackend(Node):
                 job_gate=job_gate,
                 map_import_svc=map_import_svc,
                 settings_svcs=settings_svcs,
+                auth=AuthConfig.from_env(logger=logger),
             ),
         )
 

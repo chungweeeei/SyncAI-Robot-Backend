@@ -240,6 +240,7 @@ def test_health_projects_worker_state():
             job_gate=MagicMock(),
             map_import_svc=MagicMock(),
             settings_svcs={},
+            auth=MagicMock(),
         ),
     )
     client = TestClient(app)

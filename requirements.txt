@@ -6,6 +6,8 @@ fastapi
 structlog  # logger.py / all modules log through structlog
 python-dotenv  # main.py `import dotenv` (.env loading in dev)
 uvicorn[standard]
+PyJWT>=2.8  # interfaces/rest/auth.py: the console's sign-in token (HS256); pure Python
+python-multipart>=0.0.13  # routers/auth.py: FastAPI reads the /docs sign-in form with it; pure Python
 pydantic>=2.11  # validate_by_name / validate_by_alias need 2.11+
 # temporalio: floored rather than left open. RobotWorkflow's pause / cancel
 # handling (temporal/workflows.py) leans on the SDK's cancellation semantics --
