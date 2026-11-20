@@ -74,11 +74,10 @@ Interactive docs: `http://<robot>:3000/docs`.
 | POST | `/api/v1/recordings/stop` | SIGINT the recorder and block until it has flushed — with compression, zstd of the open split, about a minute for a full 2 GB one on the Orin. Escalates to SIGTERM/SIGKILL only after 15 s with no write under its directory (or 5 min total), so set client timeouts accordingly. `complete: false` = killed; run `ros2 bag reindex` (the messages are there). 409 `not_recording` |
 | GET | `/api/v1/recordings` | Every bag under `record/`, newest first: `status` `recording` / `ok` / `interrupted` and, once finished, `duration_seconds`, `message_count`, topics recorded. `message_count: 0` signals a topic typo — nothing refuses a topic that does not exist yet |
 | DELETE | `/api/v1/recordings/{name}` | `rmtree`, no undo. 409 `recording_active` for the live one, else 404 |
-| POST | `/api/v1/webrtc/whep` | Camera to browser (WHEP): body is the SDP offer (`application/sdp`); **201** with the answer and a **relative** `Location: /api/v1/webrtc/whep/{session_id}`. Preempts a live `video` or `duplex` (one camera). 400 for an empty, oversized (> 64 KiB), non-UTF-8 or media-less offer; 409 `whep_session_pending` while another create is mid-handshake (retry); anything else, a missing `.so` included, 502 with the worker's sentence. Blocks for ICE gathering (0.1–5 s) |
-| POST | `/api/v1/webrtc/whip` | Browser mic to robot speaker (WHIP), same shape; `Location: /api/v1/webrtc/whip/{session_id}`. Preempts `audio` or `duplex` (one speaker); coexists with `video` |
-| POST | `/api/v1/webrtc/duplex` | Both directions on one peer connection; holds camera **and** speaker, so preempts everything |
-| DELETE | `/api/v1/webrtc/{whep,whip,duplex}/{session_id}` | Tear down. **204 even for an unknown id** — the worker cannot tell "already self-closed" from "never existed" |
-| GET | `/api/v1/webrtc/status` | `library_loaded` plus the `video` / `audio` / `duplex` slots (`session_id`, `age_seconds`) as this backend believes them. No callback from the worker, so an abandoned session reads live until the next create preempts it. Deliberately not in `/health` |
+| POST | `/api/v1/webrtc/whep` | Camera to browser (WHEP): body is the SDP offer (`application/sdp`); **201** with the answer and a **relative** `Location: /api/v1/webrtc/whep/{session_id}`. Preempts a live `video` (one camera). 400 for an empty, oversized (> 64 KiB), non-UTF-8 or media-less offer; 409 `whep_session_pending` while another create is mid-handshake (retry); anything else, a missing `.so` included, 502 with the worker's sentence. Blocks for ICE gathering (0.1–5 s) |
+| POST | `/api/v1/webrtc/whip` | Browser mic to robot speaker (WHIP), same shape; `Location: /api/v1/webrtc/whip/{session_id}`. Preempts `audio` (one speaker); coexists with `video` |
+| DELETE | `/api/v1/webrtc/{whep,whip}/{session_id}` | Tear down. **204 even for an unknown id** — the worker cannot tell "already self-closed" from "never existed" |
+| GET | `/api/v1/webrtc/status` | `library_loaded` plus the `video` / `audio` slots (`session_id`, `age_seconds`) as this backend believes them. No callback from the worker, so an abandoned session reads live until the next create preempts it. Deliberately not in `/health` |
 | WS | `/api/v1/robot/pointcloud/stream` | Live `body_cloud`, ~10 Hz |
 | WS | `/api/v1/robot/pointcloud/map/stream` | pgo's merged "map so far", every few seconds at most, mapping mode only; each frame replaces the whole layer |
 | WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (1 Hz), and while a navigation runs `local_costmap` (2 Hz) and `local_plan` (5 Hz) |
@@ -247,7 +246,7 @@ construction touches nothing, the first create pays, and a boot that never
 streams carries none of it.
 
 - **One slot per kind, arbitrated by device.** One camera, one speaker: `whep`
-  holds the camera, `whip` the speaker, `duplex` both. A create preempts every
+  holds the camera, `whip` the speaker. A create preempts every
   live session sharing a device, so a dead tab that never sent DELETE cannot
   lock the camera out. The worker knows none of this; left alone it would build
   a second session and fail deep in GStreamer with an ALSA or V4L2 code.
