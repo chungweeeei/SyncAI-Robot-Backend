@@ -13,7 +13,7 @@ It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
-map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
+map srvs `StartMapping`, `ResumeMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
 `NavigateToGoal` action the MOVE step sends — and the CHARGE step on its `behavior_tree`
 `charge.xml` (2026-11), sent the charger waypoint as stored, its heading out of the marker's
 face; docs/ros-interfaces.md) — plus `rclpy`,
@@ -497,7 +497,10 @@ outside `/dev/shm`, bad PCD) is a warning that leaves the slot untouched — nev
 raise out of the callback, it would end `spin()` and the process. A successful `save_maps` sends the same empty notice
 (2026-10): pgo ends the run, goes idle and clears `/dev/shm` itself — this
 process deletes nothing there. Its run state is latched on `pgo/mapping_status`
-(`MappingStatusRepo`); `POST /api/v1/mapping/start` is what begins a run.
+(`MappingStatusRepo`); `POST /api/v1/mapping/start` is what begins a run, and
+`POST /api/v1/mapping/resume` (2026-11, `pgo/resume_mapping`, `ResumeMapping` in `syncai_common` at or after
+SyncAI-Robot-Interface `46b84f0`) begins one on top of a saved map, in its frame: it blocks for tens of
+seconds, reads the map and writes nothing, and the run is then saved under another name.
 
 ### Heavy imports
 

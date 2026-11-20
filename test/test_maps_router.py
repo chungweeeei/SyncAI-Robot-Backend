@@ -77,6 +77,18 @@ class _StubMapGateway:
             True,
             "Mapping started. Keep the robot still until the lidar has re-levelled.",
         )
+        # Resuming a saved map: the other way into a run.
+        self.resume_calls = []
+        self.resume_result = (
+            True,
+            "Resumed the saved map (812 keyframes): the robot is at (3.2, -1.5), "
+            "heading 90°. New keyframes are added to it — save under a new map "
+            "name when done.",
+            types.SimpleNamespace(
+                prior_key_poses=812, method="last_pose",
+                x=3.2, y=-1.5, z=0.6, yaw=1.5707963,
+            ),
+        )
         # The map-switch surface. `order` records every ROS step across both
         # clients in sequence, because for a switch the ordering *is* the
         # contract: the localizer moves before Octo3D so that the likeliest
@@ -133,6 +145,10 @@ class _StubMapGateway:
     def start_mapping(self, reset_lio=True):
         self.start_calls.append(reset_lio)
         return self.start_result
+
+    def resume_mapping(self, directory, hint=None):
+        self.resume_calls.append((directory, hint))
+        return self.resume_result
 
     def localizer_ready(self, timeout_sec=2.0):
         return self.services_ready
@@ -1325,6 +1341,140 @@ def test_start_mapping_touches_nothing_else(client, map_gw, catalog_repo):
     assert client.post("/api/v1/mapping/start").status_code == 200
 
     assert {entry.name for entry in catalog_repo.list_maps()} == before
+    assert map_gw.save_calls == []
+    assert map_gw.reset_calls == []
+
+
+# --- POST /api/v1/mapping/resume ----------------------------------------------
+
+
+def test_resume_mapping_hands_pgo_the_maps_directory(client, map_gw, maps_dir):
+    response = client.post("/api/v1/mapping/resume", json={"name": "full"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resumed"] is True
+    assert body["name"] == "full"
+    # pgo's sentence, which tells the operator to save under a new name.
+    assert "save under a new map name" in body["message"]
+    assert body["prior_key_poses"] == 812
+    assert body["method"] == "last_pose"
+    assert (body["x"], body["y"], body["z"]) == (3.2, -1.5, 0.6)
+    # REST speaks degrees.
+    assert body["theta"] == pytest.approx(90.0, abs=1e-4)
+    # The directory, not the name; and no hint unless one was given.
+    assert map_gw.resume_calls == [(str(maps_dir / "full"), None)]
+
+
+def test_resume_mapping_passes_a_hint_on_in_radians(client, map_gw):
+    response = client.post(
+        "/api/v1/mapping/resume",
+        json={"name": "full", "hint": {"x": 3.0, "y": -1.0, "z": 4.2, "theta": 90.0}},
+    )
+
+    assert response.status_code == 200
+    (_, hint), = map_gw.resume_calls
+    assert hint[:3] == (3.0, -1.0, 4.2)
+    assert hint[3] == pytest.approx(1.5707963, abs=1e-6)
+
+
+def test_a_hint_without_a_height_is_on_the_ground_floor(client, map_gw):
+    response = client.post(
+        "/api/v1/mapping/resume",
+        json={"name": "full", "hint": {"x": 3.0, "y": -1.0, "theta": 0.0}},
+    )
+
+    assert response.status_code == 200
+    assert map_gw.resume_calls[0][1] == (3.0, -1.0, 0.0, 0.0)
+
+
+def test_resume_mapping_may_resume_the_loaded_map(client, map_gw, catalog_repo):
+    # The usual case: navigate on a map, switch to mapping, resume it. That is
+    # also the map the localizer's saved pose is for.
+    assert catalog_repo.active_name() == "full"
+
+    assert client.post("/api/v1/mapping/resume", json={"name": "full"}).status_code == 200
+
+
+def test_resume_mapping_names_a_way_of_finding_the_robot_it_does_not_know(client, map_gw):
+    ok, message, resumed = map_gw.resume_result
+    resumed.method = "unknown"
+
+    response = client.post("/api/v1/mapping/resume", json={"name": "full"})
+
+    assert response.status_code == 200
+    assert response.json()["method"] == "unknown"
+
+
+def test_resume_mapping_is_a_404_for_an_unknown_map(client, map_gw):
+    response = client.post("/api/v1/mapping/resume", json={"name": "nowhere"})
+
+    assert response.status_code == 404
+    assert map_gw.resume_calls == []
+
+
+def test_resume_mapping_refuses_a_name_that_is_not_a_map_name(client, map_gw):
+    response = client.post("/api/v1/mapping/resume", json={"name": "../evil"})
+
+    assert response.status_code == 400
+    assert map_gw.resume_calls == []
+
+
+def test_resume_mapping_reports_pgos_refusal(client, map_gw):
+    # Not found, a look-alike place, a map saved without its keyframes, not in
+    # a mapping session: pgo's sentence, rendered verbatim.
+    map_gw.resume_result = (
+        False,
+        "This place looks like another one in the saved map: (3.2, -1.5) and "
+        "(14.0, 2.1) fit about equally. Give the robot's position, or start "
+        "from a more distinctive place. Nothing started.",
+        None,
+    )
+
+    response = client.post("/api/v1/mapping/resume", json={"name": "full"})
+
+    assert response.status_code == 502
+    assert "looks like another one" in response.json()["detail"]
+
+
+def test_resume_mapping_is_refused_while_already_mapping(client, map_gw, mapping_status_repo):
+    _latch(mapping_status_repo, MappingState.MAPPING, key_poses=3)
+
+    response = client.post("/api/v1/mapping/resume", json={"name": "full"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_running"
+    assert map_gw.resume_calls == []
+
+
+def test_resume_mapping_is_refused_mid_transition(client, map_gw, mapping_status_repo):
+    # Which a resume itself is, for tens of seconds: a second press is told so.
+    _latch(mapping_status_repo, MappingState.RESETTING)
+
+    response = client.post("/api/v1/mapping/resume", json={"name": "full"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "mapping_busy"
+    assert map_gw.resume_calls == []
+
+
+def test_resume_mapping_asks_pgo_when_the_state_is_unknown_or_idle(
+    client, map_gw, mapping_status_repo
+):
+    assert client.post("/api/v1/mapping/resume", json={"name": "full"}).status_code == 200
+    _latch(mapping_status_repo, MappingState.IDLE)
+    assert client.post("/api/v1/mapping/resume", json={"name": "full"}).status_code == 200
+
+    assert len(map_gw.resume_calls) == 2
+
+
+def test_resume_mapping_touches_nothing_else(client, map_gw, catalog_repo):
+    before = {entry.name for entry in catalog_repo.list_maps()}
+
+    assert client.post("/api/v1/mapping/resume", json={"name": "full"}).status_code == 200
+
+    assert {entry.name for entry in catalog_repo.list_maps()} == before
+    assert map_gw.start_calls == []
     assert map_gw.save_calls == []
     assert map_gw.reset_calls == []
 
@@ -3000,6 +3150,7 @@ def test_the_mapping_run_has_its_own_openapi_tag(client):
     assert tags[("GET", "/api/v1/mapping")] == ["Mapping"]
     assert tags[("POST", "/api/v1/mapping/start")] == ["Mapping"]
     assert tags[("POST", "/api/v1/mapping/reset")] == ["Mapping"]
+    assert tags[("POST", "/api/v1/mapping/resume")] == ["Mapping"]
     assert tags[("POST", "/api/v1/maps")] == ["Map"]
     assert tags[("GET", "/api/v1/maps/{name}/vertices")] == ["Map"]
     assert all(len(t) == 1 for t in tags.values())

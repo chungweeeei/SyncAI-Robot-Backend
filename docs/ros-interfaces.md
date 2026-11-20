@@ -226,6 +226,14 @@ preview a newer one preempted (the planner takes one at a time),
     `pgo_node`) — the only things that serialise a run, undo one, and move pgo
     from idle to mapping (a mapping session comes up banking nothing; a
     successful save returns it to idle).
+  - `pgo/resume_mapping` (`syncai_common/ResumeMapping`, 2026-11; the same
+    node) — the other way from idle to mapping: a saved map's directory, and
+    optionally where the robot is in it. It blocks while pgo loads the map,
+    resets the LIO and searches, so the client's deadline is 90 s, past pgo's
+    own waits. `pgo/mapping_status` reads `RESETTING` meanwhile and nothing in
+    it says a run was resumed; only the service's answer does. A pgo from
+    before the service has no such server, which reads here as "not in
+    mapping mode".
   - `relocalize` / `relocalize_check` (`syncai_localizer`, the map switch) —
     **bare** names in the robot namespace (`/<robot_id>/relocalize`, not
     `/<robot_id>/localizer/relocalize`); `gateways/map/map.py` records why.
