@@ -3,13 +3,16 @@
 What is pinned: the one account signs in and nothing else does, with one
 sentence for either half wrong; a token opens a guarded route over a header
 and a WebSocket over its query, and an expired, forged or missing one opens
-neither; and sign-in itself is reachable without one.
+neither; sign-in itself is reachable without one, as JSON for the console and
+as the form /docs' Authorize dialog sends; and the real server's OpenAPI names
+that flow on every guarded route.
 """
 
 import pytest
 
 pytest.importorskip("httpx")
 pytest.importorskip("jwt")
+pytest.importorskip("python_multipart")
 
 from fastapi import APIRouter, Depends, FastAPI, WebSocket  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -17,6 +20,7 @@ from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from syncai_backend.interfaces.rest.auth import (  # noqa: E402
     SIGN_IN_AGAIN,
+    TOKEN_URL,
     AuthConfig,
     init_auth_guard,
     issue_token,
@@ -79,6 +83,26 @@ def test_a_wrong_half_is_refused_without_saying_which(client, username, password
     assert res.json() == {"detail": "Wrong username or password."}
 
 
+def test_the_form_sign_in_answers_a_token_that_opens_a_guarded_route(client):
+    # What the Authorize dialog of /docs posts: an OAuth2 password grant.
+    res = client.post(
+        TOKEN_URL, data={"grant_type": "password", "username": "admin", "password": "s3cret"}
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["token_type"] == "bearer"
+    res = client.get(
+        "/api/v1/guarded", headers={"Authorization": f"Bearer {body['access_token']}"}
+    )
+    assert res.status_code == 200
+
+
+def test_the_form_sign_in_refuses_a_wrong_pair_as_the_json_one_does(client):
+    res = client.post(TOKEN_URL, data={"username": "admin", "password": "wrong"})
+    assert res.status_code == 401
+    assert res.json() == {"detail": "Wrong username or password."}
+
+
 def test_a_token_opens_a_guarded_route(client):
     token = _sign_in(client)["access_token"]
     res = client.get("/api/v1/guarded", headers={"Authorization": f"Bearer {token}"})
@@ -133,7 +157,7 @@ def test_every_route_of_the_real_server_but_sign_in_and_health_needs_a_token(log
     } | {"settings_svcs": {}, "auth": CFG})
     client = TestClient(init_rest_server(logger=logger, deps=deps))
 
-    open_paths = {"/health", "/api/v1/auth/login"}
+    open_paths = {"/health", "/api/v1/auth/login", TOKEN_URL}
     paths = client.app.openapi()["paths"]
     assert "/api/v1/logs/export" in paths
     unguarded = [
@@ -144,3 +168,33 @@ def test_every_route_of_the_real_server_but_sign_in_and_health_needs_a_token(log
         if client.request(method, re.sub(r"\{[^}]+\}", "x", path)).status_code != 401
     ]
     assert unguarded == []
+
+
+def test_the_real_servers_openapi_names_the_sign_in_on_every_guarded_route(logger):
+    # What puts the Authorize dialog in /docs and the token on each request
+    # tried from it: the flow declared once, and required by every operation
+    # but the three that are open.
+    pytest.importorskip("temporalio")
+    from unittest.mock import MagicMock
+
+    from syncai_backend.interfaces.rest.server import RestDeps, init_rest_server
+
+    deps = RestDeps(**{
+        name: MagicMock() for name in RestDeps.__dataclass_fields__
+    } | {"settings_svcs": {}, "auth": CFG})
+    spec = init_rest_server(logger=logger, deps=deps).openapi()
+
+    (scheme_name, scheme), = spec["components"]["securitySchemes"].items()
+    assert scheme == {
+        "type": "oauth2",
+        "flows": {"password": {"tokenUrl": TOKEN_URL, "scopes": {}}},
+    }
+
+    open_paths = {"/health", "/api/v1/auth/login", TOKEN_URL}
+    wrong = [
+        (method.upper(), path)
+        for path, methods in spec["paths"].items()
+        for method, operation in methods.items()
+        if (operation.get("security") == [{scheme_name: []}]) == (path in open_paths)
+    ]
+    assert wrong == []

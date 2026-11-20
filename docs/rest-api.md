@@ -4,7 +4,8 @@
 
 Interactive docs: `http://<robot>:3000/docs`.
 
-**Every route but `/health` and `POST /api/v1/auth/login` needs a token**
+**Every route but `/health` and the two sign-ins (`POST /api/v1/auth/login`,
+`POST /api/v1/auth/token`) needs a token**
 (`interfaces/rest/auth.py`): `Authorization: Bearer <token>` on a request, and
 `?token=<token>` on a WebSocket, since a browser cannot set a header there. A
 missing, forged or expired token is 401 `{"detail": "Your session has ended.
@@ -13,9 +14,15 @@ There is one account (`AUTH_USERNAME` / `AUTH_PASSWORD`) and no route to add
 another; a token lasts `JWT_EXPIRE_SECONDS` and there is no refresh — the
 console signs in again.
 
+The guard is declared to OpenAPI as an OAuth2 password flow, so `/docs` has an
+**Authorize** button: give it the account (leave `client_id` / `client_secret`
+empty) and every request tried from the page carries the token. `/docs` and
+`/openapi.json` themselves are open.
+
 | Method | Path | Notes |
 |---|---|---|
 | POST | `/api/v1/auth/login` | Sign in: `{username, password}` → `{access_token, token_type: "bearer", expires_at, expires_in}` — `expires_at` in epoch seconds, `expires_in` the seconds it lasts, which is what a client should time a sign-out by, since the robot's clock and the browser's need not agree. 401 `Wrong username or password.` for either half wrong. No token needed |
+| POST | `/api/v1/auth/token` | The same sign-in as an OAuth2 password grant: a form (`username`, `password`), the same answer and the same 401. What `/docs`' Authorize dialog calls; the console uses `login`. No token needed |
 | GET | `/api/v1/auth/me` | The token's `{username, expires_at}`: how a console checks that a token it kept still works |
 | GET | `/health` | Liveness probe (always 200); `status` is `degraded` while `task_server` is not `running` (`connecting`/`dead` + `task_server_error`) |
 | POST | `/api/v1/tasks` | Start a `RobotWorkflow`; body `{id, steps[], kind?, name?, map_name?}` (legacy `timestamp` ignored). `kind` (`goal` / `standup` / `liedown` / `task`; `schedule` is the backend's and refused) and `name` are stamped as search attributes for the history. A job with a MOVE / PATROL is checked against the loaded map — 409 `map_mismatch`, see [*A job's map is checked twice*](tasks.md); stand / lie down / SPEAK / WAIT never are. 409 `task_running` while any task runs — one task at a time. **Or** `{id, continue_from, kind?, name?}` instead of `steps` (exactly one; 400 otherwise, and with `map_name`): a new run of a FAILED task from the failed step on — see [*Continuing a failed task*](tasks.md). The answer then carries `continued_from` and `from_step_id` (both `null` otherwise) |

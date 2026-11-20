@@ -5,6 +5,10 @@ environment; there is no user table and no way to add one over the API, by
 design for now. A sign-in answers a JWT (HS256) that the console sends on every
 request, and which expires on its own: the token is the whole session, so there
 is nothing to revoke server-side and a sign-out is the console forgetting it.
+
+The guard is declared to OpenAPI as an OAuth2 password flow, which is what
+gives /docs its Authorize dialog: it trades the account for a token at
+TOKEN_URL and sends it with every request tried from the page.
 """
 
 import hmac
@@ -15,7 +19,8 @@ from dataclasses import dataclass
 
 import jwt
 import structlog
-from fastapi import WebSocketException, status
+from fastapi import Depends, WebSocketException, status
+from fastapi.security import OAuth2PasswordBearer
 from starlette.requests import HTTPConnection
 
 from syncai_backend.exceptions import UnauthorizedError
@@ -29,6 +34,10 @@ _ALGORITHM = "HS256"
 # Said for every refusal of a request without a usable token, so the answer
 # never tells a caller whether the token was missing, forged or merely old.
 SIGN_IN_AGAIN = "Your session has ended. Sign in again."
+
+# Where /docs' Authorize dialog signs in: the form twin of the console's JSON
+# sign-in (routers/auth.py).
+TOKEN_URL = "/api/v1/auth/token"
 
 
 @dataclass(frozen=True)
@@ -92,16 +101,6 @@ def verify_token(cfg: AuthConfig, token: str) -> dict:
         raise UnauthorizedError(SIGN_IN_AGAIN) from exc
 
 
-def _bearer(conn: HTTPConnection) -> "str | None":
-    header = conn.headers.get("authorization", "")
-    scheme, _, value = header.partition(" ")
-    if scheme.lower() == "bearer" and value:
-        return value.strip()
-    # A browser cannot set a header on a WebSocket, so the streams carry the
-    # token in the query; nothing else should need to.
-    return conn.query_params.get("token")
-
-
 def init_auth_guard(cfg: AuthConfig):
     """The dependency every route but sign-in and /health sits behind.
 
@@ -109,9 +108,16 @@ def init_auth_guard(cfg: AuthConfig):
     the WebSocket streams too, where a refusal has to be a close before the
     accept instead of a 401.
     """
+    # Reads the Authorization header, and is what lists the guard in OpenAPI.
+    # auto_error off: the refusal below is this module's, in the house shape.
+    bearer = OAuth2PasswordBearer(tokenUrl=TOKEN_URL, auto_error=False)
 
-    def require_auth(conn: HTTPConnection) -> dict:
-        token = _bearer(conn)
+    def require_auth(
+        conn: HTTPConnection, header_token: "str | None" = Depends(bearer)
+    ) -> dict:
+        # A browser cannot set a header on a WebSocket, so the streams carry
+        # the token in the query; nothing else should need to.
+        token = header_token or conn.query_params.get("token")
         try:
             if not token:
                 raise UnauthorizedError(SIGN_IN_AGAIN)

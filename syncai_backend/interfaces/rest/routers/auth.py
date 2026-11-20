@@ -1,9 +1,11 @@
 import structlog
 from fastapi import APIRouter, Depends
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 
 from syncai_backend.exceptions import UnauthorizedError
 from syncai_backend.interfaces.rest.auth import (
+    TOKEN_URL,
     AuthConfig,
     check_credentials,
     init_auth_guard,
@@ -38,18 +40,27 @@ def init_auth_router(logger: structlog.stdlib.BoundLogger, auth: AuthConfig) -> 
     auth_router = APIRouter(prefix="", tags=["Auth"])
     require_auth = init_auth_guard(auth)
 
-    @auth_router.post("/api/v1/auth/login", response_model=LoginResponse)
-    def login(request: LoginRequest):
-        if not check_credentials(auth, request.username, request.password):
-            logger.warning("Sign-in refused", username=request.username)
+    def sign_in(username: str, password: str) -> LoginResponse:
+        if not check_credentials(auth, username, password):
+            logger.warning("Sign-in refused", username=username)
             # One sentence for either half wrong: which one was is the
             # guesser's next clue, not the operator's.
             raise UnauthorizedError("Wrong username or password.")
-        token, expires_at = issue_token(auth, request.username)
-        logger.info("Signed in", username=request.username)
+        token, expires_at = issue_token(auth, username)
+        logger.info("Signed in", username=username)
         return LoginResponse(
             access_token=token, expires_at=expires_at, expires_in=auth.expire_s
         )
+
+    @auth_router.post("/api/v1/auth/login", response_model=LoginResponse)
+    def login(request: LoginRequest):
+        return sign_in(request.username, request.password)
+
+    @auth_router.post(TOKEN_URL, response_model=LoginResponse)
+    def token(form: OAuth2PasswordRequestForm = Depends()):
+        """The same sign-in as a form, which is how an OAuth2 password flow
+        sends it: what the Authorize dialog of /docs calls."""
+        return sign_in(form.username, form.password)
 
     @auth_router.get("/api/v1/auth/me", response_model=SessionResponse)
     def me(claims: dict = Depends(require_auth)):
