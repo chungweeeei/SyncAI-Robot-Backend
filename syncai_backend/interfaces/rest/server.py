@@ -29,6 +29,7 @@ from syncai_backend.interfaces.rest.routers.teleop import init_teleop_router
 from syncai_backend.interfaces.rest.routers.tts import init_tts_router
 from syncai_backend.interfaces.rest.routers.webrtc import init_webrtc_router
 from syncai_backend.interfaces.rest.routers.recording import init_recording_router
+from syncai_backend.interfaces.rest.routers.logs import init_logs_router
 from syncai_backend.interfaces.rest.routers.settings import init_settings_router
 from syncai_backend.interfaces.rest.routers.landmark import init_landmark_router
 
@@ -49,6 +50,7 @@ from syncai_backend.gateways.landmark.landmark import LandmarkGateway
 from syncai_backend.gateways.tts.tts import TtsGateway
 from syncai_backend.gateways.webrtc.webrtc import WebRtcGateway
 from syncai_backend.gateways.recording.recording import RecordingGateway
+from syncai_backend.gateways.logs.logs import LogBundleGateway
 
 from syncai_backend.services.map_import import MapImportService
 from syncai_backend.services.map_switch import MapSwitchService
@@ -122,6 +124,7 @@ class RestDeps:
     webrtc_gw: WebRtcGateway
     recording_gw: RecordingGateway
     recording_catalog_repo: RecordingCatalogRepo
+    log_bundle_gw: LogBundleGateway
     restart_svc: ModeRestartService
     mapping_status_repo: MappingStatusRepo
     safety_lock_svc: SafetyLockService
@@ -286,6 +289,10 @@ def init_rest_server(
             recording_gw=deps.recording_gw,
             recording_catalog_repo=deps.recording_catalog_repo,
         )
+    )
+    # The last day of the stack's pane logs and the host journal, as a tar.
+    app.include_router(
+        init_logs_router(logger=logger, log_bundle_gw=deps.log_bundle_gw)
     )
 
     # /api/v1/settings/<page>: a node's tunable parameters, set live over its

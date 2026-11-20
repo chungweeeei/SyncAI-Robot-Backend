@@ -42,6 +42,7 @@ from syncai_backend.gateways.workflow.workflow import init_workflow_gateway
 from syncai_backend.gateways.tts.tts import init_tts_gateway
 from syncai_backend.gateways.webrtc.webrtc import init_webrtc_gateway
 from syncai_backend.gateways.recording.recording import init_recording_gateway
+from syncai_backend.gateways.logs.logs import init_log_bundle_gateway
 from syncai_backend.gateways.parameters.parameters import init_parameter_gateway
 
 from syncai_backend.services.map_import import init_map_import_service
@@ -150,6 +151,13 @@ class SyncAIBackend(Node):
             logger=logger,
             robot_id=robot_id,
             records_dir=recording_catalog_repo.records_dir,
+        )
+        # GET /api/v1/logs/export: the panes' multilog files and the host journal,
+        # tarred onto the maps' disk (where the space for a map is known to be).
+        log_bundle_gw = init_log_bundle_gateway(
+            logger=logger,
+            robot_id=robot_id,
+            scratch_dir=map_catalog_repo.maps_dir,
         )
 
         # Whether a map may be edited, destroyed, switched to or driven on. The
@@ -278,6 +286,7 @@ class SyncAIBackend(Node):
                 webrtc_gw=webrtc_gw,
                 recording_gw=recording_gw,
                 recording_catalog_repo=recording_catalog_repo,
+                log_bundle_gw=log_bundle_gw,
                 restart_svc=restart_svc,
                 mapping_status_repo=mapping_status_repo,
                 safety_lock_svc=safety_lock_svc,
