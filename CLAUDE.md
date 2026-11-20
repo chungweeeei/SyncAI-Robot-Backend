@@ -208,7 +208,9 @@ gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), 
         │                  with the shared TF buffer; helpers/landmark_heading judges them), parameters (one
         │                  node's get/set_parameters; controller_server, planner_server), workflow (Temporal),
         │                  tts (HTTP → syncai_tts container), webrtc (dlopen'd Go worker), recording
-        │                  (supervised `ros2 bag record` child). tts/webrtc/recording hold no node.
+        │                  (supervised `ros2 bag record` child), logs (the panes' multilog files
+        │                  under log/stack/<robot_id>/ + `journalctl -D /var/log/journal`, one tar).
+        │                  tts/webrtc/recording/logs hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
         │                  mapping — pgo's latched run state, aged out after 5 s),
         │                  PostgreSQL CRUD (map vertices, task_templates, task_record), on-disk catalogues (map/, record/),
@@ -286,7 +288,7 @@ Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
 Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
 `~/robot_ws/config/params`, `~/robot_ws/src/syncai_controller/params` (read-only),
-`~/robot_ws/record`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
+`~/robot_ws/record`, `~/robot_ws/log/stack`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
 reliably run from the workspace root. `/dev/shm` is absolute for a different reason: it is
 the tmpfs `ipc: host` makes common to this container and the robot's, and pgo and this
 process agree on `/dev/shm/syncai_pgo/<robot_id>` by convention — neither end reads it from

@@ -124,6 +124,7 @@ refusal codes and the reasons behind them: [docs/rest-api.md](docs/rest-api.md).
 | Wifi | `/api/v1/network/wifi/*` |
 | Speech | `/api/v1/tts/*` |
 | Recordings | `/api/v1/recordings` |
+| Log export | `/api/v1/logs/export` |
 | WebRTC signalling | `/api/v1/webrtc/*` |
 | WebSocket streams | `/api/v1/robot/teleop`, `/robot/pointcloud/stream`, `/robot/pointcloud/map/stream`, `/robot/telemetry/stream` |
 
@@ -138,7 +139,7 @@ syncai_backend/
 ├── main.py              the node: wires everything, starts uvicorn and the Temporal worker
 ├── interfaces/rest/     FastAPI app, routers, schemas
 ├── services/            domain work that outlives a request (map switch, import, safety lock, …)
-├── gateways/            outbound: ROS, Temporal, TTS, WebRTC, recordings
+├── gateways/            outbound: ROS, Temporal, TTS, WebRTC, recordings, logs
 ├── repositories/        state: in-memory caches, PostgreSQL CRUD, on-disk catalogues
 ├── database/            SQLAlchemy engine + models
 ├── subscribers/         ROS topics → repositories
@@ -177,7 +178,7 @@ subscriber, and keep it in sync when behaviour changes.
 |---|---|
 | [architecture.md](docs/architecture.md) | process model and threads, shutdown order, layering, map storage (octomap, keepout, floors, archives), `robot_id` scoping |
 | [ros-interfaces.md](docs/ros-interfaces.md) | subscriptions and QoS, the map cloud file, action / service clients, publishers, TF |
-| [rest-api.md](docs/rest-api.md) | every REST / WebSocket route, errors, wire formats, settings pages, recordings, WebRTC, templates, the run record |
+| [rest-api.md](docs/rest-api.md) | every REST / WebSocket route, errors, wire formats, settings pages, recordings, the log export, WebRTC, templates, the run record |
 | [tasks.md](docs/tasks.md) | Temporal: step types, retries, groups, pause / resume, continuing a failed task, history, schedules |
 | [configuration.md](docs/configuration.md) | every environment variable, the system INI, the loaded map, Postgres |
 | [deployment.md](docs/deployment.md) | build and run, in a workspace and as its own container |
