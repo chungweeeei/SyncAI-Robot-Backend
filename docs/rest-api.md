@@ -16,11 +16,19 @@ console signs in again.
 
 The guard is declared to OpenAPI as an OAuth2 password flow, so `/docs` has an
 **Authorize** button: give it the account and every request tried from the
-page carries the token. Swagger UI's dialog would also ask for a `client_id` /
-`client_secret`, which this server never reads; `/docs` is served with a style
-rule hiding them (`_DOCS_SIGN_IN_STYLE`, server.py), keyed on Swagger UI's own
-element ids — if a release renames them the fields reappear and can be left
-empty. `/docs` and `/openapi.json` themselves are open.
+page carries the token. `/docs` and `/openapi.json` themselves are open.
+
+`/docs` is Swagger UI's stock page with a few settings and one stylesheet
+(`interfaces/rest/docs_page.py`): the tags open folded; the token is kept in the
+browser's localStorage, so a reload does not sign out (once it expires, Logout
+in the dialog and sign in again); a tried request shows how long it took; the
+Authorize bar stays at the top of the window and turns solid green, with the
+locks, once signed in. "Try it out" is left a click away on purpose. Swagger
+UI's dialog would also ask for a `client_id` / `client_secret`, which this
+server never reads, so the stylesheet hides them. Every rule is keyed on
+Swagger UI's own class names and ids — if a release renames them the rule stops
+matching and that part of the page looks stock again; the hidden fields
+reappear and can be left empty.
 
 | Method | Path | Notes |
 |---|---|---|

@@ -170,9 +170,10 @@ def test_every_route_of_the_real_server_but_sign_in_and_health_needs_a_token(log
     assert unguarded == []
 
 
-def test_docs_is_open_and_hides_the_client_credentials_of_its_sign_in(logger):
-    # Swagger UI's password dialog asks for a client id and secret this
-    # server never reads; /docs is the stock page plus the rule hiding them.
+def test_docs_is_open_and_is_the_stock_page_set_up_for_this_api(logger):
+    # /docs is Swagger UI's page plus docs_page.py's settings and stylesheet:
+    # the tags folded, the token kept over a reload, and a sign-in dialog
+    # without the client id and secret this server never reads.
     pytest.importorskip("temporalio")
     from unittest.mock import MagicMock
 
@@ -185,8 +186,16 @@ def test_docs_is_open_and_hides_the_client_credentials_of_its_sign_in(logger):
 
     assert res.status_code == 200
     assert "swagger-ui-bundle.js" in res.text and "/openapi.json" in res.text
+    for setting in (
+        '"docExpansion": "none"',
+        '"persistAuthorization": true',
+        '"displayRequestDuration": true',
+    ):
+        assert setting in res.text
+    assert "tryItOutEnabled" not in res.text
     for field in ("password_type", "client_id_password", "client_secret_password"):
         assert f'label[for="{field}"]' in res.text
+    assert ".scheme-container" in res.text
     assert res.text.index("<style>") < res.text.index("</head>")
 
 
@@ -209,6 +218,9 @@ def test_the_real_servers_openapi_names_the_sign_in_on_every_guarded_route(logge
         "type": "oauth2",
         "flows": {"password": {"tokenUrl": TOKEN_URL, "scopes": {}}},
     }
+
+    # Under a tag of its own, not Swagger UI's "default".
+    assert spec["paths"]["/health"]["get"]["tags"] == ["Health"]
 
     open_paths = {"/health", "/api/v1/auth/login", TOKEN_URL}
     wrong = [
