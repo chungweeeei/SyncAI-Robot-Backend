@@ -2985,3 +2985,21 @@ def test_a_finished_clean_does_not_hold_the_map(client, maps_dir):
     _plant_clean(maps_dir / "rawonly", _clean_payload("ok", written=True))
 
     assert _rename(client, "rawonly", "hall").status_code == 200
+
+
+def test_the_mapping_run_has_its_own_openapi_tag(client):
+    # Each route under exactly one tag: a tag on the composing router too would
+    # list every route twice in /docs.
+    paths = client.get("/openapi.json").json()["paths"]
+    tags = {
+        (method.upper(), path): op["tags"]
+        for path, ops in paths.items()
+        for method, op in ops.items()
+    }
+
+    assert tags[("GET", "/api/v1/mapping")] == ["Mapping"]
+    assert tags[("POST", "/api/v1/mapping/start")] == ["Mapping"]
+    assert tags[("POST", "/api/v1/mapping/reset")] == ["Mapping"]
+    assert tags[("POST", "/api/v1/maps")] == ["Map"]
+    assert tags[("GET", "/api/v1/maps/{name}/vertices")] == ["Map"]
+    assert all(len(t) == 1 for t in tags.values())

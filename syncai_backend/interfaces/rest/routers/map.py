@@ -37,9 +37,21 @@ from syncai_backend.interfaces.rest.routers.maps import (
 )
 from syncai_backend.interfaces.rest.routers.maps.context import MapRouteContext
 
-# Registration order. Paths do not overlap across areas, so this only orders
-# the OpenAPI listing.
-_AREAS = (catalog, archive, mapping, switch, vertices, keepout, cloud, octomap, floors)
+# Registration order, and each area's OpenAPI tag. Paths do not overlap across
+# areas, so the order only orders the listing. The mapping run (start, reset,
+# its status) is its own tag: it drives pgo, not a map on disk. Saving the run
+# is POST /api/v1/maps, which creates a map, so it stays under Map.
+_AREAS = (
+    (catalog, "Map"),
+    (archive, "Map"),
+    (mapping, "Mapping"),
+    (switch, "Map"),
+    (vertices, "Map"),
+    (keepout, "Map"),
+    (cloud, "Map"),
+    (octomap, "Map"),
+    (floors, "Map"),
+)
 
 
 def init_map_router(
@@ -66,7 +78,11 @@ def init_map_router(
         job_gate=job_gate,
         map_import_svc=map_import_svc,
     )
-    map_router = APIRouter(prefix="", tags=["Map"])
-    for area in _AREAS:
-        area.register(map_router, ctx)
+    # Untagged itself: tags accumulate from router to route, so a tag here
+    # would put every route under it as well as under its area's.
+    map_router = APIRouter(prefix="")
+    for area, tag in _AREAS:
+        area_router = APIRouter(tags=[tag])
+        area.register(area_router, ctx)
+        map_router.include_router(area_router)
     return map_router
