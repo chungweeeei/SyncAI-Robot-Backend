@@ -15,9 +15,12 @@ another; a token lasts `JWT_EXPIRE_SECONDS` and there is no refresh — the
 console signs in again.
 
 The guard is declared to OpenAPI as an OAuth2 password flow, so `/docs` has an
-**Authorize** button: give it the account (leave `client_id` / `client_secret`
-empty) and every request tried from the page carries the token. `/docs` and
-`/openapi.json` themselves are open.
+**Authorize** button: give it the account and every request tried from the
+page carries the token. Swagger UI's dialog would also ask for a `client_id` /
+`client_secret`, which this server never reads; `/docs` is served with a style
+rule hiding them (`_DOCS_SIGN_IN_STYLE`, server.py), keyed on Swagger UI's own
+element ids — if a release renames them the fields reappear and can be left
+empty. `/docs` and `/openapi.json` themselves are open.
 
 | Method | Path | Notes |
 |---|---|---|

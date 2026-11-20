@@ -4,8 +4,8 @@ What is pinned: the one account signs in and nothing else does, with one
 sentence for either half wrong; a token opens a guarded route over a header
 and a WebSocket over its query, and an expired, forged or missing one opens
 neither; sign-in itself is reachable without one, as JSON for the console and
-as the form /docs' Authorize dialog sends; and the real server's OpenAPI names
-that flow on every guarded route.
+as the form /docs' Authorize dialog sends; the real server's OpenAPI names
+that flow on every guarded route; and /docs asks for the account alone.
 """
 
 import pytest
@@ -168,6 +168,26 @@ def test_every_route_of_the_real_server_but_sign_in_and_health_needs_a_token(log
         if client.request(method, re.sub(r"\{[^}]+\}", "x", path)).status_code != 401
     ]
     assert unguarded == []
+
+
+def test_docs_is_open_and_hides_the_client_credentials_of_its_sign_in(logger):
+    # Swagger UI's password dialog asks for a client id and secret this
+    # server never reads; /docs is the stock page plus the rule hiding them.
+    pytest.importorskip("temporalio")
+    from unittest.mock import MagicMock
+
+    from syncai_backend.interfaces.rest.server import RestDeps, init_rest_server
+
+    deps = RestDeps(**{
+        name: MagicMock() for name in RestDeps.__dataclass_fields__
+    } | {"settings_svcs": {}, "auth": CFG})
+    res = TestClient(init_rest_server(logger=logger, deps=deps)).get("/docs")
+
+    assert res.status_code == 200
+    assert "swagger-ui-bundle.js" in res.text and "/openapi.json" in res.text
+    for field in ("password_type", "client_id_password", "client_secret_password"):
+        assert f'label[for="{field}"]' in res.text
+    assert res.text.index("<style>") < res.text.index("</head>")
 
 
 def test_the_real_servers_openapi_names_the_sign_in_on_every_guarded_route(logger):

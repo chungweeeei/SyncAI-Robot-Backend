@@ -6,7 +6,8 @@ import uvicorn
 import structlog
 from fastapi import APIRouter, Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from syncai_backend.exceptions import (
     BadRequestError,
@@ -140,6 +141,20 @@ class RestDeps:
     auth: AuthConfig
 
 
+# Swagger UI draws an OAuth2 password dialog with the client's own credentials
+# beside the account's, and has no setting that leaves them out. This server
+# reads neither, so /docs hides their rows: each is a `.wrapper` whose own
+# label names the field. Should a Swagger UI release rename them, the rows
+# come back and sign-in works as before.
+_DOCS_SIGN_IN_STYLE = """<style>
+    .auth-container .wrapper:has(> label[for="password_type"]),
+    .auth-container .wrapper:has(> label[for="client_id_password"]),
+    .auth-container .wrapper:has(> label[for="client_secret_password"]) {
+        display: none;
+    }
+    </style>"""
+
+
 def init_rest_server(
     logger: structlog.stdlib.BoundLogger, deps: RestDeps
 ) -> FastAPI:
@@ -161,7 +176,20 @@ def init_rest_server(
         description=description,
         version="1.0.0",
         lifespan=lifespan,
+        # Served below instead, with the sign-in dialog trimmed.
+        docs_url=None,
     )
+
+    @app.get("/docs", include_in_schema=False)
+    async def docs(request: Request) -> HTMLResponse:
+        root_path = request.scope.get("root_path", "").rstrip("/")
+        page = get_swagger_ui_html(
+            openapi_url=root_path + app.openapi_url,
+            title=f"{app.title} - Swagger UI",
+        )
+        return HTMLResponse(
+            page.body.decode().replace("</head>", _DOCS_SIGN_IN_STYLE + "\n    </head>", 1)
+        )
 
     app.add_middleware(
         CORSMiddleware,
