@@ -37,6 +37,7 @@ from syncai_backend.repositories.pointcloud.pointcloud import (  # noqa: E402
 
 LIVE_PATH = "/api/v1/robot/pointcloud/stream"
 MAP_PATH = "/api/v1/robot/pointcloud/map/stream"
+SAVED_PATH = "/api/v1/robot/pointcloud/map/saved/stream"
 
 
 @pytest.fixture
@@ -51,13 +52,20 @@ def map_repo_slot(logger):
 
 
 @pytest.fixture
-def client(logger, live_repo, map_repo_slot):
+def saved_repo_slot(logger):
+    """The third: the saved map a resumed run continues."""
+    return init_pointcloud_repo(logger=logger)
+
+
+@pytest.fixture
+def client(logger, live_repo, map_repo_slot, saved_repo_slot):
     app = FastAPI()
     app.include_router(
         init_pointcloud_router(
             logger=logger,
             pointcloud_repo=live_repo,
             map_cloud_repo=map_repo_slot,
+            saved_map_cloud_repo=saved_repo_slot,
         )
     )
     return TestClient(app)
@@ -77,9 +85,13 @@ def _expect_frame(ws, expected: np.ndarray):
     assert np.array_equal(received, expected)
 
 
-@pytest.mark.parametrize("path", [LIVE_PATH, MAP_PATH])
-def test_stream_sends_the_seeded_frame(client, live_repo, map_repo_slot, path):
-    repo = live_repo if path == LIVE_PATH else map_repo_slot
+@pytest.mark.parametrize("path", [LIVE_PATH, MAP_PATH, SAVED_PATH])
+def test_stream_sends_the_seeded_frame(
+    client, live_repo, map_repo_slot, saved_repo_slot, path
+):
+    repo = {LIVE_PATH: live_repo, MAP_PATH: map_repo_slot, SAVED_PATH: saved_repo_slot}[
+        path
+    ]
     expected = _seed(repo, [(1.0, 2.0, 3.0), (-4.5, 0.0, 9.25)])
 
     with client.websocket_connect(path) as ws:
@@ -98,12 +110,17 @@ def test_stream_sends_a_frame_only_once_per_seq(client, live_repo, map_repo_slot
         _expect_frame(ws, second)
 
 
-def test_streams_drain_independent_repos(client, live_repo, map_repo_slot):
-    """The two endpoints must not share a slot or a cursor."""
+def test_streams_drain_independent_repos(
+    client, live_repo, map_repo_slot, saved_repo_slot
+):
+    """The endpoints must not share a slot or a cursor."""
     live = _seed(live_repo, [(1.0, 0.0, 0.0)])
     merged = _seed(map_repo_slot, [(0.0, 1.0, 0.0), (0.0, 0.0, 1.0)])
+    saved = _seed(saved_repo_slot, [(5.0, 5.0, 5.0)])
 
     with client.websocket_connect(LIVE_PATH) as live_ws:
         _expect_frame(live_ws, live)
     with client.websocket_connect(MAP_PATH) as map_ws:
         _expect_frame(map_ws, merged)
+    with client.websocket_connect(SAVED_PATH) as saved_ws:
+        _expect_frame(saved_ws, saved)

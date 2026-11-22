@@ -112,6 +112,9 @@ class SyncAIBackend(Node):
         pointcloud_repo = init_pointcloud_repo(logger=logger)
         # Same slot shape for pgo's merged "map so far" cloud (mapping mode only).
         map_cloud_repo = init_pointcloud_repo(logger=logger)
+        # And for the saved map a resumed run continues, which pgo hands off
+        # apart from what the run adds.
+        saved_map_cloud_repo = init_pointcloud_repo(logger=logger)
         # pgo's latched run state, so GET /api/v1/mapping survives a console
         # reload and run routes can refuse with a code. Ages its sample out,
         # because this container outlives the mapping session.
@@ -232,7 +235,12 @@ class SyncAIBackend(Node):
             tf_buffer=self._tf_listener.buffer,
         )
         # pgo's merged cloud is already in the map frame: no tf_buffer.
-        init_map_cloud_subscriber(logger=logger, node=self, map_cloud_repo=map_cloud_repo)
+        init_map_cloud_subscriber(
+            logger=logger,
+            node=self,
+            map_cloud_repo=map_cloud_repo,
+            saved_map_cloud_repo=saved_map_cloud_repo,
+        )
         init_mapping_status_subscriber(
             logger=logger, node=self, mapping_status_repo=mapping_status_repo
         )
@@ -279,6 +287,7 @@ class SyncAIBackend(Node):
                 landmark_gw=landmark_gw,
                 pointcloud_repo=pointcloud_repo,
                 map_cloud_repo=map_cloud_repo,
+                saved_map_cloud_repo=saved_map_cloud_repo,
                 telemetry_repo=telemetry_repo,
                 task_template_repo=task_template_repo,
                 task_record_repo=task_record_repo,

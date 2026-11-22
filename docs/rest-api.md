@@ -114,7 +114,8 @@ reappear and can be left empty.
 | DELETE | `/api/v1/webrtc/{whep,whip}/{session_id}` | Tear down. **204 even for an unknown id** — the worker cannot tell "already self-closed" from "never existed" |
 | GET | `/api/v1/webrtc/status` | `library_loaded` plus the `video` / `audio` slots (`session_id`, `age_seconds`) as this backend believes them. No callback from the worker, so an abandoned session reads live until the next create preempts it. Deliberately not in `/health` |
 | WS | `/api/v1/robot/pointcloud/stream` | Live `body_cloud`, ~10 Hz |
-| WS | `/api/v1/robot/pointcloud/map/stream` | pgo's merged "map so far", every few seconds at most, mapping mode only; each frame replaces the whole layer |
+| WS | `/api/v1/robot/pointcloud/map/stream` | pgo's merged "map so far", every few seconds at most, mapping mode only; each frame replaces the whole layer. On a resumed run, only what the run added |
+| WS | `/api/v1/robot/pointcloud/map/saved/stream` | the saved map a resumed run continues: a frame when the resume loads it, an empty one (count 0) when the run ends or was begun empty; same wire format |
 | WS | `/api/v1/robot/telemetry/stream` | JSON frames keyed by `type`: `pose` (~20 Hz), `joints`, `path` (1 Hz), and while a navigation runs `local_costmap` (2 Hz) and `local_plan` (5 Hz) |
 
 **A job's map is read-only while it runs.** Vertex create / update / delete,

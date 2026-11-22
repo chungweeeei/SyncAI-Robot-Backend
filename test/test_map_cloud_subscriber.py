@@ -126,6 +126,12 @@ def repo(logger):
 
 
 @pytest.fixture
+def saved_repo(logger):
+    """The saved map a resumed run continues: its own slot."""
+    return init_pointcloud_repo(logger=logger)
+
+
+@pytest.fixture
 def shm(tmp_path):
     """Stands in for /dev/shm/syncai_pgo/<robot_id>: the only place a notice
     may point at."""
@@ -135,7 +141,7 @@ def shm(tmp_path):
 
 
 @pytest.fixture
-def wire(logger, repo, tmp_path):
+def wire(logger, repo, saved_repo, tmp_path):
     """(fake node, recorded callback) with the subscriber wired up, its
     allowed root being tmp_path/shm."""
     node = FakeNode()
@@ -143,6 +149,7 @@ def wire(logger, repo, tmp_path):
         logger=logger,
         node=node,
         map_cloud_repo=repo,
+        saved_map_cloud_repo=saved_repo,
         allowed_root=str(tmp_path / "shm"),
     )
     assert len(node.subscriptions) == 1
@@ -396,7 +403,123 @@ def test_a_file_that_is_not_a_pcd_keeps_the_current_map(wire, repo, shm):
     _unchanged_after(repo, callback, notice(path=str(truncated), points=1, seq=3))
 
 
+# ---- a resumed run: the saved map in its own slot ---------------------------
+
+
+def test_a_resumed_run_fills_both_slots_apart(wire, repo, saved_repo, shm):
+    # The console draws them in two colours: what the run added over the map
+    # it continues. Mixed into one slot, the two could not be told apart.
+    _, callback = wire
+    saved = write_pcd(shm / "map_cloud_prior_1.pcd", [(1.0, 1.0, 1.0), (2.0, 2.0, 2.0)])
+    run = write_pcd(shm / "map_cloud_1.pcd", [(9.0, 9.0, 9.0)])
+
+    callback(notice(path=run, points=1, prior_path=saved, prior_points=2))
+
+    assert slot_points(saved_repo)[1].tolist() == [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]
+    assert slot_points(repo)[1].tolist() == [[9.0, 9.0, 9.0]]
+
+
+def test_the_saved_map_is_read_once_per_path(wire, repo, saved_repo, shm):
+    # It cannot change during the run, and it is the bulk of the bytes: a
+    # rewrite per notice would re-send it to every browser every few seconds.
+    _, callback = wire
+    saved = write_pcd(shm / "map_cloud_prior_1.pcd", [(1.0, 1.0, 1.0)])
+    run1 = write_pcd(shm / "map_cloud_1.pcd", [(9.0, 9.0, 9.0)])
+    run2 = write_pcd(shm / "map_cloud_2.pcd", [(8.0, 8.0, 8.0)])
+
+    callback(notice(path=run1, points=1, seq=1, prior_path=saved, prior_points=1))
+    first = saved_repo.get_latest()
+    callback(notice(path=run2, points=1, seq=2, prior_path=saved, prior_points=1))
+
+    assert saved_repo.get_latest().seq == first.seq
+    assert slot_points(repo)[1].tolist() == [[8.0, 8.0, 8.0]]
+
+
+def test_a_second_resume_is_a_new_path_and_is_read(wire, saved_repo, shm):
+    # pgo names the file by the merge that wrote it, so a later resume in the
+    # same process is never mistaken for the map already shown.
+    _, callback = wire
+    a = write_pcd(shm / "map_cloud_prior_1.pcd", [(1.0, 1.0, 1.0)])
+    b = write_pcd(shm / "map_cloud_prior_7.pcd", [(2.0, 2.0, 2.0)])
+    run = write_pcd(shm / "map_cloud_9.pcd", [(9.0, 9.0, 9.0)])
+
+    callback(notice(path=run, points=1, seq=1, prior_path=a, prior_points=1))
+    callback(notice(path="", points=0, seq=2))
+    callback(notice(path=run, points=1, seq=7, prior_path=b, prior_points=1))
+
+    assert slot_points(saved_repo)[1].tolist() == [[2.0, 2.0, 2.0]]
+
+
+def test_a_run_begun_empty_writes_the_saved_slot_empty_once(wire, saved_repo, shm):
+    # A console joining such a run must be told there is no saved map rather
+    # than wait for one; after that, nothing changes and nothing is written.
+    _, callback = wire
+    run1 = write_pcd(shm / "map_cloud_1.pcd", [(9.0, 9.0, 9.0)])
+    run2 = write_pcd(shm / "map_cloud_2.pcd", [(8.0, 8.0, 8.0)])
+
+    callback(notice(path=run1, points=1, seq=1))
+    first = saved_repo.get_latest()
+    callback(notice(path=run2, points=1, seq=2))
+
+    assert (first.num_points, first.data) == (0, b"")
+    assert saved_repo.get_latest().seq == first.seq
+
+
+def test_the_empty_notice_that_ends_a_run_clears_the_saved_map(wire, saved_repo, shm):
+    # A save, reset or new start: the next run does not continue this map.
+    _, callback = wire
+    saved = write_pcd(shm / "map_cloud_prior_1.pcd", [(1.0, 1.0, 1.0)])
+    run = write_pcd(shm / "map_cloud_1.pcd", [(9.0, 9.0, 9.0)])
+
+    callback(notice(path=run, points=1, seq=1, prior_path=saved, prior_points=1))
+    callback(notice(path="", points=0, seq=2))
+
+    frame = saved_repo.get_latest()
+    assert (frame.num_points, frame.data) == (0, b"")
+
+
+def test_an_unreadable_saved_map_is_tried_again_by_the_next_notice(wire, saved_repo, shm):
+    # Not recorded as shown, since every notice of the run names it again.
+    _, callback = wire
+    run = write_pcd(shm / "map_cloud_1.pcd", [(9.0, 9.0, 9.0)])
+    missing = str(shm / "map_cloud_prior_1.pcd")
+
+    callback(notice(path=run, points=1, seq=1, prior_path=missing, prior_points=1))
+    assert saved_repo.get_latest() is None
+    write_pcd(shm / "map_cloud_prior_1.pcd", [(1.0, 1.0, 1.0)])
+    callback(notice(path=run, points=1, seq=2, prior_path=missing, prior_points=1))
+
+    assert slot_points(saved_repo)[1].tolist() == [[1.0, 1.0, 1.0]]
+
+
+def test_a_saved_map_outside_the_shared_root_is_ignored(wire, saved_repo, tmp_path, shm):
+    _, callback = wire
+    run = write_pcd(shm / "map_cloud_1.pcd", [(9.0, 9.0, 9.0)])
+    elsewhere = write_pcd(tmp_path / "elsewhere.pcd", [(1.0, 1.0, 1.0)])
+
+    callback(notice(path=run, points=1, prior_path=elsewhere, prior_points=1))
+
+    assert saved_repo.get_latest() is None
+
+
 # ---- the parser on its own --------------------------------------------------
+
+
+def test_parse_map_cloud_notice_reads_the_saved_map_fields():
+    got = parse_map_cloud_notice(
+        json.dumps(
+            {
+                "seq": 3,
+                "path": "/dev/shm/syncai_pgo/robot01/map_cloud_3.pcd",
+                "points": 10,
+                "prior_path": "/dev/shm/syncai_pgo/robot01/map_cloud_prior_2.pcd",
+                "prior_points": 90,
+                "frame_id": "map",
+            }
+        )
+    )
+    assert got.prior_path == "/dev/shm/syncai_pgo/robot01/map_cloud_prior_2.pcd"
+    assert got.prior_points == 90
 
 
 def test_parse_map_cloud_notice_reads_the_five_fields():
@@ -434,6 +557,12 @@ def test_parse_map_cloud_notice_reads_the_five_fields():
         json.dumps({"seq": 1, "path": "", "points": "0", "frame_id": "map"}),
         json.dumps({"seq": 1, "path": None, "points": 0, "frame_id": "map"}),
         json.dumps({"seq": 1, "path": "", "points": 0, "frame_id": 3}),
+        json.dumps(
+            {"seq": 1, "path": "", "points": 0, "frame_id": "map", "prior_path": None}
+        ),
+        json.dumps(
+            {"seq": 1, "path": "", "points": 0, "frame_id": "map", "prior_points": -1}
+        ),
     ],
 )
 def test_parse_map_cloud_notice_rejects_anything_else(data):
