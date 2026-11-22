@@ -6,9 +6,10 @@ the robot thinks it is; a second publisher on RobotGateway's topic is fine.
 
 The clients split by session: ``planner_server/Octo3D/*``, ``relocalize``,
 ``relocalize_check`` and ``reset_odometry`` exist only in the nav (AUTO)
-session; ``pgo/start_mapping``, ``pgo/save_maps`` and ``pgo/reset_mapping``
-only in the mapping (MANUAL) one. "Service is not available" usually means
-"wrong mode", which activate turns into ``stack_not_ready``.
+session; ``pgo/start_mapping``, ``pgo/resume_mapping``, ``pgo/save_maps`` and
+``pgo/reset_mapping`` only in the mapping (MANUAL) one. "Service is not
+available" usually means "wrong mode", which activate turns into
+``stack_not_ready``.
 
 There is no ``map_server`` or ``filter_mask_server`` client: the stack
 navigates on 3D maps only (2026-10-28), and both went with the 2D gridmap.
@@ -22,6 +23,7 @@ import math
 import os
 import time
 import structlog
+from dataclasses import dataclass
 from typing import Optional
 from rclpy.node import Node
 from rclpy.client import Client
@@ -30,7 +32,8 @@ from geometry_msgs.msg import Point, Pose, PoseWithCovarianceStamped, Quaternion
 from std_msgs.msg import Header
 from nav2_msgs.srv import LoadMap
 from syncai_common.srv import (
-    IsValid, Relocalize, ResetMapping, ResetOdometry, SaveMaps, StartMapping,
+    IsValid, Relocalize, ResetMapping, ResetOdometry, ResumeMapping, SaveMaps,
+    StartMapping,
 )
 
 from syncai_backend.gateways import ros
@@ -50,6 +53,32 @@ def _load_map_failure(result: int, server: str, image: str, yaml: str) -> str:
         LoadMap.Response.RESULT_UNDEFINED_FAILURE: f"{server} reported an undefined failure",
     }
     return messages.get(result, f"{server} returned result {result}")
+
+
+# How pgo found the robot in a resumed map, by ResumeMapping.srv's constant.
+# The srv says a consumer must not assume the list is closed: a value from a
+# newer pgo reads "unknown" rather than failing the answer to a resume that
+# worked.
+_RESUME_METHODS = {
+    ResumeMapping.Response.METHOD_HINT: "hint",
+    ResumeMapping.Response.METHOD_LAST_POSE: "last_pose",
+    ResumeMapping.Response.METHOD_GLOBAL: "global",
+}
+
+
+@dataclass(frozen=True)
+class ResumedRun:
+    """What a successful ``resume_mapping`` says about the run it began."""
+
+    # Keyframes loaded from the saved map; the run's own are added to them.
+    prior_key_poses: int
+    # "hint", "last_pose", "global", or "unknown" (see _RESUME_METHODS).
+    method: str
+    # The lidar body in the saved map's frame, as pgo registered it (m, rad).
+    x: float
+    y: float
+    z: float
+    yaw: float
 
 
 class MapGateway:
@@ -100,6 +129,14 @@ class MapGateway:
             srv_name="pgo/start_mapping",
         )
 
+        # Moves pgo from IDLE to MAPPING too, with a saved map loaded (2026-11).
+        # Absent on a stack whose pgo predates it, which reads as "not in
+        # mapping mode" like the others: see resume_mapping().
+        resume_mapping_client = self._node.create_client(
+            srv_type=ResumeMapping,
+            srv_name="pgo/resume_mapping",
+        )
+
         # Bare names, unlike load_map's: the localizer's plain
         # `create_service("relocalize", ...)` lands at /<robot_id>/relocalize.
         # Do not write `localizer/relocalize`; it caused false stack_not_ready.
@@ -130,6 +167,7 @@ class MapGateway:
                 "save_maps": save_maps_client,
                 "reset_mapping": reset_mapping_client,
                 "start_mapping": start_mapping_client,
+                "resume_mapping": resume_mapping_client,
                 "relocalize": relocalize_client,
                 "relocalize_check": relocalize_check_client,
                 "reset_odometry": reset_odometry_client,
@@ -482,6 +520,85 @@ class MapGateway:
                 lio_last_odom_time=response.lio_last_odom_time,
             )
         return response.success, response.message
+
+    def resume_mapping(
+        self,
+        directory: str,
+        hint: Optional[tuple[float, float, float, float]] = None,
+    ) -> tuple[bool, str, Optional[ResumedRun]]:
+        """Begin a mapping run on top of a saved map: pgo from IDLE to MAPPING.
+
+        pgo loads the map's ``poses.txt`` + ``patches/`` from ``directory``,
+        resets the LIO, finds the robot in the saved map and maps on in that
+        map's frame, the saved keyframes frozen. ``hint`` is where the robot
+        is, roughly, as ``(x, y, z, yaw)`` of the lidar body in the map frame
+        (m, rad); a hint that does not register fails the call. Without one
+        pgo tries the pose the nav session's localizer last saved on this map,
+        then searches the whole map. The robot must be standing still, inside
+        the saved map, until this returns (nothing here can check it).
+
+        The path is the one ``save_map`` hands pgo: both containers mount the
+        maps at ``~/robot_ws/map``. Its last segment is the map's name, which
+        is what pgo matches the localizer's saved pose by.
+
+        A failure leaves pgo IDLE with nothing loaded. No ``Failure`` code:
+        pgo's refusals carry a sentence and no code, and the router pre-empts
+        "already mapping" from the latched status, as for start_mapping.
+
+        The 90 s deadline outlasts pgo's own waits (2 s + 5 s for the LIO
+        reset, 15 s of scans, two searches of 10 s when a stale saved pose
+        falls back to the whole map) plus the load of a large map, which has
+        no bound of its own: an answer that comes late would be a 502 here and
+        a run begun there.
+        """
+        resume_client = self._service_clients.get("resume_mapping")
+        if not resume_client.wait_for_service(timeout_sec=5.0):
+            return False, (
+                "pgo/resume_mapping is not available — resuming a map needs "
+                "the robot in MANUAL (mapping) mode."
+            ), None
+
+        map_path = os.path.abspath(os.path.expanduser(directory))
+        request = ResumeMapping.Request(map_path=map_path, reset_lio=True)
+        if hint is not None:
+            request.use_hint = True
+            request.x, request.y, request.z, request.yaw = (float(v) for v in hint)
+
+        self._logger.info(
+            "[MapGateway] Resuming a saved map", path=map_path, hint=hint
+        )
+
+        response = ros.call_service(resume_client, request, timeout_s=90.0)
+        if response is None:
+            return False, "Timeout waiting for pgo/resume_mapping response", None
+
+        if not response.success:
+            return False, response.message, None
+
+        resumed = ResumedRun(
+            prior_key_poses=response.prior_key_poses,
+            method=_RESUME_METHODS.get(response.method, "unknown"),
+            x=response.aligned_x,
+            y=response.aligned_y,
+            z=response.aligned_z,
+            yaw=response.aligned_yaw,
+        )
+        self._logger.info(
+            "[MapGateway] Mapping run resumed",
+            prior_key_poses=resumed.prior_key_poses,
+            method=resumed.method,
+            x=resumed.x,
+            y=resumed.y,
+            z=resumed.z,
+            yaw=resumed.yaw,
+            fitness=response.fitness,
+            overlap_ratio=response.overlap_ratio,
+            inlier_ratio=response.inlier_ratio,
+            xy_info_ratio=response.xy_info_ratio,
+            tilt_residual_deg=response.tilt_residual_deg,
+            lio_last_odom_time=response.lio_last_odom_time,
+        )
+        return True, response.message, resumed
 
 
 def init_map_gateway(logger: structlog.stdlib.BoundLogger, node: Node) -> MapGateway:

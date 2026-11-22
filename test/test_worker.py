@@ -223,6 +223,7 @@ def test_health_projects_worker_state():
             landmark_gw=MagicMock(),
             pointcloud_repo=MagicMock(),
             map_cloud_repo=MagicMock(),
+            saved_map_cloud_repo=MagicMock(),
             telemetry_repo=MagicMock(),
             task_template_repo=MagicMock(),
             task_record_repo=MagicMock(),

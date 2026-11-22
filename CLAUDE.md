@@ -13,7 +13,7 @@ It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
 `SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
-map srvs `StartMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
+map srvs `StartMapping`, `ResumeMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
 `NavigateToGoal` action the MOVE step sends — and the CHARGE step on its `behavior_tree`
 `charge.xml` (2026-11), sent the charger waypoint as stored, its heading out of the marker's
 face; docs/ros-interfaces.md) — plus `rclpy`,
@@ -494,10 +494,17 @@ default UDP receive buffer over CycloneDDS; do not go back to it or "fix" it wit
 arrive and every read is ENOENT. An empty notice (`points: 0`, `path: ""`) clears
 the slot (pgo's reset signal); every other failure (missing file, bad JSON, path
 outside `/dev/shm`, bad PCD) is a warning that leaves the slot untouched — never
-raise out of the callback, it would end `spin()` and the process. A successful `save_maps` sends the same empty notice
+raise out of the callback, it would end `spin()` and the process. A **resumed** run's
+notice also names `prior_path`: the saved map, merged once by pgo into its own file, while
+`path` carries only what the run added. It fills a second slot, read once per path and
+streamed on `pointcloud/map/saved/stream` (an empty frame for a run begun empty), so the
+console can draw the saved map and the run in two colours. A successful `save_maps` sends the same empty notice
 (2026-10): pgo ends the run, goes idle and clears `/dev/shm` itself — this
 process deletes nothing there. Its run state is latched on `pgo/mapping_status`
-(`MappingStatusRepo`); `POST /api/v1/mapping/start` is what begins a run.
+(`MappingStatusRepo`); `POST /api/v1/mapping/start` is what begins a run, and
+`POST /api/v1/mapping/resume` (2026-11, `pgo/resume_mapping`, `ResumeMapping` in `syncai_common` at or after
+SyncAI-Robot-Interface `46b84f0`) begins one on top of a saved map, in its frame: it blocks for tens of
+seconds, reads the map and writes nothing, and the run is then saved under another name.
 
 ### Heavy imports
 

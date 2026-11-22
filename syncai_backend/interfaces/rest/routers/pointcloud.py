@@ -10,6 +10,7 @@ def init_pointcloud_router(
     logger: structlog.stdlib.BoundLogger,
     pointcloud_repo: PointCloudRepo,
     map_cloud_repo: PointCloudRepo,
+    saved_map_cloud_repo: PointCloudRepo,
 ) -> APIRouter:
     pointcloud_router = APIRouter(prefix="", tags=["PointCloud"])
 
@@ -56,8 +57,19 @@ def init_pointcloud_router(
         """Stream pgo's merged "map so far" cloud as binary frames.
 
         Only while mapping (MANUAL), every few seconds at most; each frame
-        replaces the last wholesale (loop-closure corrected).
+        replaces the last wholesale (loop-closure corrected). On a resumed run
+        it carries only what the run added; the saved map is the next stream.
         """
         await _pump(ws, map_cloud_repo)
+
+    @pointcloud_router.websocket("/api/v1/robot/pointcloud/map/saved/stream")
+    async def stream_saved_map_cloud(ws: WebSocket):
+        """Stream the saved map a resumed mapping run continues.
+
+        A frame when a resume loads it and an empty one (count 0) when the
+        run ends or was begun empty, so it is a separate stream rather than a
+        part of every map frame: the saved map does not change during the run.
+        """
+        await _pump(ws, saved_map_cloud_repo)
 
     return pointcloud_router

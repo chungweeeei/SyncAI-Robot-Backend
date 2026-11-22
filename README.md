@@ -126,7 +126,7 @@ refusal codes and the reasons behind them: [docs/rest-api.md](docs/rest-api.md).
 | Recordings | `/api/v1/recordings` |
 | Log export | `/api/v1/logs/export` |
 | WebRTC signalling | `/api/v1/webrtc/*` |
-| WebSocket streams | `/api/v1/robot/teleop`, `/robot/pointcloud/stream`, `/robot/pointcloud/map/stream`, `/robot/telemetry/stream` |
+| WebSocket streams | `/api/v1/robot/teleop`, `/robot/pointcloud/stream`, `/robot/pointcloud/map/stream`, `/robot/pointcloud/map/saved/stream`, `/robot/telemetry/stream` |
 
 Errors are JSON with `detail` and, where a client should branch, a
 machine-readable `code`: 400 bad request, 404 not found, 409 conflict, 413

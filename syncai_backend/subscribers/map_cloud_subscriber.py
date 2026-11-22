@@ -21,12 +21,19 @@ class MapCloudNotice:
 
     ``seq`` is informational: it restarts with every pgo process. ``path`` is
     ``""`` and ``points`` is ``0`` when the map is empty.
+
+    ``prior_path`` names a resumed run's saved map, a file of its own that is
+    the same on every notice of the run; ``path`` then holds only what the run
+    added. ``""`` for a run begun empty, and from a pgo older than the split,
+    which sent the two as one file.
     """
 
     seq: int
     path: str
     points: int
     frame_id: str
+    prior_path: str = ""
+    prior_points: int = 0
 
 
 def parse_map_cloud_notice(data: str) -> MapCloudNotice:
@@ -57,7 +64,25 @@ def parse_map_cloud_notice(data: str) -> MapCloudNotice:
         raise ValueError("map cloud notice points must be a non-negative integer")
     if not isinstance(path, str) or not isinstance(frame_id, str):
         raise ValueError("map cloud notice path and frame_id must be strings")
-    return MapCloudNotice(seq=seq, path=path, points=points, frame_id=frame_id)
+    # Optional: a pgo from before the saved map had its own file sends neither.
+    prior_path = obj.get("prior_path", "")
+    prior_points = obj.get("prior_points", 0)
+    if not isinstance(prior_path, str):
+        raise ValueError("map cloud notice prior_path must be a string")
+    if (
+        not isinstance(prior_points, int)
+        or isinstance(prior_points, bool)
+        or prior_points < 0
+    ):
+        raise ValueError("map cloud notice prior_points must be a non-negative integer")
+    return MapCloudNotice(
+        seq=seq,
+        path=path,
+        points=points,
+        frame_id=frame_id,
+        prior_path=prior_path,
+        prior_points=prior_points,
+    )
 
 
 class MapCloudSubscriber:
@@ -85,6 +110,16 @@ class MapCloudSubscriber:
     An **empty** notice (``points: 0``, ``path: ""``) is pgo's reset signal and
     clears the slot.
 
+    A **resumed** run fills a second slot: the saved map it continues, which
+    pgo writes once and names on every notice as ``prior_path``, while
+    ``path`` carries only what the run added. The console draws the two in
+    different colours, so the operator sees what the run has covered and a
+    resume that landed off the saved map shows as a wall drawn twice. The
+    saved map's file is read once per path, not per notice: it cannot change
+    during the run, and a large one is the bulk of the bytes. Its slot is
+    written empty as soon as a notice names no saved map, so a console that
+    joins a run begun empty is told so rather than left waiting.
+
     Every failure in the callback is a warning that leaves the slot untouched,
     never an exception: one out of a callback ends ``spin()`` and the process.
     A missing file is the normal "stale" case (pgo pruned or reset).
@@ -94,19 +129,25 @@ class MapCloudSubscriber:
         self,
         logger: structlog.stdlib.BoundLogger,
         map_cloud_repo: PointCloudRepo,
+        saved_map_cloud_repo: PointCloudRepo,
         allowed_root: str = "/dev/shm",
     ):
         self._logger = logger
         self._map_cloud_repo = map_cloud_repo
+        self._saved_map_cloud_repo = saved_map_cloud_repo
         # A file named by a topic must sit under this root. A foot-gun guard,
         # not a security boundary. Tests point it at a tmp dir.
         self._allowed_root = PurePosixPath(allowed_root)
         # The browser's wire/GPU budget (~6 MB per frame). Real sites exceed it
-        # (2.79 M points on a large floor), so expect the stride to apply.
+        # (2.79 M points on a large floor), so expect the stride to apply. Per
+        # slot: the saved map is sent once, not every few seconds.
         self._max_points = 500000
 
         # Edge-triggered: log once when the first merge lands, not per frame.
         self._streaming = False
+        # The prior_path the saved slot holds ("" once written empty); None
+        # until the first notice, so that one is always written.
+        self._saved_shown: str | None = None
 
     def register(self, node: Node):
         # Own MutuallyExclusive group: parsing a multi-MB PCD must not starve
@@ -126,6 +167,64 @@ class MapCloudSubscriber:
             "map cloud cleared", reason=reason, seq=notice.seq, frame=notice.frame_id
         )
 
+    def _read(self, path: str, seq: int):
+        """The file's finite xyz, or None (logged) when it is not one to draw.
+
+        None leaves the caller's slot as it was.
+        """
+        if self._allowed_root not in PurePosixPath(path).parents:
+            self._logger.warning(
+                "map cloud notice names a file outside the shared tmpfs; ignored",
+                path=path,
+                allowed_root=str(self._allowed_root),
+                seq=seq,
+            )
+            return None
+        try:
+            return read_pcd_xyz(path)
+        except OSError as exc:
+            # ENOENT is ordinary (pgo pruned or reset); the next notice corrects.
+            self._logger.warning(
+                "map cloud file unreadable; keeping the current map",
+                path=path,
+                seq=seq,
+                error=str(exc),
+            )
+        except (ValueError, KeyError) as exc:
+            # ValueError: truncated body, unsupported DATA format, no x/y/z;
+            # KeyError: a TYPE/SIZE pair the reader has no dtype for.
+            self._logger.warning(
+                "map cloud file is not a PCD this reader accepts; keeping the current map",
+                path=path,
+                seq=seq,
+                error=str(exc),
+            )
+        return None
+
+    def _apply_saved(self, notice: MapCloudNotice):
+        if notice.prior_path == self._saved_shown:
+            return
+        if not notice.prior_path or notice.prior_points == 0:
+            self._saved_shown = ""
+            self._saved_map_cloud_repo.update_frame(num_points=0, data=b"")
+            return
+        points = self._read(notice.prior_path, notice.seq)
+        # Not recorded as shown, so the next notice, which names it again,
+        # tries again.
+        if points is None:
+            return
+        points = cap_points(points=points, max_points=self._max_points)
+        self._saved_shown = notice.prior_path
+        self._saved_map_cloud_repo.update_frame(
+            num_points=points.shape[0], data=pack_xyz_f32(points)
+        )
+        self._logger.info(
+            "saved map cloud loaded",
+            num_points=int(points.shape[0]),
+            announced_points=notice.prior_points,
+            path=notice.prior_path,
+        )
+
     def _notice_cb(self, msg: String):
         try:
             notice = parse_map_cloud_notice(msg.data)
@@ -133,40 +232,15 @@ class MapCloudSubscriber:
             self._logger.warning("map cloud notice rejected", error=str(exc))
             return
 
+        # First, so the saved map is up by the time the run's half arrives.
+        self._apply_saved(notice)
+
         if notice.points == 0 or not notice.path:
             self._clear(notice, reason="empty notice")
             return
 
-        path = PurePosixPath(notice.path)
-        if self._allowed_root not in path.parents:
-            self._logger.warning(
-                "map cloud notice names a file outside the shared tmpfs; ignored",
-                path=notice.path,
-                allowed_root=str(self._allowed_root),
-                seq=notice.seq,
-            )
-            return
-
-        try:
-            points = read_pcd_xyz(notice.path)
-        except OSError as exc:
-            # ENOENT is ordinary (pgo pruned or reset); the next notice corrects.
-            self._logger.warning(
-                "map cloud file unreadable; keeping the current map",
-                path=notice.path,
-                seq=notice.seq,
-                error=str(exc),
-            )
-            return
-        except (ValueError, KeyError) as exc:
-            # ValueError: truncated body, unsupported DATA format, no x/y/z;
-            # KeyError: a TYPE/SIZE pair the reader has no dtype for.
-            self._logger.warning(
-                "map cloud file is not a PCD this reader accepts; keeping the current map",
-                path=notice.path,
-                seq=notice.seq,
-                error=str(exc),
-            )
+        points = self._read(notice.path, notice.seq)
+        if points is None:
             return
 
         if points.shape[0] == 0:
@@ -195,10 +269,14 @@ def init_map_cloud_subscriber(
     logger: structlog.stdlib.BoundLogger,
     node: Node,
     map_cloud_repo: PointCloudRepo,
+    saved_map_cloud_repo: PointCloudRepo,
     allowed_root: str = "/dev/shm",
 ) -> MapCloudSubscriber:
     map_cloud_subscriber = MapCloudSubscriber(
-        logger=logger, map_cloud_repo=map_cloud_repo, allowed_root=allowed_root
+        logger=logger,
+        map_cloud_repo=map_cloud_repo,
+        saved_map_cloud_repo=saved_map_cloud_repo,
+        allowed_root=allowed_root,
     )
     map_cloud_subscriber.register(node=node)
     return map_cloud_subscriber

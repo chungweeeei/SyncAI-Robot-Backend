@@ -14,7 +14,7 @@
 | `local_costmap/costmap/raw` | `nav2_msgs/Costmap` | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | the controller's rolling costmap, origin into `map` by TF → telemetry WS `local_costmap`, while a navigation runs |
 | `local_plan` | `nav_msgs/Path` | BEST_EFFORT, depth 1 | MPPI's optimal trajectory, into `map` by TF, kept at 5 Hz → telemetry WS `local_plan`, while a navigation runs |
 | `pointlio/body_cloud` | `sensor_msgs/PointCloud2` | BEST_EFFORT, depth 5 | TF→`map`, thinned, packed → WS `pointcloud/stream` |
-| `pgo/map_cloud_file` | `std_msgs/String` (JSON notice) | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | names a PCD in the shared `/dev/shm`; read, stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only) |
+| `pgo/map_cloud_file` | `std_msgs/String` (JSON notice) | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | names a PCD in the shared `/dev/shm`; read, stride-capped, packed → WS `pointcloud/map/stream` (mapping mode only). A resumed run's `prior_path` (the saved map, read once per path) → WS `pointcloud/map/saved/stream` |
 | `pgo/mapping_status` | `syncai_common/MappingStatus` | RELIABLE, **TRANSIENT_LOCAL**, depth 1 | pgo's run state (`IDLE` / `MAPPING` / `RESETTING`, keyframe and loop counts) → `MappingStatusRepo` → `GET /api/v1/mapping`, and the 409s on the run routes. Aged out after 5 s of silence; `unknown` outside a mapping session |
 
 Everything is BEST_EFFORT except pgo's two latched control messages (below) —
@@ -226,6 +226,14 @@ preview a newer one preempted (the planner takes one at a time),
     `pgo_node`) — the only things that serialise a run, undo one, and move pgo
     from idle to mapping (a mapping session comes up banking nothing; a
     successful save returns it to idle).
+  - `pgo/resume_mapping` (`syncai_common/ResumeMapping`, 2026-11; the same
+    node) — the other way from idle to mapping: a saved map's directory, and
+    optionally where the robot is in it. It blocks while pgo loads the map,
+    resets the LIO and searches, so the client's deadline is 90 s, past pgo's
+    own waits. `pgo/mapping_status` reads `RESETTING` meanwhile and nothing in
+    it says a run was resumed; only the service's answer does. A pgo from
+    before the service has no such server, which reads here as "not in
+    mapping mode".
   - `relocalize` / `relocalize_check` (`syncai_localizer`, the map switch) —
     **bare** names in the robot namespace (`/<robot_id>/relocalize`, not
     `/<robot_id>/localizer/relocalize`); `gateways/map/map.py` records why.

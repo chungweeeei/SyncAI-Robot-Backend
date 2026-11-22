@@ -20,6 +20,12 @@
   against this stack. The status ages out after 5 s (`MAPPING_STATUS_TTL_S`):
   this container outlives the mapping session, and a latched `mapping` from a
   pgo that is gone must not refuse a Start forever.
+- **A resumed run is saved as another map.** `POST /api/v1/mapping/resume` loads
+  a saved map and maps on in its frame; pgo refuses a save into that map's own
+  directory (the save empties `patches/`, the only copy), and `POST /api/v1/maps`
+  refuses an existing name anyway. The new map shares the old one's frame but
+  not its rows: waypoints (`map_vertices`), `keepout.json`, `octomap_edits.json`
+  and `floors.json` stay with the old name, and nothing copies them yet.
 - **The map cloud is a file in the host's `/dev/shm`; both containers need
   `ipc: host`.** Without it, notices still arrive, every read logs
   `map cloud file unreadable`, and the preview never updates. Do not "fix" the size cliff by

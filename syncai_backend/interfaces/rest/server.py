@@ -119,6 +119,7 @@ class RestDeps:
     landmark_gw: LandmarkGateway
     pointcloud_repo: PointCloudRepo
     map_cloud_repo: PointCloudRepo
+    saved_map_cloud_repo: PointCloudRepo
     telemetry_repo: TelemetryRepo
     task_template_repo: TaskTemplateRepo
     task_record_repo: TaskRecordRepo
@@ -288,6 +289,7 @@ def init_rest_server(
             logger=logger,
             pointcloud_repo=deps.pointcloud_repo,
             map_cloud_repo=deps.map_cloud_repo,
+            saved_map_cloud_repo=deps.saved_map_cloud_repo,
         )
     )
     protected.include_router(

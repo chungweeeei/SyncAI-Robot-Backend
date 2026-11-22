@@ -1,4 +1,4 @@
-"""Tests for MapGateway: the map router's eight service clients.
+"""Tests for MapGateway: the map router's nine service clients.
 
 Same seams as test_robot_gateway.py: the node is a MagicMock and futures are
 the hand-completed ``_Future`` below, so no ROS graph (or rclpy.init) is
@@ -31,11 +31,11 @@ pytest.importorskip("syncai_common")
 from builtin_interfaces.msg import Time  # noqa: E402
 from nav2_msgs.srv import LoadMap  # noqa: E402
 from syncai_common.srv import (  # noqa: E402
-    ResetMapping, ResetOdometry, SaveMaps, StartMapping,
+    ResetMapping, ResetOdometry, ResumeMapping, SaveMaps, StartMapping,
 )
 
 from syncai_backend.gateways import ros as ros_module  # noqa: E402
-from syncai_backend.gateways.map.map import MapGateway  # noqa: E402
+from syncai_backend.gateways.map.map import MapGateway, ResumedRun  # noqa: E402
 from syncai_backend.gateways.ros import wait_for_future  # noqa: E402
 
 
@@ -75,6 +75,7 @@ def map_gw(logger) -> MapGateway:
         "pgo/save_maps": MagicMock(),
         "pgo/reset_mapping": MagicMock(),
         "pgo/start_mapping": MagicMock(),
+        "pgo/resume_mapping": MagicMock(),
         "relocalize": MagicMock(),
         "relocalize_check": MagicMock(),
         "reset_odometry": MagicMock(),
@@ -495,6 +496,151 @@ class TestStartMapping:
 
         map_gw._service_clients["save_maps"].call_async.assert_not_called()
         map_gw._service_clients["reset_mapping"].call_async.assert_not_called()
+
+
+class TestResumeMapping:
+    """The other entry into a run: a saved map loaded, and pgo mapping on in
+    its frame from wherever it found the robot."""
+
+    MESSAGE = (
+        "Resumed the saved map (812 keyframes): the robot is at (3.2, -1.5), "
+        "heading 90°. New keyframes are added to it — save under a new map "
+        "name when done."
+    )
+
+    @classmethod
+    def _resumed(cls, method=ResumeMapping.Response.METHOD_LAST_POSE):
+        return SimpleNamespace(
+            success=True,
+            message=cls.MESSAGE,
+            lio_last_odom_time=1234.5,
+            prior_key_poses=812,
+            method=method,
+            aligned_x=3.2,
+            aligned_y=-1.5,
+            aligned_z=0.6,
+            aligned_yaw=1.5707963,
+            fitness=0.02,
+            overlap_ratio=0.9,
+            inlier_ratio=0.85,
+            xy_info_ratio=0.4,
+            tilt_residual_deg=0.7,
+        )
+
+    def test_success_answers_pgos_sentence_and_where_the_robot_was_found(self, map_gw):
+        _arm(map_gw, "resume_mapping", self._resumed())
+
+        success, message, resumed = map_gw.resume_mapping("/maps/hall")
+
+        assert (success, message) == (True, self.MESSAGE)
+        assert resumed == ResumedRun(
+            prior_key_poses=812, method="last_pose", x=3.2, y=-1.5, z=0.6, yaw=1.5707963
+        )
+
+    def test_the_map_is_named_by_its_absolute_directory(self, map_gw):
+        # What save_map hands pgo for the same map: both containers mount the
+        # maps at one path, and pgo matches the localizer's saved pose by the
+        # directory's name.
+        client = _arm(map_gw, "resume_mapping", self._resumed())
+
+        map_gw.resume_mapping("~/robot_ws/map/hall")
+
+        request = client.call_async.call_args[0][0]
+        assert isinstance(request, ResumeMapping.Request)
+        assert request.map_path == os.path.expanduser("~/robot_ws/map/hall")
+        assert os.path.isabs(request.map_path)
+
+    def test_without_a_hint_pgo_is_left_to_find_the_robot(self, map_gw):
+        client = _arm(map_gw, "resume_mapping", self._resumed())
+
+        map_gw.resume_mapping("/maps/hall")
+
+        request = client.call_async.call_args[0][0]
+        assert request.use_hint is False
+        # Always with the LIO front end, as the console's start is.
+        assert request.reset_lio is True
+
+    def test_a_hint_is_sent_whole(self, map_gw):
+        client = _arm(
+            map_gw, "resume_mapping", self._resumed(ResumeMapping.Response.METHOD_HINT)
+        )
+
+        _, _, resumed = map_gw.resume_mapping("/maps/hall", hint=(3.0, -1.0, 4.2, 1.57))
+
+        request = client.call_async.call_args[0][0]
+        assert request.use_hint is True
+        assert (request.x, request.y, request.z, request.yaw) == (3.0, -1.0, 4.2, 1.57)
+        assert resumed.method == "hint"
+
+    @pytest.mark.parametrize(
+        "constant,name",
+        [
+            (ResumeMapping.Response.METHOD_HINT, "hint"),
+            (ResumeMapping.Response.METHOD_LAST_POSE, "last_pose"),
+            (ResumeMapping.Response.METHOD_GLOBAL, "global"),
+            # The srv says the list is not closed: a newer pgo's way of finding
+            # the robot must not fail the answer to a resume that worked.
+            (99, "unknown"),
+        ],
+    )
+    def test_the_method_is_named(self, map_gw, constant, name):
+        _arm(map_gw, "resume_mapping", self._resumed(constant))
+
+        assert map_gw.resume_mapping("/maps/hall")[2].method == name
+
+    def test_pgo_refusal_passes_through_verbatim(self, map_gw):
+        # Nothing is loaded after a refusal, so there is no run to describe:
+        # the sentence is the whole answer.
+        sentence = (
+            "Could not find the robot in the saved map. Move it to a place the "
+            "saved map covers, or give its position. Nothing started."
+        )
+        _arm(
+            map_gw,
+            "resume_mapping",
+            SimpleNamespace(success=False, message=sentence, prior_key_poses=812, method=0),
+        )
+
+        assert map_gw.resume_mapping("/maps/hall") == (False, sentence, None)
+
+    def test_service_unavailable_blames_the_mode(self, map_gw):
+        client = _arm(map_gw, "resume_mapping", available=False)
+
+        success, message, resumed = map_gw.resume_mapping("/maps/hall")
+
+        assert success is False
+        assert "not available" in message
+        assert "MANUAL" in message
+        assert resumed is None
+        client.call_async.assert_not_called()
+
+    def test_the_deadline_outlasts_pgos_own_waits(self, map_gw, monkeypatch):
+        # pgo waits up to 42 s on its own (LIO reset, scans, two searches)
+        # before the load of a large map is counted; a deadline under that
+        # would answer 502 for a run pgo then begins.
+        client = _arm(map_gw, "resume_mapping", completed=False)
+        deadlines = []
+
+        def _never(future, timeout):
+            deadlines.append(timeout)
+            return False
+
+        monkeypatch.setattr(ros_module, "wait_for_future", _never)
+
+        success, message, resumed = map_gw.resume_mapping("/maps/hall")
+
+        assert (success, resumed) == (False, None)
+        assert message == "Timeout waiting for pgo/resume_mapping response"
+        assert deadlines and deadlines[0] > 42.0
+        client.call_async.assert_called_once()
+
+    def test_a_resume_touches_no_other_run_service(self, map_gw):
+        _arm(map_gw, "resume_mapping", self._resumed())
+
+        map_gw.resume_mapping("/maps/hall")
+
+        for other in ("start_mapping", "save_maps", "reset_mapping"):
+            map_gw._service_clients[other].call_async.assert_not_called()
 
 
 class TestSwapLocalizerMap:

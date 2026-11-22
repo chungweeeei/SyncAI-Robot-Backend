@@ -292,6 +292,79 @@ class StartMappingResponse(BaseModel):
     message: str = Field(..., description="What happened, for the operator to read.")
 
 
+class ResumeMappingHint(BaseModel):
+    """Roughly where the robot stands in the saved map."""
+
+    x: float = Field(..., description="Map frame, metres.")
+    y: float = Field(..., description="Map frame, metres.")
+    z: float = Field(
+        0.0,
+        description=(
+            "Map frame, metres. Only picks the storey: the saved keyframes "
+            "within 1.5 m of it are searched, so the floor's height does as "
+            "well as the lidar's."
+        ),
+    )
+    theta: float = Field(..., description="Heading in degrees, map frame.")
+
+
+class ResumeMappingRequest(BaseModel):
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description=(
+            "The saved map to keep building. It is only read; the run is "
+            "saved under another name."
+        ),
+    )
+    hint: Optional[ResumeMappingHint] = Field(
+        None,
+        description=(
+            "Where the robot is in that map, within a few metres and about "
+            "45 degrees. A hint that does not match fails the call rather "
+            "than falling back to a search. Omitted: the robot is looked for "
+            "where it last stood while navigating on this map, then across "
+            "the whole map."
+        ),
+    )
+
+
+class ResumeMethod(str, Enum):
+    """How the robot was found in the saved map."""
+
+    # Near the request's hint.
+    HINT = "hint"
+    # Near the pose the navigation session's localizer last saved on this map.
+    LAST_POSE = "last_pose"
+    # By searching the whole map.
+    GLOBAL = "global"
+    # A way this backend does not know by name (a newer pgo).
+    UNKNOWN = "unknown"
+
+
+class ResumeMappingResponse(BaseModel):
+    resumed: bool = Field(
+        ...,
+        description=(
+            "True on any 200 — the saved map is loaded and pgo is adding to "
+            "it from where the robot stands. A failure is a 502 (or a 409 "
+            "while already mapping), never a 200 with false; pgo is then idle "
+            "with nothing loaded."
+        ),
+    )
+    message: str = Field(..., description="What happened, for the operator to read.")
+    name: str = Field(..., description="The map that was resumed.")
+    prior_key_poses: int = Field(
+        ..., description="Keyframes loaded from the saved map; the run adds to them."
+    )
+    method: ResumeMethod = Field(..., description="How the robot was found in it.")
+    x: float = Field(..., description="Where it was found: map frame, metres.")
+    y: float = Field(..., description="Map frame, metres.")
+    z: float = Field(..., description="Map frame, metres (the lidar's height).")
+    theta: float = Field(..., description="Heading in degrees, map frame.")
+
+
 class MappingRunState(str, Enum):
     """The run state as REST reports it.
 
