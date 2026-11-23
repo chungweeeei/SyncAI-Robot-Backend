@@ -30,6 +30,8 @@ switches) happens here.
 
 ## Features
 
+- **Sign-in** — one console account, a JWT on every route but `/health`,
+  renewed while the console is open, up to a session cap.
 - **Robot** — state, teleop (WebSocket), localization, mode switch / restart,
   safety lock, wifi.
 - **Maps** — 3D maps (`octomap.bt`) saved from a mapping run, switched live,
@@ -55,6 +57,7 @@ tests standalone**, but **running** it needs the rest of the robot stack:
 | PostgreSQL | **hard** dependency (vertices, templates, run records); retried 20 × 5 s at startup |
 | Temporal | soft dependency (tasks, schedules); `/health` reports `degraded` without it |
 | `~/robot_ws/{config,map,record,lib}` | the per-robot INI, maps, bags and the WebRTC worker |
+| `~/robot_ws/log/stack`, `/var/log/journal` | optional: the log export's two sources |
 | `syncai_tts`, `libsyncai_worker.so` | optional: speech and camera; everything else works without them |
 
 ## Quick start
@@ -69,6 +72,9 @@ docker compose up -d --build        # or pull ghcr.io/chungweeeei/syncai-backend
 docker compose logs -f
 curl http://127.0.0.1:3000/health   # always 200; status is ok or degraded
 ```
+
+Every other route needs a token from `POST /api/v1/auth/login` (see [API](#api)).
+Set `AUTH_PASSWORD` and `JWT_SECRET` before a robot leaves the bench.
 
 ### Inside a colcon workspace
 
@@ -95,6 +101,9 @@ parameters.
 
 | Variable | Default | |
 |---|---|---|
+| `AUTH_USERNAME` / `AUTH_PASSWORD` | `admin` / `admin` | the one console account; the default password is warned about at startup |
+| `JWT_SECRET` | drawn per process | unset, a restart signs everyone out |
+| `JWT_EXPIRE_SECONDS` / `JWT_MAX_SESSION_SECONDS` | `3600` / `43200` | a token's life; how long renewals may carry one sign-in |
 | `TEMPORAL_ADDRESS` | `127.0.0.1:7233` | Temporal client + worker |
 | `POSTGRES_HOST` / `POSTGRES_PORT` | `localhost` / `5432` | database `<robot_id>_db`, created if absent |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `syncrobotic` / `syncrobotic` | |
@@ -109,12 +118,14 @@ the Temporal task queue prefix. Full reference:
 
 ## API
 
-Interactive docs (OpenAPI): `http://<robot>:3000/docs`. Every route, its
+Interactive docs (OpenAPI): `http://<robot>:3000/docs` (sign in with its
+Authorize button). Every route, its
 refusal codes and the reasons behind them: [docs/rest-api.md](docs/rest-api.md).
 
 | Area | Prefix |
 |---|---|
-| Health | `GET /health` |
+| Health | `GET /health` (no token) |
+| Sign-in | `/api/v1/auth/login`, `/token` (the `/docs` form), `/refresh`, `/me` |
 | Tasks, history, route preview | `/api/v1/tasks`, `/active_tasks`, `/task_history`, `/task_steps`, `/route_preview` |
 | Schedules, templates | `/api/v1/schedules`, `/task_templates` |
 | Robot, teleop, localization | `/api/v1/robot/*`, `/localization/auto`, `/landmarks/detect` |
@@ -128,8 +139,11 @@ refusal codes and the reasons behind them: [docs/rest-api.md](docs/rest-api.md).
 | WebRTC signalling | `/api/v1/webrtc/*` |
 | WebSocket streams | `/api/v1/robot/teleop`, `/robot/pointcloud/stream`, `/robot/pointcloud/map/stream`, `/robot/pointcloud/map/saved/stream`, `/robot/telemetry/stream` |
 
+Every route but `/health` and the sign-ins takes `Authorization: Bearer <token>`;
+a WebSocket takes `?token=` and is closed with 1008 without a valid one.
+
 Errors are JSON with `detail` and, where a client should branch, a
-machine-readable `code`: 400 bad request, 404 not found, 409 conflict, 413
+machine-readable `code`: 400 bad request, 401 no valid token, 404 not found, 409 conflict, 413
 payload too large, 502 a downstream (Temporal or a ROS service) failed.
 
 ## Project layout
@@ -137,7 +151,7 @@ payload too large, 502 a downstream (Temporal or a ROS service) failed.
 ```
 syncai_backend/
 ├── main.py              the node: wires everything, starts uvicorn and the Temporal worker
-├── interfaces/rest/     FastAPI app, routers, schemas
+├── interfaces/rest/     FastAPI app, routers, schemas, sign-in and its guard
 ├── services/            domain work that outlives a request (map switch, import, safety lock, …)
 ├── gateways/            outbound: ROS, Temporal, TTS, WebRTC, recordings, logs
 ├── repositories/        state: in-memory caches, PostgreSQL CRUD, on-disk catalogues
@@ -178,9 +192,9 @@ subscriber, and keep it in sync when behaviour changes.
 |---|---|
 | [architecture.md](docs/architecture.md) | process model and threads, shutdown order, layering, map storage (octomap, keepout, floors, archives), `robot_id` scoping |
 | [ros-interfaces.md](docs/ros-interfaces.md) | subscriptions and QoS, the map cloud file, action / service clients, publishers, TF |
-| [rest-api.md](docs/rest-api.md) | every REST / WebSocket route, errors, wire formats, settings pages, recordings, the log export, WebRTC, templates, the run record |
+| [rest-api.md](docs/rest-api.md) | sign-in, every REST / WebSocket route, errors, wire formats, settings pages, recordings, the log export, WebRTC, templates, the run record |
 | [tasks.md](docs/tasks.md) | Temporal: step types, retries, groups, pause / resume, continuing a failed task, history, schedules |
-| [configuration.md](docs/configuration.md) | every environment variable, the system INI, the loaded map, Postgres |
+| [configuration.md](docs/configuration.md) | every environment variable (sign-in included), the system INI, the loaded map, Postgres |
 | [deployment.md](docs/deployment.md) | build and run, in a workspace and as its own container |
 | [testing.md](docs/testing.md) | running the suite on and off the robot |
 | [gotchas.md](docs/gotchas.md) | things that have bitten before |
