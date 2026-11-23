@@ -2987,21 +2987,28 @@ def test_floors_are_detected_from_the_trajectory(client, maps_dir):
             {"name": "2F", "level": 5.3, "low": 5.3, "high": 5.3},
         ],
         "saved": False,
+        "storey": None,
     }
 
 
 def test_floors_are_empty_for_one_storey_or_no_trajectory(client, maps_dir):
-    assert client.get("/api/v1/maps/rawonly/floors").json()["floors"] == []
+    body = client.get("/api/v1/maps/rawonly/floors").json()
+    assert body["floors"] == [] and body["storey"] is None
 
     _plant_poses(maps_dir / "full", (0.0, 400))
-    assert client.get("/api/v1/maps/full/floors").json()["floors"] == []
+    body = client.get("/api/v1/maps/full/floors").json()
+    assert body["floors"] == []
+    assert body["storey"] == {"level": 0.0, "low": 0.0, "high": 0.0}
 
 
 def test_two_heights_walked_in_different_places_are_one_floor(client, maps_dir):
     # The foot and the top of a long slope: a storey apart, over nothing.
     _plant_poses(maps_dir / "full", (0.0, 400, 0), (-3.0, 300, 60))
 
-    assert client.get("/api/v1/maps/full/floors").json()["floors"] == []
+    body = client.get("/api/v1/maps/full/floors").json()
+    assert body["floors"] == []
+    # Still one storey to the console, but one it must not cut at 0's height.
+    assert body["storey"] == {"level": 0.0, "low": -3.0, "high": 0.0}
 
 
 def test_floors_404_for_a_missing_map(client):
@@ -3060,6 +3067,8 @@ def test_an_empty_save_is_one_floor_and_still_saved(client, maps_dir):
     assert "one floor" in response.json()["message"]
     body = client.get("/api/v1/maps/full/floors").json()
     assert body["floors"] == [] and body["saved"] is True
+    # Saved as one storey, it spans every floor it was walked on.
+    assert body["storey"] == {"level": 0.0, "low": 0.0, "high": 5.3}
 
 
 @pytest.mark.parametrize(
@@ -3086,6 +3095,7 @@ def test_an_unreadable_floors_file_falls_back_to_detection(client, maps_dir):
 
     assert body["saved"] is False
     assert [floor["name"] for floor in body["floors"]] == ["1F", "2F"]
+    assert body["storey"] is None
 
 
 # --- the robot's map cleaning holds its map directory -----------------------------

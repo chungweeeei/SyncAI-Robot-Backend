@@ -1,14 +1,14 @@
 """A multi-storey map's floors: detected from poses.txt, or saved."""
 
 import math
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter
 
 from syncai_backend.exceptions import (
     BadRequestError,
 )
-from syncai_backend.helpers.floors import detect_floors, floor_name
+from syncai_backend.helpers.floors import DetectedFloor, detect_floors, floor_name
 from syncai_backend.repositories.map.catalog import (
     MapFloor,
 )
@@ -16,6 +16,7 @@ from syncai_backend.repositories.map.catalog import (
 from syncai_backend.interfaces.rest.routers.maps.schemas import (
     MapFloorModel,
     MapFloorsResponse,
+    MapStoreyModel,
     SaveMapFloorsRequest,
     SaveMapFloorsResponse,
 )
@@ -42,9 +43,11 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
             for floor in floors
         ]
 
-    def _detected_floors(name: str) -> List[MapFloor]:
+    def _detected(name: str) -> List[DetectedFloor]:
         poses = map_catalog_repo.read_poses(name)
-        found = detect_floors(poses) if poses else []
+        return detect_floors(poses) if poses else []
+
+    def _named(found: List[DetectedFloor]) -> List[MapFloor]:
         # One storey needs no split.
         if len(found) < 2:
             return []
@@ -52,6 +55,15 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
             MapFloor(name=floor_name(i), level=floor.level, low=floor.low, high=floor.high)
             for i, floor in enumerate(found)
         ]
+
+    def _storey(found: List[DetectedFloor]) -> Optional[MapStoreyModel]:
+        """The heights one storey spans: the console's ceiling for a map
+        shown whole, which at the start's height cut off a storey whose
+        ground climbs. ``floors`` stays ``[]`` for it -- that, not a list of
+        one, is what tells the console a stop takes its column's ground."""
+        if not found:
+            return None
+        return MapStoreyModel(level=found[0].level, low=found[0].low, high=found[-1].high)
 
     @map_router.get("/api/v1/maps/{name}/floors", response_model=MapFloorsResponse)
     def get_map_floors(name: str):
@@ -61,13 +73,16 @@ def register(map_router: APIRouter, ctx: MapRouteContext) -> None:
         map that has never been looked at needs no step to have floors.
         """
         _require_exists(name)
-        detected = _detected_floors(name)
+        found = _detected(name)
+        detected = _named(found)
         saved = map_catalog_repo.read_floors(name)
+        floors = saved if saved is not None else detected
         return MapFloorsResponse(
             name=name,
-            floors=_floor_models(saved if saved is not None else detected),
+            floors=_floor_models(floors),
             detected=_floor_models(detected),
             saved=saved is not None,
+            storey=None if floors else _storey(found),
         )
 
     def _validate_floors(entries: List[MapFloorModel]) -> List[MapFloor]:

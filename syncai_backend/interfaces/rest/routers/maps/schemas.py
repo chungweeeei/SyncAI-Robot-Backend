@@ -215,6 +215,16 @@ class MapFloorModel(BaseModel):
     )
 
 
+class MapStoreyModel(BaseModel):
+    """The heights a map of one storey was walked at."""
+
+    level: float = Field(
+        ..., description="Body height walked at most, metres in the map frame."
+    )
+    low: float = Field(..., description="Lowest body height walked, metres.")
+    high: float = Field(..., description="Highest body height walked, metres.")
+
+
 class MapFloorsResponse(BaseModel):
     """The storeys a map spans, for showing one at a time."""
 
@@ -235,6 +245,15 @@ class MapFloorsResponse(BaseModel):
     )
     saved: bool = Field(
         ..., description="Whether `floors` is a saved list rather than the detected one."
+    )
+    storey: Optional[MapStoreyModel] = Field(
+        None,
+        description=(
+            "With `floors: []`, the body heights the one storey was walked at "
+            "(every detected floor's, when one storey was saved over several), "
+            "so a storey whose ground climbs is not cut at its start's height. "
+            "Null with floors, or without a trajectory."
+        ),
     )
 
 
