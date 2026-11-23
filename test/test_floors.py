@@ -1,5 +1,7 @@
 """helpers/floors.py: storeys found from where the robot walked."""
 
+import math
+
 from syncai_backend.helpers.floors import (
     FLOOR_MIN_POSES,
     detect_floors,
@@ -103,6 +105,84 @@ def test_levels_closer_than_a_storey_collapse_into_the_one_walked_more():
     poses = _walk((0.0, 300, 0, 40), (1.0, 500, 0, 40))
 
     assert _levels(poses) == [1.0]
+
+
+def _garage(turns, pitch=3.0, decks_per_turn=2, deck=120, ramp=40, sloped=False):
+    """A parking structure walked up from the ground: decks round an oval,
+    one half after the other, each ``pitch / decks_per_turn`` over the one
+    before, so every deck lies over the one a turn under it. A split-level
+    garage walks each deck flat and climbs a ramp at its end; a sloping one
+    climbs all the way round."""
+    poses = []
+    step = pitch / decks_per_turn
+    for d in range(turns * decks_per_turn):
+        z0, side = d * step, 1 if d % 2 == 0 else -1
+        for i in range(deck):
+            t = i / deck
+            poses.append((side * (-15 + 30 * t), side * 8.0, z0 + (step * t if sloped else 0.0)))
+        if not sloped:
+            for i in range(ramp):
+                t = i / ramp
+                poses.append((
+                    side * (15 + 8 * math.sin(math.pi * t)),
+                    side * 8 * math.cos(math.pi * t),
+                    z0 + step * t,
+                ))
+    return poses
+
+
+def _stacked_within_a_floor(poses, floors):
+    """Plan cells where one floor's heights hold ground over ground."""
+    cells = {}
+    for x, y, z in poses:
+        for n, floor in enumerate(floors):
+            if floor.low <= z <= floor.high:
+                cells.setdefault((n, math.floor(x / 2.0), math.floor(y / 2.0)), []).append(z)
+    return [key for key, zs in cells.items() if max(zs) - min(zs) >= 2.0]
+
+
+def test_a_split_level_garage_is_a_floor_a_turn():
+    # Half-levels 1.5 m apart, joined by ramps: no flat gap between storeys
+    # and no level 2 m from the next, yet every deck is over the one a turn
+    # down. Two half-levels side by side are one floor; no floor holds a
+    # deck over another.
+    poses = _garage(turns=4)
+
+    floors = detect_floors(poses)
+    assert [floor.level for floor in floors] == [0.0, 3.0, 6.0, 9.0]
+    assert _stacked_within_a_floor(poses, floors) == []
+
+
+def test_a_sloping_garage_is_cut_every_turn():
+    # A deck that climbs all the way round has no level of its own; cut by
+    # heights alone it was one floor nine metres tall, every turn over the
+    # one under it.
+    poses = _garage(turns=3, sloped=True)
+
+    floors = detect_floors(poses)
+    assert len(floors) == 3
+    assert _stacked_within_a_floor(poses, floors) == []
+
+
+def test_a_slope_out_of_a_garage_joins_its_ground_floor():
+    # outdoor_1119: a long slope down away from the structure, under none
+    # of its decks, is the lowest floor's.
+    poses = _garage(turns=2) + _slope(0.0, -6.0, 120, 30, 90) + _walk((-6.0, 60, 90, 100))
+
+    floors = detect_floors(poses)
+    assert [floor.level for floor in floors] == [0.0, 3.0]
+    assert floors[0].low == -6.04
+
+
+def test_a_stair_is_cut_where_it_is_walked_least():
+    # The flights lie over the floor they leave and under the one they
+    # reach, so the stair is cut off both, and is on no floor.
+    poses = _walk((0.0, 900, 0, 40), (5.3, 600, 0, 40))
+    poses += [(10.0 + 0.2 * i, 0.5 * (i % 2), 0.1 * i) for i in range(1, 53)]
+
+    floors = detect_floors(poses)
+    assert [floor.level for floor in floors] == [0.0, 5.3]
+    assert floors[0].high < 1.0 and floors[1].low > 4.5
 
 
 def test_a_short_run_detects_nothing():

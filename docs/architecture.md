@@ -156,12 +156,21 @@ the keys hold for exactly that save's map frame.
 
 **Floors.** A map that spans storeys is one tree in one frame; the console
 shows one storey at a time. `GET /api/v1/maps/{name}/floors` detects them from
-`poses.txt` on every read — a height the robot spent at least 5 % of its walk at
-is a floor, a stair or landing it passed through is not, levels under 2 m apart
-are one, and so are two levels never walked one over the other (a long slope, a
-ramp down to a bay: nothing to hide, so nothing to split); each floor also
-carries `low` / `high`, the body heights walked on it, so a floor that is not
-flat is drawn whole — and `PUT` saves an operator's list (names, body heights) to
+`poses.txt` on every read. The split goes only where the robot walked ground
+over ground: in 2 m plan cells, heights 2 m or more apart are two grounds, each
+such pair asks for a cut between them, the fewest cuts answering every ask (by
+three cells or more) are made, and each is moved to the height walked least —
+a building's stair, the ramp between a garage's decks. Two levels never walked
+one over the other stay one floor (a long slope, a ramp down to a bay: nothing
+to hide, so nothing to split), and a piece between cuts holding under 5 % of
+the walk is a stair, on no floor. Within a floor, its `level` is the height it
+was walked at most and `low` / `high` the heights it spans (bins of 5 % and the
+bins of 2 % beside them; a stair is not part of it), so a floor that is not flat
+is drawn whole. A split-level garage (half-levels 1.5 m apart, outdoor_1119)
+comes out a floor a turn, its two half-levels side by side in it; a garage whose
+decks slope all the way round, which no height peak describes, alike
+(2026-11-23; cut by height peaks before, it was one floor nine metres tall).
+`PUT` saves an operator's list (names, body heights) to
 `floors.json`, which then wins. The trajectory rather than the ceiling, because
 the robot stood on every floor it mapped and a ceiling is a different height on
 every site. Only the console reads the file.
