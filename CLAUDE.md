@@ -22,7 +22,8 @@ those imports as they are. **DOCK / UNDOCK steps, the MOVE's auto-undock and the
 telemetry frame were removed on 2026-11-12** with the robot stack's dock trees, and the stored
 data cleaned the same day: a stored DOCK / UNDOCK step no longer parses, so
 `init_task_template_repo` strips them from templates and `run_worker` from schedules at every
-startup, idempotently (`tasks/retired_steps.py`). **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
+startup, idempotently (`tasks/retired_steps.py` for the rule and the templates,
+`temporal/retired_schedules.py` for the schedules). **The PATROL step sends `syncai_common`'s `NavigateThroughGoals` on
 `navigate_through_goals`** (2026-11; nav2's `NavigateThroughPoses` until then, whose Empty result
 carried no reason), so a patrol's failure goes through `_move_failure` like a MOVE's. **Whether a
 failed MOVE / CHARGE / PATROL is retried is decided by its `error_code`**
@@ -108,8 +109,12 @@ docker compose up -d --build                        # the runtime image as a ser
 
 `docker-compose.yml` runs the `runtime` stage alone — host networking (DDS over
 `lo`, so `127.0.0.1:<published port>` for postgres/temporal/tts),
-`rmw_cyclonedds_cpp`, three bind mounts from `ROBOT_WS` for
-`~/robot_ws/{config,map,lib}`, and `~/robot_ws/record` from this repo's own
+`rmw_cyclonedds_cpp`, bind mounts from `ROBOT_WS` for `~/robot_ws/{config,map}`,
+the INI of `ROBOT_INSTANCE` as `config/system.ini`, the two factory params dirs
+(`src/syncai_controller/params`, `src/syncai_global_planner/params`, read-only) and
+`log/stack` (read-only, with the host's `/var/log/journal` and `JOURNAL_GID` in
+`group_add`, for the log export), the WebRTC worker from `WEBRTC_LIB` (default
+this repo's `lib/`), and `~/robot_ws/record` from this repo's own
 `record/` (`RECORD_DIR`) — bags are the one thing nothing else in the stack
 reads, so they are not tied to a workspace checkout — plus **`ipc: host`**, so
 this container shares the host's `/dev/shm` with the robot container (see
@@ -188,6 +193,9 @@ interfaces/rest/routers/   HTTP + WS surface; pydantic schemas; raises domain ex
         │                  ctx.require_exists (one isdir) for a 404 on an unknown map;
         │                  ctx.require only where the route uses the StoredMap, since
         │                  get_map walks every file of the map (patches/: hundreds)
+        │                  interfaces/rest/auth.py: the console sign-in (one account from env,
+        │                  an HS256 JWT, renewed up to a session cap) and the guard;
+        │                  docs_page.py: the /docs page served by the app itself
         │
 services/                  domain work that outlives a request: mode_restart (the latest
         │                  restart_mode dispatch and its outcome),
@@ -201,7 +209,8 @@ services/                  domain work that outlives a request: mode_restart (th
         │                  partitions made ahead, DETACH + DROP past 30 days, every 30 min),
         │                  node_settings (a settings page's saga, one per node: validate
         │                  against its schema -- controller_schema / planner_schema --, set
-        │                  live, read back, write the runtime overlay)
+        │                  live, read back, write the runtime overlay; settings_schema is
+        │                  what a page's schema is made of)
         │
 gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), landmark (ROS srv:
         │                  detect_landmark, polled for 5 steady sightings, carried into map
@@ -221,14 +230,18 @@ database/                  SQLAlchemy engine + ORM (models.py: MapPoint, TaskTem
 
 tasks/                     the task model and its Temporal contract (schema: Step, groups,
                            TaskState; config: queues, signals, the Temporal address;
-                           search_attributes), imported by REST, gateways/workflow and
-                           temporal/ alike and importing none of them
+                           search_attributes; catalogue: GET /task_steps, the steps a client
+                           draws its editor from; template_resolution: a template's steps
+                           against its map's vertices now; retired_steps), imported by REST,
+                           gateways/workflow and temporal/ alike and importing none of them
 
 subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
                            names the PCD, which the subscriber reads from the shared /dev/shm);
                            qos.py names the two subscription shapes (latched, best_effort)
-temporal/                  worker, RobotWorkflow, activities
-helpers/                   pointcloud, system_config, map_archive (checksummed zip /
+temporal/                  worker, RobotWorkflow, activities, retired_schedules
+helpers/                   pointcloud, system_config, floors (poses.txt -> storeys),
+                           planar_pose (a 6-DOF pose's heading on the floor),
+                           map_archive (checksummed zip /
                            tar.gz of a map dir), move_guard (a run's TaskMap against the loaded map),
                            landmark_heading (a detect's sightings -> the waypoint: position,
                            heading -- the line of sight when ambiguous --, off_axis),
@@ -249,6 +262,15 @@ router means a `RestDeps` field, its value in `main.py`, and the router's call i
 That rule is why stateful map work (the switch saga, the import, the usage policy) is
 a `services/` object built in `main.py` rather than module state inside a router:
 tests get a fresh one per test, and nothing reaches into another module's globals.
+
+**Every route but `/health` and the sign-ins needs a token.** `server.py` includes
+the auth router on the app and every other router into one `protected` `APIRouter`
+whose dependency is the guard, so a router added there is guarded without
+remembering to be; never include one on `app` directly. Requests send
+`Authorization: Bearer <token>`, WebSockets `?token=` (closed with 1008 when it is
+missing or expired); a refusal is 401 with one sentence whatever the cause.
+`POST /api/v1/auth/token` is the form twin of `login` that `/docs`' Authorize dialog
+calls. docs/rest-api.md has the routes.
 
 **Imports are grouped by layer, with blank lines carrying meaning** (see `main.py`).
 That is why `ruff.toml` excludes isort — do not "organize imports".
@@ -282,12 +304,16 @@ TF frame names are not namespaced.
 ### Configuration
 
 Environment only (`TEMPORAL_ADDRESS`, `POSTGRES_*`, `SYNCAI_SYSTEM_INI`,
+`AUTH_USERNAME` / `AUTH_PASSWORD` (default `admin` / `admin`, warned at startup),
+`JWT_SECRET` (unset: a key per process, so a restart signs everyone out),
+`JWT_EXPIRE_SECONDS` (3600), `JWT_MAX_SESSION_SECONDS` (43200),
 `TTS_SERVICE_URL`, `SYNCAI_WEBRTC_LIB`, `LOG_LEVEL` (default `info`), `LOG_FORMAT`
 (`console` / `json`); the WebRTC worker's own `*_RTP_PORT` /
 `STUN_SERVERS` / `TURN_*` are only `setdefault`ed before `InitWorker`), loaded from the cwd `.env` via python-dotenv at import time — see
 `.env.example`. **No ROS parameters** anywhere. Everything is read once at startup.
 Several paths are absolute on purpose (`~/robot_ws/config/system.ini`, `~/robot_ws/map`,
-`~/robot_ws/config/params`, `~/robot_ws/src/syncai_controller/params` (read-only),
+`~/robot_ws/config/params`, `~/robot_ws/src/syncai_controller/params` and
+`~/robot_ws/src/syncai_global_planner/params` (read-only),
 `~/robot_ws/record`, `~/robot_ws/log/stack`, `~/robot_ws/lib/libsyncai_worker.so`) because entrypoints do not
 reliably run from the workspace root. `/dev/shm` is absolute for a different reason: it is
 the tmpfs `ipc: host` makes common to this container and the robot's, and pgo and this
