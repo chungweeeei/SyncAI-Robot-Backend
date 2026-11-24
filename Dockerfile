@@ -97,7 +97,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #     that falls back to the default fastrtps starts cleanly, logs nothing
 #     alarming and sees none of the robot's topics — the worst failure shape
 #     there is. Installing it here is half the fix; docker-compose.yml sets the
-#     variable and mounts the XML.
+#     variable and mounts the XML. The M20 is the exception (2026-11): it
+#     runs rmw_fastrtps_cpp, which ros-base already carries, picked by
+#     SYNCAI_RMW in compose's .env.
 #   * open3d's native dependencies. `libGL.so.1` is needed even though nothing
 #     here ever renders: open3d links it unconditionally, so without it every
 #     `import open3d` fails on a missing shared library while pip insists the

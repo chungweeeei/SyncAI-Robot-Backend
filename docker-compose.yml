@@ -40,7 +40,8 @@ services:
 
     # Host networking, and it is not a shortcut. DDS discovery between this
     # process and the nav stack happens over lo with multicast off (see
-    # CYCLONEDDS_URI below), which only works if both are on the host's network
+    # CYCLONEDDS_URI below; the M20's Fast DDS profile whitelists lo and the
+    # host's internal-LAN address), which only works if both are on the host's network
     # namespace — the robot01 container already is. It also puts the REST API on
     # the host's :3000 with no `ports:` mapping, which is how the frontend and
     # the operator console reach it.
@@ -97,16 +98,30 @@ services:
 
     environment:
       # ── ROS ──────────────────────────────────────────────────────────────
-      # A literal, NOT ${ROS_DOMAIN_ID:-1}: compose interpolation gives the
-      # invoking shell precedence over .env, and this Jetson's ~/.bashrc exports
-      # ROS_DOMAIN_ID=69 — an "overridable default" silently resolves to 69 and
-      # the backend sees an empty ROS graph. It also has to stay in step with
-      # <Domain Id="1"> in the cyclonedds.xml mounted below.
-      ROS_DOMAIN_ID: "1"
-      # Not the default. The rest of the stack is cyclonedds; a backend left on
-      # fastrtps comes up looking perfectly healthy and sees no topics at all.
-      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
-      CYCLONEDDS_URI: /home/syncrobotic/robot_ws/config/cyclonedds.xml
+      # The DDS wiring is the robot stack's, and has to be the same three values
+      # its compose runs on (SyncAI-Robot-Workspace, docker-compose.robots.yml):
+      # a backend on another RMW, domain or profile comes up looking perfectly
+      # healthy and sees no topics at all. Unset, they are what every robot ran
+      # on until the M20: CycloneDDS on domain 1, lo only (config/cyclonedds.xml).
+      # The M20 runs Fast DDS on the vendor's domain 0, so its host's .env (this
+      # directory's, beside this file) carries the workspace .env's three lines:
+      #
+      #   SYNCAI_RMW=rmw_fastrtps_cpp
+      #   SYNCAI_DDS_CONFIG=models/m20/fastdds.xml
+      #   SYNCAI_ROS_DOMAIN_ID=0
+      #
+      # SYNCAI_-prefixed, NOT ${ROS_DOMAIN_ID:-1}: compose interpolation gives
+      # the invoking shell precedence over .env, and this Jetson's ~/.bashrc
+      # exports ROS_DOMAIN_ID=69 — a default overridable under that name
+      # silently resolves to 69. Under Cyclone the domain also has to stay in
+      # step with <Domain Id> in the XML; Fast DDS takes it from here alone.
+      ROS_DOMAIN_ID: "${SYNCAI_ROS_DOMAIN_ID:-1}"
+      RMW_IMPLEMENTATION: ${SYNCAI_RMW:-rmw_cyclonedds_cpp}
+      # One variable names the file for either RMW (a path under the mounted
+      # config/): both are set to it and each RMW opens only its own, so
+      # SYNCAI_DDS_CONFIG and SYNCAI_RMW are always set together.
+      CYCLONEDDS_URI: /home/syncrobotic/robot_ws/config/${SYNCAI_DDS_CONFIG:-cyclonedds.xml}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /home/syncrobotic/robot_ws/config/${SYNCAI_DDS_CONFIG:-cyclonedds.xml}
       # rcl/spdlog per-process logs, onto the size-capped tmpfs below instead of
       # ~/.ros/log — they never rotate and this container is long-lived.
       ROS_LOG_DIR: /tmp/ros_log

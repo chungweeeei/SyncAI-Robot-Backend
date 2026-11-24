@@ -110,7 +110,9 @@ docker compose up -d --build                        # the runtime image as a ser
 
 `docker-compose.yml` runs the `runtime` stage alone — host networking (DDS over
 `lo`, so `127.0.0.1:<published port>` for postgres/temporal/tts),
-`rmw_cyclonedds_cpp`, bind mounts from `ROBOT_WS` for `~/robot_ws/{config,map}`,
+`rmw_cyclonedds_cpp` on domain 1 unless `.env` names the robot stack's other wiring
+(`SYNCAI_RMW` / `SYNCAI_DDS_CONFIG` / `SYNCAI_ROS_DOMAIN_ID`, the workspace's three: the M20
+runs `rmw_fastrtps_cpp` on domain 0 with `models/m20/fastdds.xml`), bind mounts from `ROBOT_WS` for `~/robot_ws/{config,map}`,
 the INI of `ROBOT_INSTANCE` as `config/system.ini`, the two factory params dirs
 (`src/syncai_controller/params`, `src/syncai_global_planner/params`, read-only) and
 `log/stack` (read-only, with the host's `/var/log/journal` and `JOURNAL_GID` in

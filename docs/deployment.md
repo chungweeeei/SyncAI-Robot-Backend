@@ -149,7 +149,10 @@ docker compose down                 # stop and remove the container
 ```
 
 **Without compose.** A plain `docker run` must reproduce the compose service;
-this equivalent drifts the moment the compose file changes, so prefer compose:
+this equivalent drifts the moment the compose file changes, so prefer compose
+(the three DDS values are the CycloneDDS defaults; an M20 takes
+`ROS_DOMAIN_ID=0`, `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` and
+`FASTRTPS_DEFAULT_PROFILES_FILE=$R/config/models/m20/fastdds.xml`):
 
 ```bash
 WS=${ROBOT_WS:-$HOME/SyncAI-Robot-Workspace}
@@ -187,13 +190,20 @@ robot_id`: namespace, database and task queue all become `default_robot`.
 The compose file comments every piece of the service; the ones that bite:
 
 - **`network_mode: host`.** DDS discovery with the nav stack runs over `lo` with
-  multicast off (`config/cyclonedds.xml`), so both sides share the host's network
+  multicast off (`config/cyclonedds.xml`; the M20's Fast DDS profile whitelists
+  `lo` and the host's internal-LAN address), so both sides share the host's network
   namespace. Compose service names therefore do not resolve — postgres, temporal
   and syncai_tts are `127.0.0.1:<published port>` — and the API lands on the
   host's `:3000` with no `ports:` mapping.
-- **`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`**, installed in the image. On the
-  default fastrtps the backend starts cleanly, logs nothing alarming and sees not
-  one topic.
+- **The DDS wiring is the robot stack's**: `RMW_IMPLEMENTATION`, `ROS_DOMAIN_ID`
+  and the profile file come from `SYNCAI_RMW` / `SYNCAI_ROS_DOMAIN_ID` /
+  `SYNCAI_DDS_CONFIG`, the names the workspace's compose reads, and this
+  directory's `.env` must carry the same three values as the workspace's. Unset,
+  they are CycloneDDS on domain 1 with `config/cyclonedds.xml`; the M20 runs
+  `rmw_fastrtps_cpp` on domain 0 with `models/m20/fastdds.xml` (`lo` and the
+  robot's internal LAN). Both RMWs are in the image. On a different RMW, domain
+  or profile the backend starts cleanly, logs nothing alarming and sees not one
+  topic.
 - **Three bind mounts from `ROBOT_WS`** carry what this package shares with the
   stack: `config/` (read-write — activating a map rewrites `system.ini` in place;
   `instances/robot.ini` goes over `config/system.ini` as one file) and `map/`
