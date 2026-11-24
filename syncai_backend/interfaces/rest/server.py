@@ -140,6 +140,8 @@ class RestDeps:
     settings_svcs: dict[str, NodeSettingsService]
     # The sign-in account and the token key (interfaces/rest/auth.py).
     auth: AuthConfig
+    # The INI's [system] robot_model (helpers/system_config.py), read once.
+    robot_model: str
 
 
 def init_rest_server(
@@ -209,6 +211,9 @@ def init_rest_server(
             ),
             "task_server": worker_status,
             "task_server_error": worker_error,
+            # Here as well as on the robot state, which needs a token: the
+            # console's sign-in screen draws the robot before there is one.
+            "robot_model": deps.robot_model,
         }
 
     # Sign-in is the one route open without a token, beside /health above,
@@ -254,6 +259,7 @@ def init_rest_server(
             restart_svc=deps.restart_svc,
             safety_lock_svc=deps.safety_lock_svc,
             job_gate=deps.job_gate,
+            robot_model=deps.robot_model,
         )
     )
     protected.include_router(init_network_router(logger=logger, robot_gw=deps.robot_gw))

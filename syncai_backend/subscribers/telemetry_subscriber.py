@@ -8,6 +8,7 @@ import structlog
 from rclpy.node import Node
 
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import JointState
 
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -26,11 +27,28 @@ PRIMARY_POSE_HOLD_S = 1.0
 # above its ~10 Hz (one per scan), so a late scan does not drop the robot a
 # storey for a frame.
 LIO_HEIGHT_HOLD_S = 1.0
+# How long one `motor_states_low_rate` sample keeps ownership of the joints:
+# well above its 20 Hz period, so `joint_states` stays inert through a hiccup
+# on a robot that publishes both.
+PRIMARY_JOINTS_HOLD_S = 1.0
 
-# The URDF frames the mapping fallback composes through (fixed by
-# description/G23.urdf), under the LIO body frame's namespace prefix.
+# The URDF frames the mapping fallback composes through, under the LIO body
+# frame's namespace prefix.
 BASE_FRAME = "base_link"
+# The URDF link Point-LIO's body frame physically is, per robot model: what
+# closes the mapping TF tree (`_lio_odom_cb`). The G23's is its lidar
+# (description/G23.urdf's `lidar_top`). The M20 has no such link: its cloud
+# arrives in the body frame already and its LIO body is the vendor's IMU,
+# `imu` in M20.urdf. A model missing here falls back to the G23's, whose
+# frame its URDF then lacks -- the pose is dropped with a warning naming it,
+# and the console draws the map with no robot on it.
 LIDAR_FRAME = "lidar_top"
+_LIO_BODY_LINK = {"g23": LIDAR_FRAME, "m20": "imu"}
+
+
+def lio_body_link(robot_model: str) -> str:
+    """The URDF link Point-LIO's body frame is on a ``robot_model``."""
+    return _LIO_BODY_LINK.get(robot_model, LIDAR_FRAME)
 
 
 def _rigid(translation, rotation) -> tuple[np.ndarray, np.ndarray]:
@@ -65,8 +83,16 @@ class TelemetrySubscriber:
        chain's z 0 on every storey, so in AUTO the height is the LIO chain's
        (``LIO_HEIGHT_HOLD_S``), the same number MANUAL reports.
 
-    2. Joints: ``motor_states_low_rate`` reduced to {URDF joint name: position}, the
-       names the frontend looks GLB nodes up by.
+    2. Joints, reduced to {URDF joint name: position}, the names the frontend
+       looks GLB nodes up by. Two sources, one per kind of robot:
+
+       * ``motor_states_low_rate``, syncai_driver_manager's, which a G23
+         publishes. It wins whenever it is live (``PRIMARY_JOINTS_HOLD_S``).
+       * ``joint_states`` (sensor_msgs/JointState), which is all an M20 has:
+         its driver publishes no motor states, and syncai_m20_joint_state
+         converts the vendor's readings into its URDF's angles for
+         robot_state_publisher. Read here too, or the console's M20 stands
+         with straight legs whatever the robot is doing.
     """
 
     def __init__(
@@ -74,8 +100,11 @@ class TelemetrySubscriber:
         logger: structlog.stdlib.BoundLogger,
         telemetry_repo: TelemetryRepo,
         tf_buffer: Buffer,
+        lidar_frame: str = LIDAR_FRAME,
     ):
         self._logger = logger
+        # See `lio_body_link`.
+        self._lidar_frame = lidar_frame
         self._repo = telemetry_repo
         # The shared TF buffer (subscribers/tf.py); tf2's Buffer is thread-safe.
         self._tf_buffer = tf_buffer
@@ -92,6 +121,9 @@ class TelemetrySubscriber:
         # the primary feed. One tuple, so a reader never pairs a z with
         # another sample's time.
         self._lio_height = (0.0, float("-inf"))
+        # When motor_states last delivered (monotonic); -inf so joint_states
+        # is live at once on a robot that has no motor states.
+        self._motor_states_seen_s = float("-inf")
 
     def register(self, node: Node):
         # Best-effort keep-last: only the newest sample matters. Matches odom
@@ -118,6 +150,14 @@ class TelemetrySubscriber:
             msg_type=MotorStates,
             topic="motor_states_low_rate",
             callback=self._motor_states_cb,
+            qos_profile=profile,
+        )
+        # The M20's joints (the class docstring has why). Subscribed
+        # unconditionally, like the mapping pose feed: unpublished on a G23.
+        node.create_subscription(
+            msg_type=JointState,
+            topic="joint_states",
+            callback=self._joint_states_cb,
             qos_profile=profile,
         )
 
@@ -201,7 +241,7 @@ class TelemetrySubscriber:
             )
             # Static, but looked up per sample (cheap) rather than cached.
             base_lidar = self._tf_buffer.lookup_transform(
-                f"{ns}{BASE_FRAME}", f"{ns}{LIDAR_FRAME}", rclpy.time.Time()
+                f"{ns}{BASE_FRAME}", f"{ns}{self._lidar_frame}", rclpy.time.Time()
             )
         except TransformException as exc:
             if self._lio_tf_available is not False:
@@ -210,6 +250,7 @@ class TelemetrySubscriber:
                     "pointlio_odom comes from pgo while mapping, from the "
                     "localizer in AUTO; is bringup up for the URDF?)",
                     body_frame=body_frame,
+                    lidar_frame=f"{ns}{self._lidar_frame}",
                     error=str(exc),
                 )
                 self._lio_tf_available = False
@@ -244,7 +285,26 @@ class TelemetrySubscriber:
             stamp=msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
         )
 
+    def _joint_states_cb(self, msg: JointState):
+        if time.monotonic() - self._motor_states_seen_s < PRIMARY_JOINTS_HOLD_S:
+            return
+        # `position` may be shorter than `name` (the message allows an empty
+        # one), and a NaN cannot go out as JSON: both are left out, and the
+        # console keeps that joint where it was.
+        joints = {
+            name: float(q)
+            for name, q in zip(msg.name, msg.position)
+            if math.isfinite(q)
+        }
+        if not joints:
+            return
+        self._repo.update_joints(
+            joints=joints,
+            stamp=msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+        )
+
     def _motor_states_cb(self, msg: MotorStates):
+        self._motor_states_seen_s = time.monotonic()
         self._repo.update_joints(
             joints={m.name: float(m.q) for m in msg.states},
             # MotorStates.timestamp is nanoseconds ON THIS TOPIC. Do not "fix"
@@ -259,9 +319,13 @@ def init_telemetry_subscriber(
     node: Node,
     telemetry_repo: TelemetryRepo,
     tf_buffer: Buffer,
+    lidar_frame: str = LIDAR_FRAME,
 ) -> TelemetrySubscriber:
     subscriber = TelemetrySubscriber(
-        logger=logger, telemetry_repo=telemetry_repo, tf_buffer=tf_buffer
+        logger=logger,
+        telemetry_repo=telemetry_repo,
+        tf_buffer=tf_buffer,
+        lidar_frame=lidar_frame,
     )
     subscriber.register(node=node)
     return subscriber

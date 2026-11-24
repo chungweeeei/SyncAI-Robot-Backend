@@ -11,6 +11,7 @@ from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 
 from syncai_backend.logger import setup_log_handler
+from syncai_backend.helpers.system_config import read_robot_model
 from syncai_backend.database.postgres import connect_to_postgres
 from syncai_backend.temporal.worker import (
     TemporalWorkerHandle,
@@ -70,6 +71,7 @@ from syncai_backend.subscribers.mapping_status_subscriber import (
 )
 from syncai_backend.subscribers.telemetry_subscriber import (
     init_telemetry_subscriber,
+    lio_body_link,
 )
 from syncai_backend.subscribers.path_subscriber import init_path_subscriber
 from syncai_backend.subscribers.local_nav_subscriber import (
@@ -88,6 +90,13 @@ class SyncAIBackend(Node):
         super().__init__("syncai_backend_node")
 
         robot_id = self.get_namespace().strip("/") or "default_robot"
+
+        # Required: no model, no start (read_robot_model has why).
+        try:
+            robot_model = read_robot_model()
+        except ValueError as e:
+            logger.error("Robot model is not configured", error=str(e))
+            raise
 
         # Connect to the PostgreSQL database
         try:
@@ -249,6 +258,7 @@ class SyncAIBackend(Node):
             node=self,
             telemetry_repo=telemetry_repo,
             tf_buffer=self._tf_listener.buffer,
+            lidar_frame=lio_body_link(robot_model),
         )
         # The planner's route, onto the telemetry socket; already in the map frame.
         init_path_subscriber(logger=logger, node=self, telemetry_repo=telemetry_repo)
@@ -309,6 +319,7 @@ class SyncAIBackend(Node):
                 map_import_svc=map_import_svc,
                 settings_svcs=settings_svcs,
                 auth=AuthConfig.from_env(logger=logger),
+                robot_model=robot_model,
             ),
         )
 

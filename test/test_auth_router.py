@@ -220,7 +220,7 @@ def test_every_route_of_the_real_server_but_sign_in_and_health_needs_a_token(log
 
     deps = RestDeps(**{
         name: MagicMock() for name in RestDeps.__dataclass_fields__
-    } | {"settings_svcs": {}, "auth": CFG})
+    } | {"settings_svcs": {}, "auth": CFG, "robot_model": "g23"})
     client = TestClient(init_rest_server(logger=logger, deps=deps))
 
     open_paths = {"/health", "/api/v1/auth/login", TOKEN_URL}
@@ -247,7 +247,7 @@ def test_docs_is_open_and_is_the_stock_page_set_up_for_this_api(logger):
 
     deps = RestDeps(**{
         name: MagicMock() for name in RestDeps.__dataclass_fields__
-    } | {"settings_svcs": {}, "auth": CFG})
+    } | {"settings_svcs": {}, "auth": CFG, "robot_model": "g23"})
     res = TestClient(init_rest_server(logger=logger, deps=deps)).get("/docs")
 
     assert res.status_code == 200
@@ -276,7 +276,7 @@ def test_the_real_servers_openapi_names_the_sign_in_on_every_guarded_route(logge
 
     deps = RestDeps(**{
         name: MagicMock() for name in RestDeps.__dataclass_fields__
-    } | {"settings_svcs": {}, "auth": CFG})
+    } | {"settings_svcs": {}, "auth": CFG, "robot_model": "g23"})
     spec = init_rest_server(logger=logger, deps=deps).openapi()
 
     (scheme_name, scheme), = spec["components"]["securitySchemes"].items()

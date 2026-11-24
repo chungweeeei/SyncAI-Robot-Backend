@@ -176,6 +176,14 @@ class RobotLowLevelMode(BaseModel):
 class RobotState(BaseModel):
     timestamp: int = Field(..., description="The timestamp of the robot state.")
     robot_id: str = Field(..., description="The unique identifier of the robot.")
+    robot_model: str = Field(
+        ...,
+        description=(
+            "Which kind of robot this is, lower-case (g23, m20): the system "
+            "INI's [system] robot_model, read at start-up. The console picks "
+            "the 3D model and the motor layout by it. Also on /health."
+        ),
+    )
     map: str = Field(..., description="The name of the map the robot is on.")
     mode: str = Field(
         ...,
@@ -501,6 +509,7 @@ def init_robot_router(
     restart_svc: ModeRestartService,
     safety_lock_svc: SafetyLockService,
     job_gate: JobGate,
+    robot_model: str,
 ) -> APIRouter:
     robot_router = APIRouter(prefix="", tags=["Robot"])
 
@@ -563,6 +572,8 @@ def init_robot_router(
         return RobotState(
             timestamp=state.timestamp,
             robot_id=state.robot_id,
+            # Not on the message: this process's own reading of the INI.
+            robot_model=robot_model,
             map=state.map,
             mode=_mode_to_str(state.mode),
             state=status_name(state.state),

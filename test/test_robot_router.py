@@ -213,6 +213,7 @@ def client(logger, robot_repo, robot_gw, safety_lock_svc, workflow_gw):
             job_gate=JobGate(
                 logger=logger, map_catalog_repo=MagicMock(), workflow_gw=workflow_gw
             ),
+            robot_model="m20",
         )
     )
     return TestClient(app)
@@ -343,6 +344,8 @@ def test_state_projects_the_message(client, robot_repo, make_robot_state):
     body = _get_state(client).json()
 
     assert body["robot_id"] == "robot01"
+    # The INI's word, handed in at start-up; the message carries none.
+    assert body["robot_model"] == "m20"
     assert body["map"] == "dp2f"
     assert body["timestamp"] == 1754000000
     assert body["mode"] == "AUTO"
@@ -465,6 +468,7 @@ def test_state_payload_keys_are_exactly_the_whitelist(
     assert set(body) == {
         "timestamp",
         "robot_id",
+        "robot_model",
         "map",
         "mode",
         "state",

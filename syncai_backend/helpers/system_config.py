@@ -32,6 +32,33 @@ def system_ini_path() -> str:
     return os.environ.get(SYSTEM_INI_ENV, DEFAULT_SYSTEM_INI)
 
 
+def read_robot_model(path: Optional[str] = None) -> str:
+    """``[system] robot_model`` of the INI, lower-cased: which kind of robot
+    this is (``g23``, ``m20``).
+
+    Required, with no fallback: the console draws the robot and lays out its
+    motors by this word, and a guessed one draws the wrong machine with no
+    sign that anything is off. Raises ValueError, naming the file and the key,
+    when the INI is missing, malformed or does not say -- read once at
+    start-up, where that stops the process.
+    """
+    path = path or system_ini_path()
+    # Interpolation off: only [system] is read, and [map]'s is not ours to trip on.
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        with _INI_LOCK:
+            found = config.read(path)
+    except configparser.Error as exc:
+        raise ValueError(f"{path} is malformed: {exc}") from exc
+    if not found:
+        raise ValueError(f"{path} not found; it must set [system] robot_model")
+
+    model = config.get("system", "robot_model", fallback="").strip().lower()
+    if not model:
+        raise ValueError(f"{path} has no [system] robot_model; set it (g23, m20)")
+    return model
+
+
 # The copy `set_active_map` takes of the INI before rewriting it in place, next
 # to it (`system.ini.bak`). The in-place rewrite truncates the file first, and a
 # process killed in that window -- switch_mode kills the byobu session this

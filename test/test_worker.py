@@ -251,6 +251,7 @@ def test_health_projects_worker_state():
             map_import_svc=MagicMock(),
             settings_svcs={},
             auth=MagicMock(),
+            robot_model="m20",
         ),
     )
     client = TestClient(app)
@@ -264,6 +265,7 @@ def test_health_projects_worker_state():
         "status": "degraded",
         "task_server": "connecting",
         "task_server_error": None,
+        "robot_model": "m20",
     }
 
     handle.mark_running()
@@ -271,6 +273,7 @@ def test_health_projects_worker_state():
         "status": "ok",
         "task_server": "running",
         "task_server_error": None,
+        "robot_model": "m20",
     }
 
     handle.mark_dead("Connection refused (stub)")

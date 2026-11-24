@@ -19,7 +19,11 @@ import threading
 import pytest
 
 from syncai_backend.helpers import system_config
-from syncai_backend.helpers.system_config import active_map_name, set_active_map
+from syncai_backend.helpers.system_config import (
+    active_map_name,
+    read_robot_model,
+    set_active_map,
+)
 
 
 # The shape of config/instances/robot.ini, interpolation and all (the real
@@ -309,3 +313,40 @@ def test_no_backup_is_written_when_there_is_nothing_to_rewrite(logger, ini):
         set_active_map("warehouse01", logger)
 
     assert not path.with_name("system.ini.bak").exists()
+
+
+# -- read_robot_model: required, never guessed --------------------------------
+
+
+def test_the_robot_model_is_read_lower_cased(ini):
+    # It names files elsewhere in the stack (params/models/<model>.yaml) and
+    # the console matches on it, so one spelling leaves this function.
+    ini("[system]\nrobot_id: robot01\nrobot_model: M20 \n")
+    assert read_robot_model() == "m20"
+
+
+def test_the_robot_model_reads_past_the_map_sections_interpolation(ini):
+    ini(_REAL_INI.replace("robot_id: robot01\n", "robot_id: robot01\nrobot_model: g23\n"))
+    assert read_robot_model() == "g23"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[system]\nrobot_id: robot01\n",
+        "[system]\nrobot_id: robot01\nrobot_model:   \n",
+        "[map]\nname: dp2f\n",
+    ],
+)
+def test_an_ini_that_names_no_robot_model_is_refused(ini, text):
+    # No fallback: a guessed model draws the wrong robot without saying so.
+    path = ini(text)
+    with pytest.raises(ValueError, match="robot_model") as exc:
+        read_robot_model()
+    assert str(path) in str(exc.value)
+
+
+def test_a_missing_ini_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("SYNCAI_SYSTEM_INI", str(tmp_path / "nope.ini"))
+    with pytest.raises(ValueError, match="robot_model"):
+        read_robot_model()

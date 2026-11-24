@@ -107,7 +107,7 @@ parameters.
 | `TEMPORAL_ADDRESS` | `127.0.0.1:7233` | Temporal client + worker |
 | `POSTGRES_HOST` / `POSTGRES_PORT` | `localhost` / `5432` | database `<robot_id>_db`, created if absent |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `syncrobotic` / `syncrobotic` | |
-| `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | per-robot INI: `[system] robot_id`, `[map] name` |
+| `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | per-robot INI: `[system] robot_id`, `[system] robot_model` (**required**: `g23`, `m20`; the backend does not start without it, and reports it on the robot state and `/health` for the console to draw the right robot), `[map] name` |
 | `TTS_SERVICE_URL` | `http://syncai_tts:8080` | the speech service |
 | `SYNCAI_WEBRTC_LIB` | `~/robot_ws/lib/libsyncai_worker.so` | the WebRTC worker |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `console` | `json` for a log collector |

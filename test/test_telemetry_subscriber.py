@@ -59,6 +59,7 @@ from syncai_backend.subscribers import telemetry_subscriber  # noqa: E402
 from syncai_backend.subscribers.telemetry_subscriber import (  # noqa: E402
     LIO_HEIGHT_HOLD_S,
     init_telemetry_subscriber,
+    lio_body_link,
 )
 
 
@@ -182,7 +183,12 @@ def subs(logger, node, repo, tf_buffer):
 
 def test_subscribes_to_the_relative_pose_and_motor_states_topics(subs):
     # Relative names, so all three inherit the robot_id namespace (CLAUDE.md).
-    assert set(subs) == {"odom", "pointlio/lio_odom", "motor_states_low_rate"}
+    assert set(subs) == {
+        "odom",
+        "pointlio/lio_odom",
+        "motor_states_low_rate",
+        "joint_states",
+    }
     assert subs["odom"].msg_type is Odometry
     # The mapping-mode pose feed: same type, different frames and different
     # arithmetic (see the composition tests below).
@@ -191,7 +197,7 @@ def test_subscribes_to_the_relative_pose_and_motor_states_topics(subs):
 
 
 def test_qos_is_best_effort_keep_last_on_every_feed(subs):
-    for topic in ("odom", "pointlio/lio_odom", "motor_states_low_rate"):
+    for topic in ("odom", "pointlio/lio_odom", "motor_states_low_rate", "joint_states"):
         qos = subs[topic].qos_profile
         # motor_states' publisher is SensorDataQoS: a reliable subscriber here
         # would not be QoS-compatible and would simply never receive a sample.
@@ -507,3 +513,101 @@ def test_motor_states_reduce_to_joint_name_to_position(subs, repo):
     # NANOSECONDS on this topic (seconds in RobotState.motor_status — the
     # aggregator rescales its copy). The 1e-9 here is the unit boundary.
     assert sample.stamp == pytest.approx(1_754_000_000.0)
+
+
+# -- The LIO body's link, per robot model -------------------------------------
+
+
+def test_the_m20_closes_the_mapping_tree_through_its_imu(logger, node, repo):
+    """An M20 has no ``lidar_top``: its LIO body is the vendor's IMU.
+
+    With the G23's link asked of an M20's tree the lookup failed on every
+    sample, so a mapping run drew its map with no robot on it (robot01,
+    2026-11-24). The IMU sits 0.06 m ahead of base_link and 0.04 m up; that
+    offset comes back out like the G23's mount does.
+    """
+    tf = _FakeTfBuffer(
+        transforms={
+            ("robot01/base_link", "robot01/imu"): _tf(x=0.0632, y=-0.0268, z=0.0435),
+            ("map", "robot01/pointlio_odom"): _tf(),
+        }
+    )
+    init_telemetry_subscriber(
+        logger=logger,
+        node=node,
+        telemetry_repo=repo,
+        tf_buffer=tf,
+        lidar_frame=lio_body_link("m20"),
+    )
+    subs = {sub.topic: sub for sub in node.subscriptions}
+
+    subs["pointlio/lio_odom"].callback(_lio_odom(x=0.0632, y=-0.0268, z=0.0435))
+
+    assert ("robot01/base_link", "robot01/imu", rclpy.time.Time()) in tf.lookups
+    pose = repo.get_pose()
+    assert (pose.x, pose.y, pose.z) == pytest.approx((0.0, 0.0, 0.0), abs=1e-9)
+
+
+def test_the_g23_and_an_unlisted_model_keep_the_lidar_link():
+    assert lio_body_link("g23") == "lidar_top"
+    # No link is known for it; the G23's is asked, and its absence is logged.
+    assert lio_body_link("x99") == "lidar_top"
+
+
+# -- joints: joint_states, for a robot with no motor states (the M20) ---------
+
+
+def _joint_states(names, positions, sec=100, nanosec=0):
+    from sensor_msgs.msg import JointState
+
+    msg = JointState()
+    msg.header.stamp.sec, msg.header.stamp.nanosec = sec, nanosec
+    msg.name = list(names)
+    msg.position = [float(q) for q in positions]
+    return msg
+
+
+def test_joint_states_reach_the_console_under_the_urdfs_names(subs, repo):
+    """An M20 publishes no motor states; its angles are on joint_states.
+
+    Without this the console drew a lying M20 standing on straight legs, its
+    wheels half a metre under the floor its scan showed (robot01, 2026-11-24).
+    """
+    subs["joint_states"].callback(
+        _joint_states(
+            ["fl_hipy_joint", "fl_knee_joint", "fl_wheel_joint"],
+            [-1.24, 2.76, -875.27],
+            sec=12,
+            nanosec=500_000_000,
+        )
+    )
+
+    sample = repo.get_joints()
+    assert sample.joints == pytest.approx(
+        {"fl_hipy_joint": -1.24, "fl_knee_joint": 2.76, "fl_wheel_joint": -875.27}
+    )
+    assert sample.stamp == pytest.approx(12.5)
+
+
+def test_motor_states_own_the_joints_while_they_are_live(subs, repo):
+    # A robot that publishes both is drawn from its driver's own readings;
+    # two feeds taking turns would make the legs jump between them.
+    subs["motor_states_low_rate"].callback(
+        _motor_states([("FL_Knee_joint", 1.5)], timestamp_ns=1_000_000_000)
+    )
+    subs["joint_states"].callback(_joint_states(["FL_Knee_joint"], [0.2]))
+
+    assert repo.get_joints().joints == pytest.approx({"FL_Knee_joint": 1.5})
+
+
+def test_joint_states_leave_out_what_cannot_be_sent(subs, repo):
+    # A NaN is not JSON, and a name with no position has nothing to say.
+    subs["joint_states"].callback(
+        _joint_states(["a_joint", "b_joint", "c_joint"], [0.5, float("nan")])
+    )
+    assert repo.get_joints().joints == pytest.approx({"a_joint": 0.5})
+
+
+def test_joint_states_with_no_position_change_nothing(subs, repo):
+    subs["joint_states"].callback(_joint_states(["a_joint"], []))
+    assert repo.get_joints() is None
