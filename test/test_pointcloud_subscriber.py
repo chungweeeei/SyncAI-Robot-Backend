@@ -14,8 +14,11 @@ executor. What is pinned is the pipeline's observable contract, not its mocks:
   comment in the source records the measured failure modes). The lookup
   arguments are load-bearing, so the happy path asserts them alongside the
   transformed floats;
-* TF miss / no-parent-yet frames are DROPPED (slot unchanged), and the stream
-  recovers on the next resolvable frame;
+* the callback never waits for TF: a scan ahead of the odom->body of its stamp
+  is HELD and sent by the retry timer once that transform is in, or on the
+  latest transform when the next scan arrives first (or the timer gives up);
+* frames with no TF at all / no parent yet are DROPPED (slot unchanged), and
+  the stream recovers on the next resolvable frame;
 * empty clouds and NaN rows never reach the repo, frames beyond the cap are
   thinned, and a new frame replaces the slot (seq advances — single-slot
   semantics, the WS pump's dedup cursor depends on it).
@@ -38,12 +41,14 @@ import yaml  # noqa: E402
 from geometry_msgs.msg import TransformStamped  # noqa: E402
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup  # noqa: E402
 from sensor_msgs.msg import PointCloud2, PointField  # noqa: E402
-from tf2_ros import ExtrapolationException  # noqa: E402
+from tf2_ros import ConnectivityException, ExtrapolationException  # noqa: E402
 
 from syncai_backend.repositories.pointcloud.pointcloud import (  # noqa: E402
     init_pointcloud_repo,
 )
 from syncai_backend.subscribers.pointcloud_subscriber import (  # noqa: E402
+    PENDING_MAX_RETRIES,
+    PENDING_RETRY_PERIOD_S,
     init_pointcloud_subscriber,
 )
 
@@ -51,11 +56,33 @@ BODY_FRAME = "robot01/pointlio_body"
 ODOM_FRAME = "robot01/pointlio_odom"
 
 
+class FakeTimer:
+    """A timer the test fires by hand; records whether it is armed."""
+
+    def __init__(self, period, callback, callback_group):
+        self.period = period
+        self.callback = callback
+        self.callback_group = callback_group
+        self.armed = True
+
+    def cancel(self):
+        self.armed = False
+
+    def reset(self):
+        self.armed = True
+
+
 class FakeNode:
-    """Records create_subscription calls; the source only ever calls that."""
+    """Records the create_subscription / create_timer calls the source makes."""
 
     def __init__(self):
         self.subscriptions = []
+        self.timers = []
+
+    def create_timer(self, period, callback, callback_group=None):
+        timer = FakeTimer(period, callback, callback_group)
+        self.timers.append(timer)
+        return timer
 
     def create_subscription(self, msg_type, topic, callback, qos_profile, **kwargs):
         self.subscriptions.append(
@@ -71,20 +98,30 @@ class FakeNode:
 
 
 class FakeTfBuffer:
-    """Just the two Buffer methods the subscriber touches, with recording.
+    """Just the three Buffer methods the subscriber touches, with recording.
 
     ``parents`` drives all_frames_as_yaml (the tree dump _resolve_fixed_frame
     parses for the split point); ``transform``/``error`` drive
-    lookup_transform_full. Both are plain attributes so a test can flip the
-    buffer between "TF missing" and "TF back" mid-stream.
+    lookup_transform_full, ``latest``/``latest_error`` the all-latest
+    lookup_transform a held scan falls back to. All plain attributes so a test
+    can flip the buffer between "TF missing" and "TF back" mid-stream.
     """
 
-    def __init__(self, parents=None, transform=None, error=None):
+    def __init__(self, parents=None, transform=None, error=None, latest=None):
         self.parents = dict(parents or {})
         self.transform = transform
         self.error = error
+        self.latest = latest
+        self.latest_error = None
         self.lookups = []
+        self.latest_lookups = []
         self.tree_reads = 0
+
+    def lookup_transform(self, target_frame, source_frame, time):
+        self.latest_lookups.append((target_frame, source_frame, time))
+        if self.latest_error is not None:
+            raise self.latest_error
+        return self.latest
 
     def all_frames_as_yaml(self):
         self.tree_reads += 1
@@ -222,29 +259,149 @@ def test_body_frame_cloud_is_transformed_using_the_split_time_lookup(wire, repo)
     assert lookup["fixed_frame"] == ODOM_FRAME
     assert lookup["target_time"].nanoseconds == 0
     assert lookup["source_time"].nanoseconds == 7 * 10**9
-    # The timeout covers the intra-process cloud-vs-/tf delivery race; without
-    # it ~20% of frames were dropped, so its presence is behavior, not tuning.
-    assert lookup["timeout"].nanoseconds == pytest.approx(0.05 * 10**9)
+    # No timeout: the callback must not wait for /tf (a scan ahead of its
+    # transform is held instead, below).
+    assert "timeout" not in lookup
 
 
 def test_tf_miss_drops_the_frame_and_a_later_frame_recovers(wire, repo):
     buffer = FakeTfBuffer(
         parents={BODY_FRAME: ODOM_FRAME},
         transform=make_transform(translation=(1.0, 0.0, 0.0)),
-        error=ExtrapolationException("not relocalized yet"),
+        error=ConnectivityException("not relocalized yet"),
     )
-    _, _, callback = wire(buffer)
+    node, _, callback = wire(buffer)
 
     callback(make_cloud([(5.0, 5.0, 5.0)], frame_id=BODY_FRAME))
     # Dropped, not published untransformed: a body-frame cloud in the map slot
-    # would draw the scan at the origin regardless of the robot's pose.
+    # would draw the scan at the origin regardless of the robot's pose. Not
+    # held either: no later /tf message fills in a missing map->odom.
     assert repo.get_latest() is None
+    assert not node.timers[0].armed
 
     buffer.error = None
     callback(make_cloud([(0.0, 0.0, 0.0)], frame_id=BODY_FRAME))
     frame, pts = slot_points(repo)
     assert frame.seq == 1
     assert pts.tolist() == [[1.0, 0.0, 0.0]]
+
+
+def test_the_retry_timer_shares_the_cloud_group_and_starts_idle(wire):
+    node, _, _ = wire(FakeTfBuffer())
+
+    (timer,) = node.timers
+    assert timer.period == PENDING_RETRY_PERIOD_S
+    # One MutuallyExclusive group for both: the held scan is touched without a
+    # lock, and it is sent before the scan after it.
+    assert timer.callback_group is node.subscriptions[0]["callback_group"]
+    assert not timer.armed
+
+
+def test_scan_ahead_of_its_tf_is_held_and_sent_once_the_tf_arrives(wire, repo):
+    buffer = FakeTfBuffer(
+        parents={BODY_FRAME: ODOM_FRAME},
+        transform=make_transform(translation=(1.0, 0.0, 0.0)),
+        error=ExtrapolationException("into the future"),
+    )
+    node, _, callback = wire(buffer)
+    (timer,) = node.timers
+
+    callback(make_cloud([(5.0, 5.0, 5.0)], frame_id=BODY_FRAME, stamp_sec=7))
+    assert repo.get_latest() is None
+    assert timer.armed
+
+    timer.callback()  # still ahead of /tf
+    assert repo.get_latest() is None
+    assert timer.armed
+
+    buffer.error = None
+    timer.callback()
+    frame, pts = slot_points(repo)
+    assert frame.seq == 1
+    assert pts.tolist() == [[6.0, 5.0, 5.0]]
+    assert not timer.armed
+    # Every try asked for the scan's own stamp; the latest pose was never used.
+    assert {lookup["source_time"].nanoseconds for lookup in buffer.lookups} == {
+        7 * 10**9
+    }
+    assert buffer.latest_lookups == []
+
+
+def test_held_scan_goes_out_on_the_latest_tf_when_the_next_scan_arrives(wire, repo):
+    buffer = FakeTfBuffer(
+        parents={BODY_FRAME: ODOM_FRAME},
+        error=ExtrapolationException("into the future"),
+        latest=make_transform(translation=(0.0, 2.0, 0.0)),
+    )
+    node, _, callback = wire(buffer)
+    (timer,) = node.timers
+
+    callback(make_cloud([(1.0, 1.0, 1.0)], frame_id=BODY_FRAME, stamp_sec=1))
+    callback(make_cloud([(9.0, 9.0, 9.0)], frame_id=BODY_FRAME, stamp_sec=2))
+
+    # The first scan was sent (latest odom->body); the second is the one held.
+    frame, pts = slot_points(repo)
+    assert frame.seq == 1
+    assert pts.tolist() == [[1.0, 3.0, 1.0]]
+    assert buffer.latest_lookups[0][:2] == ("map", BODY_FRAME)
+    assert buffer.latest_lookups[0][2].nanoseconds == 0
+    assert timer.armed
+
+
+def test_held_scan_with_no_scan_after_it_is_sent_when_the_timer_gives_up(wire, repo):
+    buffer = FakeTfBuffer(
+        parents={BODY_FRAME: ODOM_FRAME},
+        error=ExtrapolationException("into the future"),
+        latest=make_transform(translation=(0.0, 0.0, 4.0)),
+    )
+    node, _, callback = wire(buffer)
+    (timer,) = node.timers
+
+    callback(make_cloud([(1.0, 1.0, 1.0)], frame_id=BODY_FRAME))
+    for _ in range(PENDING_MAX_RETRIES - 1):
+        timer.callback()
+    assert repo.get_latest() is None
+    assert timer.armed
+
+    timer.callback()
+    _, pts = slot_points(repo)
+    assert pts.tolist() == [[1.0, 1.0, 5.0]]
+    assert not timer.armed
+
+
+def test_held_scan_is_dropped_when_no_tf_serves_it(wire, repo):
+    buffer = FakeTfBuffer(
+        parents={BODY_FRAME: ODOM_FRAME},
+        error=ExtrapolationException("into the future"),
+    )
+    buffer.latest_error = ConnectivityException("map gone")
+    node, _, callback = wire(buffer)
+
+    callback(make_cloud([(1.0, 1.0, 1.0)], frame_id=BODY_FRAME))
+    callback(make_cloud([(2.0, 2.0, 2.0)], frame_id="map"))
+
+    # The held scan found no transform and was dropped; the map-frame scan
+    # behind it still went out, and nothing is left held.
+    frame, pts = slot_points(repo)
+    assert frame.seq == 1
+    assert pts.tolist() == [[2.0, 2.0, 2.0]]
+    assert not node.timers[0].armed
+
+
+def test_a_failing_retry_never_raises_out_of_the_timer(wire, repo):
+    buffer = FakeTfBuffer(
+        parents={BODY_FRAME: ODOM_FRAME},
+        error=ExtrapolationException("into the future"),
+    )
+    node, _, callback = wire(buffer)
+    (timer,) = node.timers
+
+    callback(make_cloud([(1.0, 1.0, 1.0)], frame_id=BODY_FRAME))
+    buffer.error = RuntimeError("buffer torn down")
+    timer.callback()  # must not raise: it would end spin()
+
+    assert repo.get_latest() is None
+    assert not timer.armed
 
 
 def test_cloud_frame_without_a_tf_parent_is_dropped_before_any_lookup(wire, repo):

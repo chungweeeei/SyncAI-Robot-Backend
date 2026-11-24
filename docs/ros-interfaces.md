@@ -329,4 +329,9 @@ zero-velocity watchdog).
 executor instead of adding another GIL-contending thread): the process's one
 `/tf` + `/tf_static` subscription, whose buffer brings `body_cloud`, the robot's
 telemetry pose and the local costmap / plan into `map`, and `LandmarkGateway`'s
-sightings (so `main.py` builds it before the gateways).
+sightings (so `main.py` builds it before the gateways). The `body_cloud`
+callback never waits on a lookup (it did, 50 ms, until 2026-11): a scan that
+arrives before the `odom -> body` of its own stamp is held, thinned, and sent by
+a 20 ms timer in the same callback group once that transform is in — or on the
+latest `odom -> body` when the next scan arrives first, placed off by the
+robot's motion since rather than not drawn.

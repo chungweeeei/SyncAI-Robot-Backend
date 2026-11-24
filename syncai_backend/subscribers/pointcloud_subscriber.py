@@ -9,7 +9,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 
-from tf2_ros import LookupException, TransformException
+from tf2_ros import ExtrapolationException, LookupException, TransformException
 from tf2_ros.buffer import Buffer
 
 from syncai_backend.subscribers import qos
@@ -22,6 +22,15 @@ from syncai_backend.helpers.pointcloud import (
 )
 
 
+# How often a scan held for its TF is tried again. A scan and the odom->body
+# stamped with it leave pointlio together, so the wait is one delivery, not one
+# scan period.
+PENDING_RETRY_PERIOD_S = 0.02
+# Tries before a held scan goes out on the latest transform anyway: the last
+# scan of a stream has no next scan to push it out, and the timer must stop.
+PENDING_MAX_RETRIES = 10
+
+
 class PointCloudSubscriber:
     """Feed the frontend 3D viewer two clouds from ROS.
 
@@ -32,6 +41,12 @@ class PointCloudSubscriber:
        from the cloud header and the live tree, so renames need no change here
        as long as the cloud's frame has exactly ONE TF parent. Packed into the
        single-slot repo the WS router drains.
+
+    The callback never waits for TF. A scan that arrives before the odom->body
+    of its own stamp (about one in five) is held, thinned, in a one-scan slot
+    and sent by a timer once that transform is in; if the next scan arrives
+    first, it goes out on the latest odom->body instead (off by the robot's
+    motion since, rather than not drawn).
 
     The stored map cloud is read from ``map/<name>/map.pcd`` on request, not
     cached here.
@@ -58,6 +73,13 @@ class PointCloudSubscriber:
 
         # {cloud source frame: its TF parent}, so a rename resolves afresh.
         self._fixed_frames: dict[str, str] = {}
+
+        # The one scan waiting for the odom->body of its stamp: (points in the
+        # source frame, source frame, stamp), or None. Touched only by the two
+        # callbacks of the one MutuallyExclusive group, so it needs no lock.
+        self._pending = None
+        self._pending_retries = 0
+        self._retry_timer = None
 
     def _resolve_fixed_frame(self, source_frame: str) -> str:
         """The TF parent of ``source_frame`` — where _cloud_cb splits the chain.
@@ -90,15 +112,22 @@ class PointCloudSubscriber:
 
     def register(self, node: Node):
         # Own MutuallyExclusive group, so a busy scan can't starve other
-        # callbacks, and so _cloud_cb's blocking lookup is safe: /tf is in the
-        # default group, serviced by another executor thread.
+        # callbacks, and shared with the retry timer, so the two never run at
+        # once and a held scan is sent before the scan after it.
+        group = MutuallyExclusiveCallbackGroup()
         node.create_subscription(
             msg_type=PointCloud2,
             topic="pointlio/body_cloud",
             callback=self._cloud_cb,
             qos_profile=qos.best_effort(depth=5),
-            callback_group=MutuallyExclusiveCallbackGroup(),
+            callback_group=group,
         )
+        # Runs only while a scan is held: armed by _hold, cancelled when the
+        # slot empties.
+        self._retry_timer = node.create_timer(
+            PENDING_RETRY_PERIOD_S, self._retry_pending, callback_group=group
+        )
+        self._retry_timer.cancel()
 
     def _cloud_cb(self, msg: PointCloud2):
 
@@ -109,55 +138,136 @@ class PointCloudSubscriber:
         if points.shape[0] == 0:
             return
 
-        # Thin BEFORE transforming, so the transform touches the fewest points.
+        # Thin BEFORE transforming, so the transform touches the fewest points
+        # (and a held scan is the thinned one).
         points = voxel_downsample(points=points, voxel_size=self._voxel_size)
         points = cap_points(points=points, max_points=self._max_points)
 
+        # A scan still held when the next one arrives has waited a whole scan
+        # period: send it on the latest odom->body rather than not at all.
+        self._flush_pending()
+
         source_frame = msg.header.frame_id
-        if source_frame != self._target_frame:
+        if source_frame == self._target_frame:
+            self._publish(points, source_frame)
+            return
+
+        stamp = rclpy.time.Time.from_msg(msg.header.stamp)
+        try:
+            tf = self._lookup_at(source_frame, stamp)
+        except ExtrapolationException:
+            # The scan is ahead of /tf: its odom->body has not been filed yet.
+            # (A stamp older than the buffer raises the same; it then goes out
+            # on the latest transform with the next scan, or is dropped there.)
+            self._hold(points, source_frame, stamp)
+            return
+        except TransformException as exc:
+            self._tf_unavailable(source_frame, exc)
+            return
+
+        self._publish(self._transformed(points, tf), source_frame)
+
+    def _lookup_at(self, source_frame: str, stamp: rclpy.time.Time):
+        """map <- ``source_frame`` for a scan stamped ``stamp``; never blocks.
+
+        lookup_transform_full, NOT a single-time lookup: the two halves of
+        map->body are valid at different times.
+         - All at the cloud stamp always extrapolates: the localizer's
+           map->pointlio_odom lags ~100 ms, so every frame drops.
+         - All at Time() places each scan at the CURRENT pose and smears a
+           moving robot's cloud.
+        So split at the odom frame: map <- odom @ Time() (the slow ICP
+        correction), odom <- body @ the stamp (this scan's pose).
+
+        No timeout: a lookup that waited for /tf held this callback group for
+        up to 50 ms a scan. The scan waits in _pending instead.
+        """
+        fixed_frame = self._resolve_fixed_frame(source_frame)
+        return self._tf_buffer.lookup_transform_full(
+            target_frame=self._target_frame,
+            target_time=rclpy.time.Time(),
+            source_frame=source_frame,
+            source_time=stamp,
+            fixed_frame=fixed_frame,
+        )
+
+    def _hold(self, points, source_frame: str, stamp: rclpy.time.Time):
+        self._pending = (points, source_frame, stamp)
+        self._pending_retries = 0
+        if self._retry_timer is not None:
+            self._retry_timer.reset()
+
+    def _clear_pending(self):
+        self._pending = None
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+
+    def _retry_pending(self):
+        """Timer: send the held scan if the transform of its stamp is in."""
+        if self._pending is None:
+            self._clear_pending()
+            return
+        try:
+            points, source_frame, stamp = self._pending
             try:
-                # lookup_transform_full, NOT a single-time lookup: the two
-                # halves of map->body are valid at different times.
-                #  - All at the cloud stamp always extrapolates: the localizer's
-                #    map->pointlio_odom lags ~100 ms, so every frame drops.
-                #  - All at Time() places each scan at the CURRENT pose and
-                #    smears a moving robot's cloud.
-                # So split at the odom frame: map <- odom @ Time() (the slow ICP
-                # correction), odom <- body @ msg.header.stamp (this scan's pose).
-                #
-                # The timeout covers the cloud arriving before /tf has filed its
-                # odom->body (~20% of frames otherwise). Safe to block: see
-                # register().
-                fixed_frame = self._resolve_fixed_frame(source_frame)
-                tf = self._tf_buffer.lookup_transform_full(
-                    target_frame=self._target_frame,
-                    target_time=rclpy.time.Time(),
-                    source_frame=source_frame,
-                    source_time=rclpy.time.Time.from_msg(msg.header.stamp),
-                    fixed_frame=fixed_frame,
-                    timeout=rclpy.duration.Duration(seconds=0.05),
-                )
+                tf = self._lookup_at(source_frame, stamp)
+            except ExtrapolationException:
+                self._pending_retries += 1
+                if self._pending_retries >= PENDING_MAX_RETRIES:
+                    self._flush_pending()
+                return  # else not yet; the timer comes round again
             except TransformException as exc:
-                if self._cloud_tf_available is not False:
-                    self._logger.warning(
-                        "body_cloud frames dropping: TF unavailable "
-                        "(localizer up? map->pointlio_odom comes from "
-                        "syncai_localizer once it has pointlio's cloud + odom)",
-                        target_frame=self._target_frame,
-                        source_frame=source_frame,
-                        error=str(exc),
-                    )
-                    self._cloud_tf_available = False
+                self._clear_pending()
+                self._tf_unavailable(source_frame, exc)
                 return
+            self._clear_pending()
+            self._publish(self._transformed(points, tf), source_frame)
+        except Exception as exc:
+            # Never out of a timer callback: it would end spin() and the process.
+            self._clear_pending()
+            self._logger.warning("held body_cloud frame dropped", error=str(exc))
 
-            t = tf.transform.translation
-            q = tf.transform.rotation
-            points = transform_points(
-                points=points,
-                translation=np.array([t.x, t.y, t.z]),
-                quat_xyzw=np.array([q.x, q.y, q.z, q.w]),
+    def _flush_pending(self):
+        """Send the held scan now: at its own stamp, else on the latest TF."""
+        if self._pending is None:
+            return
+        points, source_frame, stamp = self._pending
+        self._clear_pending()
+        try:
+            try:
+                tf = self._lookup_at(source_frame, stamp)
+            except ExtrapolationException:
+                tf = self._tf_buffer.lookup_transform(
+                    self._target_frame, source_frame, rclpy.time.Time()
+                )
+        except TransformException as exc:
+            self._tf_unavailable(source_frame, exc)
+            return
+        self._publish(self._transformed(points, tf), source_frame)
+
+    @staticmethod
+    def _transformed(points, tf):
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        return transform_points(
+            points=points,
+            translation=np.array([t.x, t.y, t.z]),
+            quat_xyzw=np.array([q.x, q.y, q.z, q.w]),
+        )
+
+    def _tf_unavailable(self, source_frame: str, exc: Exception):
+        if self._cloud_tf_available is not False:
+            self._logger.warning(
+                "body_cloud frames dropping: TF unavailable "
+                "(localizer up? map->pointlio_odom comes from "
+                "syncai_localizer once it has pointlio's cloud + odom)",
+                target_frame=self._target_frame,
+                source_frame=source_frame,
+                error=str(exc),
             )
+            self._cloud_tf_available = False
 
+    def _publish(self, points, source_frame: str):
         if self._cloud_tf_available is not True:
             self._logger.info(
                 "body_cloud streaming to frontend",

@@ -22,8 +22,9 @@ class TfListener:
 
         self.buffer = Buffer()
         # spin_thread=False: serviced by the node's executor (no extra thread),
-        # in the default callback group, so PointCloudSubscriber can block on a
-        # lookup in its own group without starving the transforms it awaits.
+        # in the default callback group. No consumer waits on a lookup: one that
+        # misses (PointCloudSubscriber's scan ahead of its odom->body) holds its
+        # data and asks again.
         # Held on self to make ownership visible.
         self._listener = TransformListener(self.buffer, node, spin_thread=False)
 
