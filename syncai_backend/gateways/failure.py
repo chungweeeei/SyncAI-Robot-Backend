@@ -73,6 +73,16 @@ class Failure(str, Enum):
     # of it and ask again (the bound is MAX_OFF_AXIS_RAD).
     LANDMARK_OFF_AXIS = "landmark_off_axis"
 
+    # RobotGateway.set_robot_state: the robot refused to be marked IDLE because
+    # the localizer has not converged (or was never heard from: the mapping
+    # session runs none), so there is no estimate to confirm. A 409 with the
+    # robot's sentence: the next step is setting a pose, not a retry.
+    NOT_CONVERGED = "not_converged"
+    # RobotGateway.set_robot_state: any other refusal (a target that is not a
+    # commandable state, or a code a newer interface added). A 409; the service
+    # not answering at all stays untagged and is the 502.
+    ROBOT_STATE_REFUSED = "robot_state_refused"
+
 
 class FailureMessage(str):
     """Operator-facing prose carrying an optional machine-readable ``code``.

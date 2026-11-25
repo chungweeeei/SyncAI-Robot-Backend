@@ -195,6 +195,20 @@ def test_no_map_loaded_is_409_before_any_detect(stubs):
     assert stubs.gateway.calls == []
 
 
+def test_a_robot_that_is_not_reporting_is_not_called_unlocalized(stubs):
+    # No fresh sample (never received, or aged out in RobotRepo): the same
+    # code, since the storey is just as unknown, but not a sentence that
+    # sends the operator to set a pose on a robot whose state service is down.
+    stubs.robot_repo.state = None
+
+    response = stubs.client.post(URL)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "not_localized"
+    assert "not reporting its state" in response.json()["detail"]
+    assert stubs.gateway.calls == []
+
+
 @pytest.mark.parametrize("state", [None, _StubRobotRepo.localized(z=0.0, valid=False)])
 def test_not_localized_is_409_before_any_detect(stubs, state):
     stubs.robot_repo.state = state

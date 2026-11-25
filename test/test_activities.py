@@ -35,6 +35,12 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     PatrolParams,
     SpeakParams,
 )
+from syncai_backend.tasks.task_admission import (  # noqa: E402
+    TaskAdmission,
+    TaskAdmissionRequest,
+    TaskEnd,
+    TaskOutcome,
+)
 from syncai_backend.services.map_usage import MapUsagePolicy  # noqa: E402
 from syncai_backend.temporal.activities import RobotActivities  # noqa: E402
 
@@ -60,7 +66,19 @@ def map_catalog_repo():
 
 
 @pytest.fixture
-def activities(logger, robot_gw, tts_gw, map_catalog_repo) -> RobotActivities:
+def robot_repo():
+    """The latest robot_state sample, as the position check reads it: a
+    confirmed robot unless a test says otherwise."""
+    repo = MagicMock()
+    repo.status.return_value = "IDLE"
+    repo.state_message.return_value = ""
+    # Only read without a fresh sample: how long the robot has been silent.
+    repo.sample_age.return_value = 0.2
+    return repo
+
+
+@pytest.fixture
+def activities(logger, robot_gw, tts_gw, map_catalog_repo, robot_repo) -> RobotActivities:
     return RobotActivities(
         logger=logger,
         robot_gw=robot_gw,
@@ -74,6 +92,7 @@ def activities(logger, robot_gw, tts_gw, map_catalog_repo) -> RobotActivities:
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
+        robot_repo=robot_repo,
     )
 
 
@@ -323,6 +342,137 @@ class TestMoveMapCheck:
         result = env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
 
         assert result.success is True
+
+
+class TestMovePositionCheck:
+    """The robot's own state, asked again before every navigation goal:
+    begin_task answered when the run started, and the operator's confirmation
+    can be withdrawn while it runs."""
+
+    def test_an_unconfirmed_robot_never_gets_a_goal(
+        self, env, activities, robot_gw, robot_repo
+    ):
+        robot_repo.status.return_value = "UNINITIALIZED"
+
+        with pytest.raises(ApplicationError, match="no longer confirmed") as exc_info:
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
+
+        # Retrying cannot confirm a position; an operator does.
+        assert exc_info.value.non_retryable is True
+        assert exc_info.value.type == "not_initialized"
+        robot_gw.move.assert_not_called()
+
+    @pytest.mark.parametrize("status", ["IDLE", "RUNNING", "CHARGING", "WARNING"])
+    def test_any_other_fresh_reading_drives(
+        self, env, activities, robot_gw, robot_repo, status
+    ):
+        robot_repo.status.return_value = status
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        result = env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert result.success is True
+
+    def test_a_robot_that_went_quiet_gets_no_goal_but_the_step_is_retried(
+        self, env, activities, robot_gw, robot_repo
+    ):
+        # The last sample aged out: nobody is vouching for the position, so
+        # the goal stays here. Retryable, unlike a fresh UNINITIALIZED: a
+        # dropped frame or a restarting state node is back within the step's
+        # three attempts far more often than not.
+        robot_repo.status.return_value = None
+        robot_repo.sample_age.return_value = 6.3
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
+
+        assert exc_info.value.type == "robot_state_stale"
+        assert exc_info.value.non_retryable is False
+        assert "has not reported its state for 6 seconds" in exc_info.value.message
+        robot_gw.move.assert_not_called()
+
+    def test_a_robot_never_heard_from_gets_no_goal_either(
+        self, env, activities, robot_gw, robot_repo
+    ):
+        robot_repo.status.return_value = None
+        robot_repo.sample_age.return_value = None
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        assert exc_info.value.type == "robot_state_stale"
+        assert exc_info.value.non_retryable is False
+        assert "has not reported its state yet" in exc_info.value.message
+        robot_gw.move.assert_not_called()
+
+    @pytest.mark.parametrize("activity_name", ["execute_charge", "execute_patrol"])
+    def test_a_charge_and_a_patrol_are_held_back_the_same(
+        self, env, activities, robot_gw, robot_repo, activity_name
+    ):
+        robot_repo.status.return_value = None
+        robot_repo.sample_age.return_value = 4.0
+        args = (
+            (_patrol_params(), "lab", "step-0", 0)
+            if activity_name == "execute_patrol"
+            else (MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
+        )
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(getattr(activities, activity_name), *args)
+
+        assert exc_info.value.type == "robot_state_stale"
+        assert exc_info.value.non_retryable is False
+        robot_gw.move.assert_not_called()
+        robot_gw.patrol.assert_not_called()
+
+    def test_a_fresh_reading_never_asks_how_long_the_robot_was_silent(
+        self, env, activities, robot_gw, robot_repo
+    ):
+        robot_gw.move.return_value = (True, "", "goal-1")
+        robot_gw.get_move_status.return_value = {"goal_id": "goal-1", "state": "succeeded"}
+
+        env.run(activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0))
+
+        robot_repo.sample_age.assert_not_called()
+
+    def test_a_charge_is_refused_the_same(self, env, activities, robot_gw, robot_repo):
+        robot_repo.status.return_value = "UNINITIALIZED"
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_charge, MoveParams(x=0.0, y=0.0, theta=0.0), "lab")
+
+        assert exc_info.value.type == "not_initialized"
+        robot_gw.move.assert_not_called()
+
+    def test_a_patrol_is_refused_the_same(self, env, activities, robot_gw, robot_repo):
+        robot_repo.status.return_value = "UNINITIALIZED"
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(activities.execute_patrol, _patrol_params(), "lab", "step-0", 0)
+
+        assert exc_info.value.type == "not_initialized"
+        assert exc_info.value.non_retryable is True
+        robot_gw.patrol.assert_not_called()
+
+    def test_another_map_is_said_first(self, env, activities, robot_gw, robot_repo):
+        # A switch both loads another map and withdraws the confirmation; the
+        # map is the one the operator can act on by name.
+        robot_repo.status.return_value = "UNINITIALIZED"
+
+        with pytest.raises(ApplicationError) as exc_info:
+            env.run(
+                activities.execute_move, MoveParams(x=0.0, y=0.0, theta=0.0), "warehouse"
+            )
+
+        assert exc_info.value.type == "map_mismatch"
+
+    def test_a_posture_is_not_asked(self, env, activities, robot_gw, robot_repo):
+        # Standing up needs no position.
+        robot_repo.status.return_value = "UNINITIALIZED"
+        robot_gw.set_motion_key.return_value = (True, "")
+
+        assert env.run(activities.execute_stand).success is True
 
 
 class TestExecuteCharge:
@@ -914,6 +1064,7 @@ class TestResolveTemplate:
             task_record_repo=MagicMock(),
             task_template_repo=task_template_repo,
             map_repo=map_repo,
+            robot_repo=MagicMock(),
         )
 
     @staticmethod
@@ -982,3 +1133,145 @@ class TestResolveTemplate:
 
     def test_a_template_that_is_gone_answers_none(self, resolver):
         assert resolver.resolve_template("0f2b8a34-6c11-4d0e-9f52-1a9b7c3d4e55") is None
+
+
+class TestBeginTask:
+    """The robot's answer is the activity's RESULT; only "no answer" raises.
+    Temporal retries what raises, and a refusal asked again is the same
+    refusal three times."""
+
+    def test_an_accepted_run_is_answered_accepted(self, env, activities, robot_gw):
+        robot_gw.begin_task.return_value = (True, "", "Task accepted.")
+
+        admission = env.run(
+            activities.begin_task,
+            TaskAdmissionRequest(task_id="task-1", needs_localization=True),
+        )
+
+        assert admission == TaskAdmission(accepted=True, code="", message="Task accepted.")
+        robot_gw.begin_task.assert_called_once_with(
+            task_id="task-1", needs_localization=True
+        )
+
+    @pytest.mark.parametrize("code", ["not_initialized", "error_latched", "robot_busy"])
+    def test_a_refusal_is_returned_not_raised(self, env, activities, robot_gw, code):
+        robot_gw.begin_task.return_value = (False, code, "The robot said no.")
+
+        admission = env.run(
+            activities.begin_task,
+            TaskAdmissionRequest(task_id="task-1", needs_localization=False),
+        )
+
+        assert admission == TaskAdmission(
+            accepted=False, code=code, message="The robot said no."
+        )
+
+    def test_no_answer_is_raised_retryable(self, env, activities, robot_gw):
+        # The service is idempotent per task_id, so asking again is safe, and
+        # a robot_state that is just coming up must be given the chance.
+        robot_gw.begin_task.return_value = (None, "", "begin_task service is not available")
+
+        with pytest.raises(ApplicationError, match="did not answer") as exc_info:
+            env.run(
+                activities.begin_task,
+                TaskAdmissionRequest(task_id="task-1", needs_localization=True),
+            )
+
+        assert exc_info.value.non_retryable is False
+
+    def test_an_attempt_outlasts_the_gateways_wait(self):
+        # An attempt must end on the gateway's "no answer" (retried), not on a
+        # start_to_close timeout with the question still out.
+        from syncai_backend.gateways.robot.robot import TASK_STATE_CALL_BUDGET_S
+        from syncai_backend.temporal.workflows import BEGIN_TASK_START_TO_CLOSE
+
+        assert BEGIN_TASK_START_TO_CLOSE.total_seconds() > TASK_STATE_CALL_BUDGET_S
+
+    def test_every_attempt_fits_before_the_run_fails_closed(self):
+        from syncai_backend.gateways.robot.robot import TASK_STATE_CALL_BUDGET_S
+        from syncai_backend.temporal.workflows import (
+            BEGIN_TASK_ATTEMPTS,
+            BEGIN_TASK_TIMEOUT,
+            TASK_STATE_RETRY_INTERVAL,
+        )
+
+        worst = (
+            BEGIN_TASK_ATTEMPTS * TASK_STATE_CALL_BUDGET_S
+            + (BEGIN_TASK_ATTEMPTS - 1) * TASK_STATE_RETRY_INTERVAL.total_seconds()
+        )
+        assert worst < BEGIN_TASK_TIMEOUT.total_seconds()
+
+
+class TestEndTask:
+    def test_reports_the_outcome_and_the_reason(self, env, activities, robot_gw):
+        robot_gw.end_task.return_value = (True, "Task ended.")
+
+        env.run(
+            activities.end_task,
+            TaskEnd(task_id="task-1", outcome=TaskOutcome.FAILED, reason="no route"),
+        )
+
+        robot_gw.end_task.assert_called_once_with(
+            task_id="task-1", outcome=TaskOutcome.FAILED, reason="no route"
+        )
+
+    def test_a_robot_that_was_not_counting_the_run_is_not_an_error(
+        self, env, activities, robot_gw
+    ):
+        # A robot whose state node restarted mid-task has forgotten the run;
+        # asking again gets the same answer, so this is done, not retried.
+        robot_gw.end_task.return_value = (False, "No such task is running.")
+
+        result = env.run(
+            activities.end_task,
+            TaskEnd(task_id="task-1", outcome=TaskOutcome.COMPLETED),
+        )
+
+        assert result is None
+        assert robot_gw.end_task.call_count == 1
+
+    def test_no_answer_is_raised_retryable(self, env, activities, robot_gw):
+        # Unreported, the robot counts the run as RUNNING and refuses every
+        # task after it.
+        robot_gw.end_task.return_value = (None, "Timeout waiting for end_task response")
+
+        with pytest.raises(ApplicationError, match="did not answer") as exc_info:
+            env.run(
+                activities.end_task,
+                TaskEnd(task_id="task-1", outcome=TaskOutcome.CANCELED),
+            )
+
+        assert exc_info.value.non_retryable is False
+
+    def test_the_release_after_an_unanswered_begin_is_on_begins_budget(self):
+        # A run already failing closed must not be held open by end_task's
+        # minute to tell a dead state service about it.
+        from syncai_backend.gateways.robot.robot import TASK_STATE_CALL_BUDGET_S
+        from syncai_backend.temporal.workflows import (
+            BEGIN_TASK_TIMEOUT,
+            END_TASK_TIMEOUT,
+            RELEASE_TASK_ATTEMPTS,
+            RELEASE_TASK_TIMEOUT,
+            TASK_STATE_RETRY_INTERVAL,
+        )
+
+        worst = (
+            RELEASE_TASK_ATTEMPTS * TASK_STATE_CALL_BUDGET_S
+            + (RELEASE_TASK_ATTEMPTS - 1) * TASK_STATE_RETRY_INTERVAL.total_seconds()
+        )
+        assert worst < RELEASE_TASK_TIMEOUT.total_seconds()
+        assert RELEASE_TASK_TIMEOUT <= BEGIN_TASK_TIMEOUT < END_TASK_TIMEOUT
+
+    def test_every_attempt_fits_before_the_run_closes_without_it(self):
+        from syncai_backend.gateways.robot.robot import TASK_STATE_CALL_BUDGET_S
+        from syncai_backend.temporal.workflows import (
+            END_TASK_ATTEMPTS,
+            END_TASK_TIMEOUT,
+            TASK_STATE_RETRY_INTERVAL,
+        )
+
+        worst = (
+            END_TASK_ATTEMPTS * TASK_STATE_CALL_BUDGET_S
+            + (END_TASK_ATTEMPTS - 1) * TASK_STATE_RETRY_INTERVAL.total_seconds()
+        )
+        assert worst < END_TASK_TIMEOUT.total_seconds()

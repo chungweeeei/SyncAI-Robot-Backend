@@ -56,6 +56,21 @@ What is pinned:
   (one before it started does not), and every run, however it ends, hands
   ``record_task`` its TaskRecord as it closes -- without that activity ever
   changing how the run ends.
+* Admission (``begin_task`` / ``end_task``, the robot's own state machine):
+  every run asks the robot before its first step -- a scheduled one after it
+  has read its template, since what it asks depends on the steps it will run
+  -- and an accepted run reports its end exactly once, however it ends, before
+  its record. A refusal fails the run at once on the first step that would
+  have run (never a SKIPPED one), with the robot's sentence and code, and
+  reports nothing. No answer after three tries fails the run the same way,
+  but is not a "no": the robot may have accepted and lost only its answer, so
+  that case alone is followed by one best-effort ``end_task(CANCELED)``. The
+  reason a FAILED report carries is the failure's sentence, without the
+  error-type prefix a step's ``error_msg`` stores. A cancel while either
+  call is out does not strand it: the answer to begin_task is waited for, and
+  the report is still made. A paused run reports nothing. Histories recorded
+  before the gate (``test/fixtures/workflow_histories/pre_task_admission``)
+  still replay.
 
 Deliberately not covered: the unknown-step-type guard in the dispatch table.
 ``Step`` validation rejects anything outside ``StepType`` before a task can
@@ -70,6 +85,8 @@ is cheaper than sharing one event loop across tests would be worth.
 """
 
 import asyncio
+import glob
+import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Optional
@@ -83,7 +100,7 @@ from temporalio.api.enums.v1 import IndexedValueType  # noqa: E402
 from temporalio.api.operatorservice.v1 import (  # noqa: E402
     AddSearchAttributesRequest,
 )
-from temporalio.client import WorkflowFailureError  # noqa: E402
+from temporalio.client import WorkflowFailureError, WorkflowHistory  # noqa: E402
 from temporalio.common import (  # noqa: E402
     SearchAttributePair,
     TypedSearchAttributes,
@@ -114,16 +131,37 @@ from syncai_backend.tasks.schema import (  # noqa: E402
     WaitParams,
     WorkflowTask,
     WorkflowTaskDefinition,
+    continuation_steps,
 )
 from syncai_backend.tasks.search_attributes import (  # noqa: E402
     TASK_KIND_KEY,
     TASK_MAP_KEY,
     TASK_NAME_KEY,
 )
+from syncai_backend.helpers.task_guard import (  # noqa: E402
+    ERROR_LATCHED,
+    NOT_INITIALIZED,
+    ROBOT_BUSY,
+    ROBOT_STATE_STALE,
+    ROBOT_STATE_UNREACHABLE,
+    UNREACHABLE_MESSAGE,
+    goal_refusal,
+)
+from syncai_backend.tasks.task_admission import (  # noqa: E402
+    TaskAdmission,
+    TaskAdmissionRequest,
+    TaskEnd,
+    TaskOutcome,
+)
 from syncai_backend.tasks.template_resolution import ResolvedTemplate  # noqa: E402
 from syncai_backend.temporal.activities import ActivityResult  # noqa: E402
 from syncai_backend.temporal.worker import HEARTBEAT_THROTTLE_MAX  # noqa: E402
-from syncai_backend.temporal.workflows import RobotWorkflow  # noqa: E402
+from syncai_backend.temporal.workflows import (  # noqa: E402
+    BEGIN_TASK_ATTEMPTS,
+    END_TASK_REASON_MAX,
+    RELEASE_TASK_ATTEMPTS,
+    RobotWorkflow,
+)
 
 # Same shape the production worker derives from robot_id; the value itself is
 # arbitrary here since client and worker share it within one test.
@@ -233,15 +271,56 @@ def _recorder(records: list):
     return record_task
 
 
+def _admitter(answer=None, asked: Optional[list] = None, events: Optional[list] = None):
+    """A ``begin_task`` answering ``answer``: accepted when None, raised when an
+    exception, and a list is one answer per call (the last one repeated), so a
+    test can drop the first call and answer the second.
+
+    ``asked`` keeps every request; ``events`` gets a ``"begin_task"`` per call,
+    for a test that pins the order across activities.
+    """
+    answers = list(answer) if isinstance(answer, list) else [answer]
+
+    @activity.defn(name="begin_task")
+    async def begin_task(request: TaskAdmissionRequest) -> TaskAdmission:
+        if asked is not None:
+            asked.append(request)
+        if events is not None:
+            events.append("begin_task")
+        current = answers.pop(0) if len(answers) > 1 else answers[0]
+        if isinstance(current, BaseException):
+            raise current
+        return current if current is not None else TaskAdmission(accepted=True)
+
+    return begin_task
+
+
+def _closer(ended: list, events: Optional[list] = None):
+    """An ``end_task`` that keeps what every run hands it."""
+
+    @activity.defn(name="end_task")
+    async def end_task(report: TaskEnd) -> None:
+        ended.append(report)
+        if events is not None:
+            events.append("end_task")
+
+    return end_task
+
+
 @asynccontextmanager
-async def _worker(activities, io_activities=None, record_task=None):
+async def _worker(
+    activities, io_activities=None, record_task=None, begin_task=None, end_task=None
+):
     """A time-skipping environment with a worker polling TASK_QUEUE.
 
     The client is built with ``pydantic_data_converter`` to mirror
     ``run_worker`` — the default converter cannot serialize WorkflowTask.
     ``io_activities`` (SPEAK) get a second worker on IO_TASK_QUEUE, the way
     run_worker splits them, always beside a ``record_task`` (a discarding
-    one unless given): every run ends with it. Both cap the heartbeat
+    one unless given): every run ends with it. And beside a ``begin_task``
+    that accepts and an ``end_task`` that discards, unless given: every run
+    starts by asking the robot, and with nothing registered to answer it
+    would fail closed before its first step. Both workers cap the heartbeat
     throttle as run_worker does: a cancel rides a heartbeat's reply, and left
     at the SDK default (0.8 x heartbeat_timeout) SPEAK's 75 s window would
     hold one for a minute.
@@ -260,7 +339,12 @@ async def _worker(activities, io_activities=None, record_task=None):
             async with Worker(
                 env.client,
                 task_queue=IO_TASK_QUEUE,
-                activities=list(io_activities or []) + [record_task or _recorder([])],
+                activities=list(io_activities or [])
+                + [
+                    record_task or _recorder([]),
+                    begin_task or _admitter(),
+                    end_task or _closer([]),
+                ],
                 max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
             ):
                 yield env.client
@@ -2085,3 +2169,825 @@ def test_a_run_without_a_template_never_asks_for_one():
     assert failure is None
     assert asked == []
     assert len(calls) == 1
+
+
+# --- Admission: the robot is asked before a run starts, and told how it ended --
+
+
+_PRE_ADMISSION_HISTORIES = os.path.join(
+    os.path.dirname(__file__), "fixtures", "workflow_histories", "pre_task_admission"
+)
+
+
+def _order(events: list) -> list:
+    """``events`` as activity names: the step stand-ins append ``(name, arg)``."""
+    return [event if isinstance(event, str) else event[0] for event in events]
+
+
+def _ordered_recorder(records: list, events: list):
+    """``_recorder`` that also marks its place among the other activities."""
+
+    @activity.defn(name="record_task")
+    async def record_task(record: TaskRecord) -> None:
+        records.append(record)
+        events.append("record_task")
+
+    return record_task
+
+
+def _refused(code: str, message: str = "The robot refused.") -> TaskAdmission:
+    return TaskAdmission(accepted=False, code=code, message=message)
+
+
+def _run_admission(task, answer=None, body=None):
+    """Run ``task`` to its end with every activity recording into one list.
+
+    ``answer`` is begin_task's (see ``_admitter``); ``body(events)`` builds the
+    body activities when the instant ones will not do. Returns the activity
+    order, begin_task's requests, end_task's reports, the records, the final
+    steps and the run's failure (None when it completed).
+    """
+
+    async def scenario():
+        events: list = []
+        asked: list = []
+        ended: list = []
+        records: list = []
+        async with _worker(
+            body(events) if body is not None else _instant_activities(events),
+            record_task=_ordered_recorder(records, events),
+            begin_task=_admitter(answer, asked, events),
+            end_task=_closer(ended, events),
+        ) as client:
+            handle = await _start(client, task)
+            failure = None
+            try:
+                await asyncio.wait_for(handle.result(), timeout=30)
+            except WorkflowFailureError as err:
+                failure = err
+            steps = await handle.query(RobotWorkflow.get_step_states)
+        return _order(events), asked, ended, records, steps, failure
+
+    return asyncio.run(scenario())
+
+
+async def _cancel_and_let_it_land(handle, timeout: float = 10.0) -> None:
+    """Cancel the run and return once the workflow has been handed the cancel.
+
+    ``handle.cancel()`` only records the request; the workflow meets it in its
+    next workflow task. A test that then releases a parked activity would
+    otherwise race the two, and pin whichever happened to win. The run's own
+    history says when: a workflow task completed after the request.
+    """
+    await handle.cancel()
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        requested = False
+        history = await handle.fetch_history()
+        for event in history.events:
+            if event.HasField("workflow_execution_cancel_requested_event_attributes"):
+                requested = True
+            elif requested and event.HasField("workflow_task_completed_event_attributes"):
+                return
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("the workflow never processed the cancel")
+        await asyncio.sleep(0.05)
+
+
+def test_a_run_asks_the_robot_before_its_first_step_and_reports_its_end_once():
+    order, asked, ended, records, steps, failure = _run_admission(
+        _task("task-admitted", StepType.MOVE, StepType.STANDUP)
+    )
+
+    assert failure is None
+    # The robot before anything moves; the robot again before the report, so
+    # it is released without waiting for an insert.
+    assert order == [
+        "begin_task", "execute_move", "execute_stand", "end_task", "record_task",
+    ]
+    # The id is the run's own workflow id: what end_task is matched on.
+    assert asked == [
+        TaskAdmissionRequest(task_id="task-admitted", needs_localization=True)
+    ]
+    assert ended == [
+        TaskEnd(task_id="task-admitted", outcome=TaskOutcome.COMPLETED, reason="")
+    ]
+    assert [step.status for step in steps] == [StepStatus.COMPLETED] * 2
+
+
+@pytest.mark.parametrize(
+    "step_types,needs",
+    [
+        ((StepType.STANDUP, StepType.WAIT, StepType.LIEDOWN), False),
+        ((StepType.MOVE,), True),
+        ((StepType.CHARGE,), True),
+        ((StepType.PATROL,), True),
+        ((StepType.STANDUP, StepType.PATROL), True),
+    ],
+    ids=["postures-and-wait", "move", "charge", "patrol", "posture-then-patrol"],
+)
+def test_begin_task_says_whether_the_run_drives(step_types, needs):
+    # Refused, so the run stops there: only the question is under test.
+    _, asked, _, _, _, _ = _run_admission(
+        _task("task-needs", *step_types), answer=_refused(ROBOT_BUSY)
+    )
+
+    assert [request.needs_localization for request in asked] == [needs]
+
+
+def test_a_skipped_step_does_not_make_a_continuation_need_a_position():
+    # A Retry whose failed MOVE is behind it: only the LIEDOWN is left, and an
+    # unconfirmed robot must still take it.
+    task = _task("task-continued-no-nav", StepType.MOVE, StepType.LIEDOWN)
+    task.definition.steps[0].status = StepStatus.SKIPPED
+
+    order, asked, _, _, _, failure = _run_admission(task)
+
+    assert failure is None
+    assert asked[0].needs_localization is False
+    assert order == ["begin_task", "execute_lie_down", "end_task", "record_task"]
+
+
+def _failing_move_body(message: str):
+    def body(events: list):
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams) -> ActivityResult:
+            events.append(("execute_move", params))
+            raise ApplicationError(message, non_retryable=True)
+
+        return [execute_move] + _instant_activities(events)[1:]
+
+    return body
+
+
+def test_a_failed_run_reports_failed_once_with_the_failed_steps_error():
+    order, _, ended, records, steps, failure = _run_admission(
+        _task("task-end-failed", StepType.STANDUP, StepType.MOVE, StepType.LIEDOWN),
+        body=_failing_move_body("move ended in aborted: no route"),
+    )
+
+    assert failure is not None
+    assert order == [
+        "begin_task", "execute_stand", "execute_move", "end_task", "record_task",
+    ]
+    # FAILED is what latches ERROR on the robot; the reason is what the
+    # console shows while it is locked.
+    assert [(report.task_id, report.outcome) for report in ended] == [
+        ("task-end-failed", TaskOutcome.FAILED)
+    ]
+    assert ended[0].reason == steps[1].error_msg
+    assert "no route" in ended[0].reason
+    assert records[0].status == "FAILED"
+
+
+def test_the_reported_reason_is_cut_to_one_sentences_worth():
+    _, _, ended, _, steps, _ = _run_admission(
+        _task("task-end-long", StepType.MOVE),
+        body=_failing_move_body("x" * (END_TASK_REASON_MAX * 3)),
+    )
+
+    assert len(steps[0].error_msg) > END_TASK_REASON_MAX
+    assert len(ended[0].reason) == END_TASK_REASON_MAX
+
+
+@pytest.mark.parametrize("step_type", [StepType.MOVE, StepType.STANDUP])
+def test_a_canceled_run_reports_canceled_once(step_type):
+    """Both shapes a cancel reaches the run in (a MOVE's asyncio.CancelledError,
+    a posture's ActivityError): the operator's cancel and the safety lock's are
+    the same workflow cancel, and neither may latch ERROR."""
+
+    async def scenario():
+        ended: list = []
+        records: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        gated = (
+            _gated_move(started, release)
+            if step_type is StepType.MOVE
+            else _gated_stand(started, release)
+        )
+        task = _task(f"task-end-canceled-{step_type.value}", step_type)
+
+        async with _worker(
+            [gated], record_task=_recorder(records), end_task=_closer(ended)
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+            return ended, records, exc_info.value
+
+    ended, records, err = asyncio.run(scenario())
+
+    assert isinstance(err.cause, CancelledError)
+    assert [report.outcome for report in ended] == [TaskOutcome.CANCELED]
+    assert ended[0].reason == ""
+    assert records[0].status == "CANCELED"
+
+
+@pytest.mark.parametrize("code", [ERROR_LATCHED, NOT_INITIALIZED, ROBOT_BUSY])
+def test_a_refused_run_fails_at_once_and_reports_nothing(code):
+    message = f"The robot said no ({code})."
+
+    order, asked, ended, records, steps, failure = _run_admission(
+        _task("task-refused", StepType.MOVE, StepType.STANDUP),
+        answer=_refused(code, message),
+    )
+
+    # Nothing ran, and above all no end_task: a refusal changed nothing on the
+    # robot, and a FAILED reported for it would latch ERROR on a robot that
+    # was merely unconfirmed, or busy with another run. Not the best-effort
+    # CANCELED an unanswered begin gets either: the robot ANSWERED, and said no.
+    assert order == ["begin_task", "record_task"]
+    assert ended == []
+    # Asked once: a refusal is an answer, never retried.
+    assert len(asked) == 1
+    # The run fails with the robot's own sentence and its code, non-retryably.
+    assert isinstance(failure.cause, ApplicationError)
+    assert failure.cause.type == code
+    assert failure.cause.non_retryable is True
+    assert failure.cause.message == message
+    assert steps[0].status is StepStatus.FAILED
+    assert steps[0].error_msg == message
+    assert steps[1].status is StepStatus.PENDING
+    assert records[0].status == "FAILED"
+
+
+def test_a_refused_continuation_fails_its_first_step_that_would_run():
+    task = _task(
+        "task-refused-continued", StepType.STANDUP, StepType.MOVE, StepType.LIEDOWN
+    )
+    task.definition.steps[0].status = StepStatus.SKIPPED
+
+    _, _, ended, _, steps, failure = _run_admission(
+        task, answer=_refused(NOT_INITIALIZED, "Confirm the position first.")
+    )
+
+    assert failure is not None and ended == []
+    # Not steps[0]: marked FAILED, the next Retry would start from it and run
+    # the STANDUP the first run had already completed.
+    assert [step.status for step in steps] == [
+        StepStatus.SKIPPED, StepStatus.FAILED, StepStatus.PENDING,
+    ]
+    assert steps[0].error_msg == ""
+    assert steps[1].error_msg == "Confirm the position first."
+    _, from_step_id = continuation_steps(steps)
+    assert from_step_id == "step-1"
+
+
+def test_one_unanswered_begin_task_is_asked_again_and_the_run_goes_on():
+    order, asked, ended, _, _, failure = _run_admission(
+        _task("task-begin-retried", StepType.STANDUP),
+        answer=[ApplicationError("The robot did not answer begin_task"), None],
+    )
+
+    assert failure is None
+    # The same id both times: the robot accepts its own retry again instead of
+    # refusing it robot_busy against itself.
+    assert [request.task_id for request in asked] == ["task-begin-retried"] * 2
+    assert order == [
+        "begin_task", "begin_task", "execute_stand", "end_task", "record_task",
+    ]
+    assert [report.outcome for report in ended] == [TaskOutcome.COMPLETED]
+
+
+def test_a_robot_that_never_answers_fails_the_run_closed():
+    order, asked, ended, records, steps, failure = _run_admission(
+        _task("task-begin-dead", StepType.MOVE, StepType.STANDUP),
+        answer=ApplicationError("The robot did not answer begin_task"),
+    )
+
+    assert len(asked) == BEGIN_TASK_ATTEMPTS
+    # No step ran. One end_task follows, before the record: see the next test.
+    assert order == ["begin_task"] * BEGIN_TASK_ATTEMPTS + ["end_task", "record_task"]
+    assert failure.cause.type == ROBOT_STATE_UNREACHABLE
+    assert failure.cause.non_retryable is True
+    # The operator's sentence, with no node or service name in it.
+    assert steps[0].status is StepStatus.FAILED
+    assert steps[0].error_msg == UNREACHABLE_MESSAGE
+    assert "begin_task" not in steps[0].error_msg
+    assert steps[1].status is StepStatus.PENDING
+    assert records[0].status == "FAILED"
+
+
+def test_an_unanswered_begin_task_is_released_with_one_canceled_report():
+    """No answer is not "no": the request may have landed, been accepted, and
+    lost only its answer. The run then fails closed believing itself
+    unadmitted while the robot counts it as RUNNING, refusing every task after
+    it. One end_task closes that, and is a no-op on a robot that never accepted
+    (matched by task_id). CANCELED, never FAILED: this must latch nothing."""
+    _, _, ended, _, _, failure = _run_admission(
+        _task("task-begin-lost", StepType.MOVE),
+        answer=ApplicationError("The robot did not answer begin_task"),
+    )
+
+    assert ended == [
+        TaskEnd(task_id="task-begin-lost", outcome=TaskOutcome.CANCELED, reason="")
+    ]
+    # And the run still ends as it was going to.
+    assert failure.cause.type == ROBOT_STATE_UNREACHABLE
+
+
+def test_a_release_the_robot_never_takes_does_not_change_how_the_run_ends():
+    # The likeliest unanswered begin: the state service is down, and the
+    # release goes unanswered too. Tried on begin's short budget, then dropped.
+    async def scenario():
+        attempts: list = []
+        records: list = []
+
+        @activity.defn(name="end_task")
+        async def end_task(report: TaskEnd) -> None:
+            attempts.append(report)
+            raise ApplicationError("The robot did not answer end_task")
+
+        task = _task("task-all-dead", StepType.STANDUP)
+        async with _worker(
+            _instant_activities([]),
+            record_task=_recorder(records),
+            begin_task=_admitter(ApplicationError("The robot did not answer begin_task")),
+            end_task=end_task,
+        ) as client:
+            handle = await _start(client, task)
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=30)
+            return attempts, records, exc_info.value
+
+    attempts, records, failure = asyncio.run(scenario())
+
+    assert len(attempts) == RELEASE_TASK_ATTEMPTS
+    assert {report.outcome for report in attempts} == {TaskOutcome.CANCELED}
+    assert failure.cause.type == ROBOT_STATE_UNREACHABLE
+    assert records[0].status == "FAILED"
+
+
+@pytest.mark.parametrize(
+    "error_type", ["not_initialized", "map_mismatch"],
+)
+def test_the_reported_reason_is_the_sentence_without_the_error_type(error_type):
+    """The robot quotes the reason in its own sentence ("A task failed:
+    <reason>. Release the error ...") and the console prints that verbatim, so
+    a code in front of it would be shown to the operator. The step keeps the
+    string it always stored: the history and the console's own rewriting of a
+    failure read that one."""
+    sentence = "The robot's position is no longer confirmed, so it will not drive."
+
+    def body(events: list):
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams) -> ActivityResult:
+            # What _refuse_unconfirmed_position / _refuse_wrong_map raise.
+            raise ApplicationError(sentence, type=error_type, non_retryable=True)
+
+        return [execute_move] + _instant_activities(events)[1:]
+
+    _, _, ended, records, steps, _ = _run_admission(
+        _task(f"task-reason-{error_type}", StepType.MOVE), body=body
+    )
+
+    assert [report.outcome for report in ended] == [TaskOutcome.FAILED]
+    assert ended[0].reason == sentence
+    # Unchanged, prefix included, on the step and in the record.
+    assert steps[0].error_msg == f"{error_type}: {sentence}"
+    assert records[0].steps[0].error_msg == f"{error_type}: {sentence}"
+
+
+def test_a_failure_with_no_sentence_of_its_own_falls_back_to_the_steps_error():
+    # A result that says success=False carries no cause; the step's error is
+    # then all there is.
+    def body(events: list):
+        @activity.defn(name="execute_stand")
+        async def execute_stand() -> ActivityResult:
+            return ActivityResult(success=False, state="aborted")
+
+        return [execute_stand]
+
+    _, _, ended, _, steps, _ = _run_admission(
+        _task("task-reason-fallback", StepType.STANDUP), body=body
+    )
+
+    assert steps[0].error_msg == "activity failed"
+    assert ended[0].reason == "activity failed"
+
+
+def _gated_admitter(started: asyncio.Event, release: asyncio.Event, answer=None):
+    """A ``begin_task`` that parks until released: the question is with the
+    robot and the answer has not come."""
+
+    @activity.defn(name="begin_task")
+    async def begin_task(request: TaskAdmissionRequest) -> TaskAdmission:
+        started.set()
+        await release.wait()
+        if isinstance(answer, BaseException):
+            # ...and never does: every attempt after the release fails too.
+            raise answer
+        return answer if answer is not None else TaskAdmission(accepted=True)
+
+    return begin_task
+
+
+def _cancel_during_begin(task_id: str, answer=None):
+    async def scenario():
+        calls: list = []
+        ended: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        task = _task(task_id, StepType.STANDUP, StepType.LIEDOWN)
+
+        async with _worker(
+            _instant_activities(calls),
+            begin_task=_gated_admitter(started, release, answer),
+            end_task=_closer(ended),
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await _cancel_and_let_it_land(handle)
+            # Only now does the robot answer: the run must still be listening.
+            release.set()
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=10)
+            steps = await handle.query(RobotWorkflow.get_step_states)
+            return calls, ended, steps, exc_info.value
+
+    return asyncio.run(scenario())
+
+
+def test_a_cancel_while_begin_task_is_out_waits_for_the_answer_and_closes_it():
+    calls, ended, steps, err = _cancel_during_begin("task-cancel-in-begin")
+
+    assert isinstance(err.cause, CancelledError)
+    # The robot had accepted: it counts the run as RUNNING, so the cancelled
+    # run still owes it an end. Dropped, every later task would be robot_busy.
+    assert ended == [
+        TaskEnd(task_id="task-cancel-in-begin", outcome=TaskOutcome.CANCELED)
+    ]
+    # And nothing ran: the cancel was the run's outcome, not the first step's.
+    assert calls == []
+    assert [step.status for step in steps] == [StepStatus.PENDING] * 2
+
+
+def test_a_cancel_while_begin_task_is_out_owes_nothing_when_the_robot_refuses():
+    calls, ended, steps, err = _cancel_during_begin(
+        "task-cancel-in-refused-begin", answer=_refused(ERROR_LATCHED)
+    )
+
+    # The operator's cancel is the outcome; the refusal only means there is
+    # nothing to close.
+    assert isinstance(err.cause, CancelledError)
+    assert ended == []
+    assert calls == []
+    assert [step.status for step in steps] == [StepStatus.PENDING] * 2
+
+
+def test_a_cancel_while_an_unanswered_begin_task_is_out_releases_the_robot():
+    calls, ended, steps, err = _cancel_during_begin(
+        "task-cancel-in-lost-begin",
+        answer=ApplicationError("The robot did not answer begin_task"),
+    )
+
+    # Still the operator's cancel, not a failure...
+    assert isinstance(err.cause, CancelledError)
+    # ...and since nobody knows whether the robot took the run, it is told.
+    assert ended == [
+        TaskEnd(task_id="task-cancel-in-lost-begin", outcome=TaskOutcome.CANCELED)
+    ]
+    assert calls == []
+    assert [step.status for step in steps] == [StepStatus.PENDING] * 2
+
+
+def test_a_cancel_while_end_task_is_out_does_not_drop_the_report():
+    async def scenario():
+        ended: list = []
+        records: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+
+        @activity.defn(name="end_task")
+        async def end_task(report: TaskEnd) -> None:
+            started.set()
+            await release.wait()
+            ended.append(report)
+
+        task = _task("task-cancel-in-end", StepType.STANDUP)
+        async with _worker(
+            _instant_activities([]), record_task=_recorder(records), end_task=end_task
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            await _cancel_and_let_it_land(handle)
+            release.set()
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return ended, records, await handle.describe()
+
+    ended, records, description = asyncio.run(scenario())
+
+    # The report was made, once, and the run closed as what it was: its steps
+    # had all completed before the cancel arrived.
+    assert [report.outcome for report in ended] == [TaskOutcome.COMPLETED]
+    assert description.status.name == "COMPLETED"
+    assert records[0].status == "COMPLETED"
+
+
+def test_a_report_the_robot_never_takes_does_not_fail_the_run():
+    async def scenario():
+        attempts: list = []
+        records: list = []
+
+        @activity.defn(name="end_task")
+        async def end_task(report: TaskEnd) -> None:
+            attempts.append(report)
+            raise ApplicationError("The robot did not answer end_task")
+
+        task = _task("task-end-broken", StepType.STANDUP)
+        async with _worker(
+            _instant_activities([]), record_task=_recorder(records), end_task=end_task
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(handle.result(), timeout=30)
+            return attempts, records, await handle.describe()
+
+    attempts, records, description = asyncio.run(scenario())
+
+    # Retried, since a report that never lands leaves the robot RUNNING; then
+    # dropped, since the run's outcome is not the robot's to hold open.
+    assert len(attempts) == 5
+    assert description.status.name == "COMPLETED"
+    assert records[0].status == "COMPLETED"
+
+
+def test_a_paused_run_reports_nothing_until_it_ends():
+    async def scenario():
+        asked: list = []
+        ended: list = []
+        started, release = asyncio.Event(), asyncio.Event()
+        task = _task("task-paused-admitted", StepType.MOVE)
+
+        async with _worker(
+            [_gated_move(started, release)],
+            begin_task=_admitter(None, asked),
+            end_task=_closer(ended),
+        ) as client:
+            handle = await _start(client, task)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            started.clear()
+            await handle.signal(RobotWorkflow.pause)
+            await _statuses_until(handle, lambda s: s[0] is StepStatus.PAUSED)
+            while_held = (list(asked), list(ended))
+
+            await handle.signal(RobotWorkflow.resume)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            release.set()
+            await asyncio.wait_for(handle.result(), timeout=10)
+            return while_held, asked, ended
+
+    (asked_held, ended_held), asked, ended = asyncio.run(scenario())
+
+    # Held, the run is still the robot's running task: no end, and the resume
+    # does not ask again either.
+    assert len(asked_held) == 1 and ended_held == []
+    assert len(asked) == 1
+    assert [report.outcome for report in ended] == [TaskOutcome.COMPLETED]
+
+
+def _run_scheduled_admission(task, template, answer=None):
+    """A template-backed scheduled run, with every activity in one order."""
+
+    async def scenario():
+        events: list = []
+        asked: list = []
+        ended: list = []
+        records: list = []
+
+        @activity.defn(name="resolve_template")
+        async def resolve_template(task_template_id: str) -> Optional[ResolvedTemplate]:
+            events.append("resolve_template")
+            return template
+
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams, expected_map=None) -> ActivityResult:
+            events.append(("execute_move", params))
+            return ActivityResult(success=True, state="succeeded")
+
+        async with _worker(
+            [execute_move] + _instant_activities(events)[1:],
+            io_activities=[resolve_template],
+            record_task=_ordered_recorder(records, events),
+            begin_task=_admitter(answer, asked, events),
+            end_task=_closer(ended, events),
+        ) as client:
+            await _register_name_and_map(client)
+            handle = await client.start_workflow(
+                RobotWorkflow.run,
+                task,
+                id=task.id,
+                task_queue=TASK_QUEUE,
+                search_attributes=TypedSearchAttributes(
+                    [
+                        SearchAttributePair(TASK_NAME_KEY, "Old name"),
+                        SearchAttributePair(TASK_MAP_KEY, "lab"),
+                    ]
+                ),
+            )
+            failure = None
+            try:
+                await asyncio.wait_for(handle.result(), timeout=30)
+            except WorkflowFailureError as err:
+                failure = err
+            return _order(events), asked, ended, failure
+
+    return asyncio.run(scenario())
+
+
+def test_a_scheduled_run_asks_the_robot_about_the_steps_it_reads_from_its_template():
+    """The one gate a run a Schedule starts by itself ever meets. Asked after
+    the template is read: the snapshot only stands up, the template now drives."""
+    edited = ResolvedTemplate(
+        name="Morning round",
+        map_name="lab",
+        steps=[
+            Step(id="1-move", type=StepType.MOVE, params=MoveParams(x=7.0, y=8.0, theta=0.0)),
+        ],
+    )
+
+    order, asked, ended, failure = _run_scheduled_admission(
+        _scheduled("sched-admitted", StepType.STANDUP), edited
+    )
+
+    assert failure is None
+    assert order == [
+        "resolve_template", "begin_task", "execute_move", "end_task", "record_task",
+    ]
+    assert asked == [
+        TaskAdmissionRequest(task_id="sched-admitted", needs_localization=True)
+    ]
+    assert [report.outcome for report in ended] == [TaskOutcome.COMPLETED]
+
+
+def test_a_scheduled_run_whose_template_no_longer_drives_needs_no_position():
+    edited = ResolvedTemplate(
+        name="Stand", map_name=None, steps=[Step(id="1-stand", type=StepType.STANDUP)]
+    )
+
+    _, asked, _, failure = _run_scheduled_admission(
+        _scheduled("sched-no-nav", StepType.MOVE), edited
+    )
+
+    assert failure is None
+    assert asked[0].needs_localization is False
+
+
+def test_a_schedule_firing_during_another_run_is_refused_and_reports_nothing():
+    """What used to be admitted and interleave its steps with the running
+    task's: the robot answers robot_busy, the run fails on its first step and
+    never reaches end_task, so the task that IS running keeps the robot."""
+    template = ResolvedTemplate(
+        name="Round",
+        map_name="lab",
+        steps=[
+            Step(id="1-move", type=StepType.MOVE, params=MoveParams(x=1.0, y=1.0, theta=0.0)),
+        ],
+    )
+
+    order, _, ended, failure = _run_scheduled_admission(
+        _scheduled("sched-busy", StepType.MOVE),
+        template,
+        answer=_refused(ROBOT_BUSY, "The robot is running another task."),
+    )
+
+    assert order == ["resolve_template", "begin_task", "record_task"]
+    assert ended == []
+    assert failure.cause.type == ROBOT_BUSY
+
+
+def test_a_template_refused_for_its_map_never_asks_the_robot():
+    refused = ResolvedTemplate(
+        name="Round",
+        map_name="warehouse",
+        steps=[
+            Step(id="1-move", type=StepType.MOVE, params=MoveParams(x=1.0, y=1.0, theta=0.0)),
+        ],
+        refusal="This job's positions are on the map 'warehouse'.",
+    )
+
+    order, asked, ended, failure = _run_scheduled_admission(
+        _scheduled("sched-wrong-map", StepType.MOVE), refused
+    )
+
+    assert failure is not None
+    assert order == ["resolve_template", "record_task"]
+    assert asked == [] and ended == []
+
+
+def _quiet_robot_body(stale_attempts: int):
+    """A MOVE whose position check finds no fresh robot_state sample on its
+    first ``stale_attempts`` attempts: what RobotActivities raises then, built
+    from the same rule (task_guard.goal_refusal), so its type, sentence and
+    retryability are the real ones."""
+
+    def body(events: list):
+        @activity.defn(name="execute_move")
+        async def execute_move(params: MoveParams) -> ActivityResult:
+            attempt = activity.info().attempt
+            events.append(("execute_move", attempt))
+            if attempt <= stale_attempts:
+                refusal = goal_refusal(None, silent_for_s=3.0 + 5.0 * attempt)
+                raise ApplicationError(
+                    refusal.message,
+                    type=refusal.code,
+                    non_retryable=not refusal.retryable,
+                )
+            return ActivityResult(success=True, state="succeeded")
+
+        return [execute_move] + _instant_activities(events)[1:]
+
+    return body
+
+
+def test_a_robot_that_goes_quiet_and_speaks_again_does_not_fail_the_move():
+    """A few seconds without a robot_state frame is far more often a hiccup
+    than a dead node: the refusal is retryable, so the step's own retry policy
+    (three attempts) outlasts it and the run goes on."""
+    order, _, ended, _, steps, failure = _run_admission(
+        _task("task-quiet-then-back", StepType.MOVE, StepType.STANDUP),
+        body=_quiet_robot_body(stale_attempts=2),
+    )
+
+    assert failure is None
+    assert order == [
+        "begin_task", "execute_move", "execute_move", "execute_move",
+        "execute_stand", "end_task", "record_task",
+    ]
+    assert [step.status for step in steps] == [StepStatus.COMPLETED] * 2
+    assert [report.outcome for report in ended] == [TaskOutcome.COMPLETED]
+
+
+def test_a_robot_that_stays_quiet_fails_the_run_with_a_sentence():
+    order, _, ended, records, steps, failure = _run_admission(
+        _task("task-quiet-for-good", StepType.MOVE, StepType.STANDUP),
+        body=_quiet_robot_body(stale_attempts=99),
+    )
+
+    # Three attempts of the MOVE, never the STANDUP after it.
+    assert order == [
+        "begin_task", "execute_move", "execute_move", "execute_move",
+        "end_task", "record_task",
+    ]
+    assert failure is not None
+    assert steps[0].status is StepStatus.FAILED
+    # The step keeps the typed string, as every activity failure does...
+    assert steps[0].error_msg.startswith(f"{ROBOT_STATE_STALE}: The robot has not")
+    assert steps[1].status is StepStatus.PENDING
+    assert records[0].status == "FAILED"
+    # ...and the robot is told why in a sentence it can quote to the operator:
+    # the last attempt's, with how long it had been by then, and no prefix.
+    assert [report.outcome for report in ended] == [TaskOutcome.FAILED]
+    assert ended[0].reason == (
+        "The robot has not reported its state for 18 seconds, so it was not "
+        "sent a navigation goal. Check that the robot's software is running "
+        "and start the task again."
+    )
+
+
+def test_a_refused_run_replays_deterministically():
+    async def scenario():
+        task = _task("task-refused-replay", StepType.MOVE)
+        async with _worker(
+            _instant_activities([]), begin_task=_admitter(_refused(NOT_INITIALIZED))
+        ) as client:
+            handle = await _start(client, task)
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+            history = await handle.fetch_history()
+
+        await Replayer(
+            workflows=[RobotWorkflow], data_converter=pydantic_data_converter
+        ).replay_workflow(history)
+
+    asyncio.run(scenario())
+
+
+_PRE_ADMISSION_RUNS = ["canceled_mid_move", "completed", "continued", "failed", "scheduled"]
+
+
+def test_the_pre_admission_fixtures_are_the_ones_replayed():
+    # A fixture nobody replays pins nothing; one that already holds a
+    # begin_task was not recorded before the gate.
+    paths = sorted(glob.glob(os.path.join(_PRE_ADMISSION_HISTORIES, "*.json")))
+
+    assert [os.path.basename(path)[: -len(".json")] for path in paths] == _PRE_ADMISSION_RUNS
+    for path in paths:
+        with open(path) as recorded:
+            assert "begin_task" not in recorded.read()
+
+
+@pytest.mark.parametrize("name", _PRE_ADMISSION_RUNS)
+def test_a_run_from_before_the_gate_replays_without_it(name):
+    """Histories recorded from the workflow as it was before begin_task /
+    end_task (commit 721783c, temporalio 1.35.0): a run in flight across the
+    deploy, and every closed run the console still queries for its steps,
+    replays through the new code. TASK_ADMISSION_PATCH is what lets it: no
+    marker in the history, so the replay schedules neither activity."""
+    with open(os.path.join(_PRE_ADMISSION_HISTORIES, f"{name}.json")) as recorded:
+        history = WorkflowHistory.from_json(f"pre-admission-{name}", recorded.read())
+
+    asyncio.run(
+        Replayer(
+            workflows=[RobotWorkflow], data_converter=pydantic_data_converter
+        ).replay_workflow(history)
+    )

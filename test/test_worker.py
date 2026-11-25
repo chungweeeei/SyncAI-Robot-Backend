@@ -103,7 +103,7 @@ def _stub_temporal(monkeypatch):
 
 
 def _activities():
-    # run_worker only forwards the six activity methods into Worker, which is
+    # run_worker only forwards the activity methods into Worker, which is
     # stubbed here, so a MagicMock quacks well enough.
     return MagicMock()
 
@@ -132,7 +132,8 @@ def test_connect_retries_then_runs():
 def test_body_and_io_activities_poll_separate_queues():
     """MOVE and the postures share one slot on the queue the workflow runs on;
     SPEAK gets several on the IO queue, so a grouped SPEAK is not stuck behind
-    a MOVE's slot."""
+    a MOVE's slot -- and so do the two calls to the robot's state machine, so a
+    second run's begin_task is answered while the first one drives."""
     activities = _activities()
     asyncio.run(
         run_worker(
@@ -154,7 +155,14 @@ def test_body_and_io_activities_poll_separate_queues():
         activities.execute_speak,
         activities.record_task,
         activities.resolve_template,
+        activities.begin_task,
+        activities.end_task,
     ]
+    # begin_task above all: on the one-slot body queue a schedule firing during
+    # another run's MOVE would wait out that MOVE for the robot's answer
+    # instead of failing robot_busy at once.
+    assert activities.begin_task not in body["activities"]
+    assert activities.end_task not in body["activities"]
     assert io["max_concurrent_activities"] == worker_mod.IO_ACTIVITY_SLOTS > 1
 
 
@@ -195,6 +203,7 @@ def test_worker_run_dying_marks_dead():
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
+        robot_repo=MagicMock(),
     )
     handle.thread.join(timeout=10)
 
@@ -306,6 +315,7 @@ def _start(monkeypatch):
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
+        robot_repo=MagicMock(),
     )
 
 
@@ -345,6 +355,7 @@ def test_request_shutdown_after_the_worker_died_answers_at_once():
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
+        robot_repo=MagicMock(),
     )
     handle.thread.join(timeout=10)
 
@@ -368,6 +379,7 @@ def test_request_shutdown_reports_a_worker_that_will_not_stop(monkeypatch):
         task_record_repo=MagicMock(),
         task_template_repo=MagicMock(),
         map_repo=MagicMock(),
+        robot_repo=MagicMock(),
     )
 
     # False, not a hang: main.py shuts down anyway and says so.

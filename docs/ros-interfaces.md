@@ -6,7 +6,7 @@
 
 | Topic | Type | QoS | Goes to |
 |---|---|---|---|
-| `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state`; `low_level_mode.safety_state` → `SafetyLockService` (rising edge cancels every task) |
+| `robot_state` | `syncai_common/RobotState` | BEST_EFFORT, depth 3 | `RobotRepo` → `GET /api/v1/robot/state`, and its `state` → the task guard (`helpers/task_guard.py`: the dispatch's advisory 409 and the check before every navigation goal); `low_level_mode.safety_state` → `SafetyLockService` (rising edge cancels every task) |
 | `odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed with TF `map→odom` → telemetry WS (x, y, yaw; z from `pointlio/lio_odom`, see [*Telemetry*](rest-api.md)) |
 | `pointlio/lio_odom` | `nav_msgs/Odometry` | BEST_EFFORT, depth 5 | composed through `map→pointlio_odom` and the lidar mount → telemetry WS: the whole pose while mapping, base_link's height in AUTO |
 | `motor_states_low_rate` | `syncai_common/MotorStates` | BEST_EFFORT, depth 5 | reduced to `{joint: radians}` → telemetry WS. driver_manager's 20 Hz copy of `motor_states` (~200 Hz) |
@@ -88,7 +88,13 @@ somebody decides otherwise. That has been decided three times:
   also hid battery, `low_level_mode` and above all `mode` exactly when they
   matter (the mapping console was blind). Pose honesty is kept by the field
   instead: gate on `localization_valid`, not on a 404, which now only means
-  `robot_state` has never published.
+  there is no **fresh** sample: `robot_state` has never published (`code`
+  `robot_state_unavailable`), or its last sample is older than
+  `ROBOT_STATE_MAX_AGE_S`, 3 s (`robot_state_stale`). `RobotRepo` ages every
+  sample out on read — three periods of the shipped 1 Hz, so two dropped
+  BEST_EFFORT frames are not a dead robot — for every reader alike: the state
+  route, the task guard (dispatch 409 and the per-goal check) and the
+  landmark route.
 - **`low_level_mode`** — the gait controller's own state machine, which the
   console cannot otherwise read: `set_motion_key` / `set_policy_mode` are one-way
   UDP whose 200 only means a datagram went out. It is decoded to **labels only**
@@ -100,11 +106,23 @@ somebody decides otherwise. That has been decided three times:
   codes apart.
 - **`state`** (2026-11-18) — `RobotStatus` as its constant's name
   (`UNINITIALIZED` / `IDLE` / `RUNNING` / `WARNING` / `ERROR` / `CHARGING`,
-  `UNKNOWN` for any other code), widened in when syncai_robot_state began
-  deriving `CHARGING` from the driver's `power_supply_status`. It is a rollup,
-  one value at a time, most-severe-first (`UNINITIALIZED` > `CHARGING` >
-  `WARNING` > `IDLE`): a robot on its charger before relocalization reads
-  `UNINITIALIZED`. `RUNNING` / `ERROR` are declared but never emitted.
+  `UNKNOWN` for any other code; the table is `status_name` in
+  `repositories/robot/robot.py`, shared with the task guard), widened in when
+  syncai_robot_state began deriving `CHARGING` from the driver's
+  `power_supply_status`. Since syncai_robot_state took the robot's state
+  machine (2026-11) all six are emitted, and it is a rollup, one value at a
+  time, most-severe-first: `ERROR` > `UNINITIALIZED` > `RUNNING` > `CHARGING` >
+  `WARNING` > `IDLE`. So a `state` that is neither `ERROR` nor `UNINITIALIZED`
+  means an operator has confirmed the position, and no separate flag says so.
+  `UNINITIALIZED` no longer means "no `map → base_link` TF yet" (that is
+  `localization_valid`): the robot boots in it and falls back to it on a map
+  switch and on every new localization guess, until `POST /api/v1/robot/state`.
+- **`state_message`** and **`localization_converged`** (2026-11, the message's
+  two trailing fields; `syncai_common` must carry them or the subscription
+  cannot deserialise) — the state machine's own sentence for `state`, written
+  for an operator, and whether the localizer's latest guess has converged.
+  Both exposed: the console's Confirm control shows the first and is enabled by
+  the second. The sentence also ends the dispatch's `error_latched` 409.
 
 `low_level_mode.safety_locked` is **not the controller's**: it is
 `syncai_driver_manager`'s software safety lock (`RobotLowLevelMode.safety_state`,
@@ -214,7 +232,37 @@ preview a newer one preempted (the planner takes one at a time),
   (`syncai_common/srv`, `syncai_sys_manager`); `set_motion_key` /
   `set_policy_mode` (`syncai_common/srv`) and `set_safety_lock`
   (`std_srvs/SetBool`, replacing the C++ driver's release-only `reset_safety`),
-  all three `syncai_driver_manager`.
+  all three `syncai_driver_manager`; and, since 2026-11, `begin_task` /
+  `end_task` / `set_robot_state` (`syncai_common/srv` `BeginTask` / `EndTask` /
+  `SetRobotState`), all three `syncai_robot_state` and all relative names, so
+  they land on this robot's node:
+  - `begin_task(task_id, needs_localization)` — asked by every run before its
+    first step (the `begin_task` activity). Three-valued in the gateway:
+    accepted, refused with a code (`NOT_INITIALIZED` → `not_initialized`,
+    `ERROR_LATCHED` → `error_latched`, `BUSY` → `robot_busy`; a code this
+    backend has no name for → `robot_state_refused`) and the robot's sentence,
+    or no answer. Waits 2 s for the service and 3 s for the answer
+    (`TASK_STATE_CALL_BUDGET_S`), far under its siblings' 5 s + 10 s, because a
+    schedule firing on a robot whose stack is down should fail in seconds.
+    Idempotent per `task_id` on the robot, which is what makes the activity's
+    retry after a lost answer safe.
+  - `end_task(task_id, outcome, reason)` — reported once by every accepted run
+    (the `end_task` activity); `outcome` is `EndTask.Request.COMPLETED` /
+    `FAILED` / `CANCELED`, never the 0 a default-constructed request carries.
+    `success: false` is an answer (the robot was not counting that id — a
+    repeated report, or a state node restarted mid-task), not a failure to
+    retry.
+  - `set_robot_state(state)` — `POST /api/v1/robot/state`, with
+    `RobotStatus.IDLE` or `UNINITIALIZED`. A refusal's `code` is tagged for the
+    router (`NOT_CONVERGED` → 409 `not_converged`, anything else → 409
+    `robot_state_refused`); the answer's `state` is the rollup after the call.
+    The robot does **not** refuse it while a task runs — it is also the
+    recovery for a workflow terminated from outside, whose `end_task` never
+    comes — so this backend does, from its own job list.
+
+  `syncai_common` must be at or after the SyncAI-Robot-Interface commit that
+  adds the three srvs and `RobotState`'s two trailing fields
+  (`cab2b03`, PR #29); an older one is an ImportError at startup.
 - `MapGateway`:
   - `planner_server/Octo3D/load_map` and `planner_server/Octo3D/load_keepout`
     (`nav2_msgs/LoadMap`, the robot's 3D planner) — a switch points Octo3D at

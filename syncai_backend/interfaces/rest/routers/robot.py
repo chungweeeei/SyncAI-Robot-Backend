@@ -4,7 +4,7 @@ import structlog
 from datetime import datetime
 from enum import Enum
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from syncai_common.msg import RobotMode, RobotState as RobotStateMsg, RobotStatus
@@ -12,7 +12,13 @@ from syncai_common.msg import RobotMode, RobotState as RobotStateMsg, RobotStatu
 from syncai_backend.exceptions import ConflictError, UpstreamError, NotFoundError
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.robot.robot import MotionKey, RobotGateway
-from syncai_backend.repositories.robot.robot import RobotRepo
+from syncai_backend.helpers.task_guard import (
+    ROBOT_STATE_STALE,
+    ROBOT_STATE_UNAVAILABLE,
+    state_silence,
+)
+from syncai_backend.repositories.robot.robot import RobotRepo, status_name
+from syncai_backend.services.map_usage import JobGate
 from syncai_backend.services.mode_restart import ModeRestartService, RestartStatus
 from syncai_backend.services.safety_lock import SafetyLockService
 
@@ -29,21 +35,9 @@ def _mode_to_str(mode: int) -> str:
     return _ROBOT_MODE_TO_STR.get(mode, "UNKNOWN")
 
 
-# Reverse lookup: RobotStatus uint8 constant -> name. All six are listed though
-# syncai_robot_state emits four (RUNNING / ERROR are never derived), so one it
-# starts emitting needs no change here; a code outside the message reads UNKNOWN.
-_ROBOT_STATUS_TO_STR = {
-    RobotStatus.UNINITIALIZED: "UNINITIALIZED",
-    RobotStatus.IDLE: "IDLE",
-    RobotStatus.RUNNING: "RUNNING",
-    RobotStatus.WARNING: "WARNING",
-    RobotStatus.ERROR: "ERROR",
-    RobotStatus.CHARGING: "CHARGING",
-}
-
-
-def _status_to_str(status: int) -> str:
-    return _ROBOT_STATUS_TO_STR.get(status, "UNKNOWN")
+# RobotStatus uint8 -> name is repositories/robot/robot.py's status_name: the
+# task guard reads the same names off the same sample, so the table lives
+# beside the slot rather than in one of its readers.
 
 
 # Reverse lookups for the gait controller's state (RobotState.low_level_mode).
@@ -193,12 +187,34 @@ class RobotState(BaseModel):
     state: str = Field(
         ...,
         description=(
-            "syncai_robot_state's one-word rollup, most-severe-first: "
-            "UNINITIALIZED (not localized; see localization_valid) > CHARGING "
-            "> WARNING (battery low) > IDLE. RUNNING and ERROR are declared "
-            "but not emitted yet; UNKNOWN for a code outside RobotStatus. "
-            "One value at a time: a robot charging before it is localized "
-            "reads UNINITIALIZED."
+            "The robot's state machine, as syncai_robot_state rolls it up, "
+            "most-severe-first: ERROR (a task failed; locked until an operator "
+            "releases it with POST /api/v1/robot/state, every task refused "
+            "meanwhile) > UNINITIALIZED (no operator has confirmed where the "
+            "robot stands, or a map switch or a new pose withdrew that; tasks "
+            "that drive are refused) > RUNNING (a task is running) > CHARGING "
+            "> WARNING (battery low) > IDLE. UNKNOWN for a code outside "
+            "RobotStatus. One value at a time, so anything but ERROR and "
+            "UNINITIALIZED means the position is confirmed; `state_message` "
+            "says why it reads as it does."
+        ),
+    )
+    state_message: str = Field(
+        "",
+        description=(
+            "The robot's own sentence for `state`, written for an operator: "
+            "what failed, for ERROR; what is missing, for UNINITIALIZED."
+        ),
+    )
+    localization_converged: bool = Field(
+        False,
+        description=(
+            "Whether the localizer's latest guess has converged on the loaded "
+            "map: the precondition for confirming the position (POST "
+            "/api/v1/robot/state with IDLE is 409 `not_converged` without "
+            "it). Not the confirmation itself: a boot guess that converges "
+            "leaves `state` UNINITIALIZED until an operator has looked. False "
+            "in the mapping session, which runs no localizer."
         ),
     )
     low_level_mode: RobotLowLevelMode = Field(
@@ -318,6 +334,49 @@ class RestartStatusResponse(BaseModel):
     finished_at: Optional[datetime] = Field(
         None, description="When it ended (UTC); null until then."
     )
+
+
+class RobotStateTarget(str, Enum):
+    """The two states an operator can put the robot in.
+
+    Everything else in RobotStatus (RUNNING, ERROR, WARNING, CHARGING) is
+    derived by the robot and never commanded, so the schema 422s it rather
+    than forward a request syncai_robot_state would refuse INVALID_TARGET.
+    """
+
+    IDLE = "IDLE"
+    UNINITIALIZED = "UNINITIALIZED"
+
+
+# The REST vocabulary is the name; the srv field is the RobotStatus uint8.
+_STATE_TARGET_TO_INT = {
+    RobotStateTarget.IDLE: RobotStatus.IDLE,
+    RobotStateTarget.UNINITIALIZED: RobotStatus.UNINITIALIZED,
+}
+
+
+class SetRobotStateRequest(BaseModel):
+    state: RobotStateTarget = Field(
+        ...,
+        description=(
+            "IDLE: the robot is where the map shows it (the Confirm control); "
+            "refused unless the localizer has converged. UNINITIALIZED: "
+            "withdraw that confirmation. Either also releases a latched ERROR."
+        ),
+    )
+
+
+class SetRobotStateResponse(BaseModel):
+    state: str = Field(
+        ...,
+        description=(
+            "The state the robot reports after the change, as GET "
+            "/api/v1/robot/state names it. The rollup, so not always the "
+            "state asked for: a robot confirmed on its charger answers "
+            "CHARGING, one with a low battery WARNING."
+        ),
+    )
+    message: str = Field(..., description="The robot's sentence for the change.")
 
 
 class SetInitialPoseRequest(BaseModel):
@@ -441,8 +500,39 @@ def init_robot_router(
     robot_gw: RobotGateway,
     restart_svc: ModeRestartService,
     safety_lock_svc: SafetyLockService,
+    job_gate: JobGate,
 ) -> APIRouter:
     robot_router = APIRouter(prefix="", tags=["Robot"])
+
+    # The job gates below are async dependencies in front of plain `def`
+    # routes, as the map routes' job lock is: the Temporal call runs on the
+    # event loop (WorkflowGateway belongs to it) and the route, which blocks
+    # on rclpy, still runs in the threadpool.
+
+    async def refuse_state_change_while_a_job_runs() -> None:
+        # Read from Temporal now, not from the gateway's 1.5 s cache: nothing
+        # stands behind this gate. syncai_robot_state does not refuse the
+        # operator's switch while a task runs -- that is its recovery for a
+        # workflow terminated from outside, whose end_task never comes -- so a
+        # stale "idle" here would clear a task that started a second ago: its
+        # end_task then matches nothing, and a failure latches no ERROR.
+        await job_gate.refuse_while_any_job(
+            "changing the robot's state",
+            "changing the robot's state",
+            fresh=True,
+        )
+
+    async def refuse_initial_pose_while_a_job_runs() -> None:
+        # The same gate as auto-localize and the map switch, for the same
+        # reason and one more: a new pose is a new guess, which withdraws the
+        # operator's confirmation (UNINITIALIZED), so the running task's next
+        # navigation step is refused, the task fails and the robot latches
+        # ERROR -- from one press of a button that looked harmless mid-task.
+        # The cached read is enough here: the navigation step's own check
+        # (RobotActivities._refuse_unconfirmed_position) stands behind it.
+        await job_gate.refuse_while_any_job(
+            "re-seating the robot's pose", "setting the initial pose"
+        )
 
     @robot_router.get("/api/v1/robot/state", response_model=RobotState)
     async def get_robot_state():
@@ -450,18 +540,37 @@ def init_robot_router(
         # WHITELIST, not a mirror, so a field added to the message (or to
         # MotorState) stays internal until someone deliberately exposes it.
         #
-        # None means the robot_state node has never published (404); "not
-        # localized yet" is localization_valid in the payload.
-        state: RobotStateMsg = robot_repo.get_robot_state()
+        # 404 without a fresh sample, two ways, told apart by `code` (the
+        # console draws its state chip from this route and must not show the
+        # last state of a robot that stopped reporting as if it were live):
+        # `robot_state_unavailable` when nothing was ever received,
+        # `robot_state_stale` when the last sample aged out (RobotRepo believes
+        # one for ROBOT_STATE_MAX_AGE_S). "Not localized yet" is neither: that
+        # is localization_valid in the payload.
+        sample = robot_repo.sample()
+        state: Optional[RobotStateMsg] = sample.state
         if state is None:
-            raise NotFoundError("Robot state is not available yet.")
+            if sample.age_s is None:
+                raise NotFoundError(
+                    "Robot state is not available yet.", code=ROBOT_STATE_UNAVAILABLE
+                )
+            raise NotFoundError(
+                f"{state_silence(sample.age_s)}. Check that the robot's "
+                "software is running.",
+                code=ROBOT_STATE_STALE,
+            )
 
         return RobotState(
             timestamp=state.timestamp,
             robot_id=state.robot_id,
             map=state.map,
             mode=_mode_to_str(state.mode),
-            state=_status_to_str(state.state),
+            state=status_name(state.state),
+            # Exposed deliberately (2026-11): the console's Confirm control
+            # needs both, the sentence to say why the robot reads as it does
+            # and the flag to know whether confirming can succeed.
+            state_message=state.state_message,
+            localization_converged=state.localization_converged,
             # Through the fallback dicts, never PolicyMode (it would 500).
             low_level_mode=RobotLowLevelMode(
                 policy=_policy_state_to_str(state.low_level_mode.policy_state),
@@ -494,6 +603,48 @@ def init_robot_router(
                 for motor in state.motor_status.states
             ],
         )
+
+    @robot_router.post(
+        "/api/v1/robot/state",
+        response_model=SetRobotStateResponse,
+        dependencies=[Depends(refuse_state_change_while_a_job_runs)],
+    )
+    def set_robot_state(request: SetRobotStateRequest):
+        """The operator's switch on the robot's state machine
+        (``set_robot_state`` on syncai_robot_state).
+
+        ``IDLE`` confirms that the robot is where the map shows it: the only
+        way out of UNINITIALIZED, which the robot boots in and falls back to
+        on a map switch or any new pose. ``UNINITIALIZED`` withdraws that.
+        Either also releases a latched ERROR (the only way out of it), and
+        clears a task the robot still counts as running.
+
+        That last effect is why this is refused while a job runs, here and not
+        on the robot: 409 ``task_running``, 409 ``tasks_unknown`` when
+        Temporal cannot be asked. 409 ``not_converged`` (the robot's sentence)
+        when IDLE is asked for and the localizer has no converged estimate to
+        confirm; 409 ``robot_state_refused`` for any other refusal; 502 when
+        the robot does not answer. The answer's ``state`` is what the robot
+        reports afterwards.
+
+        Plain ``def``: a ROS round trip.
+        """
+        success, message, state = robot_gw.set_robot_state(
+            state=int(_STATE_TARGET_TO_INT[request.state])
+        )
+        if not success:
+            code = failure_code(message)
+            if code in (Failure.NOT_CONVERGED, Failure.ROBOT_STATE_REFUSED):
+                # The gateway logged the refusal with the robot's code.
+                raise ConflictError(message, code=code.value)
+            logger.error(
+                "Failed to set the robot state",
+                asked=request.state.value,
+                message=message,
+            )
+            raise UpstreamError(message)
+
+        return SetRobotStateResponse(state=status_name(state), message=message)
 
     @robot_router.post("/api/v1/robot/mode", response_model=SwitchModeResponse)
     def switch_mode(request: SwitchModeRequest):
@@ -581,9 +732,16 @@ def init_robot_router(
         )
 
     @robot_router.post(
-        "/api/v1/robot/set_initial_pose", response_model=SetInitialPoseResponse
+        "/api/v1/robot/set_initial_pose",
+        response_model=SetInitialPoseResponse,
+        dependencies=[Depends(refuse_initial_pose_while_a_job_runs)],
     )
     def set_initial_pose(request: SetInitialPoseRequest):
+        # 409 `task_running` / `tasks_unknown` while a job runs (2026-11, the
+        # dependency above). A pose that lands leaves the robot UNINITIALIZED
+        # even once the localizer converges on it: the operator confirms it
+        # with POST /api/v1/robot/state.
+        #
         # Plain `def`: the gateway call blocks on rclpy.
         #
         # REST is degrees everywhere, ROS radians; this is the conversion.

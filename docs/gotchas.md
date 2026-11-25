@@ -45,5 +45,61 @@
 - **A client that drops `name` / `z_min` / `z_max` widens zones.**
   `PUT …/keepout` replaces the whole list, and a zone sent without a band
   covers every floor. Send back what `GET` returned.
+- **The robot boots unconfirmed, and so do its schedules.** Since 2026-11
+  `syncai_robot_state` comes up `UNINITIALIZED` and stays there until an
+  operator confirms the position (`POST /api/v1/robot/state` with `IDLE`) — a
+  boot guess that converges on the last saved pose does not count. Until then
+  every run with a MOVE / PATROL / CHARGE fails on its first step
+  (`not_initialized`), scheduled ones included; a run that only stands, lies
+  down, speaks or waits still goes. A map switch and every new pose put the
+  robot back there.
+- **One failed task stops all the others.** A run that ends `FAILED` latches
+  `ERROR` on the robot (`end_task`, whose `reason` the robot quotes verbatim
+  in the sentence the console shows — keep it a sentence, with no error-type
+  prefix), and every run after it — a posture or a
+  SPEAK too, and every schedule — fails at once (`error_latched`) until an
+  operator releases it with `POST /api/v1/robot/state`. That includes a MOVE
+  that gave up after three tries on a person in the way. A cancel (the
+  operator's, the safety lock's) and a run the robot refused never latch.
+- **A `robot_state` sample is believed for 3 s, then it is no sample.**
+  `RobotRepo` stamps each one on arrival (monotonic clock) and every default
+  read — `get_robot_state()`, `status()`, `state_message()` — answers "none"
+  once it is older than `ROBOT_STATE_MAX_AGE_S` (three periods of
+  syncai_robot_state's 1 Hz, so two dropped best-effort frames are not a dead
+  robot). Until 2026-11 it never aged, and a dead state node's last word went
+  on answering for it. There is no accessor for the last sample whatever its
+  age: no reader has a use for a state nobody is reporting. Raising the
+  publish rate's period means raising this with it.
+- **`POST /api/v1/tasks`' robot-state 409s are advisory.** They read the
+  latest fresh `robot_state` sample, up to 3 s old; a stale one is no sample
+  and passes, because the decision is `begin_task`'s, taken on the robot as
+  the run starts, and it fails closed when the state service is gone.
+- **A navigation goal waits for the robot to speak.** Before every MOVE /
+  PATROL / CHARGE goal, no fresh sample (stale, or never received) holds the
+  goal back as `robot_state_stale` — **retryable**, unlike the fresh
+  `UNINITIALIZED`'s non-retryable `not_initialized`. A few seconds without a
+  frame is more often a hiccup than a dead node, and the step's retry policy
+  (three attempts, 5 s then 10 s) gives it about 15 s to come back; after
+  that the step fails, and the run latches `ERROR` with that sentence. So a
+  restart of `syncai_robot_state` mid-task (a mode switch does one) is
+  survived only if it comes back within those ~15 s.
+- **A new initial pose mid-task is refused, and pause does not lift that.**
+  `POST /api/v1/robot/set_initial_pose` is 409 `task_running` while a job runs,
+  held included: a new pose withdraws the confirmation, so the task's next
+  navigation step would fail and latch `ERROR`. "Pause, re-seat the pose,
+  resume" no longer works — cancel the task first, then set the pose and
+  confirm.
+- **`RUNNING` with no job is a robot nobody released.** A workflow terminated
+  from the Temporal UI never sends `end_task`; the robot then refuses every
+  task `robot_busy`. (A `begin_task` whose answer was lost is not that case any
+  more: the run follows it with a best-effort `end_task(CANCELED)`, and only if
+  that goes unanswered as well is the robot left counting it.)
+  `POST /api/v1/robot/state` clears it — which is exactly why that route is
+  refused while this backend's own job list has a running job, and reads that
+  list fresh.
+- **The backend, `syncai_common` and the robot stack move together.**
+  `RobotState` grew two trailing fields, so a backend built against the new
+  message cannot read an old `syncai_robot_state`'s topic, nor the reverse.
+  Update with no task running; nothing stored needs migrating.
 - The `sqlalchemy` session convention is per-repo: `init_map_repo` creates the
   schema and builds its own `sessionmaker` from the injected engine.

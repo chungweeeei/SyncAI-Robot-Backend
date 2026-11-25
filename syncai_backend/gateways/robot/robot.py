@@ -18,13 +18,16 @@ from syncai_common.action import ComputePathToPose, NavigateThroughGoals, Naviga
 from syncai_common.msg import WifiConnection, WifiNetwork
 from syncai_common.srv import (
     ActivateWifiConnection,
+    BeginTask,
     ConnectWifiNetwork,
     DeleteWifiConnection,
+    EndTask,
     ListWifiConnections,
     RestartMode,
     ScanWifiNetworks,
     SetMotionKey,
     SetPolicyMode,
+    SetRobotState,
     SwitchMode,
 )
 
@@ -41,7 +44,9 @@ from geometry_msgs.msg import (
 
 from syncai_backend.gateways import ros
 from syncai_backend.gateways.failure import Failure, fail
+from syncai_backend.helpers import task_guard
 from syncai_backend.helpers.route_preview import RoutePreview, planned, refused
+from syncai_backend.tasks.task_admission import TaskOutcome
 
 
 class MotionKey(str, Enum):
@@ -122,6 +127,39 @@ NAV_GOAL_SEND_BUDGET_S = NAV_SERVER_WAIT_S + NAV_ACCEPT_WAIT_S
 # flight, so twice that and some. A REST call, not an activity: no heartbeat
 # budget to fit under.
 PREVIEW_RESULT_WAIT_S = 6.0
+
+# How long begin_task() / end_task() wait for syncai_robot_state: for the
+# service to be there, then for its answer. Short on purpose. The answer is a
+# lookup in the node's own state, so one that has not come in 3 s is not coming;
+# and begin_task is what stands between a schedule firing and its first step,
+# so a robot whose stack is down should fail that run in seconds, not after
+# the 5 s + 10 s its sibling calls here allow. Each attempt of the activity
+# must fit under its start_to_close (workflows.BEGIN_TASK_START_TO_CLOSE), and
+# all of end_task's attempts under END_TASK_TIMEOUT; test_activities.py pins
+# both.
+TASK_STATE_SERVICE_WAIT_S = 2.0
+TASK_STATE_RESPONSE_WAIT_S = 3.0
+TASK_STATE_CALL_BUDGET_S = TASK_STATE_SERVICE_WAIT_S + TASK_STATE_RESPONSE_WAIT_S
+
+# BeginTask.Response.code -> the task guard's code for that refusal, which is
+# what the failed run carries as its ApplicationError type. Through a dict with
+# a fallback, as the RobotStatus names are: a code a newer interface adds reads
+# robot_state_refused with the robot's own sentence, never a KeyError that
+# would retry a refusal as if it were a crash.
+_BEGIN_TASK_REFUSALS = {
+    BeginTask.Response.NOT_INITIALIZED: task_guard.NOT_INITIALIZED,
+    BeginTask.Response.ERROR_LATCHED: task_guard.ERROR_LATCHED,
+    BeginTask.Response.BUSY: task_guard.ROBOT_BUSY,
+}
+
+# TaskOutcome -> EndTask.Request.outcome. 0 is deliberately no outcome on the
+# wire (a default-constructed request reports nothing), so there is no fallback
+# here: an outcome without an entry is a bug in this module, and a KeyError.
+_END_TASK_OUTCOMES = {
+    TaskOutcome.COMPLETED: EndTask.Request.COMPLETED,
+    TaskOutcome.FAILED: EndTask.Request.FAILED,
+    TaskOutcome.CANCELED: EndTask.Request.CANCELED,
+}
 
 
 # NavigateToGoal.behavior_tree for a CHARGE (task runner charge.xml, SyncAI-Robot-
@@ -296,6 +334,26 @@ class RobotGateway:
             srv_name="restart_mode",
         )
 
+        # syncai_robot_state's state machine (2026-11): the judge of whether a
+        # task may start, the report of how it ended, and the operator's switch.
+        # Relative like the rest, so each lands on this robot's node only: a
+        # begin_task answered by another robot's state would let a run through
+        # on a robot nobody confirmed.
+        begin_task_client = self._node.create_client(
+            srv_type=BeginTask,
+            srv_name="begin_task",
+        )
+
+        end_task_client = self._node.create_client(
+            srv_type=EndTask,
+            srv_name="end_task",
+        )
+
+        set_robot_state_client = self._node.create_client(
+            srv_type=SetRobotState,
+            srv_name="set_robot_state",
+        )
+
         self._service_clients.update(
             {
                 "scan_wifi": scan_wifi_client,
@@ -308,6 +366,9 @@ class RobotGateway:
                 "set_safety_lock": safety_lock_client,
                 "switch_mode": switch_mode_client,
                 "restart_mode": restart_mode_client,
+                "begin_task": begin_task_client,
+                "end_task": end_task_client,
+                "set_robot_state": set_robot_state_client,
             }
         )
 
@@ -480,6 +541,159 @@ class RobotGateway:
             return False, "Timeout waiting for set_safety_lock response"
 
         return response.success, response.message
+
+    def begin_task(
+        self, task_id: str, needs_localization: bool
+    ) -> Tuple[Optional[bool], str, str]:
+        """Ask the robot whether the run ``task_id`` may start. Three-valued.
+
+        ``(True, "", message)``: accepted, and the robot counts the run as
+        RUNNING from this call on, so it must be closed with ``end_task``.
+        ``(False, code, message)``: refused, with task_guard's code for why
+        (not_initialized / error_latched / robot_busy) and the robot's own
+        sentence; nothing changed on the robot and there is nothing to close.
+        ``(None, "", why)``: no answer -- the service is not there, or did not
+        respond in time. NOT a refusal: the caller retries (the service is
+        idempotent per task_id, so a retry after a lost answer is accepted
+        again rather than refused BUSY against itself) and then fails closed.
+
+        ``needs_localization`` is whether a step the run will execute drives on
+        the map; an unconfirmed robot refuses only those.
+        """
+        client = self._service_clients.get("begin_task")
+        if not client.wait_for_service(timeout_sec=TASK_STATE_SERVICE_WAIT_S):
+            self._logger.warning(
+                "[RobotGateway] begin_task service is not available; the task "
+                "cannot be admitted",
+                task_id=task_id,
+                waited_s=TASK_STATE_SERVICE_WAIT_S,
+            )
+            return None, "", "begin_task service is not available"
+
+        response = ros.call_service(
+            client,
+            BeginTask.Request(task_id=task_id, needs_localization=needs_localization),
+            timeout_s=TASK_STATE_RESPONSE_WAIT_S,
+        )
+        if response is None:
+            self._logger.warning(
+                "[RobotGateway] No answer to begin_task; the task cannot be admitted",
+                task_id=task_id,
+                waited_s=TASK_STATE_RESPONSE_WAIT_S,
+            )
+            return None, "", "Timeout waiting for begin_task response"
+
+        if response.accepted:
+            self._logger.info(
+                "[RobotGateway] The robot accepted the task",
+                task_id=task_id,
+                needs_localization=needs_localization,
+            )
+            return True, "", response.message
+
+        code = _BEGIN_TASK_REFUSALS.get(response.code, task_guard.ROBOT_STATE_REFUSED)
+        self._logger.warning(
+            "[RobotGateway] The robot refused the task",
+            task_id=task_id,
+            needs_localization=needs_localization,
+            code=code,
+            raw_code=int(response.code),
+            message=response.message,
+        )
+        return False, code, response.message
+
+    def end_task(
+        self, task_id: str, outcome: TaskOutcome, reason: str = ""
+    ) -> Tuple[Optional[bool], str]:
+        """Report how the run ``task_id``, accepted by begin_task, ended.
+
+        ``(True, message)``: the robot stopped counting it (and latched ERROR
+        for FAILED, with ``reason`` as what the console shows meanwhile).
+        ``(False, message)``: answered, but the robot was not counting this
+        id -- a repeated report, or a robot whose state node restarted
+        mid-task. A no-op there, and not worth a retry here.
+        ``(None, why)``: no answer; the caller retries, since a report that
+        never lands leaves the robot RUNNING and every later task refused
+        robot_busy until an operator clears it.
+        """
+        client = self._service_clients.get("end_task")
+        if not client.wait_for_service(timeout_sec=TASK_STATE_SERVICE_WAIT_S):
+            self._logger.warning(
+                "[RobotGateway] end_task service is not available; the robot "
+                "still counts the task as running",
+                task_id=task_id,
+                outcome=outcome.value,
+                waited_s=TASK_STATE_SERVICE_WAIT_S,
+            )
+            return None, "end_task service is not available"
+
+        response = ros.call_service(
+            client,
+            EndTask.Request(
+                task_id=task_id, outcome=_END_TASK_OUTCOMES[outcome], reason=reason
+            ),
+            timeout_s=TASK_STATE_RESPONSE_WAIT_S,
+        )
+        if response is None:
+            self._logger.warning(
+                "[RobotGateway] No answer to end_task; the robot may still "
+                "count the task as running",
+                task_id=task_id,
+                outcome=outcome.value,
+                waited_s=TASK_STATE_RESPONSE_WAIT_S,
+            )
+            return None, "Timeout waiting for end_task response"
+
+        return bool(response.success), response.message
+
+    def set_robot_state(self, state: int) -> Tuple[bool, str, Optional[int]]:
+        """The operator's switch on the robot's state machine: mark the robot
+        IDLE ("it is where the map shows it") or UNINITIALIZED (withdraw that).
+
+        Takes and answers RobotStatus uint8s, not a REST enum. ``(True,
+        message, state)`` carries the state the robot reports after the call,
+        which is the rollup: a confirmed robot on its charger answers CHARGING,
+        not IDLE. A refusal is ``(False, message, state)`` with the unchanged
+        state and the robot's sentence tagged ``Failure.NOT_CONVERGED`` (IDLE
+        asked for with no converged estimate to confirm) or
+        ``Failure.ROBOT_STATE_REFUSED`` (anything else); an unreachable
+        service is untagged with no state.
+
+        Either target also releases a latched ERROR and clears a task the robot
+        still counts as running, and the robot does NOT refuse while one runs:
+        that is this backend's to refuse (the router's job gate), because only
+        it knows its job list.
+        """
+        client = self._service_clients.get("set_robot_state")
+        if not client.wait_for_service(timeout_sec=5.0):
+            return False, "The robot's state service is not available.", None
+
+        self._logger.info("[RobotGateway] Setting the robot state", state=state)
+
+        # Same 10.0 as its siblings: the callback is a lookup and cannot block.
+        response = ros.call_service(
+            client, SetRobotState.Request(state=state), timeout_s=10.0
+        )
+        if response is None:
+            return False, "The robot's state service did not answer.", None
+
+        if not response.success:
+            code = (
+                Failure.NOT_CONVERGED
+                if response.code == SetRobotState.Response.NOT_CONVERGED
+                else Failure.ROBOT_STATE_REFUSED
+            )
+            self._logger.warning(
+                "[RobotGateway] The robot refused the state change",
+                asked=state,
+                state=int(response.state),
+                code=code.value,
+                raw_code=int(response.code),
+                message=response.message,
+            )
+            return False, fail(code, response.message), int(response.state)
+
+        return True, response.message, int(response.state)
 
     def switch_mode(self, mode: int) -> Tuple[Optional[bool], str]:
         """Ask sys_manager to switch the operating mode. Three-valued on purpose.

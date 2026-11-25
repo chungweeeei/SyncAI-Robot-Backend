@@ -34,11 +34,13 @@ from syncai_backend.tasks.schema import (
     WorkflowTask,
     WorkflowTaskDefinition,
     continuation_steps,
+    needs_localization,
     step_group_problem,
 )
 from syncai_backend.gateways.failure import Failure, failure_code
 from syncai_backend.gateways.workflow.workflow import WorkflowGateway
 from syncai_backend.helpers.route_preview import RoutePreview
+from syncai_backend.helpers.task_guard import start_refusal
 from syncai_backend.interfaces.rest.schemas import StepRequest
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
@@ -240,6 +242,20 @@ class MoveMessageSource(Protocol):
     def preview_route(
         self, x: float, y: float, yaw: float, z: float = 0.0
     ) -> Tuple[bool, str, Optional[RoutePreview]]: ...
+
+
+class RobotStateSource(Protocol):
+    """What this router needs from RobotRepo: the fresh robot_state sample's
+    state by name (None without one: never received, or aged out) and the
+    robot's sentence for it, for the dispatch's advisory 409.
+
+    A Protocol for MoveMessageSource's reason: RobotRepo's module imports the
+    generated RobotState message.
+    """
+
+    def status(self) -> Optional[str]: ...
+
+    def state_message(self) -> str: ...
 
 
 class RoutePreviewRequest(MoveParams):
@@ -678,8 +694,32 @@ def init_task_router(
     map_usage: MapUsagePolicy,
     robot_gw: MoveMessageSource,
     task_record_repo: TaskRecordRepo,
+    robot_repo: RobotStateSource,
 ) -> APIRouter:
     task_router = APIRouter(prefix="", tags=["Task"])
+
+    def refuse_on_robot_state(steps) -> None:
+        """409 ``error_latched`` / ``not_initialized`` off the latest
+        robot_state sample, before a run of ``steps`` is dispatched.
+
+        ADVISORY: so the operator who pressed Start reads why here, instead of
+        finding a run that failed in its first second. The gate that counts is
+        begin_task, which the run asks the robot itself before its first step
+        (RobotWorkflow._begin_task) -- the only one a schedule's run meets,
+        and the one that holds when this sample is a second stale. So no
+        fresh sample passes -- never received, or aged out because the robot
+        stopped reporting: answering the last state's reason then would name
+        the wrong cause, and begin_task fails that run closed -- and a state
+        that changes right after this read is the run's to hear. In-memory,
+        so it is safe on the loop.
+        """
+        refusal = start_refusal(
+            robot_repo.status(),
+            needs_localization(steps),
+            robot_repo.state_message(),
+        )
+        if refusal is not None:
+            raise ConflictError(refusal.message, code=refusal.code)
 
     def stamp_map(steps, expected_map: Optional[str]) -> Optional[str]:
         """The map a job is stamped with: the loaded one, if it drives to a pose.
@@ -709,6 +749,7 @@ def init_task_router(
             raise problem.refusal()
 
         map_name = stamp_map(req.steps, req.map_name)
+        refuse_on_robot_state(req.steps)
 
         workflow_task = WorkflowTask(
             id=req.id,
@@ -754,6 +795,9 @@ def init_task_router(
             [step for step in steps if step.status is StepStatus.PENDING],
             failed.map_name,
         )
+        # The whole list: needs_localization passes over the SKIPPED steps
+        # itself, as the run's own begin_task will.
+        refuse_on_robot_state(steps)
 
         kind = req.kind or failed.kind
         if kind is TaskKind.SCHEDULE:

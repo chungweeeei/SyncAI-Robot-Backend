@@ -169,6 +169,24 @@ POSE_STEP_TYPES = frozenset({StepType.MOVE, StepType.CHARGE, StepType.PATROL})
 NAV_STEP_TYPES = POSE_STEP_TYPES
 
 
+def needs_localization(steps) -> bool:
+    """Whether a run of ``steps`` drives on the map, so the robot must know where
+    it stands before it starts (BeginTask.needs_localization).
+
+    A step a continuation passes over (SKIPPED) does not count: a Retry whose
+    failed MOVE is behind it and only a LIEDOWN ahead needs no position, and
+    refusing it on an unconfirmed robot would leave that robot standing.
+    Duck-typed on ``.type`` (and ``.status``, absent on the request models,
+    whose steps all run) so the routers' advisory check and RobotWorkflow's
+    begin_task read one rule.
+    """
+    return any(
+        step.type in NAV_STEP_TYPES
+        and getattr(step, "status", None) is not StepStatus.SKIPPED
+        for step in steps
+    )
+
+
 # Steps on the one-slot body queue (config.TASK_QUEUE_SUFFIX). Two in one group would
 # just run one after the other, so a group may hold at most one.
 BODY_STEP_TYPES = NAV_STEP_TYPES | {StepType.STANDUP, StepType.LIEDOWN}

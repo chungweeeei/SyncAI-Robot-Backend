@@ -203,14 +203,28 @@ class MapSwitchService:
 
         message = f"The robot is now on '{name}'"
         message += f" (was '{previous}')." if previous else "."
+        # A switch withdraws the operator's confirmation of the position
+        # whether or not the localizer converged (syncai_robot_state falls back
+        # to UNINITIALIZED on every map load), so both branches end on the
+        # confirm step: until then every task that drives is refused, and a
+        # message that stopped at "set an initial pose" left the operator with
+        # a robot that looked ready and took no MOVE.
         if localized:
-            message += " The localizer converged on the new map."
+            message += (
+                " The localizer converged on the new map; check that the map "
+                "shows the robot where it stands, then confirm its position "
+                "on the dashboard before starting a task that drives."
+            )
         else:
             message += (
                 " The pose was reset to the map origin; set an initial pose on "
                 "the dashboard, because the localizer has not converged"
             )
-            message += " yet." if localized is False else " and could not be asked."
+            message += " yet" if localized is False else " and could not be asked"
+            message += (
+                ", then confirm the robot's position there before starting a "
+                "task that drives."
+            )
         if count:
             message += f" Its {count} forbidden zone{'s' if count != 1 else ''} are active."
         return SwitchOutcome(

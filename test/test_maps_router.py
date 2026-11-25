@@ -2122,6 +2122,9 @@ def test_activate_reports_an_unconverged_localizer(
     assert body["switched"] is True
     assert body["localized"] is False
     assert "set an initial pose" in body["message"]
+    # And then the step that actually lets a MOVE start again: a switch
+    # withdraws the operator's confirmation of the position.
+    assert "confirm the robot's position" in body["message"]
 
 
 def test_activate_reports_an_unreachable_localizer_check(
@@ -2135,6 +2138,23 @@ def test_activate_reports_an_unreachable_localizer_check(
     assert body["switched"] is True
     assert body["localized"] is None
     assert "could not be asked" in body["message"]
+    assert "confirm the robot's position" in body["message"]
+
+
+def test_activate_points_at_the_confirm_step_even_when_the_localizer_converged(
+    catalog_repo, client, map_gw, monkeypatch, tmp_path
+):
+    """Converged is not confirmed: the robot is UNINITIALIZED after every
+    switch, and a message that stopped at "converged" left the operator with a
+    robot that looked ready and refused every task that drives."""
+    _point_ini_at(catalog_repo, monkeypatch, tmp_path, _INTERPOLATED_INI)
+    map_gw.converged = True
+
+    body = _activate(client, "full").json()
+
+    assert body["localized"] is True
+    assert "converged" in body["message"]
+    assert "confirm its position" in body["message"]
 
 
 def test_activate_names_the_zones_the_3d_planner_read_with_the_tree(

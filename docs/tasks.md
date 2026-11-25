@@ -93,6 +93,115 @@ before the next step as usual. `GET /api/v1/tasks/{id}` echoes each step's
 templates and schedules without it run exactly as before, and an ungrouped step
 issues the same commands it always did, so pre-existing histories replay.
 
+**The robot decides whether a task starts (2026-11).** `syncai_robot_state`
+owns the robot's state machine — `UNINITIALIZED` (no operator has confirmed
+where the robot stands: every boot, every map switch, every new pose), `IDLE`,
+`RUNNING`, and `ERROR` (a task failed; latched until an operator releases it
+with `POST /api/v1/robot/state`) — and is the single judge of whether a task
+may start. Every run of `RobotWorkflow` asks it before its first step and tells
+it how it ended (`BeginTask.srv` / `EndTask.srv` in SyncAI-Robot-Interface are
+the contract):
+
+| | Activity | When | What the robot does |
+|---|---|---|---|
+| `begin_task(task_id, needs_localization)` | `begin_task`, IO queue | after `_resolve_template`, before the first block | accepts — the run **is** `RUNNING` there from that call on — or refuses: `error_latched` (every task, while `ERROR`), `not_initialized` (unconfirmed, and the run has a MOVE / PATROL / CHARGE still to execute), `robot_busy` (another run is running) |
+| `end_task(task_id, outcome, reason)` | `end_task`, IO queue | as the run closes, before `record_task` | stops counting the run; `FAILED` also latches `ERROR`, with `reason` as what the console shows meanwhile: the robot quotes it in its own `state_message` ("A task failed: <reason>. …"), so it is the failure's sentence — the `ApplicationError`'s message, **without** the type prefix (`not_initialized: `, `map_mismatch: `) that the step's `error_msg` keeps — cut to 300 characters (`_failure_sentence`; the step's own error when the failure carries no sentence) |
+
+- **Every run, including the ones nothing else gates.** A direct dispatch and a
+  continuation are also checked by REST, but a run a Schedule starts by itself
+  never passes a route: `begin_task` is the only gate it meets. That is why the
+  decision is the robot's and is applied where it is taken — there is no sample
+  of `robot_state` to read a second too late, and two runs cannot both be let
+  through.
+- **A refusal fails the run at once**: the first step that would have run
+  (never a `SKIPPED` one — in a continuation `steps[0]` may be, and marking it
+  FAILED would make the next Retry re-run what the first run completed) ends
+  `FAILED` with the robot's own sentence, and the run fails with a
+  non-retryable `ApplicationError` whose type is the code. **No `end_task`**: a
+  refusal changed nothing on the robot, and reporting it `FAILED` would latch
+  `ERROR` on a robot that was merely unconfirmed, or busy with another run.
+- **Fail closed.** The activity returns a refusal and raises only when there is
+  no answer (the service absent, or silent past the gateway's 2 s + 3 s); that
+  is retried — three attempts, 2 s apart, safe because the service is
+  idempotent per `task_id` — and then the run fails as
+  `robot_state_unreachable` with a sentence that names no node. A run the robot
+  does not know of is one nothing would refuse, count or stop.
+- **No answer is not "no", so it is followed by one best-effort
+  `end_task(CANCELED)`** (`_release_unanswered_begin`). The request can land,
+  be accepted, and lose only its answer (the state node busy past the
+  gateway's wait): the run would then fail closed believing itself unadmitted
+  while the robot counted it as `RUNNING` and refused every later task
+  `robot_busy` until an operator noticed. The report is safe whichever way it
+  was — `end_task` is matched by `task_id` and is a no-op on a robot that is
+  not running it, and `CANCELED` never latches — so it is sent for an
+  **unknown** outcome only: never after an answered refusal (the robot said
+  no), and without setting `_admitted`. On `begin_task`'s budget (three
+  attempts, 30 s from scheduling), not `end_task`'s minute, since the likeliest
+  cause is a dead state service; a failure is logged and dropped, a cancel
+  meanwhile swallowed, and the run ends as it was going to — `FAILED`
+  `robot_state_unreachable`, or `CANCELED` when the cancel came during
+  `begin_task`. Only when this report goes unanswered too can the robot be
+  left `RUNNING`, and `POST /api/v1/robot/state` is then the recovery, as for
+  a workflow terminated from outside.
+- **`end_task` exactly once per accepted run** (and once more, as above, for
+  a run whose acceptance is unknown), on every way out: `COMPLETED`,
+  `FAILED`, and `CANCELED` for the operator's cancel and the safety lock's
+  alike (neither is a fault, neither latches). It follows `RobotWorkflow.
+  _admitted`, set by the accepted answer, not a second `patched()` call. Its own
+  activity rather than part of `record_task`: the robot is released before the
+  insert's retry budget, and a database retry never re-sends it. Five attempts,
+  2 s apart, 60 s from scheduling; a report that still cannot be made is logged
+  and dropped, as `record_task`'s is — the run's outcome is not the robot's to
+  hold open. A paused run is still the robot's running task and sends nothing.
+- **A cancel does not strand either call.** Both are started with
+  `start_activity` and waited for on `wait_condition(handle.done)` in a loop
+  that swallows `asyncio.CancelledError` (`_outlast_cancel`), never `await
+  handle`: a cancel during `begin_task` must not cancel a question the robot
+  may already have answered yes to — the answer is waited for, the run then
+  ends `CANCELED` and reports it if it had been accepted — and a cancel during
+  `end_task` must not drop the report. An eviction still gets through: the SDK
+  ends an evicted run by cancelling its tasks, and the next `wait_condition`
+  raises its own `BaseException`.
+- **On the IO queue, not the body queue.** The body worker has one slot; behind
+  another run's MOVE, `begin_task` would wait out the MOVE (up to its hour)
+  instead of being answered `robot_busy` in milliseconds.
+- **A schedule firing while another run is in flight** used to be admitted and
+  interleave its steps with that run's (`SKIP` only constrains a schedule
+  against itself, and the one-slot worker serialises activities, not tasks). It
+  is now refused `robot_busy` and fails on its first step, having run nothing;
+  the running task keeps the robot, and nothing is latched.
+- **Asked again before every navigation goal.** `execute_move` /
+  `execute_charge` / `execute_patrol` read the latest `robot_state` sample
+  right after the map check and refuse the goal non-retryably
+  (`not_initialized`) while it reads `UNINITIALIZED`
+  (`_refuse_unconfirmed_position`, rule in `helpers/task_guard.py`): the
+  confirmation can be withdrawn while a run goes on (the localizer restarted, a
+  pose published from outside this backend). That failure then latches `ERROR`
+  through `end_task`, which is why `POST /api/v1/robot/set_initial_pose` is
+  refused while a job runs. **No fresh sample** (`RobotRepo` believes one for
+  3 s; stale, or never received) holds the goal back too, as
+  `robot_state_stale` — but **retryably**: nobody is vouching for the position
+  then, and a goal sent is a robot driving, yet a few seconds without a frame
+  is more often a hiccup than a dead node, so the step's retry policy (three
+  attempts, 5 s then 10 s, about 15 s in all) gets the chance to see it come
+  back. Stale through all three, the step fails and `end_task` carries the
+  sentence ("The robot has not reported its state for N seconds, so it was not
+  sent a navigation goal. …").
+- **REST's check is advisory.** `POST /api/v1/tasks` and its `continue_from`
+  answer 409 `error_latched` / `not_initialized` off the same sample by the
+  same rule, after the map check, so the operator who pressed Start reads why
+  at once. No fresh sample passes — never received, or stale: the last state's
+  reason would name the wrong cause, and `begin_task` fails such a run closed;
+  `robot_busy` is not asked there (Temporal answers that question at dispatch,
+  `_require_idle`).
+- **Replay.** One patch, `task-admission`, read once where `begin_task` goes.
+  A run from before it has no marker, schedules neither activity and never
+  sets `_admitted`; `test/fixtures/workflow_histories/pre_task_admission/`
+  holds five such histories (completed, failed, canceled mid-MOVE, a
+  continuation, a scheduled run), recorded from the workflow as it was, and
+  `test_workflows.py` replays them. Deploy with no run in flight all the same:
+  `RobotState` grew two fields, so the stack and this backend move together.
+
 Details that matter when editing this path:
 
 - **Two queues, split by what an activity occupies.** The body queue
@@ -103,7 +212,10 @@ Details that matter when editing this path:
   to queue with its timeouts ticking, and two runs can never drive at once. The
   IO queue (`<robot_id>.ROBOT_IO_QUEUE`, `IO_ACTIVITY_SLOTS` = 4) runs `SPEAK`,
   which only talks to the speech service; that is what lets a grouped `SPEAK`
-  play while its `MOVE` holds the body slot. Both workers live in the same
+  play while its `MOVE` holds the body slot. `record_task`, `resolve_template`
+  and the two calls to the robot's state machine (`begin_task`, `end_task`) are
+  there too, for the same reason: none of them moves the robot, and a second
+  run's `begin_task` has to be answered while the first one drives. Both workers live in the same
   thread and share one client. `SPEAK` moved queues behind the
   `speak-on-io-queue` patch, and the body worker still registers
   `execute_speak` for runs that scheduled it there before the upgrade.
@@ -174,7 +286,9 @@ Details that matter when editing this path:
   `waypoints_passed` and the run seeds its dispatch count from it, so it goes on
   past them. The positions are the failed run's, so its `TaskMap` is the
   expectation (409 `map_mismatch` when the loaded map changed), checked only
-  against the steps still to run; `kind` / `name` default to the failed run's, a
+  against the steps still to run, as the robot-state check is (a continuation
+  whose driving is all `SKIPPED` needs no confirmed position, at dispatch and
+  in its `begin_task` alike); `kind` / `name` default to the failed run's, a
   schedule's becoming `task`. Replay-safe without a patch: no run before it has a
   `SKIPPED` step or a nonzero `waypoints_passed` in its input.
 - **The hold is two workflow signals** (`pause` / `resume`, via
@@ -274,9 +388,13 @@ Details that matter when editing this path:
   `workflow.info()`, passed as their optional second argument). The second check is the one a schedule meets — it
   never passes the first — and its refusal is a non-retryable step failure, so
   the history row says why. A schedule registered before `TaskMap` drives as it
-  always did.
+  always did. The robot's own state is checked the same two times and once
+  more (`helpers/task_guard.py`): at dispatch (advisory), by the robot itself
+  as the run starts (`begin_task`, the one that counts), and before every goal.
 - **Schedules use `SKIP` overlap** — a new run never starts while the previous
-  one executes.
+  one executes. That is one schedule against itself; against *another* run
+  (a direct task, another schedule) the robot's `begin_task` is what stops it:
+  `robot_busy`, see *The robot decides whether a task starts* above.
 - **The trigger is editable in place** (`PATCH /api/v1/schedules/{id}`) via
   `ScheduleHandle.update()`: the callback gets the described schedule and swaps
   only its `spec`; action, policy and state go back as described. The ownership

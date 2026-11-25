@@ -3,7 +3,11 @@ repositories:
   # the map gateway's StartMapping / SaveMaps / ResetMapping / Relocalize /
   # IsValid (the first four used to come from SyncAI-Fast-LIO2's `interface`
   # package), ResumeMapping (at or after 46b84f0) and the MappingStatus
-  # message behind GET /api/v1/mapping.
+  # message behind GET /api/v1/mapping. Since 2026-11 also BeginTask /
+  # EndTask / SetRobotState (syncai_robot_state's state machine) and
+  # RobotState's two trailing fields, state_message and
+  # localization_converged (at or after cab2b03, PR #29); an older checkout
+  # fails this backend's gateway import.
   src/syncai_common:
     type: git
     url: https://github.com/chungweeeei/SyncAI-Robot-Interface.git

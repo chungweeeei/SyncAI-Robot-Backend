@@ -1,5 +1,15 @@
 class NotFoundError(Exception):
-    pass
+    """Something asked for by name or id is not there (HTTP 404).
+
+    ``code`` is the optional machine-readable discriminator ConflictError
+    carries, for the one route whose 404s a client must tell apart without
+    matching prose: GET /api/v1/robot/state, "never reported" against "went
+    silent". Every other 404 leaves it unset and answers the bare ``detail``.
+    """
+
+    def __init__(self, message: str, code: "str | None" = None):
+        super().__init__(message)
+        self.code = code
 
 
 class UnauthorizedError(Exception):

@@ -163,19 +163,54 @@ class JobGate:
                 code="task_running",
             )
 
-    async def refuse_while_any_job(self, change: str, before: str) -> None:
+    async def running_task_ids_now(self, change: str) -> List[str]:
+        """``running_tasks``' ids, read from Temporal now instead of the
+        gateway's 1.5 s cache; 409 ``tasks_unknown`` on the same terms.
+
+        For a gate nothing stands behind (``refuse_while_any_job(fresh=True)``).
+        """
+        try:
+            return await self._workflow_gw.running_task_ids()
+        except Exception as exc:
+            self._logger.warning(
+                "Could not confirm the robot is idle; refusing rather than "
+                "assuming so",
+                change=change,
+                error=str(exc),
+            )
+            raise ConflictError(
+                "Could not confirm that no job is running, and "
+                f"{change} under a moving robot is not safe to guess at. Check "
+                "the Tasks page and try again.",
+                code="tasks_unknown",
+            )
+
+    async def refuse_while_any_job(
+        self, change: str, before: str, fresh: bool = False
+    ) -> None:
         """409 ``task_running`` while *any* job runs, whatever map it holds.
 
         Stricter than ``refuse_while_a_job_holds``, for the operations that
-        move the map frame under the robot (a switch, a kidnap search).
-        ``before`` ends the sentence: "Cancel or wait for it before <before>."
+        move the map frame under the robot (a switch, a kidnap search, a new
+        initial pose) or change what the robot believes of itself (the
+        operator's switch on its state). ``before`` ends the sentence: "Cancel
+        or wait for it before <before>."
+
+        ``fresh`` asks Temporal now rather than reading the gateway's cache.
+        The cache is good enough where the guarded operation checks again
+        itself; POST /api/v1/robot/state has no such second check (the robot
+        does not refuse its operator while a task runs, by design), so there a
+        stale "idle" would clear a task that started a second ago.
         """
-        active_tasks = await self.running_tasks(change)
-        if active_tasks:
-            running = ", ".join(task.id for task in active_tasks)
+        if fresh:
+            running_ids = await self.running_task_ids_now(change)
+        else:
+            running_ids = [task.id for task in await self.running_tasks(change)]
+        if running_ids:
+            running = ", ".join(running_ids)
             raise ConflictError(
-                f"The robot is running {len(active_tasks)} "
-                f"{'task' if len(active_tasks) == 1 else 'tasks'} ({running}). "
+                f"The robot is running {len(running_ids)} "
+                f"{'task' if len(running_ids) == 1 else 'tasks'} ({running}). "
                 f"Cancel or wait for it before {before}.",
                 code="task_running",
             )
