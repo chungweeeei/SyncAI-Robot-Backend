@@ -271,6 +271,9 @@ class SyncAIBackend(Node):
             task_record_repo=task_record_repo,
             task_template_repo=task_template_repo,
             map_repo=map_repo,
+            # The latest robot_state sample: a navigation goal is refused while
+            # it reads UNINITIALIZED (no operator vouches for the position).
+            robot_repo=robot_repo,
         )
         # Kept for main()'s shutdown: the worker is stopped before the ROS
         # context goes, so a running MOVE can still cancel its nav2 goal.

@@ -360,6 +360,8 @@ def make_robot_state():
         policy_state=1,
         motion_state=1,
         safety_state=False,
+        state_message="",
+        localization_converged=True,
     ):
         msg = RobotStateMsg()
         msg.robot_id = robot_id
@@ -393,6 +395,10 @@ def make_robot_state():
         msg.low_level_mode.policy_state = policy_state
         msg.low_level_mode.motion_state = motion_state
         msg.low_level_mode.safety_state = safety_state
+        # The state machine's own sentence for `state`, and the localizer's
+        # verdict the Confirm control waits for (2026-11).
+        msg.state_message = state_message
+        msg.localization_converged = localization_converged
         return msg
 
     return _make

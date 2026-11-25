@@ -349,9 +349,10 @@ class TestWorkflowGateway:
     #
     # The worker's max_workers=1 only serialises *activities*; two Running
     # workflows interleave step-by-step, so the task-level mutex has to live at
-    # the dispatch entrance. Scheduled runs cannot be gated (Temporal starts
-    # them itself) — what is pinned here is that a direct dispatch is refused
-    # while anything, scheduled or direct, is already running.
+    # the dispatch entrance. Scheduled runs cannot be gated here (Temporal starts
+    # them itself; such a run is refused by the robot's begin_task instead,
+    # test_workflows.py) — what is pinned here is that a direct dispatch is
+    # refused while anything, scheduled or direct, is already running.
 
     def test_start_task_refuses_while_anything_is_running(self, workflow_gw, mock_client):
         # A scheduled run is on the queue — the case SKIP cannot see.
@@ -982,6 +983,72 @@ class TestWorkflowGateway:
         with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
             with pytest.raises(UpstreamError):
                 asyncio.run(workflow_gw.cancel_active_tasks())
+
+    # ==================== running_task_ids ====================
+    #
+    # The fresh read behind POST /api/v1/robot/state's gate: nothing checks
+    # again after it, so neither the TTL cache nor the eventually consistent
+    # index alone is good enough.
+
+    def test_running_task_ids_bypasses_the_cache(self, workflow_gw, mock_client):
+        self._listing(mock_client, [_execution("robot01-task-001")])
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+
+            async def _poll_then_ask():
+                await workflow_gw.list_active_tasks()
+                return await workflow_gw.running_task_ids()
+
+            ids = asyncio.run(_poll_then_ask())
+
+        # A console poll a moment ago must not stand in for the sweep.
+        assert mock_client.list_workflows.call_count == 2
+        assert ids == ["robot01-task-001"]
+
+    def test_running_task_ids_includes_a_start_the_index_has_not_seen(
+        self, workflow_gw, mock_client
+    ):
+        self._workflow_handle(mock_client, describe=self._owned_running())
+        self._listing(mock_client, [])
+        workflow_gw._last_started_task_id = "robot01-task-002"
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            ids = asyncio.run(workflow_gw.running_task_ids())
+
+        assert ids == ["robot01-task-002"]
+
+    def test_running_task_ids_names_a_run_once(self, workflow_gw, mock_client):
+        self._workflow_handle(mock_client, describe=self._owned_running())
+        self._listing(mock_client, [_execution("robot01-task-002")])
+        workflow_gw._last_started_task_id = "robot01-task-002"
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            ids = asyncio.run(workflow_gw.running_task_ids())
+
+        assert ids == ["robot01-task-002"]
+
+    def test_running_task_ids_forgets_a_finished_last_start(
+        self, workflow_gw, mock_client
+    ):
+        self._workflow_handle(
+            mock_client,
+            describe=SimpleNamespace(status=WorkflowExecutionStatus.COMPLETED),
+        )
+        self._listing(mock_client, [])
+        workflow_gw._last_started_task_id = "robot01-task-002"
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            ids = asyncio.run(workflow_gw.running_task_ids())
+
+        assert ids == []
+        assert workflow_gw._last_started_task_id is None
+
+    def test_running_task_ids_raises_when_the_sweep_fails(
+        self, workflow_gw, mock_client
+    ):
+        # "Could not tell" is the caller's to refuse on, never an empty list.
+        mock_client.list_workflows.side_effect = RPCError(
+            "unavailable", RPCStatusCode.UNAVAILABLE, b""
+        )
+        with patch(CONNECT, new_callable=AsyncMock, return_value=mock_client):
+            with pytest.raises(UpstreamError):
+                asyncio.run(workflow_gw.running_task_ids())
 
     # ==================== list_task_history ====================
 

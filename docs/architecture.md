@@ -11,7 +11,7 @@ starts two extra threads:
 |---|---|
 | main | `MultiThreadedExecutor.spin()` — all ROS subscriptions, TF, service/action clients |
 | uvicorn (daemon) | The FastAPI app on `0.0.0.0:3000` |
-| Temporal worker (daemon) | Polls `<robot_id>.ROBOT_TASK_QUEUE` (`RobotWorkflow` + the body activities) and `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`) |
+| Temporal worker (daemon) | Polls `<robot_id>.ROBOT_TASK_QUEUE` (`RobotWorkflow` + the body activities) and `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`, `record_task`, `resolve_template`, and `begin_task` / `end_task`: the run asking the robot whether it may start, and telling it how it ended) |
 
 - The executor is **multi-threaded on purpose**. Each point-cloud callback
   (`body_cloud`, and the multi-MB PCD reads behind `pgo/map_cloud_file`) has its
@@ -65,8 +65,9 @@ repositories/              state: in-memory caches, PostgreSQL CRUD, and the two
 database/                  SQLAlchemy engine + ORM models; the shared session factory
 
 tasks/                     the task model and its Temporal contract (steps, groups, queues,
-                           signals, search attributes) — REST, the workflow gateway and the
-                           worker all import it, and it imports none of them
+                           signals, search attributes, and task_admission: what a run and
+                           the robot's state machine say to each other) — REST, the workflow
+                           gateway and the worker all import it, and it imports none of them
 
 subscribers/               ROS topics → repositories (ingest) — except the map cloud, whose
                            topic only names a PCD the subscriber reads from the shared /dev/shm;
@@ -75,7 +76,8 @@ temporal/                  worker, RobotWorkflow, activities
 helpers/                   pointcloud (read a binary PCD, downsample / transform / pack),
                            system_config (INI reader), map_archive (checksummed zip / tar.gz
                            of a map dir), move_guard (a run's TaskMap against the loaded
-                           map), disk (directory size + newest mtime), single_flight
+                           map), task_guard (the robot's own state against a task
+                           starting or a goal going out), disk (directory size + newest mtime), single_flight
                            (concurrent callers share one slow read); and, called by nothing
                            since the 2D removal, kept as a library: occupancy_grid
                            (OccupancyGrid→PNG), pgm (whose write_text_atomic the catalogue
@@ -207,7 +209,7 @@ robot_id = self.get_namespace().strip("/") or "default_robot"
 |---|---|
 | ROS topics/services/actions | relative names inherit the `/<robot_id>` namespace |
 | PostgreSQL database | `<robot_id>_db` (auto-created on first connect) |
-| Temporal task queues | `<robot_id>.ROBOT_TASK_QUEUE` (workflow, body activities), `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`) |
+| Temporal task queues | `<robot_id>.ROBOT_TASK_QUEUE` (workflow, body activities), `<robot_id>.ROBOT_IO_QUEUE` (`SPEAK`, `record_task`, `resolve_template`, `begin_task`, `end_task`) |
 
 **All ROS names here are relative** (`map`, `robot_state`, `navigate_to_goal`,
 `pointlio/body_cloud`). Never hardcode `/<robot_id>/…` — that bug has been fixed

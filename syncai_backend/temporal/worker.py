@@ -24,6 +24,7 @@ from syncai_backend.gateways.tts.tts import TtsGateway
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.map.map import MapRepo
+from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 from syncai_backend.services.map_usage import MapUsagePolicy
@@ -41,9 +42,10 @@ RETRY_INTERVAL = 5
 # MOVE_HEARTBEAT_TIMEOUT (pinned in test_activities.py).
 HEARTBEAT_THROTTLE_MAX = timedelta(milliseconds=500)
 
-# Concurrent IO activities (SPEAK, record_task): more than one so a second run's SPEAK
-# does not tick its start_to_close behind the first; few, as each holds an HTTP request
-# (or a database connection) open.
+# Concurrent IO activities (SPEAK, record_task, begin_task / end_task): more than one
+# so a second run's SPEAK does not tick its start_to_close behind the first, and so a
+# second run's begin_task is answered (refused) while the first run speaks; few, as
+# each holds an HTTP request (or a database connection, or a ROS service call) open.
 IO_ACTIVITY_SLOTS = 4
 
 # How long main.py gives the worker to stop on SIGTERM / SIGINT / SIGHUP. The
@@ -205,16 +207,23 @@ async def run_worker(
         ],
         # One body activity at a time, set twice: the executor is the thread that runs
         # activities, max_concurrent_activities is how many the worker accepts. With
-        # the default (100) a second activity (e.g. a schedule firing during a direct
-        # task) ticked its heartbeat/start_to_close timeouts queued behind the thread;
-        # capped, Temporal holds it server-side. Also keeps two runs from driving.
+        # the default (100) a second activity ticked its heartbeat/start_to_close
+        # timeouts queued behind the thread; capped, Temporal holds it server-side.
+        # Also the last thing between two runs and one robot, but no longer the
+        # first: a schedule firing during another run used to get this far and
+        # interleave its steps with that run's, and is now refused robot_busy by
+        # begin_task (IO queue, below) before any of its steps is scheduled.
         activity_executor=ThreadPoolExecutor(max_workers=1),
         max_concurrent_activities=1,
         max_heartbeat_throttle_interval=HEARTBEAT_THROTTLE_MAX,
     )
     # SPEAK on its own queue so a run can speak while its MOVE holds the body slot;
     # record_task and resolve_template beside it, as they only talk to the database.
-    # Executor and cap equal for the same reason as above.
+    # begin_task and end_task too, and for begin_task that is the point: it asks
+    # the robot whether a run may start, and on the body queue a schedule firing
+    # during another run's MOVE would wait behind that MOVE for the answer
+    # instead of failing robot_busy at once. Executor and cap equal for the same
+    # reason as above.
     io_worker = Worker(
         client,
         task_queue=io_task_queue(robot_id),
@@ -222,6 +231,8 @@ async def run_worker(
             activities.execute_speak,
             activities.record_task,
             activities.resolve_template,
+            activities.begin_task,
+            activities.end_task,
         ],
         activity_executor=ThreadPoolExecutor(max_workers=IO_ACTIVITY_SLOTS),
         max_concurrent_activities=IO_ACTIVITY_SLOTS,
@@ -257,6 +268,7 @@ def start_temporal_worker(
     task_record_repo: TaskRecordRepo,
     task_template_repo: TaskTemplateRepo,
     map_repo: MapRepo,
+    robot_repo: RobotRepo,
 ) -> TemporalWorkerHandle:
 
     ready = threading.Event()
@@ -275,6 +287,7 @@ def start_temporal_worker(
                 task_record_repo=task_record_repo,
                 task_template_repo=task_template_repo,
                 map_repo=map_repo,
+                robot_repo=robot_repo,
             )
             asyncio.run(
                 run_worker(

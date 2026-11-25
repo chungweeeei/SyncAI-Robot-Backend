@@ -14,6 +14,8 @@ existed nothing mechanical enforced it.
 """
 
 import math
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -32,17 +34,22 @@ from syncai_common.msg import RobotMode, RobotStatus  # noqa: E402
 
 from syncai_backend.gateways.failure import Failure, fail  # noqa: E402
 from syncai_backend.gateways.robot.robot import MotionKey  # noqa: E402
+from syncai_backend.exceptions import UpstreamError  # noqa: E402
 from syncai_backend.interfaces.rest.routers.robot import (  # noqa: E402
     RobotNetworkStatus,
     init_robot_router,
     _mode_to_str,
-    _status_to_str,
     _parse_wifi_info,
 )
 from syncai_backend.interfaces.rest.server import (  # noqa: E402
     register_exception_handlers,
 )
-from syncai_backend.repositories.robot.robot import init_robot_repo  # noqa: E402
+from syncai_backend.repositories.robot.robot import (  # noqa: E402
+    ROBOT_STATE_MAX_AGE_S,
+    init_robot_repo,
+    status_name,
+)
+from syncai_backend.services.map_usage import JobGate  # noqa: E402
 from syncai_backend.services.mode_restart import (  # noqa: E402
     init_mode_restart_service,
 )
@@ -73,6 +80,14 @@ class _StubRobotGateway:
         self.safety_locks = []
         self.safety_lock_result = (True, "Safety lock engaged. Remote control blocked.")
         self.initial_poses = []
+        # The operator's switch: the RobotStatus uint8s asked for, and the
+        # gateway's (success, message, resulting state) answer.
+        self.state_changes = []
+        self.state_result = (True, "Position confirmed.", RobotStatus.IDLE)
+
+    def set_robot_state(self, state):
+        self.state_changes.append(state)
+        return self.state_result
 
     def set_motion_key(self, key):
         self.motion_keys.append(key)
@@ -113,9 +128,41 @@ class _StubSafetyLockService:
         return self.edge
 
 
+class _StubWorkflowGateway:
+    """What is running, for the job gate in front of the state switch and the
+    initial pose. Two reads, counted apart, because which one a route uses is
+    the point: ``list_active_tasks`` is the gateway's 1.5 s cache,
+    ``running_task_ids`` a fresh read of Temporal. ``error`` stands for an
+    outage, which the gate must not read as "nothing is running".
+    """
+
+    def __init__(self):
+        self.running = []
+        self.error = None
+        self.cached_reads = 0
+        self.fresh_reads = 0
+
+    async def list_active_tasks(self):
+        self.cached_reads += 1
+        if self.error is not None:
+            raise self.error
+        return [SimpleNamespace(id=task_id) for task_id in self.running], [], None
+
+    async def running_task_ids(self):
+        self.fresh_reads += 1
+        if self.error is not None:
+            raise self.error
+        return list(self.running)
+
+
 @pytest.fixture
 def robot_gw():
     return _StubRobotGateway()
+
+
+@pytest.fixture
+def workflow_gw():
+    return _StubWorkflowGateway()
 
 
 @pytest.fixture
@@ -123,18 +170,35 @@ def safety_lock_svc():
     return _StubSafetyLockService()
 
 
+class _Clock:
+    """RobotRepo's clock, moved by hand: a sample ages when a test says so."""
+
+    def __init__(self):
+        self.now = 500.0
+
+    def __call__(self):
+        return self.now
+
+
 @pytest.fixture
-def robot_repo(logger):
+def clock():
+    return _Clock()
+
+
+@pytest.fixture
+def robot_repo(logger, clock):
     """A real, empty RobotRepo. Populate it with `robot_repo.update_robot_state`.
 
     Separate from the `client` fixture so a test can seed a state sample before
-    the request; the POST tests leave it empty, which is also the 404 case.
+    the request; the POST tests leave it empty, which is also the 404 case. On
+    the `clock` fixture, which stands still unless a test moves it: a seeded
+    sample stays fresh however slow the test machine is.
     """
-    return init_robot_repo(logger=logger)
+    return init_robot_repo(logger=logger, now=clock)
 
 
 @pytest.fixture
-def client(logger, robot_repo, robot_gw, safety_lock_svc):
+def client(logger, robot_repo, robot_gw, safety_lock_svc, workflow_gw):
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -144,6 +208,11 @@ def client(logger, robot_repo, robot_gw, safety_lock_svc):
             robot_gw=robot_gw,
             restart_svc=init_mode_restart_service(logger=logger, robot_gw=robot_gw),
             safety_lock_svc=safety_lock_svc,
+            # Real, over the stub: the 409s under test are the gate's own. The
+            # catalogue is only read by the per-map gate, which no route here uses.
+            job_gate=JobGate(
+                logger=logger, map_catalog_repo=MagicMock(), workflow_gw=workflow_gw
+            ),
         )
     )
     return TestClient(app)
@@ -186,8 +255,10 @@ def test_mode_to_str_unknown_mode():
         (255, "UNKNOWN"),
     ],
 )
-def test_status_to_str(status, label):
-    assert _status_to_str(status) == label
+def test_status_name(status, label):
+    # The table lives beside RobotRepo since the task guard reads the same
+    # names; this route is one of its three readers.
+    assert status_name(status) == label
 
 
 def test_parse_wifi_info_valid_json():
@@ -217,6 +288,53 @@ def test_state_404_before_any_sample(client):
 
     assert response.status_code == 404
     assert "not available" in response.json()["detail"]
+    # The same sentence as ever, with a code beside it since the route grew a
+    # second 404 a client has to tell from this one.
+    assert response.json() == {
+        "detail": "Robot state is not available yet.",
+        "code": "robot_state_unavailable",
+    }
+
+
+def test_state_404_once_the_robot_has_stopped_reporting(
+    client, robot_repo, clock, make_robot_state
+):
+    """A sample that aged out is not served as the robot's state: the console
+    draws a state chip from this route, and IDLE from a robot whose state
+    node died an hour ago would read as live. Same body shape as the 404
+    above, told apart by `code`, with how long it has been."""
+    robot_repo.update_robot_state(state=make_robot_state(state=RobotStatus.IDLE))
+    clock.now += 7.4
+
+    response = _get_state(client)
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": (
+            "The robot has not reported its state for 7 seconds. Check that "
+            "the robot's software is running."
+        ),
+        "code": "robot_state_stale",
+    }
+
+
+def test_state_is_served_up_to_the_age_limit(client, robot_repo, clock, make_robot_state):
+    robot_repo.update_robot_state(state=make_robot_state())
+    clock.now += ROBOT_STATE_MAX_AGE_S
+
+    assert _get_state(client).status_code == 200
+
+
+def test_state_comes_back_with_the_next_sample(client, robot_repo, clock, make_robot_state):
+    robot_repo.update_robot_state(state=make_robot_state())
+    clock.now += 60.0
+    assert _get_state(client).status_code == 404
+
+    robot_repo.update_robot_state(state=make_robot_state(state=RobotStatus.UNINITIALIZED))
+
+    response = _get_state(client)
+    assert response.status_code == 200
+    assert response.json()["state"] == "UNINITIALIZED"
 
 
 def test_state_projects_the_message(client, robot_repo, make_robot_state):
@@ -350,8 +468,10 @@ def test_state_payload_keys_are_exactly_the_whitelist(
         "map",
         "mode",
         "state",
+        "state_message",
         "low_level_mode",
         "localization_valid",
+        "localization_converged",
         "localization_status",
         "network_status",
         "battery_status",
@@ -361,7 +481,9 @@ def test_state_payload_keys_are_exactly_the_whitelist(
     # the payload must keep holding back. (localization_valid and state used to
     # be held back too; each was widened in deliberately — localization_valid
     # when the subscriber stopped dropping unlocalized samples, state when
-    # syncai_robot_state began deriving CHARGING.)
+    # syncai_robot_state began deriving CHARGING, and state_message /
+    # localization_converged when it took the robot's state machine: the
+    # console's Confirm control cannot work without them.)
     assert "timestamp" not in body["motor_status"][0]
 
 
@@ -738,3 +860,232 @@ def test_an_initial_pose_on_another_storey_carries_its_z(client, robot_gw):
     assert response.status_code == 200
     assert robot_gw.initial_poses[0]["z"] == 3.2
     assert "z=3.2" in response.json()["message"]
+
+
+# --- GET /api/v1/robot/state: the state machine's fields ----------------------
+
+
+@pytest.mark.parametrize(
+    "status,label",
+    [(RobotStatus.RUNNING, "RUNNING"), (RobotStatus.ERROR, "ERROR")],
+)
+def test_state_reports_the_states_the_robot_now_derives(
+    client, robot_repo, make_robot_state, status, label
+):
+    robot_repo.update_robot_state(state=make_robot_state(state=status))
+
+    assert _get_state(client).json()["state"] == label
+
+
+def test_state_carries_the_robots_sentence_and_the_localizers_verdict(
+    client, robot_repo, make_robot_state
+):
+    # A boot guess that converged: the precondition for confirming holds, and
+    # the robot is still UNINITIALIZED until an operator has looked.
+    robot_repo.update_robot_state(
+        state=make_robot_state(
+            state=RobotStatus.UNINITIALIZED,
+            state_message="The position has not been confirmed.",
+            localization_converged=True,
+        )
+    )
+
+    body = _get_state(client).json()
+
+    assert body["state"] == "UNINITIALIZED"
+    assert body["state_message"] == "The position has not been confirmed."
+    assert body["localization_converged"] is True
+
+
+def test_state_reports_a_localizer_that_has_not_converged(
+    client, robot_repo, make_robot_state
+):
+    robot_repo.update_robot_state(state=make_robot_state(localization_converged=False))
+
+    assert _get_state(client).json()["localization_converged"] is False
+
+
+# --- RobotRepo: what the task guard reads off the same sample ------------------
+
+
+def test_the_repo_answers_no_status_before_any_sample(robot_repo):
+    # None, not UNINITIALIZED: "nobody is saying" is its own answer, which the
+    # dispatch's advisory check lets through (begin_task decides) and the
+    # check before a navigation goal holds back retryably -- where
+    # UNINITIALIZED would be a non-retryable refusal on a backend that merely
+    # came up before the robot's state node. The ageing is test_robot_repo.py's.
+    assert robot_repo.status() is None
+    assert robot_repo.state_message() == ""
+
+
+def test_the_repo_names_the_latest_samples_state(robot_repo, make_robot_state):
+    robot_repo.update_robot_state(
+        state=make_robot_state(
+            state=RobotStatus.ERROR, state_message="Task morning-round failed."
+        )
+    )
+
+    assert robot_repo.status() == "ERROR"
+    assert robot_repo.state_message() == "Task morning-round failed."
+
+
+def test_the_repo_degrades_an_unknown_code_to_a_name(robot_repo, make_robot_state):
+    # A code a newer interface adds must not fail a task on a lookup; UNKNOWN
+    # is neither ERROR nor UNINITIALIZED, so the guard lets it through and the
+    # robot's own begin_task answers.
+    robot_repo.update_robot_state(state=make_robot_state(state=99))
+
+    assert robot_repo.status() == "UNKNOWN"
+
+
+# --- POST /api/v1/robot/state --------------------------------------------------
+
+
+def _post_state(client, payload):
+    return client.post("/api/v1/robot/state", json=payload)
+
+
+@pytest.mark.parametrize(
+    "target,sent",
+    [("IDLE", RobotStatus.IDLE), ("UNINITIALIZED", RobotStatus.UNINITIALIZED)],
+)
+def test_the_operators_switch_sends_the_status_constant(client, robot_gw, target, sent):
+    response = _post_state(client, {"state": target})
+
+    assert response.status_code == 200
+    assert robot_gw.state_changes == [sent]
+
+
+def test_the_answer_is_the_state_the_robot_reports_and_its_sentence(client, robot_gw):
+    # The rollup, not the state asked for: confirmed on the charger.
+    robot_gw.state_result = (True, "Position confirmed.", RobotStatus.CHARGING)
+
+    response = _post_state(client, {"state": "IDLE"})
+
+    assert response.json() == {"state": "CHARGING", "message": "Position confirmed."}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"state": "RUNNING"},
+        {"state": "ERROR"},
+        {"state": "CHARGING"},
+        {"state": "WARNING"},
+        {"state": "idle"},
+        {"state": 1},
+        {},
+    ],
+)
+def test_only_the_two_commandable_states_are_accepted(client, robot_gw, payload):
+    # RUNNING, ERROR, WARNING and CHARGING are derived by the robot, never
+    # commanded; the schema stops them before anything is asked.
+    response = _post_state(client, payload)
+
+    assert response.status_code == 422
+    assert robot_gw.state_changes == []
+
+
+def test_the_switch_is_refused_while_a_job_runs(client, robot_gw, workflow_gw):
+    # The robot would not refuse it: either target clears the task it counts
+    # as running, whose end_task then matches nothing.
+    workflow_gw.running = ["task-7"]
+
+    response = _post_state(client, {"state": "UNINITIALIZED"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "task_running"
+    assert "task-7" in response.json()["detail"]
+    assert robot_gw.state_changes == []
+
+
+def test_the_switch_asks_temporal_now_not_the_cache(client, workflow_gw):
+    # Nothing stands behind this gate, so a 1.5 s old "idle" is not good enough.
+    _post_state(client, {"state": "IDLE"})
+
+    assert (workflow_gw.fresh_reads, workflow_gw.cached_reads) == (1, 0)
+
+
+def test_the_switch_is_refused_when_temporal_cannot_answer(client, robot_gw, workflow_gw):
+    workflow_gw.error = UpstreamError("List active tasks failed")
+
+    response = _post_state(client, {"state": "IDLE"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "tasks_unknown"
+    assert robot_gw.state_changes == []
+
+
+def test_a_robot_that_has_not_converged_is_409_with_its_own_sentence(client, robot_gw):
+    robot_gw.state_result = (
+        False,
+        fail(Failure.NOT_CONVERGED, "The localizer has not converged on the map yet."),
+        RobotStatus.UNINITIALIZED,
+    )
+
+    response = _post_state(client, {"state": "IDLE"})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "The localizer has not converged on the map yet.",
+        "code": "not_converged",
+    }
+
+
+def test_any_other_refusal_is_409_robot_state_refused(client, robot_gw):
+    robot_gw.state_result = (
+        False,
+        fail(Failure.ROBOT_STATE_REFUSED, "That state cannot be commanded."),
+        RobotStatus.ERROR,
+    )
+
+    response = _post_state(client, {"state": "IDLE"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "robot_state_refused"
+    assert response.json()["detail"] == "That state cannot be commanded."
+
+
+def test_an_unreachable_state_service_is_502(client, robot_gw):
+    robot_gw.state_result = (False, "The robot's state service is not available.", None)
+
+    response = _post_state(client, {"state": "IDLE"})
+
+    assert response.status_code == 502
+    assert "code" not in response.json()
+
+
+# --- POST /api/v1/robot/set_initial_pose: the job gate -------------------------
+
+
+def test_an_initial_pose_is_refused_while_a_job_runs(client, robot_gw, workflow_gw):
+    # A new pose withdraws the operator's confirmation, so the running task's
+    # next navigation step would fail and latch ERROR.
+    workflow_gw.running = ["task-7"]
+
+    response = _post_initial_pose(client, {"x": 1.0, "y": -2.0, "theta": 90.0})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "task_running"
+    assert "setting the initial pose" in response.json()["detail"]
+    assert robot_gw.initial_poses == []
+
+
+def test_an_initial_pose_is_refused_when_temporal_cannot_answer(
+    client, robot_gw, workflow_gw
+):
+    workflow_gw.error = UpstreamError("List active tasks failed")
+
+    response = _post_initial_pose(client, {"x": 1.0, "y": -2.0, "theta": 90.0})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "tasks_unknown"
+    assert robot_gw.initial_poses == []
+
+
+def test_an_initial_pose_reads_the_same_cache_as_the_map_gates(client, workflow_gw):
+    # The navigation step's own position check stands behind this one, as
+    # execute_move's map check stands behind the map routes' gate.
+    _post_initial_pose(client, {"x": 1.0, "y": -2.0, "theta": 90.0})
+
+    assert (workflow_gw.cached_reads, workflow_gw.fresh_reads) == (1, 0)

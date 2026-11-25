@@ -34,6 +34,9 @@ from syncai_common.action import (  # noqa: E402
     NavigateToGoal,
 )
 
+from syncai_common.msg import RobotStatus  # noqa: E402
+from syncai_common.srv import BeginTask, EndTask, SetRobotState  # noqa: E402
+
 from syncai_backend.gateways.failure import Failure, failure_code  # noqa: E402
 from syncai_backend.gateways import ros as ros_module  # noqa: E402
 from syncai_backend.gateways.robot import robot as robot_module  # noqa: E402
@@ -44,7 +47,11 @@ from syncai_backend.gateways.robot.robot import (  # noqa: E402
     MotionKey,
     MoveState,
     RobotGateway,
+    TASK_STATE_CALL_BUDGET_S,
+    TASK_STATE_RESPONSE_WAIT_S,
+    TASK_STATE_SERVICE_WAIT_S,
 )
+from syncai_backend.tasks.task_admission import TaskOutcome  # noqa: E402
 
 
 GOAL_UUID = uuid.UUID("12345678-1234-5678-1234-567812345678")
@@ -676,6 +683,236 @@ class TestCommandServices:
 
         published = publisher.publish.call_args[0][0]
         assert published.pose.covariance[INITIAL_POSE_Z_VARIANCE_INDEX] > 0.0
+
+
+class TestTaskAdmission:
+    """begin_task / end_task on syncai_robot_state: the judge of whether a run
+    may start, and the report of how it ended.
+
+    Both are three-valued, like switch_mode, because the caller acts
+    differently on each: an answer is final (a refusal included), no answer is
+    retried. The unanswered cases shrink the response wait rather than sit out
+    the real 3 s.
+    """
+
+    def _service(self, robot_gw, name, response=None, available=True, completed=True):
+        client = robot_gw._service_clients[name]
+        client.wait_for_service.return_value = available
+        client.call_async.return_value = _Future(result=response, completed=completed)
+        client.call_async.reset_mock()
+        client.remove_pending_request.reset_mock()
+        return client
+
+    def test_the_three_clients_are_relative_names(self, logger):
+        # Relative, so each lands on this robot's node: a begin_task answered
+        # by another robot's state would admit a run nobody confirmed here.
+        node = MagicMock()
+        with patch("syncai_backend.gateways.robot.robot.ActionClient"):
+            RobotGateway(logger=logger, node=node)
+
+        created = {
+            call.kwargs["srv_name"]: call.kwargs["srv_type"]
+            for call in node.create_client.call_args_list
+        }
+        assert created["begin_task"] is BeginTask
+        assert created["end_task"] is EndTask
+        assert created["set_robot_state"] is SetRobotState
+        assert not any(name.startswith("/") for name in created)
+
+    def test_an_accepted_task_carries_its_id_and_whether_it_drives(self, robot_gw):
+        client = self._service(
+            robot_gw,
+            "begin_task",
+            SimpleNamespace(accepted=True, code=BeginTask.Response.NONE, message="ok"),
+        )
+
+        answer = robot_gw.begin_task(task_id="task-1", needs_localization=True)
+
+        assert answer == (True, "", "ok")
+        request = client.call_async.call_args[0][0]
+        assert (request.task_id, request.needs_localization) == ("task-1", True)
+        client.wait_for_service.assert_called_with(timeout_sec=TASK_STATE_SERVICE_WAIT_S)
+
+    @pytest.mark.parametrize(
+        "raw,code",
+        [
+            (BeginTask.Response.NOT_INITIALIZED, "not_initialized"),
+            (BeginTask.Response.ERROR_LATCHED, "error_latched"),
+            (BeginTask.Response.BUSY, "robot_busy"),
+            # A code a newer interface adds: a refusal with the robot's own
+            # sentence, never a KeyError that would be retried as a crash.
+            (99, "robot_state_refused"),
+        ],
+    )
+    def test_a_refusal_is_answered_with_its_code_and_the_robots_sentence(
+        self, robot_gw, raw, code
+    ):
+        self._service(
+            robot_gw,
+            "begin_task",
+            SimpleNamespace(accepted=False, code=raw, message="The robot said no."),
+        )
+
+        answer = robot_gw.begin_task(task_id="task-1", needs_localization=False)
+
+        assert answer == (False, code, "The robot said no.")
+
+    def test_begin_task_with_no_service_is_no_answer_not_a_refusal(self, robot_gw):
+        client = self._service(robot_gw, "begin_task", available=False)
+
+        accepted, code, message = robot_gw.begin_task(
+            task_id="task-1", needs_localization=True
+        )
+
+        assert accepted is None and code == ""
+        assert "not available" in message
+        client.call_async.assert_not_called()
+
+    def test_an_unanswered_begin_task_is_no_answer_and_abandons_the_request(
+        self, robot_gw, monkeypatch
+    ):
+        monkeypatch.setattr(robot_module, "TASK_STATE_RESPONSE_WAIT_S", 0.01)
+        client = self._service(robot_gw, "begin_task", completed=False)
+
+        accepted, _, message = robot_gw.begin_task(
+            task_id="task-1", needs_localization=True
+        )
+
+        assert accepted is None
+        assert "Timeout" in message
+        # ros.call_service's contract: nothing left in the pending table.
+        client.remove_pending_request.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "outcome,raw",
+        [
+            (TaskOutcome.COMPLETED, EndTask.Request.COMPLETED),
+            (TaskOutcome.FAILED, EndTask.Request.FAILED),
+            (TaskOutcome.CANCELED, EndTask.Request.CANCELED),
+        ],
+    )
+    def test_end_task_sends_the_outcome_by_its_constant(self, robot_gw, outcome, raw):
+        client = self._service(
+            robot_gw, "end_task", SimpleNamespace(success=True, message="ended")
+        )
+
+        answer = robot_gw.end_task(task_id="task-1", outcome=outcome, reason="no route")
+
+        assert answer == (True, "ended")
+        request = client.call_async.call_args[0][0]
+        assert (request.task_id, request.outcome, request.reason) == (
+            "task-1", raw, "no route",
+        )
+        # 0 is deliberately no outcome on the wire; none of ours may be it.
+        assert request.outcome != 0
+
+    def test_end_task_for_a_task_the_robot_is_not_running_is_an_answer(self, robot_gw):
+        self._service(
+            robot_gw, "end_task", SimpleNamespace(success=False, message="no such task")
+        )
+
+        answer = robot_gw.end_task(task_id="task-1", outcome=TaskOutcome.COMPLETED)
+
+        # False, not None: answered, so nothing to retry.
+        assert answer == (False, "no such task")
+
+    def test_end_task_with_no_service_is_no_answer(self, robot_gw):
+        client = self._service(robot_gw, "end_task", available=False)
+
+        answered, message = robot_gw.end_task(
+            task_id="task-1", outcome=TaskOutcome.FAILED, reason="x"
+        )
+
+        assert answered is None
+        assert "not available" in message
+        client.call_async.assert_not_called()
+
+    def test_an_unanswered_end_task_is_no_answer(self, robot_gw, monkeypatch):
+        monkeypatch.setattr(robot_module, "TASK_STATE_RESPONSE_WAIT_S", 0.01)
+        client = self._service(robot_gw, "end_task", completed=False)
+
+        answered, _ = robot_gw.end_task(task_id="task-1", outcome=TaskOutcome.CANCELED)
+
+        assert answered is None
+        client.remove_pending_request.assert_called_once()
+
+    def test_the_call_budget_is_the_two_waits(self):
+        # What the activity timeouts are sized against (test_activities.py).
+        assert TASK_STATE_CALL_BUDGET_S == (
+            TASK_STATE_SERVICE_WAIT_S + TASK_STATE_RESPONSE_WAIT_S
+        )
+        assert (TASK_STATE_SERVICE_WAIT_S, TASK_STATE_RESPONSE_WAIT_S) == (2.0, 3.0)
+
+
+class TestSetRobotState:
+    """The operator's switch. Refusals are tagged, because REST answers them
+    409 with the robot's sentence; an unreachable service is the plain 502."""
+
+    def _service(self, robot_gw, response=None, available=True):
+        client = robot_gw._service_clients["set_robot_state"]
+        client.wait_for_service.return_value = available
+        client.call_async.return_value = _Future(result=response)
+        client.call_async.reset_mock()
+        return client
+
+    def test_a_change_answers_the_state_the_robot_reports(self, robot_gw):
+        # The rollup: a robot confirmed on its charger answers CHARGING.
+        client = self._service(
+            robot_gw,
+            SimpleNamespace(
+                success=True,
+                code=SetRobotState.Response.NONE,
+                message="Position confirmed.",
+                state=RobotStatus.CHARGING,
+            ),
+        )
+
+        answer = robot_gw.set_robot_state(state=RobotStatus.IDLE)
+
+        assert answer == (True, "Position confirmed.", RobotStatus.CHARGING)
+        assert client.call_async.call_args[0][0].state == RobotStatus.IDLE
+
+    def test_not_converged_is_tagged_with_the_robots_sentence(self, robot_gw):
+        self._service(
+            robot_gw,
+            SimpleNamespace(
+                success=False,
+                code=SetRobotState.Response.NOT_CONVERGED,
+                message="The localizer has not converged.",
+                state=RobotStatus.UNINITIALIZED,
+            ),
+        )
+
+        success, message, state = robot_gw.set_robot_state(state=RobotStatus.IDLE)
+
+        assert success is False
+        assert failure_code(message) is Failure.NOT_CONVERGED
+        assert message == "The localizer has not converged."
+        assert state == RobotStatus.UNINITIALIZED
+
+    @pytest.mark.parametrize("raw", [SetRobotState.Response.INVALID_TARGET, 99])
+    def test_any_other_refusal_is_tagged_refused(self, robot_gw, raw):
+        self._service(
+            robot_gw,
+            SimpleNamespace(
+                success=False, code=raw, message="No.", state=RobotStatus.ERROR
+            ),
+        )
+
+        success, message, _ = robot_gw.set_robot_state(state=RobotStatus.IDLE)
+
+        assert success is False
+        assert failure_code(message) is Failure.ROBOT_STATE_REFUSED
+
+    def test_service_unavailable_is_untagged(self, robot_gw):
+        client = self._service(robot_gw, available=False)
+
+        success, message, state = robot_gw.set_robot_state(state=RobotStatus.IDLE)
+
+        assert (success, state) == (False, None)
+        assert failure_code(message) is None
+        assert "not available" in message
+        client.call_async.assert_not_called()
 
 
 class TestSwitchMode:

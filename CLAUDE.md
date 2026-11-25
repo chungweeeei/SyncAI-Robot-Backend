@@ -12,7 +12,8 @@ ROS 2 `ament_python` package (`package.xml`, `setup.py`), split out of
 It **cannot run standalone**, but as of 2026-09 it **can be built and tested**
 standalone. It imports generated interfaces from one other colcon package —
 `syncai_common` (`RobotState`, `RobotMode`, `MotorStates`, `WifiNetwork`, `MappingStatus`;
-`SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`, the
+`SwitchMode`, `RestartMode`, `SetMotionKey`, `SetPolicyMode`, `Scan/ConnectWifiNetwork`,
+`BeginTask` / `EndTask` / `SetRobotState` (syncai_robot_state's state machine, 2026-11), the
 map srvs `StartMapping`, `ResumeMapping`, `SaveMaps`, `ResetMapping`, `Relocalize`, `IsValid`, `ResetOdometry`, `DetectLandmark`, and the
 `NavigateToGoal` action the MOVE step sends — and the CHARGE step on its `behavior_tree`
 `charge.xml` (2026-11), sent the charger waypoint as stored, its heading out of the marker's
@@ -140,7 +141,8 @@ two daemon threads. Main thread: `MultiThreadedExecutor.spin()` (all ROS callbac
 service/action clients). uvicorn thread: FastAPI on `0.0.0.0:3000`. Temporal worker
 thread: two workers on one client — `<robot_id>.ROBOT_TASK_QUEUE` runs `RobotWorkflow`
 + the body activities (MOVE, CHARGE, PATROL, postures) in a single-worker `ThreadPoolExecutor`,
-`max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time.
+`max_concurrent_activities=1`; `<robot_id>.ROBOT_IO_QUEUE` runs `SPEAK` a few at a time,
+beside `record_task`, `resolve_template` and `begin_task` / `end_task`.
 
 Consequences:
 - **Blocking REST handlers are plain `def`, not `async def`** (ROS service calls up to
@@ -221,7 +223,8 @@ gateways/                  outbound: robot (ROS srv/action/pub), map (ROS srv), 
         │                  under log/stack/<robot_id>/ + `journalctl -D /var/log/journal`, one tar).
         │                  tts/webrtc/recording/logs hold no node.
 repositories/              state: in-memory single-slot caches (robot, pointcloud, telemetry,
-        │                  mapping — pgo's latched run state, aged out after 5 s),
+        │                  mapping — pgo's latched run state, aged out after 5 s; robot_state
+        │                  likewise after 3 s),
         │                  PostgreSQL CRUD (map vertices, task_templates, task_record), on-disk catalogues (map/, record/),
         │                  params (config/params/<robot_id>/ runtime overlays, over the workspace's
         │                  factory params file, read-only)
@@ -232,7 +235,8 @@ tasks/                     the task model and its Temporal contract (schema: Ste
                            TaskState; config: queues, signals, the Temporal address;
                            search_attributes; catalogue: GET /task_steps, the steps a client
                            draws its editor from; template_resolution: a template's steps
-                           against its map's vertices now; retired_steps), imported by REST,
+                           against its map's vertices now; task_admission: the begin_task /
+                           end_task arguments; retired_steps), imported by REST,
                            gateways/workflow and temporal/ alike and importing none of them
 
 subscribers/               ROS topics → repositories (ingest side; the map cloud's topic only
@@ -243,6 +247,8 @@ helpers/                   pointcloud, system_config, floors (poses.txt -> store
                            planar_pose (a 6-DOF pose's heading on the floor),
                            map_archive (checksummed zip /
                            tar.gz of a map dir), move_guard (a run's TaskMap against the loaded map),
+                           task_guard (the robot's own state against a task starting or a
+                           navigation goal going out; RobotStatus by name, so free of syncai_common),
                            landmark_heading (a detect's sightings -> the waypoint: position,
                            heading -- the line of sight when ambiguous --, off_axis),
                            route_preview (a planner preview's answer: the route thinned as the
@@ -507,6 +513,56 @@ than memo because a scheduled run inherits only its action's attributes. Dispatc
 `execute_move` both check it against the loaded map through `helpers/move_guard.py`.
 `ARTIFACT` steps were removed 2026-08 — stored
 templates carrying one fail validation.
+
+**The robot decides whether a task starts (2026-11).** `syncai_robot_state` owns the robot's
+state machine (`UNINITIALIZED` / `IDLE` / `RUNNING` / `ERROR`; rollup `ERROR` >
+`UNINITIALIZED` > `RUNNING` > `CHARGING` > `WARNING` > `IDLE`, so anything but the first two
+means an operator has confirmed the position) and is the single judge; SyncAI-Robot-Interface's
+`BeginTask.srv` / `EndTask.srv` / `SetRobotState.srv` are the contract. **Every** run of
+`RobotWorkflow` — direct, a continuation, and one a Schedule starts by itself, which no REST
+check ever sees — asks `begin_task` after `_resolve_template` and before its first block
+(`needs_localization` = a MOVE / PATROL / CHARGE among the steps it will execute, SKIPPED ones
+not counted). A refusal (`error_latched`, `not_initialized`, `robot_busy`) fails the run at once
+on the **first step that is not SKIPPED**, non-retryably, with the robot's sentence and **no
+`end_task`** — a refusal changes nothing on the robot, and a FAILED reported for it would latch
+ERROR. No answer after three attempts fails closed (`robot_state_unreachable`, a sentence that
+names no node) — and, because no answer is not "no" (the request may have landed and only the
+answer been lost, leaving the robot RUNNING), that **unknown** outcome alone is followed by one
+best-effort `end_task(CANCELED)` on begin's short budget (`_release_unanswered_begin`): a no-op
+on a robot that never accepted, since `end_task` is matched by id; never sent after an answered
+refusal, and never setting `_admitted`. An accepted run reports `end_task` exactly once on every
+way out — COMPLETED, FAILED (latches ERROR until `POST /api/v1/robot/state`; its `reason` is
+quoted verbatim in the robot's `state_message`, so it is the failure's sentence
+(`_failure_sentence`: the `ApplicationError`'s message, not the `type: message` string a step's
+`error_msg` stores and the history keeps)), CANCELED (the operator's cancel and the
+safety lock's alike) — gated on `self._admitted`, not a second `patched()`: the one patch is
+`task-admission`, read once where `begin_task` goes, and
+`test/fixtures/workflow_histories/pre_task_admission/` holds histories from before it that
+`test_workflows.py` replays. Both activities are on the **IO queue** (on the body queue a
+schedule firing during a MOVE would wait behind it instead of hearing `robot_busy`), the
+activity **returns** a refusal and raises only for "no answer" (as `resolve_template` answers
+another map), and the workflow waits for both on `wait_condition(handle.done)` in a loop that
+swallows `asyncio.CancelledError` (`_outlast_cancel`): a cancel must neither cancel a
+`begin_task` the robot may already have accepted nor drop the `end_task`. Do not `await` either
+handle, and do not fold `end_task` into `record_task` (a database retry must not re-send it,
+and the robot is released first). The same rule is read off the latest `robot_state` sample in
+two more places, both through `helpers/task_guard.py`: `POST /api/v1/tasks` (and
+`continue_from`) answers an **advisory** 409 `error_latched` / `not_initialized` after
+`stamp_map` — no fresh sample passes — and `RobotActivities._refuse_unconfirmed_position` refuses
+each MOVE / PATROL / CHARGE goal right after `_refuse_wrong_map`: a fresh UNINITIALIZED
+non-retryably (`not_initialized`), no fresh sample **retryably** (`robot_state_stale`: a hiccup
+usually, and the step's three attempts give it ~15 s). "Fresh" is `RobotRepo`'s: like
+`MappingStatusRepo`, it ages a sample out on read, after `ROBOT_STATE_MAX_AGE_S` (3 s, three
+periods of syncai_robot_state's 1 Hz), in every default accessor, so no reader gets a dead
+node's last word; `GET /api/v1/robot/state` is then 404 `robot_state_stale` (before any sample,
+404 `robot_state_unavailable`). `set_robot_state`
+is deliberately **not** refused by the robot while a task runs (it is the recovery for a
+workflow terminated from outside), so `POST /api/v1/robot/state` is, here, with
+`JobGate.refuse_while_any_job(fresh=True)` — a read of Temporal now, not the 1.5 s cache,
+because nothing stands behind it; `POST /api/v1/robot/set_initial_pose` takes the cached gate
+(a new pose withdraws the confirmation, and the running task's next goal would fail and latch
+ERROR). A schedule firing while another run is in flight used to be admitted and interleave;
+it now fails `robot_busy` on its first step. docs/tasks.md has the whole of it.
 
 ### Mapping-mode map cloud (`subscribers/map_cloud_subscriber.py`)
 

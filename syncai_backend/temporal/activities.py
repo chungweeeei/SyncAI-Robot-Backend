@@ -19,6 +19,12 @@ from syncai_backend.tasks.config import (
     reports_start,
 )
 from syncai_backend.tasks.schema import MoveParams, PatrolParams, SpeakParams, TaskRecord
+from syncai_backend.tasks.task_admission import (
+    TaskAdmission,
+    TaskAdmissionRequest,
+    TaskEnd,
+    TaskOutcome,
+)
 from syncai_backend.tasks.template_resolution import (
     ResolvedTemplate,
     resolve_stored_steps,
@@ -30,9 +36,11 @@ from syncai_backend.gateways.robot.robot import (
     RobotGateway,
 )
 from syncai_backend.gateways.tts.tts import TtsGateway
+from syncai_backend.helpers.task_guard import goal_refusal
 
 from syncai_backend.repositories.map.catalog import MapCatalogRepo
 from syncai_backend.repositories.map.map import MapRepo
+from syncai_backend.repositories.robot.robot import RobotRepo
 from syncai_backend.repositories.task.task_record import TaskRecordRepo
 from syncai_backend.repositories.task.task_template import TaskTemplateRepo
 from syncai_backend.services.map_usage import MapUsagePolicy
@@ -134,10 +142,14 @@ class RobotActivities:
         task_record_repo: TaskRecordRepo,
         task_template_repo: TaskTemplateRepo,
         map_repo: MapRepo,
+        robot_repo: RobotRepo,
     ):
         self._logger = logger
         self._robot_gw = robot_gw
         self._tts_gw = tts_gw
+        # Read-only: the latest robot_state sample while it is fresh, for the
+        # check before every navigation goal (_refuse_unconfirmed_position).
+        self._robot_repo = robot_repo
         # Read-only: the loaded map, for the map checks.
         self._map_catalog_repo = map_catalog_repo
         # execute_move's check, the same rule POST /api/v1/tasks applies.
@@ -314,10 +326,11 @@ class RobotActivities:
         details; the goal carries only the waypoints past the larger of the two,
         the last one always. ``step_id`` names the step in those reports.
 
-        The map check is a MOVE's (_navigate's). The cleanup on a cancel is too:
-        whatever is executing is cancelled.
+        The map check and the position check are a MOVE's (_navigate's). The
+        cleanup on a cancel is too: whatever is executing is cancelled.
         """
         self._refuse_wrong_map(expected_map)
+        self._refuse_unconfirmed_position()
 
         total = len(params.waypoints)
         passed = max(start, _patrol_passed(activity.info().heartbeat_details))
@@ -370,6 +383,46 @@ class RobotActivities:
         if refusal is not None:
             raise ApplicationError(refusal.message, type=refusal.code, non_retryable=True)
 
+    def _refuse_unconfirmed_position(self) -> None:
+        """Raise task_guard's refusal for a navigation goal unless a FRESH
+        robot_state sample says the robot's position is confirmed.
+
+        begin_task answered for the run as a whole, when it started; this is
+        the same question asked again before each goal, because the operator's
+        confirmation can be withdrawn while the run goes on (the localizer
+        restarted, a pose published from outside this backend) and the goal
+        would then be planned from a pose nobody has looked at.
+
+        Two refusals (helpers/task_guard.py has the rule):
+
+        - a fresh UNINITIALIZED is ``not_initialized``, non-retryable: five
+          seconds do not confirm a position, an operator does. The failed
+          step then latches ERROR through end_task, which is the point -- the
+          robot stopped mid-task somewhere it cannot vouch for.
+        - no fresh sample (aged out past ROBOT_STATE_MAX_AGE_S, or never
+          received) is ``robot_state_stale``, RETRYABLE: the robot's state
+          service has gone quiet, so nobody is vouching for the position, and
+          a goal must not go out on the last thing a dead node said. Usually
+          it is a hiccup, though -- a dropped frame or two, the node coming
+          back -- and the workflow's retry policy (three attempts, 5 s then
+          10 s) gives it about 15 s to speak again before the step fails.
+        """
+        status = self._robot_repo.status()
+        silent_for_s = self._robot_repo.sample_age() if status is None else None
+        refusal = goal_refusal(status, silent_for_s)
+        if refusal is not None:
+            self._logger.warning(
+                "[RobotActivity] Navigation goal refused on the robot's state",
+                state=status,
+                state_message=self._robot_repo.state_message(),
+                silent_for_s=silent_for_s,
+                code=refusal.code,
+                retryable=refusal.retryable,
+            )
+            raise ApplicationError(
+                refusal.message, type=refusal.code, non_retryable=not refusal.retryable
+            )
+
     def _navigate(
         self,
         params: MoveParams,
@@ -383,13 +436,16 @@ class RobotActivities:
         ``expected_map`` is the run's ``TaskMap``. The goal is first checked
         against the loaded map (helpers/move_guard.py, as POST /api/v1/tasks
         does): another map's coordinates are refused, non-retryable; this is the
-        check that catches a schedule firing after a map switch.
+        check that catches a schedule firing after a map switch. Then against
+        the robot's own state (_refuse_unconfirmed_position): a position no
+        operator vouches for is not driven from.
 
         Cancellation is *thrown* into this thread as CancelledError (in the poll
         loop or inside move()), so cleanup lives in the except clause. A blocking
         call like time.sleep is not interrupted, hence the short NAV_POLL_INTERVAL_S.
         """
         self._refuse_wrong_map(expected_map)
+        self._refuse_unconfirmed_position()
         move_kwargs = _pose_kwargs(params)
         if behavior_tree:
             move_kwargs["behavior_tree"] = behavior_tree
@@ -557,6 +613,79 @@ class RobotActivities:
             "[RobotActivity] Task recorded",
             task_id=record.task_id,
             status=record.status,
+        )
+
+    @activity.defn
+    def begin_task(self, request: TaskAdmissionRequest) -> TaskAdmission:
+        """Ask the robot whether this run may start (RobotWorkflow._begin_task).
+
+        On the IO queue, not the body queue: the body worker has one slot, so
+        a schedule firing during another run's MOVE would wait behind it for
+        up to an hour instead of hearing robot_busy at once.
+
+        A refusal is RETURNED, as resolve_template answers another map: it is
+        the robot's decision, and raising it would have Temporal ask twice
+        more for the same answer. Only "no answer" raises -- retryable, and
+        safe to retry because the service is idempotent per task_id -- and the
+        workflow fails closed once the attempts are spent.
+        """
+        accepted, code, message = self._robot_gw.begin_task(
+            task_id=request.task_id, needs_localization=request.needs_localization
+        )
+        if accepted is None:
+            raise ApplicationError(
+                f"The robot did not answer begin_task: {message}", non_retryable=False
+            )
+        return TaskAdmission(accepted=accepted, code=code, message=message)
+
+    @activity.defn
+    def end_task(self, report: TaskEnd) -> None:
+        """Tell the robot how a run it accepted ended (RobotWorkflow._end_task).
+
+        Its own activity, not part of record_task: the robot is released
+        before the report row is written rather than after an insert's retry
+        budget, and a database retry never re-sends it. "No answer" raises and
+        is retried; an answer that the robot was not counting this run is
+        logged and done, since asking again gets the same answer.
+
+        Also what the workflow sends, as CANCELED, after a begin_task nobody
+        answered (RobotWorkflow._release_unanswered_begin): the robot may or
+        may not have accepted that run, and this is harmless either way.
+        """
+        answered, message = self._robot_gw.end_task(
+            task_id=report.task_id, outcome=report.outcome, reason=report.reason
+        )
+        if answered is None:
+            raise ApplicationError(
+                f"The robot did not answer end_task: {message}", non_retryable=False
+            )
+        if not answered:
+            # Not an error of this run's: a robot whose state node restarted
+            # mid-task has forgotten it (and reads UNINITIALIZED), and a
+            # FAILED it never hears latches nothing. Said, so that a missing
+            # ERROR after a failed task has a line to be traced to -- a
+            # warning for that case. For CANCELED it is the expected answer
+            # to the best-effort report after an unanswered begin_task (the
+            # robot never accepted the run), and nothing is lost either way,
+            # so that one is info.
+            log = (
+                self._logger.info
+                if report.outcome is TaskOutcome.CANCELED
+                else self._logger.warning
+            )
+            log(
+                "[RobotActivity] The robot was not counting this task as "
+                "running; its end changed nothing on the robot",
+                task_id=report.task_id,
+                outcome=report.outcome.value,
+                robot_message=message,
+            )
+            return
+        self._logger.info(
+            "[RobotActivity] Task end reported to the robot",
+            task_id=report.task_id,
+            outcome=report.outcome.value,
+            reason=report.reason,
         )
 
     @activity.defn

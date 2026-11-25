@@ -548,14 +548,80 @@ class WorkflowGateway:
             self._logger.error(f"[WorkflowGateway] {log}", error=str(err), **context)
             raise UpstreamError(failure)
 
+    async def _last_started_is_running(self, client: Client) -> bool:
+        """Whether the task this process last started is still open, by a
+        describe: strongly consistent, so it covers a start the visibility
+        index has not caught up with. Forgotten once it is not running.
+
+        A describe that fails for any reason but NOT_FOUND reads as not
+        running, and is not fatal: every caller follows this with a visibility
+        sweep that fails closed.
+        """
+        if self._last_started_task_id is None:
+            return False
+
+        handle = client.get_workflow_handle(self._last_started_task_id)
+        try:
+            description = await handle.describe(rpc_timeout=_TASK_STATE_RPC)
+        except RPCError as err:
+            if err.status == RPCStatusCode.NOT_FOUND:
+                # Retention already dropped it; certainly not running.
+                description = None
+            else:
+                self._logger.warn(
+                    "[WorkflowGateway] Failed to describe last started task",
+                    task_id=self._last_started_task_id,
+                    error=str(err),
+                )
+                description = None
+
+        if (
+            description is not None
+            and _WORKFLOW_STATUS_MAP.get(description.status) == "IN_PROGRESS"
+        ):
+            return True
+        self._last_started_task_id = None
+        return False
+
+    async def running_task_ids(self) -> List[str]:
+        """The ids of the runs open on this robot right now, read fresh.
+
+        For a gate with nothing behind it. The map routes' gates read the TTL
+        cache because the operation they guard checks again (execute_move, the
+        localizer); POST /api/v1/robot/state has no second check -- the robot
+        does not refuse the operator's switch while a task runs, on purpose --
+        so a 1.5 s old "nothing running" would clear a task that had just
+        started. The same two reads as _require_idle, for the same reasons.
+
+        Raises (UpstreamError) when the sweep fails: the caller refuses rather
+        than assume idle.
+        """
+        client = await self._connect()
+
+        ids: List[str] = []
+        if await self._last_started_is_running(client):
+            ids.append(self._last_started_task_id)
+
+        snapshot = await self._fetch_active_tasks()
+        # Store it: keeps the active_tasks cache warm, as _require_idle does.
+        self._active_snapshot = snapshot
+        if snapshot.error is not None:
+            raise snapshot.error
+        ids.extend(task.id for task in snapshot.tasks or [] if task.id not in ids)
+        return ids
+
     async def _require_idle(self, client: Client) -> None:
         """Refuse to dispatch while anything is already running on this robot.
 
         SKIP only constrains a schedule against itself, and the one-slot worker
         serialises activities, not tasks: two runs' steps would interleave. Every
-        direct dispatch comes through here; scheduled runs cannot be gated
-        (Temporal starts them), so a dispatch is refused during a scheduled run
-        but not the reverse.
+        direct dispatch comes through here, so a dispatch is refused (a 409,
+        before anything starts) during a scheduled run. The reverse cannot be
+        gated here, since Temporal starts a scheduled run by itself: that run
+        starts, asks the robot begin_task as every run does, is refused
+        robot_busy and fails on its first step without running any
+        (RobotWorkflow._begin_task, 2026-11). Until then it was admitted and
+        its steps interleaved with the running task's.
 
         Two reads, cheapest-and-strongest first:
 
@@ -565,34 +631,13 @@ class WorkflowGateway:
            restart). Not the TTL cache: stale is fine to display, not to dispatch.
 
         Check-then-start is not atomic; with one console and the MCP server as
-        writers that window is accepted (the alternative is a per-robot mutex
-        workflow).
+        writers that window is accepted here, and begin_task closes it on the
+        robot: of two runs that both got through, the second is refused.
         """
-        if self._last_started_task_id is not None:
-            handle = client.get_workflow_handle(self._last_started_task_id)
-            try:
-                description = await handle.describe(rpc_timeout=_TASK_STATE_RPC)
-            except RPCError as err:
-                if err.status == RPCStatusCode.NOT_FOUND:
-                    # Retention already dropped it; certainly not running.
-                    description = None
-                else:
-                    # Not fatal: the sweep below still runs and fails closed.
-                    self._logger.warn(
-                        "[WorkflowGateway] Failed to describe last started task",
-                        task_id=self._last_started_task_id,
-                        error=str(err),
-                    )
-                    description = None
-
-            if (
-                description is not None
-                and _WORKFLOW_STATUS_MAP.get(description.status) == "IN_PROGRESS"
-            ):
-                raise ConflictError(
-                    f"Robot is busy: task {self._last_started_task_id} is running"
-                )
-            self._last_started_task_id = None
+        if await self._last_started_is_running(client):
+            raise ConflictError(
+                f"Robot is busy: task {self._last_started_task_id} is running"
+            )
 
         snapshot = await self._fetch_active_tasks()
         # Store it: keeps the active_tasks cache warm.

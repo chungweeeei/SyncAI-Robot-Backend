@@ -82,7 +82,19 @@ def init_landmark_router(
 
     def _localized_z() -> float:
         state = robot_repo.get_robot_state()
-        if state is None or not state.localization_valid:
+        if state is None:
+            # No fresh sample: never received, or aged out because the robot
+            # stopped reporting (RobotRepo believes one for a few seconds).
+            # The same code -- the console's next step is the same, and which
+            # storey the robot stands on is just as unknown -- but not the
+            # sentence: "not localized" would send the operator to set a pose
+            # on a robot whose state service is down.
+            raise ConflictError(
+                "The robot is not reporting its state, so where it stands on "
+                "the map is unknown.",
+                code="not_localized",
+            )
+        if not state.localization_valid:
             raise ConflictError(
                 "The robot is not localized, so what it sees has no place on the map.",
                 code="not_localized",

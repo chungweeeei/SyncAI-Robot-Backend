@@ -24,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
         TaskRecord,
         WaitParams,
         WorkflowTask,
+        needs_localization,
         step_blocks,
     )
     from syncai_backend.tasks.search_attributes import (
@@ -32,7 +33,18 @@ with workflow.unsafe.imports_passed_through():
         TASK_MAP_KEY,
         TASK_NAME_KEY,
     )
+    from syncai_backend.tasks.task_admission import (
+        TaskAdmission,
+        TaskAdmissionRequest,
+        TaskEnd,
+        TaskOutcome,
+    )
     from syncai_backend.tasks.template_resolution import ResolvedTemplate
+    from syncai_backend.helpers.task_guard import (
+        ROBOT_STATE_REFUSED,
+        ROBOT_STATE_UNREACHABLE,
+        UNREACHABLE_MESSAGE,
+    )
     from syncai_backend.temporal.activities import ActivityResult, RobotActivities
 
 
@@ -68,6 +80,54 @@ SCHEDULE_RESOLVES_TEMPLATE_PATCH = "schedule-resolves-template"
 # IO worker polling, the run goes on its snapshot rather than waiting.
 RESOLVE_TEMPLATE_TIMEOUT = timedelta(seconds=30)
 
+# Every run asks the robot whether it may start (begin_task) and tells it how
+# it ended (end_task); syncai_robot_state is the judge, 2026-11. One patch for
+# both: it is read once, where begin_task goes, and end_task follows the
+# answer (RobotWorkflow._admitted) rather than a second patched() call, so a
+# run from before it replays without either.
+TASK_ADMISSION_PATCH = "task-admission"
+
+# begin_task, per attempt: above the gateway's whole wait for the service and
+# its answer (TASK_STATE_CALL_BUDGET_S, 5 s; test_activities.py pins the
+# relation), so an attempt ends on the gateway's "no answer", which is
+# retried, and not on a timeout that would leave the question out.
+BEGIN_TASK_START_TO_CLOSE = timedelta(seconds=8)
+# ...and from scheduling, for all of them: three attempts 2 s apart are 19 s
+# of answering at worst, and with no IO worker polling the run fails closed
+# here instead of waiting unstarted for as long as the outage lasts.
+BEGIN_TASK_TIMEOUT = timedelta(seconds=30)
+BEGIN_TASK_ATTEMPTS = 3
+
+# end_task, from scheduling. Longer than begin's and with more attempts: a
+# report that never lands leaves the robot counting a finished run as RUNNING,
+# and every task after it refused robot_busy until an operator clears it. Five
+# attempts 2 s apart fit (33 s at worst; test_activities.py pins it), and past
+# this the run closes anyway: its outcome is not the robot's to hold open.
+END_TASK_TIMEOUT = timedelta(seconds=60)
+END_TASK_ATTEMPTS = 5
+
+# The best-effort end_task(CANCELED) after a begin_task nobody answered
+# (RobotWorkflow._release_unanswered_begin). begin's own budget, not
+# end_task's: the likeliest reason for the silence is a robot whose state
+# service is down, and a run that is already failing closed must not be held
+# open a minute to tell a dead service about it. Three attempts 2 s apart are
+# 19 s at worst (test_activities.py pins it).
+RELEASE_TASK_TIMEOUT = timedelta(seconds=30)
+RELEASE_TASK_ATTEMPTS = 3
+
+# One retry interval for both, flat (backoff 1.0): the service is a lookup in
+# another process on this host, so there is nothing a longer wait would let
+# recover that 2 s would not, and the default doubling would spend begin's
+# budget on waiting rather than asking.
+TASK_STATE_RETRY_INTERVAL = timedelta(seconds=2)
+
+# EndTask.reason is what the console shows while the robot is locked in ERROR:
+# syncai_robot_state builds its state_message as "A task failed: <reason>. ..."
+# and the console prints that verbatim. So it is one sentence (_failure_sentence)
+# and, since a step's error can carry a planner's whole explanation, cut to
+# this many characters.
+END_TASK_REASON_MAX = 300
+
 ACTIVITY_MAP = {
     StepType.MOVE: RobotActivities.execute_move,
     StepType.STANDUP: RobotActivities.execute_stand,
@@ -91,6 +151,27 @@ def _is_cancel(err: BaseException) -> bool:
     return isinstance(err, asyncio.CancelledError) or (
         isinstance(err, ActivityError) and isinstance(err.cause, CancelledError)
     )
+
+
+def _failure_sentence(err: BaseException | None, fallback: str = "") -> str:
+    """Why the run failed, as a sentence an operator reads: EndTask.reason.
+
+    The message of the ApplicationError behind ``err`` when there is one --
+    the activity's own, under the ActivityError the workflow sees, or one the
+    workflow raised itself. NOT ``str()`` of it, which is what a step's
+    error_msg stores: that prefixes the error's type (``not_initialized: The
+    robot's position is no longer confirmed...``, ``map_mismatch: ...``), a
+    code where the robot's state_message quotes the reason mid-sentence.
+    error_msg itself is left as it is: the history and the console's own
+    rewriting of a failure read that string.
+
+    ``fallback`` (the failed step's error_msg) when there is no such message:
+    a timeout, a failure with no cause.
+    """
+    cause = err.cause if isinstance(err, ActivityError) and err.cause else err
+    if isinstance(cause, ApplicationError) and cause.message:
+        return cause.message
+    return fallback or str(cause or "")
 
 
 def _end(step: Step, status: StepStatus, error_msg: str | None = None) -> None:
@@ -146,6 +227,11 @@ class RobotWorkflow:
         # Per PATROL step, how many of its waypoints the robot has passed
         # (PATROL_PROGRESS_SIGNAL); a re-dispatch after a pause starts past them.
         self._patrol_passed: dict[str, int] = {}
+        # Whether the robot accepted this run (begin_task), and so counts it as
+        # RUNNING until it is told otherwise: what end_task is owed on. False
+        # for a refused run, one that got no answer, and one from before
+        # TASK_ADMISSION_PATCH, none of which the robot is counting.
+        self._admitted: bool = False
 
     @workflow.query
     def get_step_states(self) -> list[Step]:
@@ -236,6 +322,13 @@ class RobotWorkflow:
                 if refusal is not None:
                     _end(self._steps[0], StepStatus.FAILED, refusal)
                     raise ApplicationError(refusal, non_retryable=True)
+            # After the template is read, never before: needs_localization is a
+            # fact about the steps this run will execute, and a scheduled run
+            # only has those once _resolve_template has replaced the snapshot.
+            # Before the first step, always: this is the one gate a run a
+            # Schedule started by itself ever meets.
+            if workflow.patched(TASK_ADMISSION_PATCH):
+                await self._begin_task()
             # A lone step is awaited directly, so pre-group histories replay unchanged.
             for block in step_blocks(self._steps):
                 # What the failed run this one continues got past (continuation_steps
@@ -247,9 +340,235 @@ class RobotWorkflow:
                 else:
                     await self._run_group(block, own_map)
         except (asyncio.CancelledError, Exception) as err:
-            await self._record("CANCELED" if _is_cancel(err) else "FAILED", own_map)
+            canceled = _is_cancel(err)
+            # The robot first, the report second: until end_task lands the
+            # robot refuses every other run as robot_busy, and that must not
+            # wait behind an insert's retries.
+            await self._end_task(
+                TaskOutcome.CANCELED if canceled else TaskOutcome.FAILED, err
+            )
+            await self._record("CANCELED" if canceled else "FAILED", own_map)
             raise
+        await self._end_task(TaskOutcome.COMPLETED)
         await self._record("COMPLETED", own_map)
+
+    async def _begin_task(self) -> None:
+        """Ask the robot whether this run may start; return only if it may.
+
+        syncai_robot_state decides and applies the decision in one place: an
+        accepted run IS running there from that call on (so two runs cannot
+        both be let through, and a schedule firing during another run hears
+        robot_busy instead of interleaving its steps with it), and it must then
+        be closed with end_task exactly once -- ``_admitted`` is that debt. A
+        refused run owes nothing: a refusal changes nothing on the robot, and
+        in particular latches no ERROR.
+
+        On the IO queue: the body worker has one slot, and behind a running
+        MOVE this question would wait out the MOVE instead of being answered.
+
+        A refusal fails the run at once, non-retryably, with the robot's own
+        sentence on the first step that would have run. So does no answer
+        after the retries (fail closed): a run the robot does not know of is
+        one nothing would refuse, count or stop. No answer is not "no": the
+        request may have landed and only the answer been lost, so that case
+        alone is followed by a best-effort end_task (_release_unanswered_begin)
+        before the run ends as it was going to.
+
+        Never ``await`` the handle, and never cancel it: by the time a run
+        cancel arrives the question is already with the robot, which may have
+        accepted it. The answer is waited for through the cancel, so the run
+        knows whether it owes an end_task, and the cancel is then re-raised.
+        """
+        info = workflow.info()
+        handle = workflow.start_activity(
+            RobotActivities.begin_task,
+            TaskAdmissionRequest(
+                task_id=info.workflow_id,
+                needs_localization=needs_localization(self._steps),
+            ),
+            task_queue=io_task_queue_for(info.task_queue),
+            start_to_close_timeout=BEGIN_TASK_START_TO_CLOSE,
+            schedule_to_close_timeout=BEGIN_TASK_TIMEOUT,
+            retry_policy=RetryPolicy(
+                initial_interval=TASK_STATE_RETRY_INTERVAL,
+                backoff_coefficient=1.0,
+                maximum_attempts=BEGIN_TASK_ATTEMPTS,
+            ),
+        )
+        cancel = await self._outlast_cancel(handle)
+
+        refusal: tuple[str, str] | None = None
+        try:
+            admission: TaskAdmission = handle.result()
+        except ActivityError as err:
+            workflow.logger.warning(
+                "The robot did not answer begin_task in %d attempts; failing the "
+                "run closed: %s",
+                BEGIN_TASK_ATTEMPTS,
+                err.cause or err,
+            )
+            refusal = (ROBOT_STATE_UNREACHABLE, UNREACHABLE_MESSAGE)
+            # Before either way out below, the cancel's included: whether the
+            # robot counts this run is unknown on both.
+            await self._release_unanswered_begin()
+        else:
+            if admission.accepted:
+                self._admitted = True
+            else:
+                refusal = (
+                    admission.code or ROBOT_STATE_REFUSED,
+                    admission.message or "The robot refused the task.",
+                )
+
+        if cancel is not None:
+            # The operator's cancel is the run's outcome whatever the robot
+            # answered; run()'s handler reports CANCELED if it had accepted,
+            # and an unanswered begin was released just above.
+            raise cancel
+        if refusal is None:
+            return
+
+        code, message = refusal
+        # Not steps[0]: in a run continuing a failed one it may be SKIPPED, and
+        # a SKIPPED step marked FAILED would have the next Retry start from it
+        # and run again what the first run had completed.
+        first = next(
+            (step for step in self._steps if step.status is not StepStatus.SKIPPED),
+            None,
+        )
+        if first is not None:
+            _end(first, StepStatus.FAILED, message)
+        raise ApplicationError(message, type=code, non_retryable=True)
+
+    async def _end_task(
+        self, outcome: TaskOutcome, err: BaseException | None = None
+    ) -> None:
+        """Tell the robot how this run ended, if it had accepted it.
+
+        Exactly once per accepted run, on every way out of ``run``: COMPLETED,
+        FAILED (which latches ERROR on the robot until an operator releases it,
+        with why the run failed as the reason shown meanwhile) or CANCELED
+        (the operator's cancel and the safety lock's alike: neither is a
+        fault). A paused run is still running and sends nothing.
+
+        Its own activity on the IO queue, before record_task: see
+        RobotActivities.end_task. Never changes how the run ends: a report the
+        robot could not be given is logged and dropped, as _record's is, and
+        the robot is then cleared by an operator (POST /api/v1/robot/state).
+
+        A cancel that arrives while the report is out is swallowed, not obeyed:
+        the run is already closing, and dropping the report would leave the
+        robot counting it as RUNNING for good.
+        """
+        if not self._admitted:
+            return
+        reason = ""
+        if outcome is TaskOutcome.FAILED:
+            failed = next(
+                (step for step in self._steps if step.status is StepStatus.FAILED),
+                None,
+            )
+            # The sentence, not the step's stored error: see _failure_sentence.
+            reason = _failure_sentence(
+                err, fallback=(failed.error_msg or "") if failed is not None else ""
+            )[:END_TASK_REASON_MAX]
+        failure = await self._report_end(
+            outcome, reason, timeout=END_TASK_TIMEOUT, attempts=END_TASK_ATTEMPTS
+        )
+        if failure is not None:
+            workflow.logger.warning(
+                "Could not tell the robot the run ended (%s); it still counts "
+                "the run as running until an operator clears it: %s",
+                outcome.value,
+                failure.cause or failure,
+            )
+
+    async def _release_unanswered_begin(self) -> None:
+        """Best-effort end_task(CANCELED) for a begin_task nobody answered.
+
+        Three attempts without an answer do not mean the robot did not hear:
+        a request can land, be accepted, and lose only its answer (the state
+        node busy past the gateway's wait, say). The run then fails closed
+        believing itself unadmitted while the robot counts it as RUNNING, and
+        every task after it is refused robot_busy until an operator notices
+        and clears it. One report closes that, and it is safe whichever way it
+        was, by EndTask's own contract: matched by task_id, it is a no-op (no
+        state changed, nothing latched) on a robot that is not running this
+        id, and CANCELED never latches ERROR on one that is.
+
+        Only for an UNKNOWN outcome. An answered refusal gets none -- the
+        robot said no, so it is not running the task -- and ``_admitted``
+        stays False: nothing here says the robot accepted.
+
+        On begin's budget, not end_task's (RELEASE_TASK_TIMEOUT), and never
+        changes how the run ends: a failure is logged and dropped, and a
+        cancel arriving meanwhile is swallowed as in _end_task -- the run is
+        already on its way out, as FAILED robot_state_unreachable or as the
+        cancel that came during begin.
+        """
+        failure = await self._report_end(
+            TaskOutcome.CANCELED,
+            "",
+            timeout=RELEASE_TASK_TIMEOUT,
+            attempts=RELEASE_TASK_ATTEMPTS,
+        )
+        if failure is not None:
+            workflow.logger.warning(
+                "Could not release the robot after the unanswered begin_task "
+                "either; if it had accepted the run it counts it as running "
+                "until an operator clears it: %s",
+                failure.cause or failure,
+            )
+
+    async def _report_end(
+        self, outcome: TaskOutcome, reason: str, *, timeout: timedelta, attempts: int
+    ) -> ActivityError | None:
+        """Run the end_task activity for this run to its end, through a cancel;
+        the failure it ended in, or None once the robot answered.
+
+        Shared by _end_task and _release_unanswered_begin, which differ only in
+        when they may send and how long they try. Neither awaits the handle:
+        see _outlast_cancel.
+        """
+        info = workflow.info()
+        handle = workflow.start_activity(
+            RobotActivities.end_task,
+            TaskEnd(task_id=info.workflow_id, outcome=outcome, reason=reason),
+            task_queue=io_task_queue_for(info.task_queue),
+            schedule_to_close_timeout=timeout,
+            retry_policy=RetryPolicy(
+                initial_interval=TASK_STATE_RETRY_INTERVAL,
+                backoff_coefficient=1.0,
+                maximum_attempts=attempts,
+            ),
+        )
+        await self._outlast_cancel(handle)
+        try:
+            handle.result()
+        except ActivityError as failure:
+            return failure
+        return None
+
+    @staticmethod
+    async def _outlast_cancel(handle) -> asyncio.CancelledError | None:
+        """Wait for ``handle`` to finish, through a run cancel; the cancel that
+        arrived meanwhile, or None.
+
+        For the activities whose answer the run needs whatever happens to it
+        (begin_task, and end_task in both its uses). On a condition, never ``await handle``:
+        awaiting the handle would pass the cancel on to the activity. Looped,
+        because the wait is what a cancel interrupts and the answer is still
+        wanted after it. Only asyncio.CancelledError is caught: the SDK ends an
+        evicted run by cancelling its tasks too, and the next wait_condition
+        then raises its own BaseException, which goes through untouched.
+        """
+        cancel: asyncio.CancelledError | None = None
+        while not handle.done():
+            try:
+                await workflow.wait_condition(handle.done)
+            except asyncio.CancelledError as err:
+                cancel = err
+        return cancel
 
     async def _resolve_template(
         self, task_template_id: str, own_map: str | None

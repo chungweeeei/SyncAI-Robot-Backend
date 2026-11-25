@@ -202,8 +202,35 @@ def robot_gw():
     return _StubRobotGateway()
 
 
+class _StubRobotRepo:
+    """The latest robot_state sample as the dispatch's advisory check reads
+    it: no sample (None) unless a test seeds one, which is also what every
+    test not about the robot's state wants -- no sample is never refused."""
+
+    def __init__(self):
+        self.state = None
+        self.message = ""
+
+    def status(self):
+        return self.state
+
+    def state_message(self):
+        return self.message
+
+
 @pytest.fixture
-def client(logger, workflow_gw, catalog, robot_gw, task_record_repo):
+def robot_repo():
+    return _StubRobotRepo()
+
+
+@pytest.fixture
+def client(logger, workflow_gw, catalog, robot_gw, task_record_repo, robot_repo):
+    return _client(logger, workflow_gw, catalog, robot_gw, task_record_repo, robot_repo)
+
+
+def _client(logger, workflow_gw, catalog, robot_gw, task_record_repo, robot_repo):
+    """The router on a bare app; a function so a test can mount it over a
+    RobotRepo of its own (the real one, for the ageing)."""
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(
@@ -217,6 +244,7 @@ def client(logger, workflow_gw, catalog, robot_gw, task_record_repo):
             ),
             robot_gw=robot_gw,
             task_record_repo=task_record_repo,
+            robot_repo=robot_repo,
         )
     )
     return TestClient(app)
@@ -1429,3 +1457,163 @@ class TestRoutePreview:
 
         assert response.status_code == 422
         assert robot_gw.previews == []
+
+
+class TestRobotStateAdvisory:
+    """POST /api/v1/tasks reads the latest robot_state sample and answers 409
+    before it dispatches: the operator who pressed Start is told why here.
+
+    Advisory only. The gate that counts is the robot's own begin_task, which
+    every run asks before its first step (test_workflows.py) -- so these pin
+    which dispatches are stopped early, and that an unknown state is not."""
+
+    def test_no_sample_passes(self, client, workflow_gw, robot_repo):
+        robot_repo.state = None
+
+        assert client.post("/api/v1/tasks", json=_move_task()).status_code == 200
+        assert len(workflow_gw.started) == 1
+
+    def test_a_stale_error_passes_and_a_fresh_one_does_not(
+        self, logger, workflow_gw, catalog, robot_gw, task_record_repo, make_robot_state
+    ):
+        """Over the real RobotRepo: a sample that aged out is no sample. The
+        robot stopped reporting, so answering 409 with its last state's reason
+        would name the wrong cause; the run is dispatched and its begin_task,
+        asked of the robot itself, fails it closed."""
+        pytest.importorskip("syncai_common")
+        from syncai_common.msg import RobotStatus
+
+        from syncai_backend.repositories.robot.robot import (
+            ROBOT_STATE_MAX_AGE_S,
+            init_robot_repo,
+        )
+
+        now = [500.0]
+        repo = init_robot_repo(logger=logger, now=lambda: now[0])
+        repo.update_robot_state(
+            state=make_robot_state(
+                state=RobotStatus.ERROR, state_message="A task failed: no route."
+            )
+        )
+        client = _client(logger, workflow_gw, catalog, robot_gw, task_record_repo, repo)
+
+        fresh = client.post("/api/v1/tasks", json=_move_task("robot01-task-001"))
+        assert fresh.status_code == 409
+        assert fresh.json()["code"] == "error_latched"
+
+        now[0] += ROBOT_STATE_MAX_AGE_S + 0.5
+        stale = client.post("/api/v1/tasks", json=_move_task("robot01-task-002"))
+        assert stale.status_code == 200, stale.text
+        assert [task.id for task, _ in workflow_gw.started] == ["robot01-task-002"]
+
+    @pytest.mark.parametrize("task", [_move_task, _charge_task, _patrol_task])
+    def test_an_unconfirmed_robot_refuses_a_job_that_drives(
+        self, client, workflow_gw, robot_repo, task
+    ):
+        robot_repo.state = "UNINITIALIZED"
+
+        response = client.post("/api/v1/tasks", json=task())
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "not_initialized"
+        assert "confirm" in response.json()["detail"]
+        assert workflow_gw.started == []
+
+    def test_an_unconfirmed_robot_takes_a_job_that_does_not_drive(
+        self, client, workflow_gw, robot_repo
+    ):
+        # Standing up needs no position.
+        robot_repo.state = "UNINITIALIZED"
+
+        assert client.post("/api/v1/tasks", json=_stand_task()).status_code == 200
+        assert len(workflow_gw.started) == 1
+
+    @pytest.mark.parametrize("task", [_stand_task, _move_task])
+    def test_a_robot_locked_in_error_refuses_every_job(
+        self, client, workflow_gw, robot_repo, task
+    ):
+        robot_repo.state = "ERROR"
+        robot_repo.message = "Task morning-round failed: no route."
+
+        response = client.post("/api/v1/tasks", json=task())
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "error_latched"
+        # What failed, in the robot's own words.
+        assert response.json()["detail"].endswith("Task morning-round failed: no route.")
+        assert workflow_gw.started == []
+
+    @pytest.mark.parametrize("state", ["IDLE", "RUNNING", "CHARGING", "WARNING"])
+    def test_a_confirmed_robot_is_dispatched_to(
+        self, client, workflow_gw, robot_repo, state
+    ):
+        # RUNNING too: whether another run holds the robot is Temporal's to
+        # say here (the gateway's _require_idle) and begin_task's on the robot.
+        robot_repo.state = state
+
+        assert client.post("/api/v1/tasks", json=_move_task()).status_code == 200
+
+    def test_another_map_is_said_before_an_unconfirmed_position(
+        self, client, workflow_gw, robot_repo
+    ):
+        # After stamp_map: a switch causes both, and the map is the one the
+        # operator can act on by name.
+        robot_repo.state = "UNINITIALIZED"
+
+        response = client.post(
+            "/api/v1/tasks", json={**_move_task(), "map_name": "warehouse"}
+        )
+
+        assert response.json()["code"] == "map_mismatch"
+
+    def test_a_continuation_that_still_drives_is_refused_unconfirmed(
+        self, client, workflow_gw, robot_repo
+    ):
+        robot_repo.state = "UNINITIALIZED"
+
+        response = client.post(
+            "/api/v1/tasks",
+            json={"id": "robot01-task-002", "continue_from": "robot01-task-001"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "not_initialized"
+        assert workflow_gw.started == []
+
+    def test_a_continuation_whose_driving_is_behind_it_is_not(
+        self, client, workflow_gw, robot_repo
+    ):
+        # The MOVE completed before the failure and is SKIPPED in the new run;
+        # what is left needs no position.
+        move = MoveParams(x=1.0, y=2.0, theta=90.0)
+        workflow_gw.failed = _failed_run(
+            steps=[
+                Step(id="s1", type=StepType.MOVE, params=move,
+                     status=StepStatus.COMPLETED),
+                Step(id="s2", type=StepType.LIEDOWN, status=StepStatus.FAILED,
+                     error_msg="LieDown rejected"),
+            ]
+        )
+        robot_repo.state = "UNINITIALIZED"
+
+        response = client.post(
+            "/api/v1/tasks",
+            json={"id": "robot01-task-002", "continue_from": "robot01-task-001"},
+        )
+
+        assert response.status_code == 200, response.text
+
+    def test_a_continuation_is_refused_while_the_robot_is_locked_in_error(
+        self, client, workflow_gw, robot_repo
+    ):
+        # The usual case: the run being retried is the one that latched it.
+        robot_repo.state = "ERROR"
+
+        response = client.post(
+            "/api/v1/tasks",
+            json={"id": "robot01-task-002", "continue_from": "robot01-task-001"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "error_latched"
+        assert workflow_gw.started == []

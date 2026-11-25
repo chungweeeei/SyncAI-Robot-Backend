@@ -33,3 +33,16 @@ PostgreSQL. The kept 2D helpers' tests also need scipy (`test_pcd_to_gridmap.py`
 → `scipy.ndimage`) and open3d (`test_traversable.py` `importorskip`s
 `helpers.traversable` per test, so it skips without open3d). The standard ament
 linters (`test_copyright`, `test_flake8`, `test_pep257`) run alongside.
+
+**Recorded workflow histories.** `test/fixtures/workflow_histories/` holds
+`RobotWorkflow` histories as JSON (`fetch_history().to_json()`), one directory
+per change they predate, replayed by `test_workflows.py` through `Replayer`
+against the workflow as it is now. `pre_task_admission/` is five runs recorded
+from the workflow as it was before `begin_task` / `end_task` (commit `721783c`,
+temporalio 1.35.0): completed, failed, canceled mid-MOVE, a continuation with a
+`SKIPPED` step, and a template-backed scheduled run. They are what shows that a
+run in flight across that deploy — and every closed run the console still
+queries for its steps, which replays it — goes through the new code. A change
+to the workflow that needs a patch should add its own directory, recorded
+**before** the change is made: a history written by the new code proves
+nothing about the old one.

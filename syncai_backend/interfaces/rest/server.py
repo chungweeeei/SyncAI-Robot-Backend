@@ -78,7 +78,7 @@ _STATUS_FOR = {
 }
 
 # Optional keys that ride beside ``detail`` when the exception sets them
-# (ConflictError: code; BadRequestError: code, step_id). Only when set, so
+# (ConflictError and NotFoundError: code; BadRequestError: code, step_id). Only when set, so
 # every body without one is the bare ``{"detail": ...}`` it always was.
 _EXTRA_KEYS = ("code", "step_id")
 
@@ -222,7 +222,9 @@ def init_rest_server(
 
     # The catalogue answers which map a dispatched job is stamped with, and
     # map_usage whether it may drive on it at all. task_record_repo is the
-    # report export's source.
+    # report export's source; robot_repo the latest robot_state sample, for
+    # the dispatch's advisory 409 (the robot locked in ERROR, or its position
+    # not confirmed).
     protected.include_router(
         init_task_router(
             logger=logger,
@@ -231,6 +233,7 @@ def init_rest_server(
             map_usage=deps.map_usage,
             robot_gw=deps.robot_gw,
             task_record_repo=deps.task_record_repo,
+            robot_repo=deps.robot_repo,
         )
     )
     protected.include_router(
@@ -240,6 +243,9 @@ def init_rest_server(
             task_template_repo=deps.task_template_repo,
         )
     )
+    # job_gate: the operator's switch on the robot's state (POST
+    # /api/v1/robot/state) and a new initial pose are both refused while a job
+    # runs, and only Temporal knows whether one does.
     protected.include_router(
         init_robot_router(
             logger=logger,
@@ -247,6 +253,7 @@ def init_rest_server(
             robot_gw=deps.robot_gw,
             restart_svc=deps.restart_svc,
             safety_lock_svc=deps.safety_lock_svc,
+            job_gate=deps.job_gate,
         )
     )
     protected.include_router(init_network_router(logger=logger, robot_gw=deps.robot_gw))
