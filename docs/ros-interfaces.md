@@ -262,7 +262,7 @@ preview a newer one preempted (the planner takes one at a time),
 
   `syncai_common` must be at or after the SyncAI-Robot-Interface commit that
   adds the three srvs and `RobotState`'s two trailing fields
-  (`feature/robot-state-machine`); an older one is an ImportError at startup.
+  (`cab2b03`, PR #29); an older one is an ImportError at startup.
 - `MapGateway`:
   - `planner_server/Octo3D/load_map` and `planner_server/Octo3D/load_keepout`
     (`nav2_msgs/LoadMap`, the robot's 3D planner) — a switch points Octo3D at
