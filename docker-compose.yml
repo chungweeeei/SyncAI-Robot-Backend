@@ -156,8 +156,7 @@ services:
       #    video track of the same WHEP session, and only to a console whose
       #    offer has a second m=video line (a one-line offer gets video1
       #    alone, and the second pipeline never runs); its RTP goes through
-      #    VIDEO_RTP_PORT_2, 5010 by default. Which of the two is the front
-      #    camera is not yet confirmed on robot01.
+      #    VIDEO_RTP_PORT_2, 5010 by default.
       #
       #    The G23 instead reads the camera feeder (syncai_camera_feeder, the
       #    camera's only opener) as VIDEO_FORMAT: rtpjpeg on 127.0.0.1:5008;
