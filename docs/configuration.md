@@ -14,7 +14,7 @@
 | `POSTGRES_PORT` | `5432` | ditto |
 | `POSTGRES_USER` | `syncrobotic` | ditto |
 | `POSTGRES_PASSWORD` | `syncrobotic` | ditto |
-| `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads, e.g. `[map]`) |
+| `SYNCAI_SYSTEM_INI` | `~/robot_ws/config/system.ini` | `helpers/system_config.py` (per-robot INI reads: `[system] robot_model`, `[map]`) |
 | `TTS_SERVICE_URL` | `http://syncai_tts:8080` | `gateways/tts` — the syncai_tts container by compose service name; `http://127.0.0.1:8080` with the backend on the host (the compose service uses `http://127.0.0.1:9090`, the port syncai_tts publishes) |
 | `LOG_LEVEL` | `info` | `logger.py`. Any stdlib level name; an unknown one logs a warning and keeps `info`. It was unfiltered (`NOTSET`) until 2026-10 |
 | `LOG_FORMAT` | `console` | `logger.py`. `json` for one object per line (ISO UTC timestamps, tracebacks as text) for a log collector; `console` is the coloured human one |
@@ -29,6 +29,15 @@ environment. This package resolves that INI by an **absolute** default
 `helpers/system_config.py`: the old relative `config/system.ini` only worked
 because every entrypoint happened to run from the workspace root, and tests and
 shells do not. Override with `system_config:=` or `SYNCAI_SYSTEM_INI`.
+
+**`[system] robot_model` is required** (2026-11): which kind of robot this is,
+`g23` or `m20`, lower-cased on read. `read_robot_model` runs once in the node's
+constructor and the process does not start without it — no fallback, because
+the console draws the robot and lays out its motors by this word, and a guessed
+one draws the wrong machine with no sign that anything is off. It is sent on
+`GET /api/v1/robot/state` and `/health`, and picks the LIO body link the mapping
+pose is composed through ([*ROS interfaces*](ros-interfaces.md)). Unlike
+`robot_id` it scopes nothing: no ROS name, database or queue depends on it.
 
 `set_active_map` (behind `POST /api/v1/maps/{name}/activate`) rewrites that INI
 **in place** — it is a single-file bind mount, so a temp file + rename would

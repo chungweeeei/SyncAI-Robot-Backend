@@ -41,7 +41,7 @@ switches) happens here.
   `SPEAK`, `WAIT`) run as Temporal workflows: pause / resume / cancel, step
   groups, schedules, templates, history and a CSV report.
 - **Streams** — live point cloud, mapping-mode map cloud and telemetry over
-  WebSocket; camera and speaker over WebRTC.
+  WebSocket; camera (both of an M20's) and speaker over WebRTC.
 - **Tools** — text-to-speech, `ros2 bag` recordings, controller / planner
   settings pages.
 
@@ -56,7 +56,7 @@ tests standalone**, but **running** it needs the rest of the robot stack:
 | The robot's ROS stack | nav stack, localizer, `robot_state`, system manager — topics, services and actions |
 | PostgreSQL | **hard** dependency (vertices, templates, run records); retried 20 × 5 s at startup |
 | Temporal | soft dependency (tasks, schedules); `/health` reports `degraded` without it |
-| `~/robot_ws/{config,map,record,lib}` | the per-robot INI, maps, bags and the WebRTC worker |
+| `~/robot_ws/{config,map,record,lib}` | the per-robot INI (`robot_id`, `robot_model`), maps, bags and the WebRTC worker |
 | `~/robot_ws/log/stack`, `/var/log/journal` | optional: the log export's two sources |
 | `syncai_tts`, `libsyncai_worker.so` | optional: speech and camera; everything else works without them |
 

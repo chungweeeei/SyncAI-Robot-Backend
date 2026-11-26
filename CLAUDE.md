@@ -172,7 +172,10 @@ Consequences:
   the server was restarted under it. `restart_mode` is the one exception (its late
   answer is wanted); `test_ros_call_service.py` enforces the rest.
 - Heavy point-cloud callbacks each get their own `MutuallyExclusiveCallbackGroup` so they
-  cannot starve `robot_state` / telemetry / TF.
+  cannot starve `robot_state` / telemetry / TF. The `body_cloud` callback **never waits on a
+  TF lookup** (2026-11; it blocked 50 ms until then): a scan ahead of the `odom -> body` of
+  its stamp is held in a one-scan slot and sent by a 20 ms timer of the same group, or on the
+  latest transform when the next scan arrives first (`PointCloudSubscriber`).
 - Postgres is a hard dependency (20 retries × 5 s, then the process exits); Temporal is
   soft — `TemporalWorkerHandle` records `connecting`/`running`/`dead`/`stopped` and `/health`
   reports `degraded` instead of crashing.
@@ -315,6 +318,25 @@ namespace**; the node reads it back with `self.get_namespace()`. That one value 
 ROS names (all topics/services/actions in this package are **relative** — never hardcode
 `/<robot_id>/…`), the PostgreSQL database `<robot_id>_db`, and the Temporal task queue.
 TF frame names are not namespaced.
+
+### robot_model: G23 and M20
+
+`[system] robot_model` of the same INI is **required** (2026-11): `read_robot_model`
+(`helpers/system_config.py`) raises at start-up when it is absent, with no fallback, because
+the console draws the robot by it — it is sent on the robot state and `/health`
+(`RestDeps.robot_model`). Any non-empty word is accepted; `g23` and `m20` are the two in use.
+What differs by model is small, and none of it is a branch in a router or the task code:
+
+- **The LIO body link** that closes the mapping TF tree: `_LIO_BODY_LINK`
+  (`subscribers/telemetry_subscriber.py`), the G23's `lidar_top`, the M20's `imu`. A model
+  missing there falls back to the G23's and the mapping pose is dropped with a warning.
+- **Joints** are not keyed on the model: `motor_states_low_rate` (a G23) wins while it is
+  live (`PRIMARY_JOINTS_HOLD_S`), `joint_states` (all an M20 publishes) otherwise.
+- **The camera and the DDS wiring** are deployment, not code: the model's compose file and
+  the three `SYNCAI_*` variables (*Commands*, above). `POST /whep` takes a second `m=video`
+  for the M20's second camera and a G23's worker answers it inactive.
+
+A new model is a row in `_LIO_BODY_LINK` and a compose file, not an `if robot_model ==`.
 
 ### Configuration
 
