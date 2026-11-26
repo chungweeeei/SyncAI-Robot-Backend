@@ -113,12 +113,15 @@ def init_webrtc_router(
     def whep_create(offer: bytes = Body(b"", media_type="application/sdp")):
         offer_sdp = _decode_offer(offer)
 
-        # The worker expects one video and one audio m-line. Logged, not
-        # refused, here and in the other routes: the constraint is the
-        # worker's, and enforcing it twice means changing it twice.
-        if offer_sdp.count("m=video") != 1 or offer_sdp.count("m=audio") != 1:
+        # The worker expects one audio m-line and one or two video m-lines:
+        # a second video line receives the second camera where the worker
+        # has one (VIDEO_RTSP_URL_2, the M20) and is answered inactive
+        # everywhere else. Logged, not refused, here and in the other routes:
+        # the constraint is the worker's, and enforcing it twice means
+        # changing it twice.
+        if offer_sdp.count("m=video") not in (1, 2) or offer_sdp.count("m=audio") != 1:
             logger.warning(
-                "WHEP offer is not the expected two-m-line shape",
+                "WHEP offer is not the expected shape (1-2 video m-lines, 1 audio)",
                 video_lines=offer_sdp.count("m=video"),
                 audio_lines=offer_sdp.count("m=audio"),
             )

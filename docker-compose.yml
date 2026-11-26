@@ -148,20 +148,29 @@ services:
       #    public STUN URL on a robot with no internet only makes ICE gathering
       #    wait out a timeout.
       STUN_SERVERS: ""
-      #    The camera feeder (syncai_camera_feeder, in the robot container) is
-      #    the camera's only opener, so ROS can publish it while a WHEP session
-      #    is up; it sends RTP/JPEG to 127.0.0.1:5008 (its rtp_port, the
-      #    worker's default VIDEO_RTP_IN_PORT). Left at the worker's `mjpeg`
-      #    default, every video session opens /dev/syncai/camera0 itself and
-      #    dies on "Device '/dev/syncai/camera0' is busy" / not-negotiated.
-      VIDEO_FORMAT: rtpjpeg
-      #    The rate the feeder sends at. With its gyro stabilization on
-      #    (`stabilize: true`), the RTP branch drops to its ros_framerate, 30,
-      #    instead of the camera's 60. Under rtpjpeg this sets nothing but the
-      #    encoder's IDR interval (VIDEO_FRAMERATE / 2 frames): left at the
-      #    worker's 60, a keyframe comes every second instead of every half
-      #    second, and the worker never answers a PLI, so a browser joining
-      #    mid-stream sits on a black view that much longer.
+      #    The Lynx M20's cameras are not USB devices on this host: its
+      #    perception board (10.21.31.103) serves them as H.265 RTSP,
+      #    /video1 and /video2, 1280x720 at 30 fps. The worker's `rtsp`
+      #    branch decodes one and re-encodes it to the H.264 the WHEP track
+      #    carries. VIDEO_RTSP_URL_2 is the other camera, sent as a second
+      #    video track of the same WHEP session, and only to a console whose
+      #    offer has a second m=video line (a one-line offer gets video1
+      #    alone, and the second pipeline never runs); its RTP goes through
+      #    VIDEO_RTP_PORT_2, 5010 by default. Which of the two is the front
+      #    camera is not yet confirmed on robot01.
+      #
+      #    The G23 instead reads the camera feeder (syncai_camera_feeder, the
+      #    camera's only opener) as VIDEO_FORMAT: rtpjpeg on 127.0.0.1:5008;
+      #    left at the worker's `mjpeg` default there, every video session
+      #    opens /dev/syncai/camera0 itself and dies on "Device is busy".
+      VIDEO_FORMAT: rtsp
+      VIDEO_RTSP_URL: rtsp://10.21.31.103:8554/video1
+      VIDEO_RTSP_URL_2: rtsp://10.21.31.103:8554/video2
+      #    The stream's rate (the G23 feeder's ros_framerate is 30 too). It
+      #    sets nothing but the encoder's IDR interval (VIDEO_FRAMERATE / 2
+      #    frames): the worker never answers a PLI, so a browser joining
+      #    mid-stream waits for the next keyframe, and at 30 that is half a
+      #    second rather than a whole one.
       VIDEO_FRAMERATE: "30"
       #    These two are what the `runtime: nvidia` above reads to decide what
       #    to inject; `all` rather than `video` because the CSV is consumed
@@ -180,34 +189,34 @@ services:
       # and the launch file reads [system] robot_id from that same path to
       # namespace the node. Override both together or neither.
 
-    devices:
-      # The USB cameras, passed through under the SAME names they have on the
-      # host. Individual minors are not stable — two camera models, two nodes
-      # each (capture + UVC metadata), and probe order decides who gets which —
-      # but the SET {video0..video3} is, so all four go through and the worker
-      # is pointed at a stable /dev/syncai/* symlink instead (VIDEO_DEVICE
-      # defaults to /dev/syncai/camera0). Remapping a node to a different name
-      # in here would break that symlink, which resolves by host name.
-      #
-      # Not covered by the nvidia runtime: its devices.csv lists Tegra hardware
-      # only, so a USB camera still needs an entry of its own.
-      - /dev/video0:/dev/video0
-      - /dev/video1:/dev/video1
-      - /dev/video2:/dev/video2
-      - /dev/video3:/dev/video3
+    # devices:
+    #   # The USB cameras, passed through under the SAME names they have on the
+    #   # host. Individual minors are not stable — two camera models, two nodes
+    #   # each (capture + UVC metadata), and probe order decides who gets which —
+    #   # but the SET {video0..video3} is, so all four go through and the worker
+    #   # is pointed at a stable /dev/syncai/* symlink instead (VIDEO_DEVICE
+    #   # defaults to /dev/syncai/camera0). Remapping a node to a different name
+    #   # in here would break that symlink, which resolves by host name.
+    #   #
+    #   # Not covered by the nvidia runtime: its devices.csv lists Tegra hardware
+    #   # only, so a USB camera still needs an entry of its own.
+    #   - /dev/video0:/dev/video0
+    #   - /dev/video1:/dev/video1
+    #   - /dev/video2:/dev/video2
+    #   - /dev/video3:/dev/video3
 
-    group_add:
-      # The video nodes are root:video 0660 and the container user is uid 1000,
-      # so without the host's video group the camera is present and unopenable
-      # — v4l2src fails with a permission error, not a missing-element one.
-      # Overridable because the gid is per-host: `getent group video`.
-      - "${VIDEO_GID:-44}"
-      # The host journal's group (systemd-journal), for GET /api/v1/logs/export:
-      # the journal files are root:systemd-journal 0640, so uid 1000 reads them
-      # only through it. Per-host like the video gid: `getent group
-      # systemd-journal`. Wrong or absent, the export answers without the journal
-      # and its manifest says permission was denied.
-      - "${JOURNAL_GID:-101}"
+    # group_add:
+    #   # The video nodes are root:video 0660 and the container user is uid 1000,
+    #   # so without the host's video group the camera is present and unopenable
+    #   # — v4l2src fails with a permission error, not a missing-element one.
+    #   # Overridable because the gid is per-host: `getent group video`.
+    #   - "${VIDEO_GID:-44}"
+    #   # The host journal's group (systemd-journal), for GET /api/v1/logs/export:
+    #   # the journal files are root:systemd-journal 0640, so uid 1000 reads them
+    #   # only through it. Per-host like the video gid: `getent group
+    #   # systemd-journal`. Wrong or absent, the export answers without the journal
+    #   # and its manifest says permission was denied.
+    #   - "${JOURNAL_GID:-101}"
 
     volumes:
       # Stable device names from syncai_sys_manager's udev rules, installed on
