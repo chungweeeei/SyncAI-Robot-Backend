@@ -19,6 +19,26 @@
 # worse, because it fails quietly — two Temporal workers polling the same
 # <robot_id>.ROBOT_TASK_QUEUE, so a task goes to whichever one grabs it. Take
 # the backend out of the session spec before running this, or stop robot01.
+#
+# THE CAMERA IS NOT IN THIS FILE. Where the WebRTC worker's video comes from is
+# the one thing that differs in kind between robot models, so each has a file
+# of its own that is merged over this one:
+#
+#   docker-compose.g23.yml   USB cameras on this host: /dev/video*, the video
+#                            group, /dev/syncai, VIDEO_FORMAT=rtpjpeg
+#   docker-compose.m20.yml   the perception board's RTSP streams:
+#                            VIDEO_FORMAT=rtsp, VIDEO_RTSP_URL(_2)
+#
+# Name the pair once in this directory's .env (beside the DDS lines an M20
+# carries there), and every `docker compose` command above reads both:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.g23.yml
+#
+# A separate file rather than a variable because `devices:` cannot be switched
+# by one: a /dev/video* that does not exist on the host fails the container's
+# start, which is what an M20 host would get. Run alone, this file is a backend
+# with no camera — POST /whep answers 502 with the worker's sentence, and
+# everything else works.
 
 services:
   backend:
@@ -148,28 +168,17 @@ services:
       #    public STUN URL on a robot with no internet only makes ICE gathering
       #    wait out a timeout.
       STUN_SERVERS: ""
-      #    The Lynx M20's cameras are not USB devices on this host: its
-      #    perception board (10.21.31.103) serves them as H.265 RTSP,
-      #    /video1 and /video2, 1280x720 at 30 fps. The worker's `rtsp`
-      #    branch decodes one and re-encodes it to the H.264 the WHEP track
-      #    carries. VIDEO_RTSP_URL_2 is the other camera, sent as a second
-      #    video track of the same WHEP session, and only to a console whose
-      #    offer has a second m=video line (a one-line offer gets video1
-      #    alone, and the second pipeline never runs); its RTP goes through
-      #    VIDEO_RTP_PORT_2, 5010 by default.
+      #    Where the video comes from (VIDEO_FORMAT and what goes with it) is
+      #    the robot model's file: docker-compose.g23.yml / .m20.yml, see the
+      #    header. Only what both share is set here.
       #
-      #    The G23 instead reads the camera feeder (syncai_camera_feeder, the
-      #    camera's only opener) as VIDEO_FORMAT: rtpjpeg on 127.0.0.1:5008;
-      #    left at the worker's `mjpeg` default there, every video session
-      #    opens /dev/syncai/camera0 itself and dies on "Device is busy".
-      VIDEO_FORMAT: rtsp
-      VIDEO_RTSP_URL: rtsp://10.21.31.103:8554/video1
-      VIDEO_RTSP_URL_2: rtsp://10.21.31.103:8554/video2
-      #    The stream's rate (the G23 feeder's ros_framerate is 30 too). It
-      #    sets nothing but the encoder's IDR interval (VIDEO_FRAMERATE / 2
-      #    frames): the worker never answers a PLI, so a browser joining
-      #    mid-stream waits for the next keyframe, and at 30 that is half a
-      #    second rather than a whole one.
+      #    The rate either source sends at: the G23's feeder at its
+      #    ros_framerate with gyro stabilization on, the M20's RTSP streams
+      #    natively. It sets nothing but the encoder's IDR interval
+      #    (VIDEO_FRAMERATE / 2 frames): left at the worker's 60, a keyframe
+      #    comes every second instead of every half second, and the worker
+      #    never answers a PLI, so a browser joining mid-stream sits on a
+      #    black view that much longer.
       VIDEO_FRAMERATE: "30"
       #    These two are what the `runtime: nvidia` above reads to decide what
       #    to inject; `all` rather than `video` because the CSV is consumed
@@ -188,45 +197,18 @@ services:
       # and the launch file reads [system] robot_id from that same path to
       # namespace the node. Override both together or neither.
 
-    # devices:
-    #   # The USB cameras, passed through under the SAME names they have on the
-    #   # host. Individual minors are not stable — two camera models, two nodes
-    #   # each (capture + UVC metadata), and probe order decides who gets which —
-    #   # but the SET {video0..video3} is, so all four go through and the worker
-    #   # is pointed at a stable /dev/syncai/* symlink instead (VIDEO_DEVICE
-    #   # defaults to /dev/syncai/camera0). Remapping a node to a different name
-    #   # in here would break that symlink, which resolves by host name.
-    #   #
-    #   # Not covered by the nvidia runtime: its devices.csv lists Tegra hardware
-    #   # only, so a USB camera still needs an entry of its own.
-    #   - /dev/video0:/dev/video0
-    #   - /dev/video1:/dev/video1
-    #   - /dev/video2:/dev/video2
-    #   - /dev/video3:/dev/video3
+    # No `devices:` here: the USB cameras are the G23's, in docker-compose.g23.yml.
 
-    # group_add:
-    #   # The video nodes are root:video 0660 and the container user is uid 1000,
-    #   # so without the host's video group the camera is present and unopenable
-    #   # — v4l2src fails with a permission error, not a missing-element one.
-    #   # Overridable because the gid is per-host: `getent group video`.
-    #   - "${VIDEO_GID:-44}"
-    #   # The host journal's group (systemd-journal), for GET /api/v1/logs/export:
-    #   # the journal files are root:systemd-journal 0640, so uid 1000 reads them
-    #   # only through it. Per-host like the video gid: `getent group
-    #   # systemd-journal`. Wrong or absent, the export answers without the journal
-    #   # and its manifest says permission was denied.
-    #   - "${JOURNAL_GID:-101}"
+    group_add:
+      # The host journal's group (systemd-journal), for GET /api/v1/logs/export:
+      # the journal files are root:systemd-journal 0640, so uid 1000 reads them
+      # only through it. Per-host: `getent group systemd-journal`. Wrong or
+      # absent, the export answers without the journal and its manifest says
+      # permission was denied. Every model needs it, which is why it is here
+      # and the video group (a list entry beside it, merged in) is not.
+      - "${JOURNAL_GID:-101}"
 
     volumes:
-      # Stable device names from syncai_sys_manager's udev rules, installed on
-      # the HOST (udev does not run in here): camera0/camera1 are the capture
-      # nodes keyed to the cameras' USB product IDs. Bind-mounted as a
-      # directory rather than passed as devices so a replug re-creating a
-      # symlink is visible without recreating this container, and the links
-      # resolve because the real nodes above keep their host names. If the
-      # rules are not installed the mount is simply empty — nothing at startup
-      # depends on it, only the first video session does.
-      - /dev/syncai:/dev/syncai:ro
       # ROBOT_WS is the host directory that carries the robot's config and maps.
       # Today that is the workspace checkout — these three paths are the
       # entirety of what this package needs *shared* with the rest of the stack,

@@ -1,0 +1,60 @@
+# The G23's camera, merged over docker-compose.yml (which has none):
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.g23.yml    # in .env
+#
+# or, for one command, `docker compose -f docker-compose.yml -f
+# docker-compose.g23.yml ...`. Never run this file alone: it is only the
+# camera's share of the service. Maps (`environment`) merge key by key and
+# lists (`devices`, `group_add`, `volumes`) append, so nothing here replaces
+# anything in the base file.
+#
+# The G23's cameras are USB devices on this host. The M20's are RTSP streams
+# on another board and need none of this: docker-compose.m20.yml.
+
+services:
+  backend:
+    environment:
+      # The camera feeder (syncai_camera_feeder, in the robot container) is
+      # the camera's only opener, so ROS can publish it while a WHEP session
+      # is up; it sends RTP/JPEG to 127.0.0.1:5008 (its rtp_port, the
+      # worker's default VIDEO_RTP_IN_PORT). Left at the worker's `mjpeg`
+      # default, every video session opens /dev/syncai/camera0 itself and
+      # dies on "Device '/dev/syncai/camera0' is busy" / not-negotiated.
+      VIDEO_FORMAT: rtpjpeg
+
+    devices:
+      # The USB cameras, passed through under the SAME names they have on the
+      # host. Individual minors are not stable — two camera models, two nodes
+      # each (capture + UVC metadata), and probe order decides who gets which —
+      # but the SET {video0..video3} is, so all four go through and the worker
+      # is pointed at a stable /dev/syncai/* symlink instead (VIDEO_DEVICE
+      # defaults to /dev/syncai/camera0). Remapping a node to a different name
+      # in here would break that symlink, which resolves by host name.
+      #
+      # Not covered by the nvidia runtime: its devices.csv lists Tegra hardware
+      # only, so a USB camera still needs an entry of its own.
+      #
+      # A node missing on the host fails the container's start, not just the
+      # camera — the reason this list is not in the file every model runs.
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
+      - /dev/video3:/dev/video3
+
+    group_add:
+      # The video nodes are root:video 0660 and the container user is uid 1000,
+      # so without the host's video group the camera is present and unopenable
+      # — v4l2src fails with a permission error, not a missing-element one.
+      # Overridable because the gid is per-host: `getent group video`.
+      - "${VIDEO_GID:-44}"
+
+    volumes:
+      # Stable device names from syncai_sys_manager's udev rules, installed on
+      # the HOST (udev does not run in here): camera0/camera1 are the capture
+      # nodes keyed to the cameras' USB product IDs. Bind-mounted as a
+      # directory rather than passed as devices so a replug re-creating a
+      # symlink is visible without recreating this container, and the links
+      # resolve because the real nodes above keep their host names. If the
+      # rules are not installed the mount is simply empty — nothing at startup
+      # depends on it, only the first video session does.
+      - /dev/syncai:/dev/syncai:ro

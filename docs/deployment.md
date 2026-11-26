@@ -40,8 +40,9 @@ lives in the infra compose stack and is up regardless of session.
 
 `Dockerfile` has four stages — `base` (ROS + pip deps, the expensive one),
 `builder` (the colcon install space), `runtime` (the service) and `dev` (the test
-image). `docker-compose.yml` runs `runtime` as one service. There is no default
-target; name it.
+image). `docker-compose.yml` runs `runtime` as one service, with the robot
+model's camera file merged over it (`docker-compose.g23.yml` /
+`docker-compose.m20.yml`, step 3). There is no default target; name it.
 
 ### Step by step
 
@@ -102,8 +103,29 @@ The GHCR package starts private: make it public in its settings, or
 `docker login ghcr.io` on the robot with a token that has `read:packages`.
 
 **3. Run it.** Compose is the supported way — host networking, `ipc: host`, the
-nvidia runtime, camera devices, mounts and environment, each commented in
-`docker-compose.yml`.
+nvidia runtime, mounts and environment, each commented in `docker-compose.yml`.
+
+**Name the robot model's camera file first**, once, in a `.env` beside the
+compose file. `docker-compose.yml` carries no camera, because where the video
+comes from differs in kind between models:
+
+| file | model | what it adds |
+|---|---|---|
+| `docker-compose.g23.yml` | G23 | USB cameras on this host: `/dev/video0`–`3`, the `video` group, `/dev/syncai`, `VIDEO_FORMAT=rtpjpeg` (the camera feeder's RTP) |
+| `docker-compose.m20.yml` | M20 | the perception board's RTSP streams: `VIDEO_FORMAT=rtsp`, `VIDEO_RTSP_URL` (`/video1`, front), `VIDEO_RTSP_URL_2` (`/video2`) |
+
+```bash
+# .env — G23
+COMPOSE_FILE=docker-compose.yml:docker-compose.g23.yml
+# .env — M20, beside its three DDS lines (below)
+COMPOSE_FILE=docker-compose.yml:docker-compose.m20.yml
+```
+
+With that line every `docker compose` command here reads both files. Without
+it the backend starts with no camera: `POST /whep` answers 502 and everything
+else works. A file rather than a variable because `devices:` cannot be switched
+by one — a `/dev/video*` missing on the host fails the container's start, which
+is what an M20 would get from the G23's list.
 
 ```bash
 docker compose up -d                # add --build to rebuild first
@@ -119,7 +141,9 @@ Optional knobs, in the shell or a `.env` beside the compose file:
 | `RECORD_DIR` | `./record` | where bags land on the host |
 | `WEBRTC_LIB` | `./lib/libsyncai_worker.so` | the WebRTC worker `.so` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` | `postgres` / `postgres` | the infra stack's credentials |
-| `UID` / `GID` / `VIDEO_GID` | `1000` / `1000` / `44` | container user and the host's `video` group (`getent group video`) |
+| `COMPOSE_FILE` | `docker-compose.yml` alone (no camera) | the base file plus the model's camera file, `:`-separated (above) |
+| `UID` / `GID` | `1000` / `1000` | container user |
+| `VIDEO_GID` | `44` | G23 only (`docker-compose.g23.yml`): the host's `video` group (`getent group video`) |
 | `JOURNAL_GID` | `101` | the host's `systemd-journal` group (`getent group systemd-journal`), so `GET /api/v1/logs/export` can read the journal; wrong, the export answers without it |
 | `PIP_INDEX_URL` | `https://pypi.org/simple` | build only: the PyPI index the base stage installs from (a mirror when PyPI is slow) |
 
@@ -150,9 +174,13 @@ docker compose down                 # stop and remove the container
 
 **Without compose.** A plain `docker run` must reproduce the compose service;
 this equivalent drifts the moment the compose file changes, so prefer compose
-(the three DDS values are the CycloneDDS defaults; an M20 takes
-`ROS_DOMAIN_ID=0`, `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` and
-`FASTRTPS_DEFAULT_PROFILES_FILE=$R/config/models/m20/fastdds.xml`):
+(this one is a G23: the three DDS values are the CycloneDDS defaults and the
+camera is the USB one. An M20 takes `ROS_DOMAIN_ID=0`,
+`RMW_IMPLEMENTATION=rmw_fastrtps_cpp` and
+`FASTRTPS_DEFAULT_PROFILES_FILE=$R/config/models/m20/fastdds.xml`, and for the
+camera `-e VIDEO_FORMAT=rtsp -e VIDEO_RTSP_URL=… -e VIDEO_RTSP_URL_2=…` in place
+of `VIDEO_FORMAT=rtpjpeg`, the `--device` lines, the `video` group and the
+`/dev/syncai` mount):
 
 ```bash
 WS=${ROBOT_WS:-$HOME/SyncAI-Robot-Workspace}

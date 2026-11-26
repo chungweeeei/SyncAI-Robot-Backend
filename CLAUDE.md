@@ -121,7 +121,14 @@ this repo's `lib/`), and `~/robot_ws/record` from this repo's own
 `record/` (`RECORD_DIR`) — bags are the one thing nothing else in the stack
 reads, so they are not tied to a workspace checkout — plus **`ipc: host`**, so
 this container shares the host's `/dev/shm` with the robot container (see
-*Mapping-mode map cloud* below). The builder stage vcs-imports syncai_common
+*Mapping-mode map cloud* below). **It carries no camera**: where the WebRTC worker's
+video comes from is the robot model's file, merged over it by `COMPOSE_FILE` in `.env` —
+`docker-compose.g23.yml` (the USB cameras: `devices`, the `video` group, `/dev/syncai`,
+`VIDEO_FORMAT=rtpjpeg`) or `docker-compose.m20.yml` (the perception board's RTSP:
+`VIDEO_FORMAT=rtsp`, `VIDEO_RTSP_URL` / `_2`). A file, not a variable, because a
+`/dev/video*` missing on the host fails the container's start; put what every model
+needs in the base file (`JOURNAL_GID` is there for that reason), never comment a block
+out for one model. The builder stage vcs-imports syncai_common
 itself; nothing needs copying in. It also builds `docker/livox_ros_driver2`, a
 messages-only stand-in for the Livox driver that exists solely so `ros2 bag
 record` can subscribe to `livox/lidar` (CustomMsg); keep its name and `.msg`

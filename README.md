@@ -68,6 +68,8 @@ PostgreSQL, Temporal and the robot container must already be up. Only one
 backend may run per robot.
 
 ```bash
+# once per host: the robot model's camera file (g23 or m20), read with the base
+echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.g23.yml' >> .env
 docker compose up -d --build        # or pull ghcr.io/chungweeeei/syncai-backend:dev
 docker compose logs -f
 curl http://127.0.0.1:3000/health   # always 200; status is ok or degraded
@@ -90,8 +92,9 @@ source install/setup.bash
 ros2 launch syncai_backend backend.launch.py           # robot_id from ~/robot_ws/config/system.ini
 ```
 
-Mirrors, image tags, compose knobs, `docker run` and the pitfalls (host
-networking, CycloneDDS, `ipc: host`) are in [docs/deployment.md](docs/deployment.md).
+Mirrors, image tags, compose knobs (the per-model camera file, the DDS
+wiring), `docker run` and the pitfalls (host networking, `ipc: host`) are in
+[docs/deployment.md](docs/deployment.md).
 
 ## Configuration
 

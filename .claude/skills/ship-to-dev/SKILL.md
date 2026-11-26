@@ -48,6 +48,9 @@ anything in this repo):
 ```bash
 uvx ruff@0.16.8 check .          # the version ci.yml pins; bump both together
 docker compose config --quiet    # a malformed compose file, without starting anything
+for m in g23 m20; do             # and each model's camera file, merged over it
+  docker compose -f docker-compose.yml -f docker-compose.$m.yml config --quiet
+done
 ```
 
 **The suite, in the dev image.** Build the image once

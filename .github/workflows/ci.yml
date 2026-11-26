@@ -58,7 +58,11 @@ jobs:
 
       # Catches a malformed compose file without starting anything. Every
       # variable in docker-compose.yml has a default, so this needs no .env.
+      # Each model's camera file is checked merged over it, the only way
+      # either is ever run.
       - run: docker compose config --quiet
+      - run: docker compose -f docker-compose.yml -f docker-compose.g23.yml config --quiet
+      - run: docker compose -f docker-compose.yml -f docker-compose.m20.yml config --quiet
 
   test:
     name: pytest (ROS 2 Humble)

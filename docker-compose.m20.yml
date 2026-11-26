@@ -1,0 +1,28 @@
+# The Lynx M20's cameras, merged over docker-compose.yml (which has none):
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.m20.yml    # in .env
+#
+# beside the three DDS lines an M20's .env already carries (SYNCAI_RMW,
+# SYNCAI_DDS_CONFIG, SYNCAI_ROS_DOMAIN_ID; see docker-compose.yml). Or, for one
+# command, `docker compose -f docker-compose.yml -f docker-compose.m20.yml ...`.
+# Never run this file alone: it is only the camera's share of the service.
+#
+# No `devices:`, no video group, no /dev/syncai: there is no V4L2 camera on
+# this host, and the worker reaches the streams over the network the container
+# already shares with it (network_mode: host). The G23's USB cameras are
+# docker-compose.g23.yml.
+
+services:
+  backend:
+    environment:
+      # The M20's perception board (10.21.31.103) serves its cameras as H.265
+      # RTSP, /video1 (the front camera) and /video2, 1280x720 at 30 fps. The
+      # worker's `rtsp` branch decodes one and re-encodes it to the H.264 the
+      # WHEP track carries.
+      VIDEO_FORMAT: rtsp
+      VIDEO_RTSP_URL: rtsp://10.21.31.103:8554/video1
+      # The other camera, sent as a second video track of the same WHEP
+      # session, and only to a console whose offer has a second m=video line
+      # (a one-line offer gets video1 alone, and the second pipeline never
+      # runs); its RTP goes through VIDEO_RTP_PORT_2, 5010 by default.
+      VIDEO_RTSP_URL_2: rtsp://10.21.31.103:8554/video2
